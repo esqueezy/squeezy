@@ -2,7 +2,7 @@ use std::io;
 
 use serde::Serialize;
 use serde_json::Value;
-use squeezy_core::{AppConfig, CostSnapshot, TurnMetrics};
+use squeezy_core::{AppConfig, CostOrigin, CostSnapshot, TurnMetrics};
 use squeezy_llm::{LlmInputItem, LlmRequest, estimate_cost};
 use squeezy_tools::{ToolResult, ToolStatus};
 
@@ -107,6 +107,14 @@ pub(crate) struct CostBroker {
     /// micros. Seeded from the resumed conversation state and updated after
     /// every provider response we record.
     session_cost_usd_micros: u64,
+    /// Cumulative session cost as a full [`CostSnapshot`] (token distribution
+    /// + USD), seeded from the resumed session and advanced on every recorded
+    /// round. Mirrors `session_cost_usd_micros` on the dollar field but also
+    /// carries input/output/cache tokens, so the live status line can show a
+    /// session-cumulative cost+token snapshot without re-reading conversation
+    /// state. Does not include out-of-band reviewer spend recorded straight to
+    /// the session (a small, next-turn-reconciled lag).
+    session_cost: CostSnapshot,
     /// Hard cap from `AppConfig.max_session_cost_usd_micros`. `None` (or a
     /// zero cap) disables session-level gating.
     max_session_cost_usd_micros: Option<u64>,
@@ -145,6 +153,7 @@ impl CostBroker {
             max_search_files: config.max_search_files_per_turn,
             metrics: TurnMetrics::default(),
             session_cost_usd_micros: 0,
+            session_cost: CostSnapshot::default(),
             max_session_cost_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
             cost_warn_percent: config.cost_warn_percent.clamp(1, 100),
             warn_emitted: false,
@@ -156,13 +165,16 @@ impl CostBroker {
 
     /// Seed the running session cost from a resumed `CostSnapshot`. Pre-seeds
     /// `warn_emitted` so a session that resumes already over the warning
-    /// threshold doesn't re-fire the warning on its first new turn.
+    /// threshold doesn't re-fire the warning on its first new turn. Stores the
+    /// full prior snapshot so the cumulative `session_cost` (tokens + USD) is
+    /// correct from the first new round.
     pub(crate) fn seed_session(
         &mut self,
-        session_cost_usd_micros: u64,
+        prior_cost: &CostSnapshot,
         calibration: squeezy_llm::TokenCalibration,
     ) {
-        self.session_cost_usd_micros = session_cost_usd_micros;
+        self.session_cost = prior_cost.clone();
+        self.session_cost_usd_micros = prior_cost.estimated_usd_micros.unwrap_or(0);
         self.calibration = calibration;
         if let Some(cap) = self.max_session_cost_usd_micros {
             let threshold = warn_threshold_micros(cap, self.cost_warn_percent);
@@ -177,8 +189,23 @@ impl CostBroker {
     /// `Some(CostCapStatus)` the first time the session crosses
     /// `cost_warn_percent` (or hits the cap), so the caller can publish a
     /// transcript event.
-    pub(crate) fn record_provider_cost(&mut self, cost: &CostSnapshot) -> Option<CostCapStatus> {
+    ///
+    /// `provider`/`model`/`origin` attribute the round to its `(provider,
+    /// model)` bucket in the per-model ledger. The ledger is additive-only and
+    /// parallel to the flat `metrics.provider` total — it is never summed back
+    /// into `session_cost_usd_micros`, so the dollar total can't drift.
+    pub(crate) fn record_provider_cost(
+        &mut self,
+        provider: &str,
+        model: &str,
+        origin: CostOrigin,
+        cost: &CostSnapshot,
+    ) -> Option<CostCapStatus> {
         self.metrics.record_provider(cost);
+        self.metrics
+            .model_ledger
+            .record(provider, model, origin, cost);
+        crate::merge_cost(&mut self.session_cost, cost);
         let delta = cost.estimated_usd_micros.unwrap_or(0);
         self.session_cost_usd_micros = self.session_cost_usd_micros.saturating_add(delta);
         let cap = self.max_session_cost_usd_micros?;
@@ -195,6 +222,20 @@ impl CostBroker {
             cap_usd_micros: cap,
             percent: cap_percent(self.session_cost_usd_micros, cap),
         })
+    }
+
+    /// The session-cumulative cost snapshot (token distribution + USD): seeded
+    /// from the resumed session and advanced by every `record_provider_cost`.
+    /// The dollar field is canonicalised to `session_cost_usd_micros` (the
+    /// authoritative cap-basis total) so the live status line always shows the
+    /// same figure the cap enforces. Emitted on cost-bearing agent events so
+    /// the status line shows session-cumulative spend that survives a mid-turn
+    /// cancel or failure.
+    pub(crate) fn session_cost_snapshot(&self) -> CostSnapshot {
+        CostSnapshot {
+            estimated_usd_micros: Some(self.session_cost_usd_micros),
+            ..self.session_cost.clone()
+        }
     }
 
     /// Reports whether a configured session cost cap cannot be enforced for

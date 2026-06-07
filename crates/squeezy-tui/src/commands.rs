@@ -53,11 +53,21 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
         style::accent("◷"),
         style::muted(snapshot.session_id.as_deref().unwrap_or("-")),
     ));
+    // When spend spans more than the active model (switch / reroute / a
+    // different-model subagent), mark the header model as the *active* one so
+    // it doesn't read as the sole spender — the authoritative split is the
+    // "By model" section below.
+    let model_active_tag = if !metrics.model_ledger.is_empty() {
+        format!(" {}", style::muted("(active)"))
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "  {} provider  {}   model {}   mode {}\n",
+        "  {} provider  {}   model {}{}   mode {}\n",
         style::accent("◉"),
         style::accent(snapshot.provider),
         style::accent(&snapshot.model),
+        model_active_tag,
         style::accent(snapshot.mode.as_str()),
     ));
     out.push_str(&format!(
@@ -117,6 +127,66 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
             style_u64_emphasize_nonzero_err(metrics.subagent_budget_denials),
         ));
     }
+    if !metrics.model_ledger.is_empty() {
+        out.push('\n');
+        out.push_str(&style::header("By model"));
+        out.push('\n');
+        let mut buckets: Vec<&squeezy_core::ModelCostBucket> =
+            metrics.model_ledger.iter().collect();
+        // Highest spend first; stable tie-break on provider:model keeps the
+        // output (and its tests) deterministic across runs.
+        buckets.sort_by(|a, b| {
+            b.total_usd_micros()
+                .unwrap_or(0)
+                .cmp(&a.total_usd_micros().unwrap_or(0))
+                .then_with(|| {
+                    (a.provider.as_str(), a.model.as_str())
+                        .cmp(&(b.provider.as_str(), b.model.as_str()))
+                })
+        });
+        for bucket in buckets {
+            let active = bucket.provider == snapshot.provider && bucket.model == snapshot.model;
+            let model_label = format!("{}:{}", bucket.provider, bucket.model);
+            let styled_label = if active {
+                format!(
+                    "{} {}",
+                    style::accent(&model_label),
+                    style::muted("(active)")
+                )
+            } else {
+                style::accent(&model_label)
+            };
+            // One row per non-empty origin so the main-vs-subagent split is
+            // explicit; a model with both prints two rows under one label.
+            for (scope, slot) in [("main", &bucket.main), ("subagent", &bucket.subagent)] {
+                if !cost_snapshot_has_data(slot) {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "  {} {} {} usd={} in={} out={} cache_r={} cache_w={}\n",
+                    style::accent("◉"),
+                    styled_label,
+                    style::muted(scope),
+                    format_cost_styled(slot),
+                    style_optional_u64(slot.input_tokens),
+                    style_optional_u64(slot.output_tokens),
+                    style_optional_u64(slot.cached_input_tokens),
+                    style_optional_u64(slot.cache_write_input_tokens),
+                ));
+            }
+        }
+        let totals = metrics.model_ledger.totals();
+        out.push_str(&format!(
+            "  {} total usd={} in={} out={} cache_r={} cache_w={}\n",
+            style::accent("Σ"),
+            format_cost_styled(&totals),
+            style_optional_u64(totals.input_tokens),
+            style_optional_u64(totals.output_tokens),
+            style_optional_u64(totals.cached_input_tokens),
+            style_optional_u64(totals.cache_write_input_tokens),
+        ));
+    }
+
     let receipt_total = metrics.receipt_stub_hits + metrics.negative_receipt_hits;
     let spill_total = metrics.spill_writes + metrics.spill_reads;
     let io_activity = metrics.bytes_read
@@ -940,6 +1010,16 @@ fn style_u64_emphasize_nonzero_err(value: u64) -> String {
     } else {
         style::err(&value.to_string())
     }
+}
+
+/// Whether a per-model ledger slot carries any spend worth a row — used to
+/// suppress an empty main/subagent sub-row in the "By model" drill.
+fn cost_snapshot_has_data(cost: &squeezy_core::CostSnapshot) -> bool {
+    cost.estimated_usd_micros.unwrap_or(0) > 0
+        || cost.input_tokens.unwrap_or(0) > 0
+        || cost.output_tokens.unwrap_or(0) > 0
+        || cost.cached_input_tokens.unwrap_or(0) > 0
+        || cost.cache_write_input_tokens.unwrap_or(0) > 0
 }
 
 /// Cost formatted with accent color when present, muted dash when not.

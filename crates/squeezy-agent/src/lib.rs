@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
     ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
-    ContextCompactionTrigger, ContextEstimate, ContextPin, CostSnapshot,
+    ContextCompactionTrigger, ContextEstimate, ContextPin, CostOrigin, CostSnapshot,
     DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL, PROJECT_SETTINGS_FILE,
     PermissionAction, PermissionCapability, PermissionPolicyMode, PermissionRequest,
     PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
@@ -4585,7 +4585,13 @@ impl Agent {
                     if let Some(provider_kind) = classify_provider_error(&error) {
                         telemetry.spawn(TelemetryEvent::provider_error(provider_kind));
                     }
-                    let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
+                    let _ = tx
+                        .send(AgentEvent::Failed {
+                            turn_id,
+                            error,
+                            session_cost: None,
+                        })
+                        .await;
                 }
             },
         );
@@ -4695,7 +4701,13 @@ where
             if let Some(provider_kind) = classify_provider_error(&error) {
                 telemetry.spawn(TelemetryEvent::provider_error(provider_kind));
             }
-            let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
+            let _ = tx
+                .send(AgentEvent::Failed {
+                    turn_id,
+                    error,
+                    session_cost: None,
+                })
+                .await;
         }
         clear_active_turn_if_current(&active_turn, turn_id);
         done.notify_waiters();
@@ -4745,6 +4757,7 @@ fn spawn_turn_cancel_monitor(
                             turn_id,
                             cost: CostSnapshot::default(),
                             metrics: TurnMetrics::default(),
+                            session_cost: None,
                         })
                         .await;
                 }
@@ -5142,6 +5155,7 @@ async fn complete_squeezy_help_turn(
             context_estimate,
             stop_reason: None,
             reasoning_only_stop: false,
+            session_cost: None,
         })
         .await;
 }
@@ -5346,6 +5360,7 @@ async fn complete_local_tool_turn(
             context_estimate,
             stop_reason: None,
             reasoning_only_stop: false,
+            session_cost: None,
         })
         .await;
 }
@@ -6460,10 +6475,7 @@ impl TurnRuntime {
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::from_store(self.store.clone());
         let mut broker = CostBroker::new(&self.config);
-        broker.seed_session(
-            prior_state.cost.estimated_usd_micros.unwrap_or(0),
-            prior_state.token_calibration.clone(),
-        );
+        broker.seed_session(&prior_state.cost, prior_state.token_calibration.clone());
         let exploration_plan = self
             .config
             .exploration_graph
@@ -6730,6 +6742,7 @@ impl TurnRuntime {
         .await;
         let decision = classify_result.decision;
         let judge_cost = classify_result.judge_cost;
+        let judge_model = classify_result.judge_model;
         // Fold the judge call's spend into the broker so its tokens
         // count against `max_session_cost_usd_micros` and surface in
         // the turn's provider cost — that's the bill the provider
@@ -6746,7 +6759,13 @@ impl TurnRuntime {
             || judge_cost.input_tokens.is_some()
             || judge_cost.output_tokens.is_some()
         {
-            if let Some(status) = broker.record_provider_cost(&judge_cost) {
+            let judge_model_for_cost = judge_model.as_deref().unwrap_or(parent_model_str.as_str());
+            if let Some(status) = broker.record_provider_cost(
+                self.provider.name(),
+                judge_model_for_cost,
+                CostOrigin::Main,
+                &judge_cost,
+            ) {
                 let _ = self
                     .tx
                     .send(AgentEvent::CostWarning {
@@ -6759,6 +6778,11 @@ impl TurnRuntime {
                 .estimated_usd_micros
                 .unwrap_or(0)
                 .saturating_add(broker.metrics.routing_judge_usd_micros);
+            // The judge call is real billable spend. Fold it into the turn's
+            // cost snapshot too (not just the broker's provider aggregate) so
+            // it lands in `state.cost`, keeping the `/cost` headline equal to
+            // the per-model ledger's main-origin total.
+            merge_cost(&mut total_cost, &judge_cost);
         }
         let mut current_model: Arc<str> = match &decision {
             turn_router::TurnRoutingDecision::Cheap { model, .. } => model.clone(),
@@ -6887,6 +6911,7 @@ impl TurnRuntime {
                     .send(AgentEvent::Failed {
                         turn_id: self.turn_id,
                         error: SqueezyError::Agent(format_cap_reached_reason(status)),
+                        session_cost: Some(broker.session_cost_snapshot()),
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -6917,6 +6942,7 @@ impl TurnRuntime {
                     .send(AgentEvent::Failed {
                         turn_id: self.turn_id,
                         error: SqueezyError::Agent(format_pressure_gate_reason(status)),
+                        session_cost: Some(broker.session_cost_snapshot()),
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -7034,6 +7060,7 @@ impl TurnRuntime {
                         .send(AgentEvent::Failed {
                             turn_id: self.turn_id,
                             error: SqueezyError::Agent(reason),
+                            session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
                     self.finish_turn(&broker.metrics).await;
@@ -7475,7 +7502,12 @@ impl TurnRuntime {
                             cost.estimated_usd_micros =
                                 estimate_cost(self.provider.name(), &effective_model, &cost);
                         }
-                        let warning = broker.record_provider_cost(&cost);
+                        let warning = broker.record_provider_cost(
+                            self.provider.name(),
+                            &effective_model,
+                            CostOrigin::Main,
+                            &cost,
+                        );
                         if broker.note_unenforceable_cap_round(&cost) {
                             let _ = self
                                 .tx
@@ -7733,6 +7765,7 @@ impl TurnRuntime {
                         context_estimate,
                         stop_reason: stop_reason.clone(),
                         reasoning_only_stop,
+                        session_cost: Some(broker.session_cost_snapshot()),
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -7842,6 +7875,7 @@ impl TurnRuntime {
                             error: SqueezyError::Agent(
                                 "model response stopped after max_tokens before completing; lower reasoning_effort, raise the provider's max_output_tokens, or run /compact and retry".to_string(),
                             ),
+                            session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
                     self.finish_turn(&broker.metrics).await;
@@ -7887,6 +7921,7 @@ impl TurnRuntime {
                             error: SqueezyError::Agent(
                                 "model reported the context window was exceeded; run /compact and retry".to_string(),
                             ),
+                            session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
                     self.finish_turn(&broker.metrics).await;
@@ -7933,6 +7968,7 @@ impl TurnRuntime {
                                 "model refused to produce a response (provider safety filter)"
                                     .to_string(),
                             ),
+                            session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
                     self.finish_turn(&broker.metrics).await;
@@ -7995,6 +8031,7 @@ impl TurnRuntime {
                             error: SqueezyError::Agent(
                                 "model paused the turn (pause_turn) without an actionable continuation after bounded re-issue; retry the turn".to_string(),
                             ),
+                            session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
                     self.finish_turn(&broker.metrics).await;
@@ -8189,6 +8226,7 @@ impl TurnRuntime {
                         context_estimate,
                         stop_reason: stop_reason.clone(),
                         reasoning_only_stop,
+                        session_cost: Some(broker.session_cost_snapshot()),
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -8878,8 +8916,23 @@ impl TurnRuntime {
         // turn already terminates the round loop, so emitting a warning
         // event here would just race the `AgentEvent::Cancelled` we are
         // about to send.
-        let _ = broker.record_provider_cost(&partial);
+        let _ = broker.record_provider_cost(
+            self.provider.name(),
+            request_model,
+            CostOrigin::Main,
+            &partial,
+        );
         merge_cost(total_cost, &partial);
+    }
+
+    /// Session-cumulative cost read from conversation state. Valid only AFTER
+    /// the turn's cost has been persisted (the `persist_turn_*` calls fold this
+    /// turn into `state.cost`), so the snapshot includes the just-finished
+    /// turn. Used by the terminal-finish methods that have no `CostBroker`
+    /// handle to put a session-cumulative cost on their event for the live
+    /// status line.
+    async fn persisted_session_cost(&self) -> CostSnapshot {
+        self.conversation_state.lock().await.cost.clone()
     }
 
     async fn finish_cancelled_turn(
@@ -8908,12 +8961,14 @@ impl TurnRuntime {
         );
         self.telemetry.end_turn();
         self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
+        let session_cost = self.persisted_session_cost().await;
         let _ = self
             .tx
             .send(AgentEvent::Cancelled {
                 turn_id: self.turn_id,
                 cost: cost.clone(),
                 metrics: metrics.clone(),
+                session_cost: Some(session_cost),
             })
             .await;
     }
@@ -9004,6 +9059,7 @@ impl TurnRuntime {
                 context_estimate,
                 stop_reason,
                 reasoning_only_stop: false,
+                session_cost: Some(self.persisted_session_cost().await),
             })
             .await;
         self.finish_turn(metrics).await;
@@ -9905,6 +9961,14 @@ struct SubagentDispatchOutcome {
     /// historical lease-cap path bumps only the global counter, so this
     /// stays `false` for that branch to preserve telemetry counts.
     bucket_failure: bool,
+    /// The provider the subagent ran on (the parent provider — subagents
+    /// reuse the parent client). Paired with `model` to key the subagent's
+    /// spend in the parent's per-model ledger.
+    provider: String,
+    /// The model the subagent actually ran on (resolved per kind/role; may
+    /// differ from the parent model). Used only when `execution_metrics` is
+    /// `Some`; empty on pre-execution failures where no run happened.
+    model: String,
 }
 
 /// Apply broker-mutation deltas captured by a [`SubagentDispatchOutcome`].
@@ -9919,6 +9983,15 @@ fn apply_subagent_dispatch(
     if let Some(metrics) = outcome.execution_metrics.as_ref() {
         broker.metrics.merge_subagent_tool_metrics(metrics);
         record_subagent_kind_execution(&mut broker.metrics, kind, metrics);
+        // Attribute the subagent's whole provider spend to its own
+        // `(provider, model)` under the SUBAGENT slot — the subagent may run a
+        // different model than the parent (cheap tier for explore/review).
+        broker.metrics.model_ledger.record(
+            &outcome.provider,
+            &outcome.model,
+            CostOrigin::Subagent,
+            &metrics.provider,
+        );
     }
     if outcome.global_failure {
         broker.metrics.subagent_failures += 1;
@@ -9978,6 +10051,8 @@ async fn run_subagent_dispatch(
             execution_metrics: None,
             global_failure: true,
             bucket_failure: true,
+            provider: context.provider.name().to_string(),
+            model: String::new(),
         };
     }
     let request = match parse_subagent_request(call, kind) {
@@ -10008,6 +10083,8 @@ async fn run_subagent_dispatch(
                 execution_metrics: None,
                 global_failure: true,
                 bucket_failure: true,
+                provider: context.provider.name().to_string(),
+                model: String::new(),
             };
         }
     };
@@ -10078,6 +10155,8 @@ async fn run_subagent_dispatch(
                 execution_metrics: None,
                 global_failure: true,
                 bucket_failure: false,
+                provider: context.provider.name().to_string(),
+                model: String::new(),
             };
         }
     };
@@ -10232,12 +10311,15 @@ async fn run_subagent_dispatch(
     }
 
     let summary = execution.summary.clone();
+    let model = execution.model.clone();
     SubagentDispatchOutcome {
         result: subagent_control_result(call, kind, execution),
         summary,
         execution_metrics: Some(execution_metrics),
         global_failure: status_is_failure,
         bucket_failure: status_is_failure,
+        provider: context.provider.name().to_string(),
+        model,
     }
 }
 
@@ -13790,6 +13872,7 @@ async fn maybe_emit_cost_update(
                 tool_count: snap.tool_count,
                 input_tokens: snap.input_tokens,
                 micro_usd: snap.micro_usd,
+                session_cost: Some(broker.session_cost_snapshot()),
             })
             .await;
     }
@@ -14367,7 +14450,7 @@ async fn permission_decision_for_request(
         } else {
             None
         };
-        match ai_reviewer::review_permission(ai_reviewer::AiReviewerInput {
+        let reviewer_result = ai_reviewer::review_permission(ai_reviewer::AiReviewerInput {
             config: &context.config,
             provider: context.provider.clone(),
             request: &request,
@@ -14377,8 +14460,28 @@ async fn permission_decision_for_request(
             cancel: context.cancel.child_token(),
             telemetry: context.telemetry.clone(),
         })
-        .await
+        .await;
+        // The reviewer's LLM call is real billable spend, but there is no
+        // `CostBroker` on the permission path. Record it straight into the
+        // persisted session cost + per-model ledger (keyed by the reviewer
+        // model, main-origin), keeping `state.cost` and `state.metrics.provider`
+        // in lockstep so the `/cost` headline and the By-model drill agree.
+        if (reviewer_result.cost.estimated_usd_micros.is_some()
+            || reviewer_result.cost.input_tokens.is_some()
+            || reviewer_result.cost.output_tokens.is_some())
+            && let Some(conversation_state) = &context.conversation_state
         {
+            let mut state = conversation_state.lock().await;
+            merge_cost(&mut state.cost, &reviewer_result.cost);
+            merge_cost(&mut state.metrics.provider, &reviewer_result.cost);
+            state.metrics.model_ledger.record(
+                context.provider.name(),
+                &reviewer_result.model,
+                CostOrigin::Main,
+                &reviewer_result.cost,
+            );
+        }
+        match reviewer_result.outcome {
             ai_reviewer::AiReviewerOutcome::Verdict(reviewed) => {
                 log_session_event(
                     context.session_log.as_ref(),
@@ -16992,6 +17095,11 @@ pub enum AgentEvent {
         /// Qwen3 "reasoning-only finish" pattern (see
         /// `LlmEvent::Completed::reasoning_only_stop`).
         reasoning_only_stop: bool,
+        /// Session-cumulative cost (token distribution + USD) at turn end, for
+        /// the live status-line cost segment. `None` on turns with no
+        /// `CostBroker` handle (help / local-tool turns); the TUI then keeps
+        /// the last known cumulative value rather than blanking.
+        session_cost: Option<CostSnapshot>,
     },
     /// Emitted at most once per session, the first time the running provider
     /// cost crosses `cost_warn_percent` of the configured
@@ -17033,6 +17141,10 @@ pub enum AgentEvent {
         tool_count: u64,
         input_tokens: u64,
         micro_usd: u64,
+        /// Session-cumulative cost (token distribution + USD) so far, so the
+        /// status-line cost segment ticks up live mid-turn. `None` only if no
+        /// broker snapshot was available.
+        session_cost: Option<CostSnapshot>,
     },
     /// Periodic heartbeat while a single tool call is still running.
     /// Emitted on a fixed interval (see `TOOL_PROGRESS_INTERVAL`) so a
@@ -17058,10 +17170,20 @@ pub enum AgentEvent {
         /// account for partial spend on a cancelled turn the same way
         /// they do on a completed one.
         metrics: TurnMetrics,
+        /// Session-cumulative cost (token distribution + USD) at the moment of
+        /// cancel, so the status-line cost segment keeps showing real spend
+        /// instead of blanking after a mid-turn break. `None` only on the
+        /// watchdog path that has no broker/state handle.
+        session_cost: Option<CostSnapshot>,
     },
     Failed {
         turn_id: TurnId,
         error: SqueezyError,
+        /// Session-cumulative cost (token distribution + USD) at the moment of
+        /// failure, so a failed turn's already-billed partial spend stays on
+        /// the status line. `None` on outer/no-broker failure paths; the TUI
+        /// then keeps the last known cumulative value.
+        session_cost: Option<CostSnapshot>,
     },
     /// Emitted whenever the per-turn router swaps the model on the wire
     /// away from the user's configured parent model. Fires twice on an

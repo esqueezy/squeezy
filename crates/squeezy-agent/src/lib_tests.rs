@@ -9491,7 +9491,13 @@ fn cost_cap_fires_pre_flight_after_partial_spend_under_cap() {
     let mut broker = CostBroker::new(&config);
     // Round 1 landed at $0.006 spent — still well under the $0.01 cap, so
     // post-hoc check passes.
-    broker.seed_session(6_000, squeezy_llm::TokenCalibration::default());
+    broker.seed_session(
+        &CostSnapshot {
+            estimated_usd_micros: Some(6_000),
+            ..Default::default()
+        },
+        squeezy_llm::TokenCalibration::default(),
+    );
     assert!(
         broker.session_cap_reached().is_none(),
         "post-hoc check must not trip at 60% of cap"
@@ -9519,7 +9525,13 @@ fn cost_cap_post_hoc_check_still_fires_when_spent_exceeds_cap() {
         ..AppConfig::default()
     };
     let mut broker = CostBroker::new(&config);
-    broker.seed_session(12_457, squeezy_llm::TokenCalibration::default());
+    broker.seed_session(
+        &CostSnapshot {
+            estimated_usd_micros: Some(12_457),
+            ..Default::default()
+        },
+        squeezy_llm::TokenCalibration::default(),
+    );
     let status = broker
         .session_cap_reached()
         .expect("post-hoc check must fire when spent >= cap");

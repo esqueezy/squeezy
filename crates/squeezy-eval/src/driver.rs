@@ -2482,6 +2482,7 @@ impl Driver {
                     tool_count,
                     input_tokens,
                     micro_usd,
+                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     self.capture.record(
@@ -2548,6 +2549,7 @@ impl Driver {
                     context_estimate,
                     stop_reason,
                     reasoning_only_stop,
+                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     frame.elapsed_ms = turn_start.elapsed().as_millis() as u64;
@@ -2613,6 +2615,7 @@ impl Driver {
                     turn_id,
                     cost,
                     metrics,
+                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     frame.elapsed_ms = turn_start.elapsed().as_millis() as u64;
@@ -2654,7 +2657,7 @@ impl Driver {
                     completed = true;
                     break;
                 }
-                AgentEvent::Failed { turn_id, error } => {
+                AgentEvent::Failed { turn_id, error, .. } => {
                     let turn_str = format!("{turn_id:?}");
                     frame.elapsed_ms = turn_start.elapsed().as_millis() as u64;
                     frame.finish = FrameFinish::Failed;

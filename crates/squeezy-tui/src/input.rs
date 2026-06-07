@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use squeezy_agent::RequestUserInputResponse;
+use squeezy_agent::{Agent, PendingConfigSwap, RequestUserInputResponse};
 use squeezy_core::PermissionCapability;
 use tokio::sync::oneshot;
 
@@ -443,7 +443,7 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
     ));
 }
 
-pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+pub(crate) fn handle_overlay_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
     let Some(overlay) = app.overlay.as_mut() else {
         return false;
     };
@@ -462,7 +462,7 @@ pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter => {
-            apply_overlay_selection(app);
+            apply_overlay_selection(app, agent);
             true
         }
         _ => false,
@@ -477,7 +477,7 @@ pub(crate) fn close_overlay(app: &mut TuiApp) {
     app.overlay_active_id = None;
 }
 
-pub(crate) fn apply_overlay_selection(app: &mut TuiApp) {
+pub(crate) fn apply_overlay_selection(app: &mut TuiApp, agent: &mut Agent) {
     let Some(overlay) = app.overlay.take() else {
         return;
     };
@@ -489,10 +489,35 @@ pub(crate) fn apply_overlay_selection(app: &mut TuiApp) {
                 let id = entry.id;
                 app.provider_name = provider;
                 app.model = id.to_string();
-                app.status = format!("selected model {provider}:{id}");
-                app.push_transcript_item(TranscriptItem::system(format!(
-                    "Model set to {provider}:{id} (restart the session to apply)"
-                )));
+                if agent.provider_name() == provider {
+                    // Same provider: the client is model-agnostic (each
+                    // request's model comes from `config.model`), so swap the
+                    // config only. Armed as a NextPrompt swap so an in-flight
+                    // turn is undisturbed; drained at the next `start_turn`,
+                    // after which pricing and the model both track the new id.
+                    let mut new_cfg = agent.config_snapshot();
+                    new_cfg.model = id.to_string();
+                    agent.arm_config_swap(PendingConfigSwap {
+                        config: new_cfg,
+                        provider: None,
+                        display_note: Some(format!(
+                            "model {provider}:{id} (applies on next prompt)"
+                        )),
+                    });
+                    app.status = format!("selected model {provider}:{id}");
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "Model set to {provider}:{id} (applies on your next prompt)"
+                    )));
+                } else {
+                    // Cross-provider switch needs a freshly built provider
+                    // client (auth/transport) that the picker can't synthesize
+                    // from a provider name alone, so keep the restart path.
+                    app.status = format!("selected model {provider}:{id}");
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "Model set to {provider}:{id} (restart the session to apply — \
+                         cross-provider switch)"
+                    )));
+                }
             }
         }
     }
