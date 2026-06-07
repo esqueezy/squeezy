@@ -111,7 +111,7 @@ impl ToolRegistry {
             return checkpoints_disabled_result(call);
         };
         let target = RollbackTarget::Latest;
-        if let Err(result) = self.preflight_checkpoint_rollback_paths(call, target) {
+        if let Some(result) = self.preflight_checkpoint_rollback_paths(call, target) {
             return result;
         }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
@@ -171,7 +171,7 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
-        if let Err(result) = self.preflight_checkpoint_rollback_paths(call, target) {
+        if let Some(result) = self.preflight_checkpoint_rollback_paths(call, target) {
             return result;
         }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
@@ -197,9 +197,9 @@ impl ToolRegistry {
         &self,
         call: &ToolCall,
         target: RollbackTarget<'_>,
-    ) -> std::result::Result<(), ToolResult> {
+    ) -> Option<ToolResult> {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
-            return Ok(());
+            return None;
         };
         match checkpoints.rollback_paths(target) {
             Ok(paths) => {
@@ -207,7 +207,7 @@ impl ToolRegistry {
                     if let Err(err) =
                         safety::assess_write_path(&path, &self.root, &self.shell_sandbox)
                     {
-                        return Err(make_result(
+                        return Some(make_result(
                             call,
                             ToolStatus::Denied,
                             json!({
@@ -222,9 +222,9 @@ impl ToolRegistry {
                         ));
                     }
                 }
-                Ok(())
+                None
             }
-            Err(err) => Err(tool_error(call, err)),
+            Err(err) => Some(tool_error(call, err)),
         }
     }
 }
