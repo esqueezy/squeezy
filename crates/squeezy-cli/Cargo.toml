@@ -30,6 +30,7 @@ squeezy-store.workspace = true
 squeezy-telemetry.workspace = true
 squeezy-tools.workspace = true
 squeezy-tui.workspace = true
+squeezy-workspace.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml_edit.workspace = true

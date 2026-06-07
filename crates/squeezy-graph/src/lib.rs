@@ -24,7 +24,9 @@ use squeezy_parse::{
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
-use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
+use squeezy_workspace::{
+    CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler, filesystem_paths_match,
+};
 
 use crate::languages::{
     csharp::{
@@ -3480,12 +3482,7 @@ fn module_path_for_file(path: &str) -> Vec<String> {
 }
 
 fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || std::fs::canonicalize(left)
-            .ok()
-            .zip(std::fs::canonicalize(right).ok())
-            .map(|(left, right)| left == right)
-            .unwrap_or(false)
+    filesystem_paths_match(left, right)
 }
 
 fn path_segments_suffix_match(left: &[String], right: &[String]) -> bool {
