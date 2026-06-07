@@ -613,7 +613,7 @@ fn windows_restricted_plan(
     required: bool,
     fallback_reason: Option<String>,
 ) -> ShellSandboxPlan {
-    let shell = ShellProgram::for_command(command);
+    let shell = ShellProgram::for_windows_restricted_command(command);
     ShellSandboxPlan {
         program: shell.program,
         args: shell.args,

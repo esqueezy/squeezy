@@ -6381,11 +6381,7 @@ async fn shell_default_sandbox_runs_benign_command() {
                 call_id: "call_default_shell".to_string(),
                 name: "shell".to_string(),
                 arguments: json!({
-                    "command": if cfg!(windows) {
-                        "[Console]::Out.Write('ok')"
-                    } else {
-                        "printf ok"
-                    },
+                    "command": "echo ok",
                     "description": "check default shell sandbox posture"
                 }),
             },
@@ -6394,7 +6390,10 @@ async fn shell_default_sandbox_runs_benign_command() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success);
-    assert_eq!(result.content["stdout"], "ok");
+    assert_eq!(
+        result.content["stdout"].as_str().expect("stdout").trim(),
+        "ok"
+    );
     let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
     assert!(audit.contains("\"mode\":\"best_effort\""));
 
