@@ -14,10 +14,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use squeezy_win_sandbox::{
     WinNetwork, WinSandboxSpec, WinTokenMode, WinWritableRoot, spawn_restricted_token,
 };
+use tokio::io::AsyncReadExt;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -53,12 +55,28 @@ fn fresh_workspace(tag: &str) -> PathBuf {
     dir
 }
 
-/// Run `cmd /c <cmdline_arg>` (a single shell command string) inside the
-/// sandbox rooted at `workspace`.  Returns the child's exit status, or `None`
-/// if the spawn was skipped because the host can't create restricted tokens.
-fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStatus> {
+struct CommandOutcome {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn ps_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+/// Run a PowerShell command inside the sandbox rooted at `workspace`. Returns
+/// the child's exit status and captured output, or `None` if the spawn was
+/// skipped because the host can't create restricted tokens.
+fn run_powershell(workspace: &Path, command: &str) -> Option<CommandOutcome> {
     let spec = make_spec(workspace);
-    let argv = vec!["cmd".to_string(), "/c".to_string(), cmdline_arg.to_string()];
+    let argv = vec![
+        "powershell.exe".to_string(),
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        command.to_string(),
+    ];
     let env: HashMap<String, String> = std::env::vars().collect();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -70,8 +88,45 @@ fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStat
         }
     };
 
-    let status = rt.block_on(child.wait()).expect("wait failed");
-    Some(status)
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
+    let output = rt.block_on(async move {
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            if let Some(mut stdout) = stdout {
+                stdout.read_to_end(&mut bytes).await?;
+            }
+            std::io::Result::Ok(bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            if let Some(mut stderr) = stderr {
+                stderr.read_to_end(&mut bytes).await?;
+            }
+            std::io::Result::Ok(bytes)
+        });
+
+        let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                child.kill();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "sandbox child timed out",
+                ));
+            }
+        };
+        let stdout = stdout_task.await.map_err(std::io::Error::other)??;
+        let stderr = stderr_task.await.map_err(std::io::Error::other)??;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
+    });
+
+    let (status, stdout, stderr) = output.expect("wait/capture failed");
+    Some(CommandOutcome {
+        status,
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+    })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -82,14 +137,20 @@ fn write_inside_workspace_allowed() {
     let workspace = fresh_workspace("write_inside");
     let out_file = workspace.join("out.txt");
 
-    let cmdline = format!(r#"echo hi > "{}""#, out_file.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let command = format!(
+        "Set-Content -LiteralPath {} -Value hi",
+        ps_quote_path(&out_file)
+    );
+    let Some(outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "write inside workspace should succeed; exit={status:?}"
+        outcome.status.success(),
+        "write inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
     assert!(
         out_file.exists(),
@@ -112,11 +173,13 @@ fn write_outside_workspace_denied() {
     // Remove any leftover from a previous run.
     let _ = std::fs::remove_file(&evil_file);
 
-    let cmdline = format!(r#"echo x > "{}""#, evil_file.display());
-    // Ignore the exit status here: cmd.exe may exit 0 even when a shell
-    // redirection is denied.  The authoritative signal is whether the file was
-    // created.
-    let Some(_status) = run_cmd(&workspace, &cmdline) else {
+    let command = format!(
+        "Set-Content -LiteralPath {} -Value x",
+        ps_quote_path(&evil_file)
+    );
+    // Ignore the exit status here: the authoritative signal is whether the
+    // outside file was created.
+    let Some(_outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
@@ -137,14 +200,20 @@ fn append_inside_allowed() {
     let target = workspace.join("append.txt");
     std::fs::write(&target, "line1\n").expect("seed file");
 
-    let cmdline = format!(r#"echo line2 >> "{}""#, target.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let command = format!(
+        "Add-Content -LiteralPath {} -Value line2",
+        ps_quote_path(&target)
+    );
+    let Some(outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "append inside workspace should succeed; exit={status:?}"
+        outcome.status.success(),
+        "append inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
     let contents = std::fs::read_to_string(&target).expect("read file after append");
     assert!(
@@ -162,18 +231,44 @@ fn delete_inside_allowed() {
     let target = workspace.join("delme.txt");
     std::fs::write(&target, "x").expect("seed file");
 
-    let cmdline = format!(r#"del /q "{}""#, target.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let command = format!("Remove-Item -LiteralPath {} -Force", ps_quote_path(&target));
+    let Some(outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "delete inside workspace should succeed; exit={status:?}"
+        outcome.status.success(),
+        "delete inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
     assert!(
         !target.exists(),
         "file should be gone after delete inside workspace"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Deleting inside protected metadata must be denied even when the workspace
+/// root itself is writable.
+#[test]
+fn protected_metadata_delete_denied() {
+    let workspace = fresh_workspace("metadata_delete");
+    let git_dir = workspace.join(".git");
+    std::fs::create_dir_all(&git_dir).expect("seed metadata dir");
+    let config = git_dir.join("config");
+    std::fs::write(&config, "keep").expect("seed metadata file");
+
+    let command = format!("Remove-Item -LiteralPath {} -Force", ps_quote_path(&config));
+    let Some(_outcome) = run_powershell(&workspace, &command) else {
+        return;
+    };
+
+    assert!(
+        config.exists(),
+        "protected metadata file should survive sandboxed delete attempt"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -185,15 +280,19 @@ fn delete_inside_allowed() {
 fn read_system_still_works() {
     let workspace = fresh_workspace("read_system");
 
-    // `dir C:\Windows` lists the directory — a read-only operation that should
-    // always succeed on the restricted-token tier.
-    let Some(status) = run_cmd(&workspace, r"dir C:\Windows") else {
+    let Some(outcome) = run_powershell(
+        &workspace,
+        r"if (Test-Path -LiteralPath 'C:\Windows') { exit 0 } else { exit 1 }",
+    ) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "reading C:\\Windows with dir should succeed on restricted-token tier; exit={status:?}"
+        outcome.status.success(),
+        "reading C:\\Windows should succeed on restricted-token tier; exit={:?}; stdout={:?}; stderr={:?}",
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
 
     let _ = std::fs::remove_dir_all(&workspace);

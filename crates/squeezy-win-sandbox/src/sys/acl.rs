@@ -10,8 +10,8 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSID};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
 };
 
 use super::winutil::{OwnedSid, to_wide_path};
@@ -122,10 +122,10 @@ fn apply_ace(
     Ok(())
 }
 
-/// Grant `FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE`
-/// (inheritable) to `sid_str` on `path`.
+/// Grant read/write/execute/delete rights (inheritable) to `sid_str` on `path`.
 pub(crate) fn add_allow_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
-    let mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    let mask =
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
     apply_ace(path, sid_str, mask, SET_ACCESS, true)
 }
 
@@ -136,7 +136,8 @@ pub(crate) fn add_deny_write_ace(path: &Path, sid_str: &str) -> crate::Result<()
         | FILE_APPEND_DATA
         | FILE_WRITE_EA
         | FILE_WRITE_ATTRIBUTES
-        | DELETE;
+        | DELETE
+        | FILE_DELETE_CHILD;
     apply_ace(path, sid_str, mask, DENY_ACCESS, true)
 }
 
