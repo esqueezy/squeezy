@@ -37,7 +37,7 @@ use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
     BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
-    SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
+    SessionReplayTape, SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
     parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
@@ -1895,13 +1895,14 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             let record = store.show(id)?;
             if *json {
                 let metadata = session_metadata_for_cli(&record.metadata)?;
+                let replay = record.replay.map(session_replay_for_cli).transpose()?;
                 let body = serde_json::json!({
                     "metadata": metadata,
                     "events": record.events,
                     "event_warnings": record.event_warnings,
                     "resume_state": record.resume_state,
                     "attachments": record.attachments,
-                    "replay": record.replay,
+                    "replay": replay,
                 });
                 println!(
                     "{}",
@@ -3046,6 +3047,15 @@ fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<
         .map_err(|err| SqueezyError::Parse(format!("failed to serialize session id: {err}")))?,
     );
     Ok(value)
+}
+
+fn session_replay_for_cli(tape: SessionReplayTape) -> squeezy_core::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "schema_version": tape.schema_version,
+        "id": PublicSessionHandle::from_store_session_id(&tape.session_id),
+        "events": tape.events,
+        "warnings": tape.warnings,
+    }))
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {

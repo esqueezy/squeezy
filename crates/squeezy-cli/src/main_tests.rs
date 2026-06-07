@@ -252,6 +252,27 @@ fn cli_sessions_and_repo_json_flags_parse() {
 }
 
 #[test]
+fn session_cli_json_uses_public_id_field() {
+    let metadata = SessionMetadata {
+        session_id: "session-123".to_string(),
+        ..Default::default()
+    };
+    let metadata_json = session_metadata_for_cli(&metadata).expect("metadata json");
+    assert_eq!(metadata_json["id"], "session-123");
+    assert!(metadata_json.get("session_id").is_none());
+
+    let replay_json = session_replay_for_cli(SessionReplayTape {
+        schema_version: 1,
+        session_id: "session-123".to_string(),
+        events: Vec::new(),
+        warnings: 0,
+    })
+    .expect("replay json");
+    assert_eq!(replay_json["id"], "session-123");
+    assert!(replay_json.get("session_id").is_none());
+}
+
+#[test]
 fn cli_doctor_and_mcp_test_flags_parse() {
     let cli = Cli::try_parse_from([
         "squeezy",
