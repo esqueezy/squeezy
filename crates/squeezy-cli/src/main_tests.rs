@@ -294,6 +294,7 @@ fn session_cli_events_rewrite_raw_session_ids() {
         ..Default::default()
     };
     let mapping = public_session_id_map_for_metadata(&metadata);
+    let mut mapping = mapping;
     let events = vec![SessionEvent::new(
         "session_forked",
         None,
@@ -304,10 +305,32 @@ fn session_cli_events_rewrite_raw_session_ids() {
         }),
     )];
 
-    let events_json = session_events_for_cli(&events, &mapping).expect("events json");
+    let events_json = session_events_for_cli(&events, &mut mapping).expect("events json");
     let rendered = serde_json::to_string(&events_json).expect("render events");
     assert!(!rendered.contains("parent-session"));
     assert!(!rendered.contains("child-session"));
+    assert!(rendered.contains("sess_"));
+}
+
+#[test]
+fn session_cli_events_discover_session_ids_from_payload_fields() {
+    let metadata = SessionMetadata {
+        session_id: "new-session".to_string(),
+        ..Default::default()
+    };
+    let mut mapping = public_session_id_map_for_metadata(&metadata);
+    let events = vec![SessionEvent::new(
+        "session_cleared",
+        None,
+        Some("cleared from old-session".to_string()),
+        serde_json::json!({
+            "cleared_from": "old-session",
+        }),
+    )];
+
+    let events_json = session_events_for_cli(&events, &mut mapping).expect("events json");
+    let rendered = serde_json::to_string(&events_json).expect("render events");
+    assert!(!rendered.contains("old-session"));
     assert!(rendered.contains("sess_"));
 }
 

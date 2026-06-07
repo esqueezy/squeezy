@@ -1896,12 +1896,12 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             let resolved = resolve_session_show_id(&store, id)?;
             let record = store.show(&resolved)?;
             if *json {
-                let session_id_map = public_session_id_map_for_metadata(&record.metadata);
+                let mut session_id_map = public_session_id_map_for_metadata(&record.metadata);
                 let metadata = session_metadata_for_cli(&record.metadata)?;
-                let events = session_events_for_cli(&record.events, &session_id_map)?;
+                let events = session_events_for_cli(&record.events, &mut session_id_map)?;
                 let replay = record
                     .replay
-                    .map(|tape| session_replay_for_cli_with_mapping(tape, &session_id_map))
+                    .map(|tape| session_replay_for_cli_with_mapping(tape, &mut session_id_map))
                     .transpose()?;
                 let mut body = serde_json::json!({
                     "metadata": metadata,
@@ -3073,16 +3073,17 @@ fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<
 fn session_replay_for_cli(tape: SessionReplayTape) -> squeezy_core::Result<serde_json::Value> {
     let mut session_id_map = BTreeMap::new();
     add_public_session_id_mapping(&mut session_id_map, &tape.session_id);
-    session_replay_for_cli_with_mapping(tape, &session_id_map)
+    session_replay_for_cli_with_mapping(tape, &mut session_id_map)
 }
 
 fn session_replay_for_cli_with_mapping(
     tape: SessionReplayTape,
-    session_id_map: &BTreeMap<String, String>,
+    session_id_map: &mut BTreeMap<String, String>,
 ) -> squeezy_core::Result<serde_json::Value> {
     let mut events = serde_json::to_value(tape.events).map_err(|err| {
         SqueezyError::Parse(format!("failed to serialize session replay events: {err}"))
     })?;
+    add_public_session_id_mappings_from_value(&events, session_id_map);
     sanitize_session_ids_in_value(&mut events, session_id_map);
     Ok(serde_json::json!({
         "schema_version": tape.schema_version,
@@ -3094,10 +3095,11 @@ fn session_replay_for_cli_with_mapping(
 
 fn session_events_for_cli(
     events: &[SessionEvent],
-    session_id_map: &BTreeMap<String, String>,
+    session_id_map: &mut BTreeMap<String, String>,
 ) -> squeezy_core::Result<serde_json::Value> {
     let mut value = serde_json::to_value(events)
         .map_err(|err| SqueezyError::Parse(format!("failed to serialize session events: {err}")))?;
+    add_public_session_id_mappings_from_value(&value, session_id_map);
     sanitize_session_ids_in_value(&mut value, session_id_map);
     Ok(value)
 }
@@ -3121,6 +3123,40 @@ fn add_public_session_id_mapping(map: &mut BTreeMap<String, String>, session_id:
             .as_ref()
             .to_string(),
     );
+}
+
+fn add_public_session_id_mappings_from_value(
+    value: &serde_json::Value,
+    session_id_map: &mut BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                add_public_session_id_mappings_from_value(item, session_id_map);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, item) in object {
+                if is_session_id_json_key(key)
+                    && let Some(session_id) = item.as_str()
+                {
+                    add_public_session_id_mapping(session_id_map, session_id);
+                }
+                add_public_session_id_mappings_from_value(item, session_id_map);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn is_session_id_json_key(key: &str) -> bool {
+    key == "session_id"
+        || key == "parent_id"
+        || key.ends_with("_session_id")
+        || key == "cleared_from"
 }
 
 fn sanitize_session_ids_in_value(
