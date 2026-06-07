@@ -6877,11 +6877,13 @@ impl TurnRuntime {
                 .await;
                 return Ok(());
             }
-            // The configured output budget, possibly raised for this round
-            // by a prior `max_tokens` truncation escalation. Used for the
-            // request AND the cost-cap projection / round-input gate so the
-            // cap sees the budget we will actually spend (not the lower
-            // configured one).
+            // The configured output budget, raised toward the model ceiling
+            // for the REST OF THE TURN once a `max_tokens` truncation has
+            // escalated (the override is intentionally sticky, not per-round:
+            // the operator's low budget was the cause, so keeping it raised
+            // stops later rounds from re-truncating under the same limit).
+            // Used for the request AND the cost-cap projection / round-input
+            // gate so the cap sees the budget we will actually spend.
             let effective_max_output_tokens =
                 max_output_tokens_override.or(self.config.max_output_tokens);
             // Two-stage cost-cap check: the post-hoc `session_cap_reached`
