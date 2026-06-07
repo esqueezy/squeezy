@@ -1891,7 +1891,10 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
 async fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
     let root = temp_workspace("agent_promised_action_retry_transcript");
     fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
-    let substantive_answer = "Let me re-run each bug scenario directly rather than trusting the compacted summary.\n\n## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.";
+    // A genuine stall: a substantive verdict followed by a trailing,
+    // undelivered intent. The final clause is the unresolved action, so the
+    // sharpened detector fires the retry — exercising the preservation path.
+    let substantive_answer = "## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.\n\nNow let me re-run each scenario directly to double-check the compacted summary.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -2029,7 +2032,7 @@ async fn promised_action_retry_preserves_prior_visible_answer_on_terminal_failur
     let root = temp_workspace("agent_promised_action_retry_terminal_failure");
     fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
     let substantive_answer =
-        "Let me inspect the result directly.\n\nThe report was already complete.";
+        "The report was already complete.\n\nNow let me inspect the result directly to confirm.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -2127,7 +2130,7 @@ async fn promised_action_retry_preserves_prior_visible_answer_on_soft_completion
         INVALID_TOOL_ARGUMENTS_RAW_KEY: "{\"query\":\"getFoo",
     });
     let substantive_answer =
-        "Let me inspect the failed lookup directly.\n\nThe useful answer is already here.";
+        "The useful answer is already here.\n\nNow let me inspect the failed lookup directly.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -9571,6 +9574,62 @@ async fn max_tokens_stop_reason_emits_failed_with_recovery_hint() {
 }
 
 #[tokio::test]
+async fn malformed_function_call_retries_with_corrective_nudge() {
+    // Gemini-style malformed tool-call arguments: round 0 stops with
+    // MalformedFunctionCall and no usable tool call. The agent should
+    // inject a corrective nudge and recover on the retry instead of ending
+    // the turn empty.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_malformed".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::MalformedFunctionCall),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("The fix is in src/foo.rs.".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_clean".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = AppConfig::default();
+    config.routing.enabled = false;
+    let agent = Agent::new(config, provider.clone());
+    let mut rx = agent.start_turn("find the bug".to_string(), CancellationToken::new());
+    let mut completed_text = None;
+    let mut failed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed_text = Some(message.content),
+            AgentEvent::Failed { .. } => failed = true,
+            _ => {}
+        }
+    }
+    assert!(!failed, "malformed tool call should recover, not fail");
+    assert_eq!(completed_text.as_deref(), Some("The fix is in src/foo.rs."));
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "malformed round plus one corrective retry"
+    );
+    let retry = &requests[1];
+    let has_nudge = retry.input.iter().any(|item| match item {
+        LlmInputItem::UserText(text) => text.contains("could not be parsed"),
+        _ => false,
+    });
+    assert!(has_nudge, "retry must carry the corrective JSON nudge");
+}
+
+#[tokio::test]
 async fn refusal_stop_reason_emits_failed_with_safety_hint() {
     let provider = Arc::new(MockProvider::new(vec![vec![
         Ok(LlmEvent::Started),
@@ -9921,6 +9980,143 @@ fn assistant_text_has_unresolved_intent_handles_multibyte_tail() {
     // panic: `é` lands at byte 44/45, exactly the slice end for `"i'll "`.
     let text = format!("I'll {}é and continue", "x".repeat(39));
     let _ = assistant_text_has_unresolved_intent(&text);
+}
+
+#[test]
+fn unresolved_intent_anchors_on_final_clause_not_midanswer() {
+    // Strong-model shape: an intent phrase used mid-answer, but the
+    // message CONCLUDES. Anchoring on the final clause means this is not
+    // treated as an unresolved promise (the dominant false positive).
+    assert!(!assistant_text_has_unresolved_intent(
+        "Let me check: yes, the bug is in foo.rs. The fix is to add a guard.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_skips_offer_idiom() {
+    // "Let me know if you'd like me to check ..." is a closing offer,
+    // not abandoned tool work.
+    assert!(!assistant_text_has_unresolved_intent(
+        "I fixed the parser. Let me know if you'd like me to check the other files.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_fires_when_final_clause_announces_action() {
+    // Multi-sentence message that ENDS on an announced, undelivered action.
+    assert!(assistant_text_has_unresolved_intent(
+        "I read the file. Now let me search the repository for callers.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_fires_on_dangling_colon() {
+    // A trailing ':' is itself an "about to act" signal.
+    assert!(assistant_text_has_unresolved_intent(
+        "Now let me grep for the symbol:",
+    ));
+}
+
+#[test]
+fn unresolved_intent_keeps_dotted_tokens_intact() {
+    // The '.' in "src/lib.rs" must not be read as a sentence boundary,
+    // or the intent that precedes it would be lost.
+    assert!(assistant_text_has_unresolved_intent(
+        "I'll edit src/lib.rs to add the guard.",
+    ));
+}
+
+#[test]
+fn retry_ack_recognizes_bare_done_confirmation() {
+    // The G2 "reply DONE if complete" path: a bare confirmation collapses
+    // back to the prior answer, but added content does not.
+    assert!(assistant_text_is_retry_ack("DONE"));
+    assert!(assistant_text_is_retry_ack("Done."));
+    assert!(assistant_text_is_retry_ack("`DONE`"));
+    assert!(assistant_text_is_retry_ack("**Done.**"));
+    // A short, content-free completeness confirmation is still an ack.
+    assert!(assistant_text_is_retry_ack(
+        "The previous output is the complete answer."
+    ));
+    assert!(!assistant_text_is_retry_ack(
+        "Done — I also updated the changelog.",
+    ));
+    // A response that OPENS like a confirmation ("the previous response
+    // is ...") but actually negates it and supplies the missing content
+    // must NOT be treated as an ack — it carries the real continuation.
+    assert!(!assistant_text_is_retry_ack(
+        "The previous response is incomplete; the missing file is src/foo.rs.",
+    ));
+    assert!(!assistant_text_is_retry_ack(
+        "The previous answer is wrong — the correct value is 42 because the cache resets at midnight UTC.",
+    ));
+}
+
+#[test]
+fn merge_retried_keeps_prior_answer_when_retry_confirms_done() {
+    // G1+G2: confirm-or-continue nudge -> a done model replies DONE, and
+    // the prior substantive answer is preserved verbatim (nothing dropped).
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(
+        &mut deferred,
+        "The function `needle` is defined once in src/lib.rs at line 12.",
+    );
+    let merged = merge_retried_visible_assistant_text(&mut deferred, "DONE");
+    assert_eq!(
+        merged,
+        "The function `needle` is defined once in src/lib.rs at line 12."
+    );
+}
+
+#[test]
+fn merge_retried_appends_real_continuation() {
+    // A genuine stall recovery: the retry produced new substantive text,
+    // appended after the prior visible text — nothing is dropped.
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(&mut deferred, "I scanned the tree.");
+    let merged =
+        merge_retried_visible_assistant_text(&mut deferred, "The entrypoint is `main` in cli.rs.");
+    assert_eq!(
+        merged,
+        "I scanned the tree.\n\nThe entrypoint is `main` in cli.rs."
+    );
+}
+
+#[test]
+fn merge_retried_appends_continuation_that_references_the_prior() {
+    // The retry response opens by referencing the prior output but then
+    // negates it and delivers the missing content. It is a real
+    // continuation and must be APPENDED, not discarded as an ack.
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(&mut deferred, "I summarized the config.");
+    let continuation = "The previous response is incomplete; the missing file is src/foo.rs.";
+    let merged = merge_retried_visible_assistant_text(&mut deferred, continuation);
+    assert_eq!(
+        merged,
+        format!("I summarized the config.\n\n{continuation}"),
+    );
+}
+
+#[test]
+fn unresolved_intent_skips_real_complete_answer_ending_in_question() {
+    // Regression witness from a real incident (gctoolkit session
+    // 1780784071532-67685-1, turn-2): the user asked "what model are you
+    // and why didn't you load the skill yet?". The model gave a complete,
+    // well-behaved 2.2k-char answer that ENDS on a permission question,
+    // but whose BODY contains mid-answer intent phrases ("I'll find out
+    // when I try", "I'll run them") that the old whole-text scan matched —
+    // firing a spurious `promised_action` retry whose pushy "call the tool
+    // now" nudge then drove unrequested file edits. Anchoring on the final
+    // clause clears the answer, so no retry fires.
+    let answer = "You're right to call that out — let me address both honestly. \
+On the model: I don't have a reliable way to verify my exact underlying model \
+from inside this environment, so I won't guess. I operate here as \"Squeezy\". \
+Those commands may or may not run in this shell — I'll find out when I try, and \
+I'll run them and surface any config/auth errors to you rather than retrying \
+blindly. So before I touch CPUSummary.java (a clean record conversion, ~4 caller \
+sites), the correct next step per the skill is to run `guidelines get`. Want me \
+to proceed with that and continue the modernization?";
+    assert!(!assistant_text_has_unresolved_intent(answer));
 }
 
 // F17-dispatch-command-completeness: each typed `DispatchCommand`

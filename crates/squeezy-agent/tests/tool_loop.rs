@@ -4008,12 +4008,12 @@ async fn stop_no_action_retry_fires_when_model_promised_tool_use() {
     // full conversation is replayed.
     let retry_request = &requests[2];
     let has_nudge = retry_request.input.iter().any(|item| match item {
-        LlmInputItem::UserText(text) => text.contains("did not call any tool"),
+        LlmInputItem::UserText(text) => text.contains("reply with just"),
         _ => false,
     });
     assert!(
         has_nudge,
-        "retry request must include the 'you described a follow-up action' nudge in its input",
+        "retry request must include the confirm-or-continue (`reply DONE`) nudge in its input",
     );
     assert!(
         final_message.contains("needle"),

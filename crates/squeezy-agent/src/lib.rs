@@ -6816,6 +6816,11 @@ impl TurnRuntime {
         // saw in the same turn.
         let mut deferred_retry_visible_assistant = String::new();
         let mut pause_turn_reissues = 0usize;
+        // One-shot corrective retry for a Gemini `MALFORMED_FUNCTION_CALL`
+        // stop (tool-call arguments the upstream parser rejected, leaving
+        // no usable call). Bounded so a model that keeps emitting bad JSON
+        // can't loop the turn forever.
+        let mut malformed_retry_used = false;
         // Per-turn model routing decision. The classifier runs once at
         // the top of the turn; `current_model` is what each round
         // dispatches on. On mid-turn escalation it is overwritten with
@@ -8142,6 +8147,84 @@ impl TurnRuntime {
                 // `Some(StopReason::PauseTurn)` with tool calls present falls
                 // through (via the `_` arm) to the existing tool-execution /
                 // re-entry logic below.
+
+                // Gemini `MALFORMED_FUNCTION_CALL`: the model tried to call a
+                // tool but emitted arguments the upstream parser rejected, so
+                // no usable call survives and the turn would otherwise end
+                // with nothing. One bounded corrective retry — tell the model
+                // its arguments were unparseable and ask it to re-issue with
+                // valid JSON. Any visible text it produced first is preserved.
+                // (When valid tool calls DID survive alongside the bad one,
+                // fall through to execute them.)
+                Some(StopReason::MalformedFunctionCall)
+                    if !malformed_retry_used && tool_calls.is_empty() =>
+                {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    let preserved_visible_chars = append_deferred_visible_assistant_text(
+                        &mut deferred_retry_visible_assistant,
+                        &raw_assistant_text,
+                    );
+                    if !raw_assistant_text.trim().is_empty() {
+                        conversation.push(redact_input_item(
+                            LlmInputItem::AssistantText(raw_assistant_text.clone()),
+                            &self.redactor,
+                        ));
+                    }
+                    let retry_metadata = json!({
+                        "branch": "malformed_function_call",
+                        "round": round,
+                        "assistant_text_chars": raw_assistant_text.chars().count(),
+                        "preserved_visible_chars": preserved_visible_chars,
+                    });
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        Some(retry_metadata.clone()),
+                    );
+                    self.log_event(
+                        "assistant_retry",
+                        Some(self.turn_id),
+                        Some(
+                            "malformed_function_call retry: asked the model to re-issue valid JSON"
+                                .to_string(),
+                        ),
+                        retry_metadata,
+                    );
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    let nudge_item = redact_input_item(
+                        LlmInputItem::UserText(
+                            "Your previous tool call could not be parsed — its arguments were not \
+                             valid JSON. Re-issue the tool call now with correctly-formed JSON \
+                             arguments."
+                                .to_string(),
+                        ),
+                        &self.redactor,
+                    );
+                    conversation.push(nudge_item.clone());
+                    if self.config.store_responses {
+                        previous_response_id = response_id.clone();
+                        next_input = vec![nudge_item];
+                    } else {
+                        previous_response_id = None;
+                        next_input = conversation.clone();
+                    }
+                    malformed_retry_used = true;
+                    tracing::debug!(
+                        target: "squeezy_agent::malformed_function_call_retry",
+                        round,
+                        preserved_visible_chars,
+                        "retrying after malformed tool-call arguments",
+                    );
+                    continue;
+                }
                 _ => {}
             }
 
@@ -8246,10 +8329,17 @@ impl TurnRuntime {
                              Respond directly to the user now."
                         }
                     } else {
-                        "You described a follow-up action but did not call any tool. \
-                         If you need to call a tool to complete the user's request, \
-                         call it now. If the previous output is enough, give the final \
-                         answer directly instead."
+                        // G2 (action safety): grant permission to finish,
+                        // do not command an action. A model that was
+                        // actually done replies `DONE` (recognized as an
+                        // ack, so its prior visible text is kept verbatim);
+                        // a model that genuinely stalled picks up the work.
+                        // This is what lets the same recovery run harmlessly
+                        // on a strong model that didn't fail.
+                        "If your previous response already fully answers the request, \
+                         reply with just `DONE` and nothing else. Otherwise, finish the \
+                         work now — call the tool you described, or give the final answer \
+                         directly. Do not repeat what you already said."
                     };
                     let nudge_item = redact_input_item(
                         LlmInputItem::UserText(nudge.to_string()),
@@ -12255,37 +12345,158 @@ fn merge_retried_visible_assistant_text(deferred: &mut String, final_text: &str)
 
 fn assistant_text_is_retry_ack(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
-    lower.starts_with("the previous output is")
-        || lower.starts_with("the previous answer is")
-        || lower.contains("previous output is the complete answer")
-        || lower.contains("previous output was the complete answer")
-}
-
-/// Heuristic: does the assistant text contain an intent phrase that
-/// implies the model promised follow-up tool work it never delivered?
-///
-/// True when ALL of the following hold:
-///   1. The text is non-empty (an actually visible message, not just whitespace).
-///   2. The text contains at least one intent phrase (`let me`, `i'll`,
-///      `i will`, `going to`, `i need to`, etc.).
-///   3. The intent phrase is followed within ~40 chars by an action verb
-///      that maps to a tool the model has access to (`scan`, `search`,
-///      `read`, `explore`, `find`, ...).
-///
-/// Skipped when the text contains a `<proposed_plan>` block (plan-mode
-/// output is a legitimate finish_reason=stop) or a fenced final-answer
-/// marker (`final answer:`, `here is the answer:`).
-fn assistant_text_has_unresolved_intent(text: &str) -> bool {
-    if text.trim().is_empty() {
+    // Bare `DONE` confirmation from the G2 "reply DONE if complete" nudge,
+    // tolerant of trailing/wrapping punctuation, quotes, or markdown
+    // emphasis ("`DONE`", "**Done.**"). Only an *essentially empty*
+    // confirmation collapses to the prior answer; if the model added real
+    // content alongside it, that content is merged (G1 never drops text).
+    // Note: `?` is deliberately NOT trimmed — "Done?" is the model asking,
+    // not confirming, so it must not collapse to the prior answer.
+    let bare = lower.trim_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '!' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '`' | '*' | '_'
+        )
+    });
+    if bare == "done" {
+        return true;
+    }
+    // Beyond the bare token, only an explicit AND essentially content-free
+    // completeness confirmation collapses to the prior answer. A response
+    // that adds real content — even one that opens "the previous response
+    // is ..." but then negates it or supplies the missing content (e.g.
+    // "the previous response is incomplete; the missing file is foo.rs") —
+    // must be MERGED (appended), never dropped. So: short, affirms
+    // completeness, and carries no negation/continuation signal.
+    let chars = lower.chars().count();
+    if chars > 120
+        || lower.contains("incomplete")
+        || lower.contains("not complete")
+        || lower.contains("missing")
+    {
         return false;
     }
-    let lower = text.to_ascii_lowercase();
+    const COMPLETE_AFFIRMATIONS: &[&str] = &[
+        "is the complete answer",
+        "was the complete answer",
+        "previous response is complete",
+        "previous output is complete",
+        "previous answer is complete",
+        "already complete",
+        "nothing to add",
+        "no changes needed",
+    ];
+    COMPLETE_AFFIRMATIONS
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+/// Phrases that turn an "intent" verb into an *offer* rather than a
+/// commitment to act now. "Let me know if you'd like me to check the
+/// other files" parses structurally like "let me ... check" but is a
+/// closing offer, not abandoned work. Excluding these (when they appear
+/// in the final clause) removes the dominant strong-model false-positive
+/// class for [`assistant_text_has_unresolved_intent`].
+///
+/// Kept tight to phrases that are *structurally* a trailing offer. Looser
+/// markers like "happy to" / "feel free to" were dropped: they can sit in
+/// front of a genuine stall ("I'm happy to fix this — let me edit it now")
+/// and would wrongly suppress it.
+const STALL_OFFER_MARKERS: &[&str] = &[
+    "let me know",
+    "if you'd like",
+    "if you would like",
+    "if you want",
+    "if you'd prefer",
+    "would you like",
+    "do you want",
+];
+
+/// Return the trailing sentence/clause of an already-lowercased,
+/// already-trimmed message. A stalled model ends *on* an intent ("Now
+/// let me search the codebase."); a complete answer ends *on* a
+/// conclusion. Anchoring the intent check to this final clause — rather
+/// than scanning the whole body — is the model-agnostic discriminator
+/// that keeps a strong model's mid-answer "let me check: yes, the bug is
+/// in foo.rs. The fix is ..." from reading as an unresolved promise.
+fn assistant_final_clause(lower_trimmed: &str) -> &str {
+    // Drop trailing sentence punctuation / dangling separators so
+    // "...the bug. let me fix it." and "...let me fix it:" both expose
+    // the real final clause. A trailing ':' or '...' is itself an "about
+    // to act" signal, so we keep the clause that precedes it.
+    let core = lower_trimmed.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '!' | '?' | ':' | ';' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | ')'
+        )
+    });
+    if core.is_empty() {
+        return lower_trimmed;
+    }
+    // Split on the rightmost *sentence* boundary: a terminator (`.!?`)
+    // immediately followed by whitespace, or a bare newline. We do NOT
+    // split on a bare `.`, so dotted tokens ("src/lib.rs", "v1.2") stay
+    // intact — splitting there would drop the intent that precedes them.
+    // ASCII terminators/whitespace are single-byte and never collide with
+    // UTF-8 continuation bytes, so the byte scan is boundary-safe.
+    let bytes = core.as_bytes();
+    let mut idx = core.len();
+    while idx >= 1 {
+        idx -= 1;
+        let c = bytes[idx];
+        if c == b'\n' {
+            return core[idx..].trim();
+        }
+        if idx >= 1
+            && (c == b' ' || c == b'\t' || c == b'\r')
+            && matches!(bytes[idx - 1], b'.' | b'!' | b'?')
+        {
+            return core[idx..].trim();
+        }
+    }
+    core.trim()
+}
+
+/// Heuristic: does the assistant's FINAL clause announce follow-up tool
+/// work the model never delivered (the "promised action then stopped"
+/// stall)?
+///
+/// True when ALL of the following hold:
+///   1. The message is non-empty visible text (not just whitespace).
+///   2. It is not plan-mode output (`<proposed_plan>`) or an explicit
+///      final-answer marker (`final answer:`, `in summary:`, ...).
+///   3. The FINAL clause contains an intent phrase (`let me`, `i'll`,
+///      `going to`, ...) followed shortly by an action verb that maps to
+///      a tool (`scan`, `read`, `search`, ...), and is not an *offer*
+///      ("let me know if you'd like me to ...").
+///
+/// This is deliberately model-agnostic — the same rule for strong and
+/// weak models. It is NOT relied on to be perfect: callers pair it with
+/// the carried-visible-output invariant (already-shown text is never
+/// dropped) and a "confirm-or-continue" nudge (a model that was actually
+/// done just confirms), so a residual false positive costs at most one
+/// bounded recovery round and can neither drop text nor force an unwanted
+/// action.
+///
+/// The tradeoff is intentional and asymmetric. Final-clause anchoring
+/// trades *recall* for *precision*: a genuine stall whose announced
+/// action is not the last clause (e.g. "Let me search.\nThanks!") is
+/// missed. We accept that — under-firing only means a weak model that was
+/// already failing gets no extra recovery round; it never hurts a model
+/// that succeeded. Over-firing is what hurt strong models (the spurious
+/// retry that drove unrequested edits), so precision is what matters here.
+pub fn assistant_text_has_unresolved_intent(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
     // Plan-mode output: a `<proposed_plan>` block is the expected
     // end-of-turn shape; not a chatty-stop bug.
     if lower.contains("<proposed_plan>") {
         return false;
     }
-    // Final-answer markers: model is signaling "this is my answer".
+    // Final-answer markers anywhere: model is signaling "this is my answer".
     const FINAL_MARKERS: &[&str] = &[
         "final answer:",
         "here is the answer:",
@@ -12293,6 +12504,11 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
         "to summarize:",
     ];
     if FINAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    let clause = assistant_final_clause(&lower);
+    // Offer idioms in the final clause are closings, not abandoned work.
+    if STALL_OFFER_MARKERS.iter().any(|m| clause.contains(m)) {
         return false;
     }
     const INTENT_PATTERNS: &[&str] = &[
@@ -12340,13 +12556,13 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
         "run ",
     ];
     for intent in INTENT_PATTERNS {
-        if let Some(idx) = lower.find(intent) {
+        if let Some(idx) = clause.find(intent) {
             let tail_start = idx + intent.len();
-            let mut tail_end = (tail_start + 40).min(lower.len());
-            while tail_end > tail_start && !lower.is_char_boundary(tail_end) {
+            let mut tail_end = (tail_start + 40).min(clause.len());
+            while tail_end > tail_start && !clause.is_char_boundary(tail_end) {
                 tail_end -= 1;
             }
-            let tail = &lower[tail_start..tail_end];
+            let tail = &clause[tail_start..tail_end];
             if ACTION_PATTERNS.iter().any(|action| tail.contains(action)) {
                 return true;
             }
