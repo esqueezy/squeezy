@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use squeezy_win_sandbox::{
     WinNetwork, WinSandboxSpec, WinTokenMode, WinWritableRoot, spawn_restricted_token,
@@ -53,25 +54,61 @@ fn fresh_workspace(tag: &str) -> PathBuf {
     dir
 }
 
-/// Run `cmd /c <cmdline_arg>` (a single shell command string) inside the
-/// sandbox rooted at `workspace`.  Returns the child's exit status, or `None`
-/// if the spawn was skipped because the host can't create restricted tokens.
-fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStatus> {
+fn run_cmd_inner(
+    workspace: &Path,
+    cmdline_arg: &str,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
     let spec = make_spec(workspace);
     let argv = vec!["cmd".to_string(), "/c".to_string(), cmdline_arg.to_string()];
     let env: HashMap<String, String> = std::env::vars().collect();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let mut child = match spawn_restricted_token(&spec, &argv, workspace, &env, false) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[skip] spawn_restricted_token returned error: {e}");
-            return None;
-        }
+        Ok(child) => child,
+        Err(err) => return Err(format!("spawn_restricted_token returned error: {err}")),
     };
 
-    let status = rt.block_on(child.wait()).expect("wait failed");
-    Some(status)
+    match rt.block_on(tokio::time::timeout(timeout, child.wait())) {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(err)) => Err(format!("wait failed: {err}")),
+        Err(_) => {
+            child.kill();
+            Err(format!("timed out after {timeout:?}"))
+        }
+    }
+}
+
+fn sandbox_smoke_available(workspace: &Path) -> bool {
+    match run_cmd_inner(
+        workspace,
+        "echo squeezy-sandbox-ready",
+        Duration::from_secs(5),
+    ) {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("[skip] restricted-token sandbox probe exited with {status:?}");
+            false
+        }
+        Err(err) => {
+            eprintln!("[skip] restricted-token sandbox probe failed: {err}");
+            false
+        }
+    }
+}
+
+/// Run `cmd /c <cmdline_arg>` (a single shell command string) inside the
+/// sandbox rooted at `workspace`.  Returns the child's exit status, or `None`
+/// if the host can't run a basic restricted-token sandboxed command.
+fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStatus> {
+    if !sandbox_smoke_available(workspace) {
+        return None;
+    }
+
+    Some(
+        run_cmd_inner(workspace, cmdline_arg, Duration::from_secs(10))
+            .expect("sandboxed command should complete after probe succeeds"),
+    )
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

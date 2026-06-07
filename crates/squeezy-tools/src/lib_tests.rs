@@ -6417,7 +6417,7 @@ fn shell_default_sandbox_runs_benign_command() {
                     call_id: "call_default_shell".to_string(),
                     name: "shell".to_string(),
                     arguments: json!({
-                        "command": "printf ok",
+                        "command": "echo ok",
                         "description": "check default shell sandbox posture"
                     }),
                 },
@@ -6426,7 +6426,7 @@ fn shell_default_sandbox_runs_benign_command() {
             .await;
 
         assert_eq!(result.status, ToolStatus::Success);
-        assert_eq!(result.content["stdout"], "ok");
+        assert_eq!(result.content["stdout"].as_str().unwrap_or("").trim(), "ok");
         let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
         assert!(audit.contains("\"mode\":\"best_effort\""));
 
@@ -12071,9 +12071,22 @@ fn shell_sandbox_runtime_unavailable_detects_linux_exit_1_empty_stderr_when_user
 }
 
 #[test]
+fn shell_sandbox_runtime_unavailable_detects_windows_silent_exit_1() {
+    let plan = fake_sandbox_plan("windows-restricted-token", true);
+
+    assert!(shell_sandbox_runtime_unavailable_with_probe(
+        &plan,
+        Some(1),
+        "",
+        true,
+    ));
+}
+
+#[test]
 fn shell_sandbox_runtime_unavailable_ignores_nonzero_exit_with_stderr() {
     let linux_plan = fake_sandbox_plan("linux-direct-syscalls", true);
     let macos_plan = fake_sandbox_plan("macos-sandbox-exec", true);
+    let windows_plan = fake_sandbox_plan("windows-restricted-token", true);
 
     assert!(!shell_sandbox_runtime_unavailable_with_probe(
         &linux_plan,
@@ -12085,6 +12098,12 @@ fn shell_sandbox_runtime_unavailable_ignores_nonzero_exit_with_stderr() {
         &macos_plan,
         Some(71),
         "ordinary exit",
+        true,
+    ));
+    assert!(!shell_sandbox_runtime_unavailable_with_probe(
+        &windows_plan,
+        Some(1),
+        "command failed",
         true,
     ));
 }

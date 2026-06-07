@@ -322,48 +322,50 @@ async fn replay_runner_uses_recorded_session_tape() {
     assert_eq!(result.final_answer, "fixture answer");
 }
 
-#[tokio::test]
-async fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cost() {
-    let suffix = unique_suffix();
-    let path = format!("src/generated-{suffix}.rs");
-    let marker = format!("harness_marker_{suffix}");
-    let task = TaskSpec {
-        id: "tool-workspace".to_string(),
-        title: "Tool workspace".to_string(),
-        prompt: "Find the generated marker".to_string(),
-        workspace: WorkspaceSpec {
-            files: vec![WorkspaceFile {
-                path: path.clone(),
-                content: format!("pub fn generated() {{ /* {marker} */ }}\n"),
-            }],
-        },
-        expect: ExpectSpec {
-            contains: vec![path.clone()],
-        },
-        mock: None,
-        replay: None,
-        baseline: None,
-    };
-    let provider = Arc::new(ToolUsingProvider::new(marker, path.clone()));
-    let config = AppConfig {
-        workspace_root: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-        ..Default::default()
-    };
+#[test]
+fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cost() {
+    run_high_stack_test(async {
+        let suffix = unique_suffix();
+        let path = format!("src/generated-{suffix}.rs");
+        let marker = format!("harness_marker_{suffix}");
+        let task = TaskSpec {
+            id: "tool-workspace".to_string(),
+            title: "Tool workspace".to_string(),
+            prompt: "Find the generated marker".to_string(),
+            workspace: WorkspaceSpec {
+                files: vec![WorkspaceFile {
+                    path: path.clone(),
+                    content: format!("pub fn generated() {{ /* {marker} */ }}\n"),
+                }],
+            },
+            expect: ExpectSpec {
+                contains: vec![path.clone()],
+            },
+            mock: None,
+            replay: None,
+            baseline: None,
+        };
+        let provider = Arc::new(ToolUsingProvider::new(marker, path.clone()));
+        let config = AppConfig {
+            workspace_root: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            ..Default::default()
+        };
 
-    let output = run_agent_with_config(&task, RunnerKind::MockOpenai, provider, config)
-        .await
-        .expect("agent run");
+        let output = run_agent_with_config(&task, RunnerKind::MockOpenai, provider, config)
+            .await
+            .expect("agent run");
 
-    let normalized_answer = output.final_answer.replace('\\', "/");
-    assert!(
-        normalized_answer.contains(&path),
-        "{:?}",
-        output.final_answer
-    );
-    assert_eq!(output.metrics.tool_calls, 1);
-    assert!(output.metrics.files_scanned >= 1);
-    assert!(output.metrics.bytes_read > 0);
-    assert_eq!(output.metrics.matches_returned, 1);
+        let normalized_answer = output.final_answer.replace('\\', "/");
+        assert!(
+            normalized_answer.contains(&path),
+            "{:?}",
+            output.final_answer
+        );
+        assert_eq!(output.metrics.tool_calls, 1);
+        assert!(output.metrics.files_scanned >= 1);
+        assert!(output.metrics.bytes_read > 0);
+        assert_eq!(output.metrics.matches_returned, 1);
+    });
 }
 
 #[test]

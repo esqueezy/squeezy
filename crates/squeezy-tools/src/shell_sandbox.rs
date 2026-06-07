@@ -1140,6 +1140,13 @@ pub(crate) fn shell_sandbox_runtime_unavailable_with_probe(
             // unavailable if the kernel no longer supports unshare.
             !linux_unshare_available && exit_code == Some(1) && stderr.is_empty()
         }
+        "windows-restricted-token" => {
+            // Hosted Windows environments can let CreateProcessAsUserW succeed
+            // but have the restricted-token child fail before the requested
+            // shell command can run. With no child stderr, best_effort should
+            // degrade to direct execution; required mode will deny.
+            exit_code == Some(1) && stderr.is_empty()
+        }
         _ => false,
     }
 }
