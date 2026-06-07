@@ -1361,6 +1361,7 @@ fn classify_filesystem(fs_type: &str) -> StorageMountClassification {
 
 #[derive(Debug, Clone)]
 struct MountEntry {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     mount_point: PathBuf,
     fs_type: String,
     source: String,

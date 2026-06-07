@@ -7,8 +7,7 @@ use squeezy_core::FileId;
 
 use crate::{
     CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphWriteBatch, STATE_FILE_NAME,
-    SqueezyStore, StorageMountClassification, cache_dir_path, graph_path, sessions::ResumeItem,
-    state_path,
+    SqueezyStore, cache_dir_path, graph_path, sessions::ResumeItem, state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -229,7 +228,7 @@ fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
         .expect("nfs mount");
     assert_eq!(
         super::classify_filesystem(&nfs.fs_type),
-        StorageMountClassification::Network
+        crate::StorageMountClassification::Network
     );
     let overlay = entries
         .iter()
@@ -237,7 +236,7 @@ fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
         .expect("overlay mount");
     assert_eq!(
         super::classify_filesystem(&overlay.fs_type),
-        StorageMountClassification::Virtual
+        crate::StorageMountClassification::Virtual
     );
     let procfs = entries
         .iter()
@@ -245,7 +244,7 @@ fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
         .expect("proc mount");
     assert_eq!(
         super::classify_filesystem(&procfs.fs_type),
-        StorageMountClassification::Virtual
+        crate::StorageMountClassification::Virtual
     );
 }
 
