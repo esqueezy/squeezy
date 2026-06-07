@@ -760,7 +760,7 @@ fn language_selector_key(language: &str) -> String {
 }
 
 fn language_enabled(language: LanguageKind, enabled: &HashSet<LanguageKind>) -> bool {
-    enabled.is_empty() || !language.family().is_some() || enabled.contains(&language)
+    enabled.is_empty() || language.family().is_none() || enabled.contains(&language)
 }
 
 fn extension_string(path: &Path) -> Option<String> {
