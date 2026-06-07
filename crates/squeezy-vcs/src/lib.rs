@@ -1169,15 +1169,17 @@ impl CheckpointStore {
             }
             created.is_ok() && deleted.is_ok()
         };
-        let lock_file_writable = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.lock_path)
-            .is_ok();
+        // Test writability via a probe file in the checkpoints directory rather
+        // than re-opening the lock file — the same process already holds the
+        // lock, so reopening it always succeeds and tells us nothing useful.
+        let checkpoints_dir = self.lock_path.parent().unwrap_or(&self.root);
+        let probe_path = checkpoints_dir.join(".squeezy-doctor-probe");
+        let lock_file_writable = fs::write(&probe_path, b"").is_ok();
+        let _ = fs::remove_file(&probe_path);
         if !lock_file_writable {
             warnings.push(format!(
-                "shadow lock file is not writable: {}",
-                self.lock_path.display()
+                "checkpoints directory is not writable: {}",
+                checkpoints_dir.display()
             ));
         }
         let gitattributes = collect_gitattributes(&self.root);
@@ -1485,13 +1487,29 @@ impl CheckpointStore {
                     Some(hash) => hash.clone(),
                     None => {
                         let path = self.root.join(&file.path);
-                        let hash = if path.exists() {
-                            Some(sha256_hex(&fs::read(&path)?))
+                        if path.exists() {
+                            match fs::read(&path) {
+                                Ok(bytes) => {
+                                    let hash = Some(sha256_hex(&bytes));
+                                    virtual_hashes.insert(identity.clone(), hash.clone());
+                                    hash
+                                }
+                                Err(err) => {
+                                    // Convert IO error to a conflict rather than aborting,
+                                    // so BestEffort rollback can continue past locked files.
+                                    conflicts.push(filesystem_rollback_conflict(
+                                        &record.id,
+                                        &file.path,
+                                        err,
+                                        "read for preflight hash",
+                                    ));
+                                    continue;
+                                }
+                            }
                         } else {
+                            virtual_hashes.insert(identity.clone(), None);
                             None
-                        };
-                        virtual_hashes.insert(identity.clone(), hash.clone());
-                        hash
+                        }
                     }
                 };
                 if let Some(conflict) = self.rollback_conflict(record, file, current_sha256)? {
@@ -1623,7 +1641,15 @@ impl CheckpointStore {
         };
         let current_basis = "current worktree byte hash";
         if current_sha256 != expected_sha256 {
-            let reason_code = if file.after_worktree_sha256.is_none() && file.after_sha256.is_some()
+            // GitFilterOrEolMismatch is only appropriate when the checkpoint
+            // itself recorded both a raw worktree hash and a Git blob hash
+            // that differ — confirming a filter/eol normalization was active.
+            // When after_worktree_sha256 is absent (pre-fix checkpoint) we
+            // cannot tell whether the difference is a user edit or a filter;
+            // use WorktreeChanged to avoid misleading the user.
+            let reason_code = if file.after_worktree_sha256.is_some()
+                && file.after_sha256.is_some()
+                && file.after_worktree_sha256 != file.after_sha256
             {
                 RollbackConflictReason::GitFilterOrEolMismatch
             } else {
@@ -1871,7 +1897,14 @@ impl CheckpointStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, bytes)?;
+        // Write to a sibling temp file then rename so that a crash mid-write
+        // cannot leave a partial blob that restore_bytes would later read.
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, bytes)?;
+        if let Err(err) = fs::rename(&tmp_path, &path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(SqueezyError::Tool(format!("raw blob rename failed: {err}")));
+        }
         Ok(())
     }
 
@@ -1909,11 +1942,11 @@ impl CheckpointStore {
     }
 
     fn cleanup_old_checkpoints(&self, retention_days: u64) -> Result<()> {
-        if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
-            *last_run = Some(now_ms());
-        }
         let journal = self.read_journal()?;
         if journal.checkpoints.is_empty() {
+            if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
+                *last_run = Some(now_ms());
+            }
             return Ok(());
         }
         let cutoff = now_ms().saturating_sub(retention_days as u128 * 24 * 60 * 60 * 1_000);
@@ -1922,6 +1955,9 @@ impl CheckpointStore {
             .into_iter()
             .partition(|record| record.created_at_ms >= cutoff);
         if prune.is_empty() {
+            if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
+                *last_run = Some(now_ms());
+            }
             return Ok(());
         }
         let mut keep = keep;
@@ -1951,7 +1987,12 @@ impl CheckpointStore {
             }
         }
         keep.sort_by_key(|record| record.created_at_ms);
+        // Update the throttle timestamp only after successfully rewriting the
+        // journal, so a failed rewrite does not suppress the next retry.
         self.rewrite_checkpoint_journal(&keep)?;
+        if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
+            *last_run = Some(now_ms());
+        }
         if pruned_any {
             let _ = self.git(["gc", "--prune=now"]);
         }
@@ -2545,6 +2586,8 @@ fn filesystem_rollback_conflict(
         expected_hash_basis: None,
         current_hash_basis: None,
         reason_code: Some(reason_code),
+        // Filesystem is the catch-all arm (ENOSPC, corruption, etc.) and is
+        // not retryable by closing editors or pausing sync agents.
         retryable: matches!(
             reason_code,
             RollbackConflictReason::AccessDenied
@@ -2552,7 +2595,6 @@ fn filesystem_rollback_conflict(
                 | RollbackConflictReason::WouldBlock
                 | RollbackConflictReason::ReadOnly
                 | RollbackConflictReason::FileInUse
-                | RollbackConflictReason::Filesystem
         ),
         reason: windows_retry_message(&format!("{operation} failed: {err}")),
     }

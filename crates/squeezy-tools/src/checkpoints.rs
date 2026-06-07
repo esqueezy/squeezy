@@ -114,17 +114,18 @@ impl ToolRegistry {
             return checkpoints_disabled_result(call);
         };
         match checkpoints.doctor() {
-            Ok(report) => make_result(
-                call,
-                if report.protected_ref_roundtrip && report.lock_file_writable {
-                    ToolStatus::Success
-                } else {
-                    ToolStatus::Stale
-                },
-                json!({ "doctor": report }),
-                ToolCostHint::default(),
-                None,
-            ),
+            Ok(report) => {
+                let ok = report.protected_ref_roundtrip
+                    && report.lock_file_writable
+                    && report.warnings.is_empty();
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({ "ok": ok, "doctor": report }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
             Err(err) => tool_error(call, err),
         }
     }
