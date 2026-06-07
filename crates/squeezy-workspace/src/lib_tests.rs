@@ -156,6 +156,32 @@ fn language_allowlist_keeps_disabled_languages_as_fallback_records() {
 }
 
 #[test]
+fn language_allowlist_refines_c_headers_before_disabling_languages() {
+    let root = temp_root("language_allowlist_refines_c_headers_before_disabling_languages");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/native.c"), "#include \"native.h\"\n").unwrap();
+    fs::write(root.join("src/native.h"), "void native(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["c".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    let header = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/native.h")
+        .expect("C header indexed");
+    assert_eq!(header.language, LanguageKind::C);
+    assert!(!snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/native.h" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
 fn invalid_language_allowlist_is_a_config_error() {
     let err = WorkspaceCrawler::try_new(CrawlOptions {
         languages: vec!["brainfuck".to_string()],

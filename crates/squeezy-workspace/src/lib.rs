@@ -476,11 +476,6 @@ impl WorkspaceCrawler {
             }
             let size_bytes = metadata.len();
             let detected_language = classify_language(&path);
-            let language = if language_enabled(detected_language, &self.enabled_languages) {
-                detected_language
-            } else {
-                LanguageKind::Unsupported
-            };
             // Java source files frequently contain many nested declarations
             // in a single file, so we lift the default cap when the user has
             // not configured an explicit one.
@@ -561,17 +556,13 @@ impl WorkspaceCrawler {
                 continue;
             }
 
-            if language == LanguageKind::Unsupported {
+            if detected_language == LanguageKind::Unsupported {
                 unsupported.push(unsupported_file(
                     &path,
                     relative_path.clone(),
                     extension_string(&path),
                     size_bytes,
-                    if detected_language == LanguageKind::Unsupported {
-                        UnsupportedReason::UnsupportedExtension
-                    } else {
-                        UnsupportedReason::LanguageDisabled
-                    },
+                    UnsupportedReason::UnsupportedExtension,
                 ));
             }
 
@@ -589,12 +580,13 @@ impl WorkspaceCrawler {
                 hash: ContentHash::new(hash),
                 size_bytes,
                 modified_unix_millis,
-                language,
+                language: detected_language,
                 freshness: Freshness::Fresh,
             });
         }
 
         refine_c_family_header_languages(&mut files);
+        apply_language_allowlist(&mut files, &self.enabled_languages, &mut unsupported);
 
         // Pull pruned directories collected by `filter_entry` into the
         // snapshot. We do this once so each excluded directory shows up
@@ -761,6 +753,26 @@ fn language_selector_key(language: &str) -> String {
 
 fn language_enabled(language: LanguageKind, enabled: &HashSet<LanguageKind>) -> bool {
     enabled.is_empty() || language.family().is_none() || enabled.contains(&language)
+}
+
+fn apply_language_allowlist(
+    files: &mut [FileRecord],
+    enabled: &HashSet<LanguageKind>,
+    unsupported: &mut Vec<UnsupportedFile>,
+) {
+    for file in files {
+        if language_enabled(file.language, enabled) {
+            continue;
+        }
+        unsupported.push(unsupported_file(
+            &file.path,
+            file.relative_path.clone(),
+            extension_string(&file.path),
+            file.size_bytes,
+            UnsupportedReason::LanguageDisabled,
+        ));
+        file.language = LanguageKind::Unsupported;
+    }
 }
 
 fn extension_string(path: &Path) -> Option<String> {
