@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -106,6 +107,81 @@ fn preview_patch_stream_supports_legacy_patches_array() {
 fn preview_patch_stream_rejects_non_json() {
     let outcome = preview_patch_stream("{not valid", |_| {});
     assert!(outcome.is_err());
+}
+
+#[test]
+fn restore_tempfile_creation_skips_existing_sibling_path() {
+    let root = temp_repo("restore_temp_collision");
+    let target = root.join("sample.txt");
+    let collision = root.join(".sample.txt.squeezy-restore-collision.tmp");
+    let next = root.join(".sample.txt.squeezy-restore-next.tmp");
+    fs::write(&collision, "user temp\n").expect("write collision");
+
+    let (tmp, mut file) =
+        create_sibling_tempfile_from_candidates([collision.clone(), next.clone()])
+            .expect("create restore tempfile");
+    file.write_all(b"restore\n").expect("write restore temp");
+    drop(file);
+
+    assert_eq!(tmp, next);
+    assert_eq!(
+        fs::read_to_string(&collision).expect("collision preserved"),
+        "user temp\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&next).expect("next created"),
+        "restore\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_symlink_creation_skips_existing_sibling_path() {
+    use std::{ffi::OsString, os::unix::fs::symlink};
+
+    let root = temp_repo("restore_symlink_temp_collision");
+    let collision = root.join(".link.txt.squeezy-restore-collision.tmp");
+    let next = root.join(".link.txt.squeezy-restore-next.tmp");
+    fs::write(&collision, "user temp\n").expect("write collision");
+
+    let tmp = create_sibling_symlink_from_candidates(
+        [collision.clone(), next.clone()],
+        OsString::from("target.txt"),
+    )
+    .expect("create restore symlink");
+
+    assert_eq!(tmp, next);
+    assert_eq!(
+        fs::read_to_string(&collision).expect("collision preserved"),
+        "user temp\n"
+    );
+    assert_eq!(
+        fs::read_link(&next).expect("next symlink target"),
+        PathBuf::from("target.txt")
+    );
+
+    let target = root.join("real-target.txt");
+    fs::write(&target, "real\n").expect("write real target");
+    let symlink_collision = root.join(".link.txt.squeezy-restore-symlink.tmp");
+    symlink(&target, &symlink_collision).expect("create symlink collision");
+    let err = create_sibling_symlink_from_candidates(
+        [symlink_collision.clone()],
+        OsString::from("replacement.txt"),
+    )
+    .expect_err("existing symlink candidate must not be removed");
+    assert!(format!("{err}").contains("exhausted checkpoint restore symlink candidates"));
+    assert_eq!(
+        fs::read_link(&symlink_collision).expect("symlink collision preserved"),
+        target
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("real-target.txt")).unwrap(),
+        "real\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

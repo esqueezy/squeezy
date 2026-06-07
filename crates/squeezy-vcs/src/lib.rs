@@ -25,6 +25,7 @@ pub const CRATE_NAME: &str = "squeezy-vcs";
 const DEFAULT_MAX_PATCH_BYTES: usize = 1_000_000;
 const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RESTORE_TEMPFILE_ATTEMPTS: usize = 128;
 const SHADOW_LOCK_FILENAME: &str = "shadow.lock";
 const SHADOW_STALE_DIR_RETENTION_DAYS: u64 = 14;
 static SHADOW_REPO_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1987,9 +1988,8 @@ fn restore_regular_file_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = sibling_tempfile(path);
+    let (tmp, mut file) = create_sibling_tempfile(path)?;
     {
-        let mut file = File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -2015,9 +2015,7 @@ fn restore_symlink_atomic(path: &Path, target: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = sibling_tempfile(path);
-    let _ = fs::remove_file(&tmp);
-    symlink(OsString::from_vec(target.to_vec()), &tmp)?;
+    let tmp = create_sibling_symlink(path, OsString::from_vec(target.to_vec()))?;
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(err.into());
@@ -2077,13 +2075,84 @@ fn sync_parent_dir(path: &Path) {
     }
 }
 
-fn sibling_tempfile(target: &Path) -> PathBuf {
+fn create_sibling_tempfile(target: &Path) -> std::io::Result<(PathBuf, File)> {
+    create_sibling_tempfile_from_candidates(
+        (0..MAX_RESTORE_TEMPFILE_ATTEMPTS).map(|_| next_sibling_tempfile(target)),
+    )
+}
+
+fn create_sibling_tempfile_from_candidates<I>(candidates: I) -> std::io::Result<(PathBuf, File)>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let mut last_exists = None;
+    for tmp in candidates {
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_exists = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_exists.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted checkpoint restore tempfile candidates",
+        )
+    }))
+}
+
+#[cfg(unix)]
+fn create_sibling_symlink(target: &Path, link_target: std::ffi::OsString) -> Result<PathBuf> {
+    create_sibling_symlink_from_candidates(
+        (0..MAX_RESTORE_TEMPFILE_ATTEMPTS).map(|_| next_sibling_tempfile(target)),
+        link_target,
+    )
+}
+
+#[cfg(unix)]
+fn create_sibling_symlink_from_candidates<I>(
+    candidates: I,
+    link_target: std::ffi::OsString,
+) -> Result<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    use std::os::unix::fs::symlink;
+
+    let mut saw_collision = false;
+    for tmp in candidates {
+        match symlink(&link_target, &tmp) {
+            Ok(()) => return Ok(tmp),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                saw_collision = true;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let message = if saw_collision {
+        "exhausted checkpoint restore symlink candidates"
+    } else {
+        "no checkpoint restore symlink candidates provided"
+    };
+    Err(SqueezyError::Tool(message.to_string()))
+}
+
+fn next_sibling_tempfile(target: &Path) -> PathBuf {
+    let unique = CHECKPOINT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    sibling_tempfile_candidate(target, unique)
+}
+
+fn sibling_tempfile_candidate(target: &Path, unique: u64) -> PathBuf {
     let name = target
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("checkpoint-restore");
-    let unique = CHECKPOINT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    target.with_file_name(format!(".{name}.squeezy-restore-{unique}.tmp"))
+    target.with_file_name(format!(
+        ".{name}.squeezy-restore-{}-{unique}.tmp",
+        std::process::id()
+    ))
 }
 
 fn rel_display(path: &Path) -> String {
