@@ -5780,6 +5780,43 @@ fn resume_hydration_reconstructs_card_without_paired_call() {
 }
 
 #[test]
+fn resume_hydration_surfaces_non_model_output_body_instead_of_dropping() {
+    // A legacy or corrupt tool result whose `output` is not the
+    // model_output() JSON object must still render — surface the raw text
+    // rather than drop the card.
+    let mut app = test_app(SessionMode::Build);
+    let result = serde_json::json!({
+        "type": "function_call_output",
+        "call_id": "call-7",
+        "output": "plain text, not json",
+    });
+
+    hydrate_transcript_item(
+        &mut app,
+        squeezy_store::HydratedTranscriptItem::ToolResult {
+            call: Some(squeezy_store::HydratedToolCall {
+                call_id: "call-7".to_string(),
+                tool: "shell".to_string(),
+                arguments: serde_json::json!({}),
+            }),
+            result,
+        },
+    );
+
+    let entry = app.transcript.first().expect("hydrated tool card");
+    let tool = match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => tool,
+        other => panic!("expected hydrated tool result, got {other:?}"),
+    };
+    assert_eq!(tool.result.status, ToolStatus::Success);
+    assert_eq!(
+        tool.result.content,
+        serde_json::Value::String("plain text, not json".to_string())
+    );
+    assert_eq!(tool.result.call_id, "call-7");
+}
+
+#[test]
 fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
     let mut app = test_app(SessionMode::Build);
 
