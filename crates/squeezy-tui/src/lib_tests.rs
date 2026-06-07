@@ -1861,6 +1861,116 @@ async fn status_line_cost_ticks_live_and_survives_cancel() {
 }
 
 #[tokio::test]
+async fn status_line_context_ticks_live_mid_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_window_tokens = 1_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 100,
+        ..ContextEstimate::default()
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::Started {
+        turn_id: TurnId::new(1),
+    })
+    .await
+    .expect("send started");
+    tx.send(AgentEvent::ContextUsageUpdate {
+        turn_id: TurnId::new(1),
+        input_tokens: 500,
+        context_window_tokens: Some(2_000),
+    })
+    .await
+    .expect("send context update");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+    let window = status::resolve_status_item(&app, status::StatusLineItem::ContextWindowSize)
+        .expect("context window");
+
+    assert_eq!(used, "ctx 25% used");
+    assert_eq!(window, "window 2000");
+    assert_eq!(app.status_context_input_tokens, Some(500));
+}
+
+#[tokio::test]
+async fn cancelled_turn_clears_live_status_context() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_window_tokens = 1_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 100,
+        ..ContextEstimate::default()
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::ContextUsageUpdate {
+        turn_id: TurnId::new(1),
+        input_tokens: 500,
+        context_window_tokens: Some(2_000),
+    })
+    .await
+    .expect("send context update");
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+
+    assert_eq!(used, "ctx 10% used");
+    assert_eq!(app.status_context_input_tokens, None);
+}
+
+#[tokio::test]
+async fn failed_turn_clears_live_status_context() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_window_tokens = 1_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 100,
+        ..ContextEstimate::default()
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::ContextUsageUpdate {
+        turn_id: TurnId::new(1),
+        input_tokens: 500,
+        context_window_tokens: Some(2_000),
+    })
+    .await
+    .expect("send context update");
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: squeezy_core::SqueezyError::Agent("boom".to_string()),
+        session_cost: None,
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+
+    assert_eq!(used, "ctx 10% used");
+    assert_eq!(app.status_context_input_tokens, None);
+}
+
+#[tokio::test]
 async fn status_line_cost_not_clobbered_by_no_broker_failure() {
     let mut app = test_app(SessionMode::Build);
     app.cost = CostSnapshot {
@@ -4459,13 +4569,13 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         reasoning: 0,
         image: 0,
         attachments: 0,
-        system: 2_100,
+        overhead: 2_100,
         ..ContextSourceTokens::default()
     });
     assert_eq!(recs.len(), 2, "{recs:?}");
     assert_eq!(
         recs[0],
-        "largest: tool_outputs 48% → narrow reads (read_slice / signature spans), prefer grep counts, or enable output dedup",
+        "largest actionable: tool_outputs 48% → narrow reads (read_slice / signature spans), prefer grep counts, or enable output dedup",
         "{recs:?}"
     );
     assert_eq!(
@@ -4481,13 +4591,23 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         reasoning: 1_000,
         image: 1_000,
         attachments: 1_000,
-        system: 1_000,
+        overhead: 1_000,
         ..ContextSourceTokens::default()
     });
     assert!(balanced.is_empty(), "{balanced:?}");
 
     // An empty/fresh session has nothing actionable to say.
     assert!(context_source_recommendations(&ContextSourceTokens::default()).is_empty());
+
+    // Fixed request overhead can dominate short sessions, but it is mostly
+    // Squeezy-owned instructions and tool advertising. Keep it in the
+    // percentage denominator without presenting it as user cleanup work.
+    let overhead_only = context_source_recommendations(&ContextSourceTokens {
+        overhead: 9_000,
+        tool_outputs: 1_000,
+        ..ContextSourceTokens::default()
+    });
+    assert!(overhead_only.is_empty(), "{overhead_only:?}");
 }
 
 #[test]
@@ -7624,7 +7744,7 @@ fn turn_divider_flush_waits_for_settling_tail_and_dedupes() {
 }
 
 #[test]
-fn cancelled_turn_scrollback_persists_connected_divider_after_warn_tail() {
+fn cancelled_turn_scrollback_persists_closing_moon_after_warn_tail() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("What is the architecture?"));
     app.push_note("mcp status 0/1 ready 0 tools 1 failed".to_string());
@@ -7649,21 +7769,24 @@ fn cancelled_turn_scrollback_persists_connected_divider_after_warn_tail() {
 
 #[test]
 fn turn_divider_flush_survives_queued_prompt_auto_start_for_all_outcomes() {
-    for (visual, expected, color) in [
+    for (visual, expected, color, expect_closing_moon) in [
         (
             TurnVisualState::Succeeded,
-            "╰─☽ Worked for 3s",
+            "─ Worked for 3s",
             crate::render::theme::green(),
+            false,
         ),
         (
             TurnVisualState::Failed,
             "╰─☽ Failed after 3s",
             crate::render::theme::red(),
+            true,
         ),
         (
             TurnVisualState::Cancelled,
             "╰─☽ Cancelled after 3s",
             crate::render::theme::cyan(),
+            true,
         ),
     ] {
         let mut app = test_app(SessionMode::Build);
@@ -7681,6 +7804,7 @@ fn turn_divider_flush_survives_queued_prompt_auto_start_for_all_outcomes() {
         let rendered = lines_to_plain_text(&lines);
         assert!(rendered.contains(expected), "{rendered}");
         assert_eq!(lines[0].spans[2].style.fg, Some(color));
+        assert_eq!(rendered.contains("╰─☽"), expect_closing_moon, "{rendered}");
     }
 }
 
@@ -7704,7 +7828,7 @@ fn turn_divider_flush_inserts_before_queued_prompt_started_before_draw() {
         .collect::<Vec<String>>();
     let divider_index = rendered_lines
         .iter()
-        .position(|line| line.contains("╰─☽ Worked for 4s"))
+        .position(|line| line.contains("─ Worked for 4s"))
         .expect("divider should render");
     let queued_prompt_index = rendered_lines
         .iter()
@@ -7719,21 +7843,24 @@ fn turn_divider_flush_inserts_before_queued_prompt_started_before_draw() {
 
 #[test]
 fn fullscreen_transcript_inserts_pending_turn_divider_before_queued_prompt_for_all_outcomes() {
-    for (visual, expected, color) in [
+    for (visual, expected, color, expect_closing_moon) in [
         (
             TurnVisualState::Succeeded,
-            "╰─☽ Worked for 4s",
+            "─ Worked for 4s",
             crate::render::theme::green(),
+            false,
         ),
         (
             TurnVisualState::Failed,
             "╰─☽ Failed after 4s",
             crate::render::theme::red(),
+            true,
         ),
         (
             TurnVisualState::Cancelled,
             "╰─☽ Cancelled after 4s",
             crate::render::theme::cyan(),
+            true,
         ),
     ] {
         let mut app = test_app(SessionMode::Build);
@@ -7755,7 +7882,7 @@ fn fullscreen_transcript_inserts_pending_turn_divider_before_queued_prompt_for_a
             .expect("queued prompt should render");
         assert!(
             divider_index < queued_prompt_index,
-            "fullscreen transcript must close the completed turn before showing the queued prompt:\n{}",
+            "fullscreen transcript must show the completed-turn footer before the queued prompt:\n{}",
             rendered_lines.join("\n")
         );
         assert_eq!(
@@ -7768,6 +7895,12 @@ fn fullscreen_transcript_inserts_pending_turn_divider_before_queued_prompt_for_a
             rendered_lines.join("\n")
         );
         assert_eq!(lines[divider_index].spans[2].style.fg, Some(color));
+        assert_eq!(
+            rendered_lines[divider_index].contains("╰─☽"),
+            expect_closing_moon,
+            "{}",
+            rendered_lines.join("\n")
+        );
     }
 }
 
@@ -7785,7 +7918,7 @@ fn transcript_overlay_appends_completed_turn_divider_after_warn_tail() {
     assert!(rendered.contains("turn cancelled"), "{rendered}");
     assert!(
         rendered.contains("╰─☽ Cancelled after 5s"),
-        "overlay must close the visible completed turn: {rendered}"
+        "overlay must close the visible cancelled turn: {rendered}"
     );
 }
 
@@ -7805,7 +7938,7 @@ fn transcript_overlay_inserts_pending_turn_divider_before_queued_prompt() {
         .collect::<Vec<String>>();
     let divider_index = rendered_lines
         .iter()
-        .position(|line| line.contains("╰─☽ Worked for 4s"))
+        .position(|line| line.contains("─ Worked for 4s"))
         .expect("divider should render");
     let queued_prompt_index = rendered_lines
         .iter()
@@ -7813,7 +7946,7 @@ fn transcript_overlay_inserts_pending_turn_divider_before_queued_prompt() {
         .expect("queued prompt should render");
     assert!(
         divider_index < queued_prompt_index,
-        "overlay must close the completed turn before showing the queued prompt:\n{}",
+        "overlay must show the completed-turn footer before the queued prompt:\n{}",
         rendered_lines.join("\n")
     );
 }
@@ -7863,6 +7996,23 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
     let coin = prompt_coin_frame(&app);
     assert!(output.contains(coin), "{output}");
     assert!(output.contains("ship it┃"), "{output}");
+}
+
+#[test]
+fn empty_composer_starts_cursor_at_normal_input_column() {
+    let app = test_app(SessionMode::Build);
+
+    let output = render_to_string(&app, 100, 12);
+    let cursor_line = output
+        .lines()
+        .find(|line| line.contains('┃'))
+        .expect("prompt cursor line");
+    let cursor_column = cursor_line
+        .chars()
+        .position(|ch| ch == '┃')
+        .expect("prompt cursor column");
+
+    assert_eq!(cursor_column, 1, "{output}");
 }
 
 #[test]
@@ -8362,7 +8512,8 @@ fn completed_turn_shows_worked_duration_divider() {
     let output = render_to_string(&app, 120, 18);
     let line = last_turn_divider_line(&app, Duration::from_secs(13 * 60 + 23), 80);
 
-    assert!(output.contains("╰─☽ Worked for 13m 23s"), "{output}");
+    assert!(output.contains("─ Worked for 13m 23s"), "{output}");
+    assert!(!output.contains("╰─☽ Worked for 13m 23s"), "{output}");
     assert!(output.contains("Worked for 13m 23s"), "{output}");
     assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::green()));
     assert!(!output.contains("Working ("), "{output}");
@@ -8417,7 +8568,7 @@ fn inline_view_hides_completed_divider_after_scrollback_flush() {
 }
 
 #[test]
-fn failed_turn_shows_red_moon_duration_row() {
+fn failed_turn_shows_red_closing_moon_duration_row() {
     let mut app = test_app(SessionMode::Build);
     app.turn_visual = TurnVisualState::Failed;
     app.last_turn_duration = Some(Duration::from_secs(7));
@@ -8438,7 +8589,7 @@ fn failed_turn_shows_red_moon_duration_row() {
 }
 
 #[test]
-fn cancelled_turn_shows_cyan_moon_duration_row() {
+fn cancelled_turn_shows_cyan_closing_moon_duration_row() {
     let mut app = test_app(SessionMode::Build);
     app.turn_visual = TurnVisualState::Cancelled;
     app.last_turn_duration = Some(Duration::from_secs(5));

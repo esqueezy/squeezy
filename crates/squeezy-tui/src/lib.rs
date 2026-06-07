@@ -7245,15 +7245,38 @@ fn turn_divider_line(snapshot: TurnDividerSnapshot, width: u16) -> Line<'static>
         _ => ("Worked for", snapshot.visual.color(0)),
     };
     let duration = format_turn_duration(snapshot.duration);
-    let label = format!("   ╰─☽ {state_label} {duration} ");
+    let state_text = format!("{state_label} {duration}");
+
+    if matches!(
+        snapshot.visual,
+        TurnVisualState::Failed | TurnVisualState::Cancelled
+    ) {
+        let label = format!("   ╰─☽ {state_text} ");
+        let label_width = label.chars().count();
+        let fill_width = (width as usize).saturating_sub(label_width);
+        return Line::from(vec![
+            Span::raw("   "),
+            Span::styled("╰─", Style::default().fg(crate::render::theme::quiet())),
+            Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {state_text} {}", "─".repeat(fill_width)),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+    }
+
+    let label = format!("   ─ {state_text} ");
     let label_width = label.chars().count();
     let fill_width = (width as usize).saturating_sub(label_width);
     Line::from(vec![
         Span::raw("   "),
-        Span::styled("╰─", Style::default().fg(crate::render::theme::quiet())),
-        Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled("─ ", Style::default().fg(crate::render::theme::quiet())),
         Span::styled(
-            format!(" {state_label} {duration} {}", "─".repeat(fill_width)),
+            state_text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", "─".repeat(fill_width)),
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ])
@@ -13964,7 +13987,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
 }
 
 fn prompt_visual_line_count(input: &str, width: u16) -> usize {
-    let content_width = width.saturating_sub(4).max(1) as usize;
+    let content_width = width.saturating_sub(1).max(1) as usize;
     if input.is_empty() {
         return 1;
     }
@@ -13979,11 +14002,10 @@ fn prompt_visual_line_count(input: &str, width: u16) -> usize {
 
 fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     // The moon coin now rides the horizon rule (see `composer_horizon_line`),
-    // so the typed content floats beneath it at a steady gutter — every line,
-    // including the first, shares the same indent rather than reserving room
-    // for a coin prefix on line one.
+    // so the typed content floats beneath it with only the open-layout pad
+    // added by `composer_bubble_lines`.
     if app.input.is_empty() {
-        return vec![Line::from(vec![Span::raw("   "), prompt_cursor_span()])];
+        return vec![Line::from(prompt_cursor_span())];
     }
     let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
@@ -13993,7 +14015,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     parts
         .iter()
         .map(|line| {
-            let mut spans = vec![Span::raw("   ")];
+            let mut spans = Vec::new();
             let line_end = line_start + line.len();
             let style_text_at = |abs_offset: usize| -> Style {
                 if bang_range
@@ -16518,6 +16540,15 @@ impl TuiApp {
     pub(crate) fn apply_status_context_snapshot(&mut self, snapshot: &SessionAccountingSnapshot) {
         self.status_context_input_tokens = Some(snapshot.transmitted_request.input_tokens);
         self.status_context_window_tokens = snapshot.transmitted_request.context_window_tokens;
+    }
+
+    pub(crate) fn apply_status_context_usage(
+        &mut self,
+        input_tokens: u64,
+        context_window_tokens: Option<u64>,
+    ) {
+        self.status_context_input_tokens = Some(input_tokens);
+        self.status_context_window_tokens = context_window_tokens;
     }
 
     pub(crate) fn clear_status_context_request_tokens(&mut self) {
