@@ -6,8 +6,8 @@ use squeezy_core::AppConfig;
 use squeezy_core::FileId;
 
 use crate::{
-    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphWriteBatch, STATE_FILE_NAME,
-    SqueezyStore, graph_path, sessions::ResumeItem, state_path,
+    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphStoreMetadata, GraphWriteBatch,
+    STATE_FILE_NAME, SqueezyStore, graph_path, sessions::ResumeItem, state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
