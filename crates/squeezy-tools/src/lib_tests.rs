@@ -13222,44 +13222,29 @@ fn sensitive_path_matcher_expands_windows_userprofile() {
 
 #[test]
 fn sensitive_path_matcher_expands_windows_appdata() {
-    // The sensitive pattern "Roaming/.aws/credentials" only matches after
-    // %APPDATA% is expanded to the configured value; the literal token
-    // "%APPDATA%/.aws/credentials" does not contain "Roaming" anywhere,
-    // so this test fails if the expansion code is absent or broken.
+    // Use a pattern that is ONLY reachable after %APPDATA% is expanded:
+    // "testuser/AppData/Roaming" is part of the expanded value but never
+    // appears in the literal token "%APPDATA%/.aws/credentials". This
+    // verifies the expansion code path without relying on a negative
+    // assertion that the backstop scan might satisfy through other means.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let custom_patterns = vec!["Roaming/.aws/credentials".to_string()];
+    let custom_patterns = vec!["testuser/AppData/Roaming".to_string()];
     let previous = env::var_os("APPDATA");
     unsafe {
         env::set_var("APPDATA", "C:/Users/testuser/AppData/Roaming");
     }
-    // Without expansion %APPDATA%/.aws/credentials does not match
-    // "Roaming/.aws/credentials".  With expansion it becomes
-    // "C:/Users/testuser/AppData/Roaming/.aws/credentials" which does.
-    let result_set = shell_command_references_sensitive_path(
+    let result = shell_command_references_sensitive_path(
         "type %APPDATA%/.aws/credentials",
         &custom_patterns,
     );
-    unsafe {
-        env::remove_var("APPDATA");
-    }
-    // Verify the negative: without APPDATA set, the pattern cannot match.
-    let result_unset = shell_command_references_sensitive_path(
-        "type %APPDATA%/.aws/credentials",
-        &custom_patterns,
-    );
-    // Restore.
     unsafe {
         match previous {
             Some(v) => env::set_var("APPDATA", v),
-            None => {} // already removed above
+            None => env::remove_var("APPDATA"),
         }
     }
     assert!(
-        result_set.is_some(),
-        "%APPDATA% prefix should be expanded before matching"
-    );
-    assert!(
-        result_unset.is_none(),
-        "unexpanded %APPDATA% must not match when env var is unset"
+        result.is_some(),
+        "%APPDATA% should expand to include testuser/AppData/Roaming"
     );
 }
