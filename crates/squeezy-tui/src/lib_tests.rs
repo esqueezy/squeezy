@@ -5511,6 +5511,63 @@ fn term_display_width_matches_unicode_for_ordinary_text() {
 }
 
 #[test]
+fn emit_buffer_row_styled_drops_wide_moon_overflowing_last_column() {
+    // The central VS Code wide-moon fix, exercised through the emission path:
+    // `emit_buffer_row_styled` measures with `term_display_width`, so a moon
+    // glyph (`◐`, unicode-width 1 but rendered two columns wide) placed at the
+    // LAST content column has no room for its second rendered column and is
+    // dropped before the row edge — it must never overflow into scrollback.
+    const WIDTH: u16 = 8;
+    let mut buf = Buffer::empty(Rect::new(0, 0, WIDTH, 1));
+    // Fill columns 0..WIDTH-1 with ASCII, then the moon in the final column.
+    buf.set_string(0, 0, "abcdefg", Style::default()); // 7 cells: x = 0..=6
+    buf.set_string(WIDTH - 1, 0, "◐", Style::default()); // x = 7 (last column)
+
+    let mut out = Vec::new();
+    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    let text = strip_ansi(&String::from_utf8_lossy(&out));
+
+    assert!(
+        text.contains("abcdefg"),
+        "the ASCII prefix must be emitted in full: {text:?}",
+    );
+    assert!(
+        !text.contains('◐'),
+        "a wide moon at the last column would render two columns wide and \
+         overflow the row, so it must be dropped: {text:?}",
+    );
+    // The emitted content, measured at the terminal's glyph widths, must not
+    // exceed the row width — the whole point of the wide-glyph guard.
+    let rendered_width: u16 = text
+        .chars()
+        .map(|c| term_display_width(c.encode_utf8(&mut [0u8; 4])))
+        .sum();
+    assert!(
+        rendered_width <= WIDTH,
+        "rendered width {rendered_width} must fit within {WIDTH}: {text:?}",
+    );
+}
+
+#[test]
+fn emit_buffer_row_styled_keeps_wide_moon_with_room_to_spare() {
+    // Control for the drop case above: the same moon glyph emits fine when its
+    // two rendered columns fit, proving the guard is about the edge, not the
+    // glyph. The moon sits well inside an oversized row.
+    const WIDTH: u16 = 8;
+    let mut buf = Buffer::empty(Rect::new(0, 0, WIDTH, 1));
+    buf.set_string(0, 0, "◐ab", Style::default());
+
+    let mut out = Vec::new();
+    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    let text = strip_ansi(&String::from_utf8_lossy(&out));
+
+    assert!(
+        text.contains('◐') && text.contains("ab"),
+        "a wide moon with room to spare must be emitted: {text:?}",
+    );
+}
+
+#[test]
 fn is_wide_rendered_glyph_classifies_the_special_set() {
     // True for every special-cased glyph the footer mirror must reserve two
     // columns for...
@@ -10699,7 +10756,7 @@ async fn transcript_navigation_keys_update_scroll_state() {
     )
     .await
     .expect("handle key");
-    assert_eq!(app.transcript_scroll_from_bottom, u16::MAX as usize);
+    assert_eq!(app.transcript_scroll_from_bottom, usize::MAX);
 }
 
 #[test]
@@ -16634,7 +16691,10 @@ fn context_window_anchors_to_resolved_effective_window() {
 // --- Unified transcript row model (`wrap_entries` + `transcript_surface`) ---
 
 /// `wrap_entries` must emit lines byte-identical to the overlay draw it
-/// instruments — only the parallel `entry_id` tag is new.
+/// instruments — only the parallel `entry_id` tag is new. The collapsed
+/// (`expand_all = false`) surface folds long tool output and coalesces a run
+/// of same-named tools into one card, so both detail modes are covered to
+/// prove the provenance-tagging loop stays a faithful mirror in either branch.
 #[test]
 fn wrap_entries_lines_match_overlay_rows() {
     let mut app = test_app(SessionMode::Build);
@@ -16643,20 +16703,38 @@ fn wrap_entries_lines_match_overlay_rows() {
         "Here is a fairly long answer that should wrap across multiple visual \
          rows at a narrow width so the continuation-row tagging is exercised too.",
     ));
+    // A long tool result folds below its full body when collapsed, so the
+    // `!expand_all && entry.collapsed` branch in `wrap_entries` diverges from
+    // the expanded one and must still match the overlay byte-for-byte.
+    let long_body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+    app.push_tool_result(sample_tool_result("explore", &long_body));
+    // A coalesced run of same-named tools exercises the `ToolRun::Lead`
+    // grouped-card path (which folds members differently per detail mode).
+    for index in 0..3 {
+        let mut result = sample_tool_result("grep", &format!("hit {index}\n"));
+        result.call_id = format!("grep-{index}");
+        app.push_tool_result(result);
+    }
+    // Rest the settle-folds so the long card carries `collapsed = true`,
+    // making the collapsed-vs-expanded divergence real.
+    app.finalize_settles_for_test();
     app.push_note("mcp status 0/1 ready".to_string());
 
-    for &width in &[24u16, 40, 100] {
-        let expanded = transcript_lines_for_overlay(&app, Some(width), true);
-        let attributed = wrap_entries(&app, width, true);
-        let attributed_lines: Vec<String> = attributed
-            .iter()
-            .map(|row| rendered_line_text(&row.line))
-            .collect();
-        let expected_lines: Vec<String> = expanded.iter().map(rendered_line_text).collect();
-        assert_eq!(
-            attributed_lines, expected_lines,
-            "wrap_entries must be byte-identical to the overlay rows at width {width}",
-        );
+    for expand_all in [true, false] {
+        for &width in &[24u16, 40, 100] {
+            let expected = transcript_lines_for_overlay(&app, Some(width), expand_all);
+            let attributed = wrap_entries(&app, width, expand_all);
+            let attributed_lines: Vec<String> = attributed
+                .iter()
+                .map(|row| rendered_line_text(&row.line))
+                .collect();
+            let expected_lines: Vec<String> = expected.iter().map(rendered_line_text).collect();
+            assert_eq!(
+                attributed_lines, expected_lines,
+                "wrap_entries must be byte-identical to the overlay rows at \
+                 width {width} (expand_all={expand_all})",
+            );
+        }
     }
 }
 

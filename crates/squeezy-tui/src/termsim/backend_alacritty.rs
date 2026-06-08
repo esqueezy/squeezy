@@ -43,7 +43,7 @@ use super::emulator::{Emulator, split_frames};
 use super::types::{CaptureLog, CursorTracking, EmulatorProfile, Grid};
 
 /// Fallback size used only when a capture carries no frame marks at all, so
-/// `replay` can still produce a usable grid for the COMPILES-FIRST scaffold.
+/// `replay` can still produce a usable grid from a frameless byte stream.
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 
 /// Reflowing emulator backed by the `alacritty_terminal` crate.
@@ -71,11 +71,10 @@ impl Emulator for AlacrittyEmulator {
         let mut parser: ansi::Processor = ansi::Processor::new();
 
         if frames.is_empty() {
-            // The frame splitter has not produced slices for this log (today it
-            // is a scaffold stub returning `[]`). Replay the whole byte stream
-            // once at the last recorded size so the leg still reconstructs a
-            // real grid end to end. When `split_frames` lands, the per-frame
-            // branch below takes over and reflow becomes frame-accurate.
+            // The capture recorded no frame marks, so `split_frames` produced
+            // no slices. Replay the whole byte stream once at the last recorded
+            // size (if any) so the leg still reconstructs a real grid end to
+            // end; the per-frame branch below handles the normal marked case.
             if let Some(mark) = log.frames.last() {
                 term.resize(Size::new(mark.w, mark.h));
             }

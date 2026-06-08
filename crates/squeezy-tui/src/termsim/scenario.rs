@@ -5,8 +5,9 @@
 //! is identical to a real session. The driver (`driver.rs`) interprets these
 //! against a `TuiHarness` + `FixedSize` + `Capture` sink.
 //!
-//! Scaffolding: [`shipped_scenarios`] returns the six named scenarios with
-//! empty step lists for now; the steps are filled in once the driver lands.
+//! [`shipped_scenarios`] returns the six named scenarios with fully scripted
+//! step lists, each ending in at least one [`Step::Frame`] so the matrix has a
+//! settled frame to assert against.
 
 use crossterm::event::KeyEvent;
 

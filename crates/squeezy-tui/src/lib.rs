@@ -3285,7 +3285,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                set_active_transcript_scroll_from_bottom(app, u16::MAX as usize);
+                set_active_transcript_scroll_from_bottom(app, usize::MAX);
                 true
             } else {
                 false

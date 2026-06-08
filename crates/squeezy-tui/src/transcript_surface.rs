@@ -1,14 +1,24 @@
 //! Shared transcript ROW MODEL.
 //!
-//! This is the faithful foundation (plan Phase 3, "MOVE 2") that the main
-//! view, the Ctrl+T overlay, selection, search, and copy will all build on.
-//! It does NOT re-implement any layout — it REUSES the crate-root transcript
-//! pipeline through [`crate::wrap_entries`], which runs the SAME per-entry
-//! formatting / coalescing / rail / divider loop as the overlay draw and wraps
-//! it with the SAME wrapper, additionally tagging each wrapped visual row with
-//! the `TranscriptEntry.id` it came from. The row model then decorates each row
+//! This is a faithfully-attributed row model (plan Phase 3, "MOVE 2") that
+//! selection, search, and copy will build on. It does NOT re-implement any
+//! layout — it REUSES the crate-root transcript pipeline through
+//! [`crate::wrap_entries`], which runs the SAME per-entry formatting /
+//! coalescing / rail / divider loop as the **overlay** draw and wraps it with
+//! the SAME wrapper, additionally tagging each wrapped visual row with the
+//! `TranscriptEntry.id` it came from. The row model then decorates each row
 //! with stable identity (`RowId` / `EntryId`), a plain-text `copy_text`
 //! projection, and per-row style/click metadata.
+//!
+//! SURFACE SCOPE (important): [`crate::wrap_entries`] today mirrors only
+//! [`crate::transcript_lines_for_overlay`] — the Ctrl+T overlay surface. It is
+//! NOT yet a faithful model of the MAIN view, which draws through
+//! [`crate::transcript_lines_for_render`] and *diverges*: the main path adds
+//! the startup card, the settle-fold animation, `Tinted` tool cards, and a
+//! different turn divider. Wiring the main view onto this row model (Phase 4)
+//! requires parameterizing `wrap_entries` by surface so it can reproduce the
+//! render-path differences; until then, treat this module as the overlay row
+//! model only.
 //!
 //! Why a separate module: the per-feature surfaces (selection rectangle,
 //! incremental search, yank-to-clipboard) all need the SAME row list with the
@@ -33,11 +43,14 @@
 //! the real, faithfully-attributed builder (it replaced the prefix-diffing
 //! stub) and is fully exercised by the row-model test surface in `lib_tests`.
 //! The production `render()` path still draws through
-//! [`crate::transcript_lines_for_overlay`]; routing it (and Ctrl+T, selection,
-//! search, copy) through this module is the Phase 4+ integration step. Until a
-//! NON-TEST caller exists the whole surface is dead in a plain `cargo build`, so
-//! the module-level `allow(dead_code)` below is what keeps `-D warnings` green;
-//! narrow it to per-item allows once the renderer consumes the row model.
+//! [`crate::transcript_lines_for_overlay`] (overlay) and
+//! [`crate::transcript_lines_for_render`] (main); routing them — plus
+//! selection, search, and copy — through this module, and parameterizing
+//! `wrap_entries` by surface so it also mirrors the main view, is the Phase 4+
+//! integration step. Until a NON-TEST caller exists the whole surface is dead
+//! in a plain `cargo build`, so the module-level `allow(dead_code)` below is
+//! what keeps `-D warnings` green; narrow it to per-item allows once the
+//! renderer consumes the row model.
 #![allow(dead_code)]
 
 use std::num::NonZeroUsize;
@@ -422,7 +435,9 @@ struct RowCacheKey {
     tool_output_verbosity: u8,
     show_reasoning_usage: bool,
     coalesce_tool_runs: bool,
-    subagent_active: u64,
+    /// Hash of the active conversation source (main vs. a specific subagent),
+    /// from `subagent_discriminator` — a discriminator, not a boolean flag.
+    subagent_source_hash: u64,
     /// FNV/Default fold over every visible `(entry.id, entry.revision)`.
     transcript_revision_hash: u64,
     /// Fold over the live pending reasoning + assistant stream (no entry id /
@@ -476,7 +491,7 @@ fn row_cache_key(app: &crate::TuiApp, width: u16, detail: DetailPolicy) -> RowCa
         tool_output_verbosity: app.tool_output_verbosity as u8,
         show_reasoning_usage: app.show_reasoning_usage,
         coalesce_tool_runs: app.coalesce_tool_runs,
-        subagent_active: subagent_discriminator(app),
+        subagent_source_hash: subagent_discriminator(app),
         transcript_revision_hash: transcript_hasher.finish(),
         pending_hash: pending_hasher.finish(),
         turn_divider_hash: divider_hasher.finish(),

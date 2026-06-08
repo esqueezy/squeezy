@@ -7,8 +7,9 @@
 //! and the future xterm.js bridge call the helpers here so there is a single
 //! replay implementation.
 //!
-//! This is scaffolding: the helpers are stubs that compile against the type
-//! shapes but do not yet implement the real frame-splitting logic.
+//! [`split_frames`] is implemented (it slices the capture on the recorded
+//! [`FrameMark`] offsets); only [`width_from_divider`] — the dash-count width
+//! recovery — remains a stub.
 
 use super::types::{CaptureLog, EmulatorProfile, FrameMark, Grid};
 
@@ -95,3 +96,7 @@ pub(crate) struct FrameBytes<'a> {
 pub(crate) fn width_from_divider(_frame: &[u8]) -> Option<u16> {
     None
 }
+
+#[cfg(test)]
+#[path = "emulator_tests.rs"]
+mod tests;

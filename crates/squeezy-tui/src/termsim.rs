@@ -23,10 +23,12 @@
 //! * [`assertions`] — the §8.5 invariant checks over a `Grid`.
 //! * [`matrix`] — the cartesian runner + the feature-gated `#[test]`.
 //!
-//! This is the COMPILES-FIRST scaffold: every backend / driver / assertion is
-//! a stub returning `Default`/`Ok`. The not-yet-wired surface area means a
-//! tree-wide `allow(dead_code)` keeps `-D warnings` builds green until the
-//! real replay + driver land.
+//! The backends, driver, scenario registry, and assertions are implemented:
+//! both Rust legs replay real captures, `shipped_scenarios` returns fully
+//! scripted steps, and the §8.5 checks run over reconstructed grids. The one
+//! remaining stub is [`emulator::width_from_divider`] (dash-count width
+//! recovery). A tree-wide `allow(dead_code)` keeps `-D warnings` builds green
+//! for the matrix entry points the in-process tests don't all reach yet.
 #![allow(dead_code)]
 
 mod assertions;

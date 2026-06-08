@@ -97,8 +97,9 @@ function readViewportLines(term) {
   const lines = [];
   for (let y = 0; y < rows; y++) {
     const line = buffer.getLine(base + y);
-    // translateToString(trimRight=false) keeps column alignment; we don't need
-    // trailing whitespace trimmed because the regex tolerates it.
+    // translateToString(trimRight=true) drops trailing blank cells so rows
+    // compare cleanly across reflows, matching the Rust legs (alacritty trims
+    // trailing spaces; vt100's rows() trims too).
     lines.push(line ? line.translateToString(true) : '');
   }
   return lines;

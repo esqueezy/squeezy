@@ -64,6 +64,30 @@ fn cursor_addressing_lands_on_the_fixed_grid() {
 }
 
 #[test]
+fn frameless_log_falls_back_to_classic_80x24_grid() {
+    // A capture with bytes but NO frame marks: `split_frames` yields nothing,
+    // so the replay falls back to the classic 80x24 size and — having no frame
+    // to feed bytes into — leaves the fixed grid blank. This documents the
+    // vt100 leg's frameless contract: a default-sized, unpainted viewport
+    // rather than a panic. (The alacritty leg, by contrast, replays the whole
+    // frameless stream; see its sibling test.)
+    let log = CaptureLog {
+        bytes: b"unmarked bytes that no frame consumes".to_vec(),
+        frames: vec![],
+    };
+
+    let grid = Vt100Emulator.replay(&log);
+
+    assert_eq!(grid.viewport.len(), 24, "fallback grid is 24 rows tall");
+    assert!(
+        grid.viewport.iter().all(String::is_empty),
+        "no frame marks means no bytes are fed, so the grid stays blank: {:?}",
+        grid.viewport,
+    );
+    assert_eq!(grid.cursor, (0, 0), "cursor at home on the unpainted grid");
+}
+
+#[test]
 fn last_frame_size_clips_the_fixed_grid_without_reflow() {
     // Two frames: the first paints "HELLO" on a wide 10x2 grid, the second
     // re-paints nothing but shrinks to 3x2. vt100's set_size clips columns
