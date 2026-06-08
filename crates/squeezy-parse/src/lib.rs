@@ -964,7 +964,7 @@ fn utf8_bom_diagnostic() -> ParseDiagnostic {
             SourcePoint::new(0, 0),
             SourcePoint::new(0, BOM_LEN),
         )),
-        confidence: Confidence::Low,
+        confidence: Confidence::Partial,
     }
 }
 
