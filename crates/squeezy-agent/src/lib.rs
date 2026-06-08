@@ -59,10 +59,11 @@ use squeezy_telemetry::{
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
     PlanModeShellSafety, ShellAskApprover, ShellAskDecision, ShellAskRequest,
-    ShellBestEffortFallback, ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions,
-    ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult,
-    ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, classify_plan_mode_shell_command,
-    pre_classify_shell, sha256_hex, shell_best_effort_fallback_from_result,
+    ShellBestEffortFallback, ShellPreClassification, ShellWindowsDegraded, ToolCall, ToolCostHint,
+    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig,
+    classify_plan_mode_shell_command, pre_classify_shell, sha256_hex,
+    shell_best_effort_fallback_from_result, shell_windows_degraded_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -1390,6 +1391,12 @@ pub struct Agent {
     /// old sequential semantics so rapid toggle/restart/add/remove actions
     /// settle in the same order the user requested them.
     mcp_background_queue: Arc<McpBackgroundQueue>,
+    /// Root cancellation token for agent-lifetime background tasks. Cancelling
+    /// this token bounds MCP reload/toggle/restart tasks so they cannot hold
+    /// tool-registry or store handles across `Agent::shutdown`. Especially
+    /// important on Windows where the redb exclusive lock prevents store
+    /// reopening while any handle is alive.
+    shutdown_token: CancellationToken,
     /// Cross-turn state for the per-turn model router. Tracks the
     /// escalation-sticky window and any pending `/cheap` / `/parent` /
     /// `/router` user override. Shared with each `TurnRuntime` via
@@ -2061,6 +2068,7 @@ impl Agent {
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
             mcp_background_queue: Arc::new(McpBackgroundQueue::default()),
+            shutdown_token: CancellationToken::new(),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
             last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
             configured_model_context_window,
@@ -2184,10 +2192,9 @@ impl Agent {
         }
         let tools = self.tools.clone();
         let servers = next.mcp_servers.clone();
+        let cancel = self.shutdown_token.child_token();
         let task = async move {
-            let _ = tools
-                .replace_mcp_servers(servers, CancellationToken::new())
-                .await;
+            let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
         // Hand the spawn to the tracked `JoinSet` so `Agent::shutdown`
         // waits for the registry to settle before dropping the redb
@@ -2491,9 +2498,10 @@ impl Agent {
             server.enabled = enabled;
         }
         let tools = self.tools.clone();
+        let cancel = self.shutdown_token.child_token();
         let task = async move {
             let _ = tools
-                .set_mcp_server_enabled(&server_name, enabled, CancellationToken::new())
+                .set_mcp_server_enabled(&server_name, enabled, cancel)
                 .await;
         };
         self.spawn_mcp_background_task(task);
@@ -2506,7 +2514,7 @@ impl Agent {
         server_name: &str,
     ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
         self.tools
-            .restart_mcp_server(server_name, CancellationToken::new())
+            .restart_mcp_server(server_name, self.shutdown_token.child_token())
             .await
     }
 
@@ -2515,10 +2523,9 @@ impl Agent {
     /// that snapshot while this task runs.
     pub fn restart_mcp_server_in_background(&self, server_name: String) {
         let tools = self.tools.clone();
+        let cancel = self.shutdown_token.child_token();
         let task = async move {
-            let _ = tools
-                .restart_mcp_server(&server_name, CancellationToken::new())
-                .await;
+            let _ = tools.restart_mcp_server(&server_name, cancel).await;
         };
         self.spawn_mcp_background_task(task);
     }
@@ -2533,7 +2540,7 @@ impl Agent {
     ) -> squeezy_tools::McpRefreshOutcome {
         self.config.mcp_servers = servers.clone();
         self.tools
-            .replace_mcp_servers(servers, CancellationToken::new())
+            .replace_mcp_servers(servers, self.shutdown_token.child_token())
             .await
     }
 
@@ -2546,10 +2553,9 @@ impl Agent {
     ) {
         self.config.mcp_servers = servers.clone();
         let tools = self.tools.clone();
+        let cancel = self.shutdown_token.child_token();
         let task = async move {
-            let _ = tools
-                .replace_mcp_servers(servers, CancellationToken::new())
-                .await;
+            let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
         self.spawn_mcp_background_task(task);
     }
@@ -2605,6 +2611,11 @@ impl Agent {
     /// `start_turn` will simply register new tasks into the now-empty
     /// JoinSet.
     pub async fn shutdown(&self) {
+        // Signal all agent-lifetime background tasks (MCP reload, toggle,
+        // restart) to stop. This bounds their lifetime so callers can safely
+        // drop the agent and reopen any held file handles (e.g. redb on
+        // Windows, which uses an exclusive lock).
+        self.shutdown_token.cancel();
         let mut tasks = match self.background_tasks.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poison) => std::mem::take(&mut *poison.into_inner()),
@@ -14338,6 +14349,13 @@ fn emit_tool_telemetry(
             &fallback.backend,
         ));
     }
+    // Windows: fire the same telemetry dimension so Windows shell backend
+    // degradation is separable from Unix fallback behavior in dashboards.
+    if let Some(degraded) = shell_windows_degraded_from_result(result) {
+        telemetry.spawn(TelemetryEvent::shell_sandbox_best_effort_fallback(
+            &degraded.backend,
+        ));
+    }
 }
 
 /// Detect a shell best_effort sandbox fallback in `result` and, when this
@@ -14351,24 +14369,47 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
     turn_id: TurnId,
     result: &ToolResult,
 ) {
-    let Some(ShellBestEffortFallback {
+    // Unix best_effort path: fires once per session on the first sandbox
+    // degradation (sandbox exec crashed, unshare failed, etc.).
+    if let Some(ShellBestEffortFallback {
         backend,
         fallback_count,
         first_in_session,
     }) = shell_best_effort_fallback_from_result(result)
-    else {
-        return;
-    };
-    if !first_in_session {
+    {
+        if first_in_session {
+            let _ = tx
+                .send(AgentEvent::ShellSandboxBestEffortFallback {
+                    turn_id,
+                    backend,
+                    fallback_count,
+                })
+                .await;
+        }
         return;
     }
-    let _ = tx
-        .send(AgentEvent::ShellSandboxBestEffortFallback {
-            turn_id,
-            backend,
-            fallback_count,
-        })
-        .await;
+    // Windows: every shell run uses `windows-job-object` with no FS/network
+    // isolation. Emit the warning once per session so the TUI can display
+    // the same safety banner that Unix best_effort fallbacks receive.
+    if let Some(ShellWindowsDegraded {
+        backend,
+        first_in_session,
+        ..
+    }) = shell_windows_degraded_from_result(result)
+    {
+        if first_in_session {
+            let _ = tx
+                .send(AgentEvent::ShellSandboxBestEffortFallback {
+                    turn_id,
+                    backend,
+                    // Windows degradation is not a runtime fallback; use 0
+                    // as the count sentinel so callers can distinguish it from
+                    // a Unix sandbox failure.
+                    fallback_count: 0,
+                })
+                .await;
+        }
+    }
 }
 
 /// SHA-256 of the canonical JSON arguments the model sent for a tool call.
