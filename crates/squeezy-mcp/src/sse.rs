@@ -30,9 +30,13 @@ use rmcp::{
 };
 use tracing::{debug, warn};
 
-/// Minimum interval between automatic reconnect attempts when the SSE stream
-/// ends without a recoverable cause.
-const SSE_RECONNECT_DELAY: Duration = Duration::from_millis(1000);
+/// Initial delay between automatic reconnect attempts when the SSE stream ends.
+const SSE_RECONNECT_DELAY_INITIAL: Duration = Duration::from_millis(1000);
+/// Maximum delay between reconnect attempts (exponential back-off ceiling).
+const SSE_RECONNECT_DELAY_MAX: Duration = Duration::from_secs(30);
+/// Number of consecutive reconnect failures before the worker gives up.
+/// A Windows service that closes immediately would otherwise spin forever.
+const SSE_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
 /// Errors raised by the SSE transport worker.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +121,15 @@ impl Worker for SseClientWorker {
             "established legacy MCP SSE session"
         );
 
+        // Reconnect state: exponential back-off starting at 1 s, capped at
+        // 30 s, with a hard limit on consecutive failures. A successful
+        // reconnect (stream opens and delivers `event: endpoint`) resets the
+        // counter. This prevents a Windows local service that exits immediately
+        // from spinning at 1 s intervals indefinitely while the session is held
+        // open by the agent.
+        let mut reconnect_attempts: u32 = 0;
+        let mut reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
+
         loop {
             tokio::select! {
                 _ = context.cancellation_token.cancelled() => {
@@ -131,6 +144,9 @@ impl Worker for SseClientWorker {
                 frame = frames.next() => {
                     match frame {
                         Some(SseEvent { event, data, .. }) => {
+                            // A live message arrived; the server is healthy.
+                            reconnect_attempts = 0;
+                            reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
                             if !is_message_event(event.as_deref()) {
                                 debug!(
                                     target: "squeezy::mcp::sse",
@@ -160,11 +176,26 @@ impl Worker for SseClientWorker {
                             }
                         }
                         None => {
-                            // Stream ended; reopen the GET after a short
-                            // back-off. Each new session re-advertises its
-                            // POST endpoint, so we replace the one we are
-                            // using rather than reusing the stale URL.
-                            tokio::time::sleep(SSE_RECONNECT_DELAY).await;
+                            // Stream ended; reopen after an exponentially
+                            // increasing back-off up to SSE_RECONNECT_DELAY_MAX.
+                            // Each new session re-advertises its POST endpoint, so
+                            // we replace the stale URL rather than reusing it.
+                            reconnect_attempts += 1;
+                            if reconnect_attempts > SSE_RECONNECT_MAX_ATTEMPTS {
+                                return Err(WorkerQuitReason::fatal(
+                                    SseTransportError::Closed,
+                                    "SSE stream closed repeatedly; giving up after max reconnect attempts",
+                                ));
+                            }
+                            warn!(
+                                target: "squeezy::mcp::sse",
+                                sse_url = %self.sse_url,
+                                attempt = reconnect_attempts,
+                                delay_ms = reconnect_delay.as_millis(),
+                                "SSE stream ended; reconnecting"
+                            );
+                            tokio::time::sleep(reconnect_delay).await;
+                            reconnect_delay = (reconnect_delay * 2).min(SSE_RECONNECT_DELAY_MAX);
                             let response = match self.open_stream().await {
                                 Ok(response) => response,
                                 Err(error) => {
@@ -176,7 +207,12 @@ impl Worker for SseClientWorker {
                             };
                             frames = sse_frame_stream(response);
                             match read_endpoint(&self.sse_url, &mut frames).await {
-                                Ok(new_endpoint) => endpoint_url = new_endpoint,
+                                Ok(new_endpoint) => {
+                                    endpoint_url = new_endpoint;
+                                    // Successfully reconnected; reset the counter.
+                                    reconnect_attempts = 0;
+                                    reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
+                                }
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
                                         error,

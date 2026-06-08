@@ -11083,6 +11083,12 @@ pub struct McpServerConfig {
     /// start. Map key is the header name, value is the env var name. On
     /// conflict with `http_headers`, the env-sourced value wins.
     pub env_http_headers: BTreeMap<String, String>,
+    /// Working directory for stdio MCP server processes. When set, the child
+    /// process is started in this directory so relative config paths, Node
+    /// package scripts, and Python virtualenv paths resolve predictably.
+    /// Particularly useful on Windows where MCP servers often need a specific
+    /// project root to locate their config files or dependencies.
+    pub cwd: Option<String>,
 }
 
 impl McpServerConfig {
@@ -11110,6 +11116,7 @@ impl McpServerConfig {
                 "bearer_token_env_var",
                 "http_headers",
                 "env_http_headers",
+                "cwd",
             ],
             source,
             path,
@@ -11176,6 +11183,7 @@ impl McpServerConfig {
             )?,
             http_headers,
             env_http_headers,
+            cwd: string_value(table, "cwd", source, &field(path, "cwd"))?,
         })
     }
 
@@ -11205,6 +11213,7 @@ impl McpServerConfig {
         if !next.env_http_headers.is_empty() {
             self.env_http_headers.extend(next.env_http_headers);
         }
+        replace_if_some(&mut self.cwd, next.cwd);
     }
 }
 
