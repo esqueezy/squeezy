@@ -3,14 +3,27 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, mpsc},
+    thread,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{Result, SkillConfigEntry, SkillsConfig, SqueezyError};
-use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
+use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookPayload, HookRegistry, HookResult};
 use tracing::warn;
+
+/// Default number of seconds to wait for a skill hook command before
+/// killing it and returning a deny result. Avoids blocking the agent
+/// turn on a hook that hangs (e.g. `sleep infinity`, blocked I/O).
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum bytes allowed in `SQUEEZY_HOOK_PAYLOAD`. Payloads that
+/// exceed this threshold are truncated before the env var is set,
+/// so Linux `execve` env-size limits do not cause spawn failures on
+/// hooks with large prompt or error payloads.
+const MAX_HOOK_PAYLOAD_ENV_BYTES: usize = 32 * 1024;
 
 pub mod help;
 pub mod implicit;
@@ -283,6 +296,16 @@ pub struct SkillHookMatcher {
 pub struct SkillHookSpec {
     pub command: String,
     pub once: bool,
+    /// Maximum seconds to wait for the hook command before killing it
+    /// and returning a deny result. Defaults to
+    /// [`DEFAULT_HOOK_TIMEOUT_SECS`] when `None`.
+    pub timeout_secs: Option<u64>,
+    /// When `false` (fail-closed), a spawn error returns a deny result
+    /// instead of silently allowing execution. Defaults to `true` for
+    /// backward-compatibility with the original fail-open behaviour;
+    /// set `fail_open = false` in the frontmatter for enforcement hooks
+    /// that must not silently pass when the interpreter is missing.
+    pub fail_open: bool,
 }
 
 impl LoadedSkill {
@@ -1462,6 +1485,8 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
             matcher.hooks.push(SkillHookSpec {
                 command: String::new(),
                 once: false,
+                timeout_secs: None,
+                fail_open: true,
             });
             if let Some(spec) = matcher.hooks.last_mut() {
                 apply_spec_kv(spec, item);
@@ -1491,6 +1516,18 @@ fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
     match key.trim() {
         "command" => spec.command = value.to_string(),
         "once" => spec.once = matches!(value, "true" | "yes" | "1"),
+        "timeout" => {
+            if let Ok(secs) = value.parse::<u64>() {
+                spec.timeout_secs = Some(secs);
+            } else {
+                warn!(
+                    target: "squeezy_skills",
+                    value = %value,
+                    "ignoring invalid hook timeout value; expected integer seconds"
+                );
+            }
+        }
+        "fail_open" => spec.fail_open = matches!(value, "true" | "yes" | "1"),
         "type" if value != "command" => {
             warn!(
                 target: "squeezy_skills",
@@ -2054,16 +2091,25 @@ impl HookHandler for SkillHookHandler {
         if ctx.event != self.event {
             return HookResult::allow();
         }
-        let payload_json = ctx.payload_json();
+
+        // Match tool_name directly from the typed payload before
+        // projecting to JSON, so unrelated tool dispatches pay no
+        // serialization cost.
         if let Some(needle) = self.matcher.as_deref() {
-            let tool = payload_json
-                .get("tool_name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            if tool != needle {
+            let tool_name = match &ctx.payload {
+                HookPayload::PreToolUse { tool_name, .. }
+                | HookPayload::PostToolUse { tool_name, .. }
+                | HookPayload::PostToolUseFailure { tool_name, .. }
+                | HookPayload::PostTool { tool_name, .. }
+                | HookPayload::PermissionRequest { tool_name, .. }
+                | HookPayload::PermissionDenied { tool_name, .. } => tool_name.as_str(),
+                _ => "",
+            };
+            if tool_name != needle {
                 return HookResult::allow();
             }
         }
+
         if self.spec.once
             && let Ok(fired) = self.fired.lock()
             && *fired
@@ -2071,10 +2117,6 @@ impl HookHandler for SkillHookHandler {
             return HookResult::allow();
         }
 
-        // Resolve the command path against the skill's base_dir when
-        // relative. The payload is piped through `SQUEEZY_HOOK_PAYLOAD`
-        // as JSON projected from the typed `HookPayload`, matching the
-        // hook-engine contract documented on `HookContext`.
         let trimmed = self.spec.command.trim();
         if trimmed.is_empty() {
             warn!(
@@ -2084,8 +2126,47 @@ impl HookHandler for SkillHookHandler {
             );
             return HookResult::allow();
         }
-        let payload = payload_json.to_string();
+
+        // Serialize the payload only after all cheap checks have passed.
+        // Truncate oversized payloads to avoid Linux execve env-size limits
+        // rather than letting spawn fail silently.
+        let payload_full = ctx.payload_json().to_string();
+        let payload: &str = if payload_full.len() > MAX_HOOK_PAYLOAD_ENV_BYTES {
+            warn!(
+                target: "squeezy_skills",
+                skill = %self.skill_name,
+                payload_bytes = payload_full.len(),
+                max_bytes = MAX_HOOK_PAYLOAD_ENV_BYTES,
+                "hook payload truncated to avoid env size limits"
+            );
+            // Truncate at a valid UTF-8 boundary at or below the limit.
+            let mut end = MAX_HOOK_PAYLOAD_ENV_BYTES;
+            while !payload_full.is_char_boundary(end) {
+                end -= 1;
+            }
+            &payload_full[..end]
+        } else {
+            &payload_full
+        };
+
+        // Use an absolute shell path on Unix to avoid PATH hijacking and
+        // to behave consistently across distros (dash on Debian/Ubuntu,
+        // bash in POSIX mode on others). Fall back to the PATH-resolved
+        // `sh` on non-Unix platforms where /bin/sh is not guaranteed.
+        #[cfg(unix)]
+        let mut command = Command::new("/bin/sh");
+        #[cfg(not(unix))]
         let mut command = Command::new("sh");
+
+        // Put the child in its own process group so a timeout signal
+        // reaches all grandchildren spawned by the hook shell script,
+        // not just the immediate sh process.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
         command
             .arg("-c")
             .arg(trimmed)
@@ -2093,8 +2174,37 @@ impl HookHandler for SkillHookHandler {
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
             .env("SQUEEZY_HOOK_PAYLOAD", payload);
-        match command.status() {
-            Ok(status) if status.success() => {
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    error = %error,
+                    "skill hook failed to spawn"
+                );
+                return if self.spec.fail_open {
+                    HookResult::allow()
+                } else {
+                    HookResult::deny(format!(
+                        "skill `{}` hook failed to spawn: {}",
+                        self.skill_name, error
+                    ))
+                };
+            }
+        };
+
+        let child_pid = child.id();
+        let timeout =
+            Duration::from_secs(self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(child.wait());
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(status)) if status.success() => {
                 // Only mark a `once: true` hook as fired once it has
                 // actually succeeded, so a failed first run can retry.
                 if self.spec.once
@@ -2104,26 +2214,64 @@ impl HookHandler for SkillHookHandler {
                 }
                 HookResult::allow()
             }
-            Ok(status) => {
+            Ok(Ok(status)) => {
+                let code = status.code();
+                let detail = match code {
+                    Some(126) => format!(
+                        "skill `{}` hook: command not executable (exit 126)",
+                        self.skill_name
+                    ),
+                    Some(127) => format!(
+                        "skill `{}` hook: interpreter or command not found (exit 127)",
+                        self.skill_name
+                    ),
+                    _ => format!("skill `{}` hook denied the action", self.skill_name),
+                };
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
-                    code = ?status.code(),
+                    code = ?code,
                     "skill hook exited non-zero"
                 );
-                HookResult::deny(format!(
-                    "skill `{}` hook denied the action",
-                    self.skill_name
-                ))
+                HookResult::deny(detail)
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
                     error = %error,
-                    "skill hook failed to spawn"
+                    "skill hook wait() error"
                 );
-                HookResult::allow()
+                if self.spec.fail_open {
+                    HookResult::allow()
+                } else {
+                    HookResult::deny(format!(
+                        "skill `{}` hook wait failed: {}",
+                        self.skill_name, error
+                    ))
+                }
+            }
+            Err(_timeout_expired) => {
+                // Send SIGKILL to the entire process group so grandchildren
+                // spawned by the hook shell cannot outlive the timeout.
+                #[cfg(unix)]
+                // SAFETY: child_pid is a valid process ID obtained from
+                // `child.id()` and the process group equals child_pid
+                // because we called `process_group(0)` above.
+                unsafe {
+                    libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
+                }
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    timeout_secs = self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
+                    "skill hook timed out"
+                );
+                HookResult::deny(format!(
+                    "skill `{}` hook timed out after {}s",
+                    self.skill_name,
+                    self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS)
+                ))
             }
         }
     }
@@ -2163,6 +2311,131 @@ pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) ->
         );
     }
     installed
+}
+
+/// A single diagnostic finding from [`catalog_hook_issues`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookDoctorIssue {
+    /// Skill name the issue belongs to.
+    pub skill: String,
+    /// Human-readable description of the problem.
+    pub message: String,
+    /// Whether this is a hard error (`true`) or an advisory note (`false`).
+    pub is_error: bool,
+}
+
+/// Inspect every non-disabled skill's hook declarations and return
+/// diagnostic issues without registering handlers or running commands.
+///
+/// Checks performed:
+/// - Missing script files for path-like commands (relative to the skill's
+///   `base_dir`).
+/// - Non-executable script files on Unix (exit 126 at runtime).
+/// - Missing shebang line in script files (may cause interpreter errors).
+/// - Commands that are inline shell snippets — noted as advisory because
+///   snippet behaviour depends on distro shell semantics.
+///
+/// This is the static analysis pass used by `squeezy doctor` to surface
+/// hook problems before a session starts. It does **not** spawn any
+/// processes; all checks are pure filesystem/metadata operations.
+pub fn catalog_hook_issues(catalog: &SkillCatalog) -> Vec<HookDoctorIssue> {
+    let mut issues = Vec::new();
+    for summary in catalog.summaries() {
+        if summary.disabled {
+            continue;
+        }
+        let loaded = match catalog.load(&summary.name) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        for (_event, matchers) in &loaded.hooks {
+            for matcher in matchers {
+                for spec in &matcher.hooks {
+                    let trimmed = spec.command.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    // Classify the command: inline snippet vs file path.
+                    let is_inline_snippet = trimmed
+                        .contains(|c| matches!(c, '|' | ';' | '>' | '<' | '&' | '(' | ')'))
+                        || trimmed.contains("&&")
+                        || trimmed.contains("||")
+                        || trimmed.contains('\n');
+                    if is_inline_snippet {
+                        issues.push(HookDoctorIssue {
+                            skill: summary.name.clone(),
+                            message: format!(
+                                "hook command is an inline shell snippet; behaviour depends on \
+                                 the distro shell (`/bin/sh`): {trimmed:.80}"
+                            ),
+                            is_error: false,
+                        });
+                        continue;
+                    }
+                    // The first whitespace-delimited token is the executable;
+                    // skip argv-style commands with arguments (e.g. `python3 hook.py`).
+                    let executable = trimmed.split_whitespace().next().unwrap_or(trimmed);
+                    // Only validate path-like executables (contains '/' or starts with '.').
+                    if !executable.contains('/') && !executable.starts_with('.') {
+                        continue;
+                    }
+                    let script_path = if Path::new(executable).is_absolute() {
+                        PathBuf::from(executable)
+                    } else {
+                        loaded.base_dir.join(executable)
+                    };
+                    match fs::metadata(&script_path) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            issues.push(HookDoctorIssue {
+                                skill: summary.name.clone(),
+                                message: format!(
+                                    "hook script not found: {}",
+                                    script_path.display()
+                                ),
+                                is_error: true,
+                            });
+                        }
+                        Ok(meta) => {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if meta.permissions().mode() & 0o111 == 0 {
+                                    issues.push(HookDoctorIssue {
+                                        skill: summary.name.clone(),
+                                        message: format!(
+                                            "hook script not executable (chmod +x): {}",
+                                            script_path.display()
+                                        ),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                            // Check for shebang line to catch missing interpreter errors.
+                            if meta.is_file() {
+                                match fs::read(&script_path) {
+                                    Ok(bytes) if bytes.len() >= 2 => {
+                                        if bytes[0] != b'#' || bytes[1] != b'!' {
+                                            issues.push(HookDoctorIssue {
+                                                skill: summary.name.clone(),
+                                                message: format!(
+                                                    "hook script missing shebang line: {}",
+                                                    script_path.display()
+                                                ),
+                                                is_error: false,
+                                            });
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    issues
 }
 
 #[cfg(test)]
