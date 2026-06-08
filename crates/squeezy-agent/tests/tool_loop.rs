@@ -197,56 +197,58 @@ async fn wait_for_persisted_graph_partition(root: &Path, file_id: &str) -> serde
     panic!("graph partition {file_id} was not persisted: {last_error}");
 }
 
-#[tokio::test]
-async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
-    let root = temp_workspace("parallel_read_search");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "grep_call".to_string(),
-                name: "grep".to_string(),
-                arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "src.rs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+#[test]
+fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("parallel_read_search");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "grep_call".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn("inspect needle".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("inspect needle".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].tools.iter().all(|tool| !tool.strict));
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs.len(), 2);
-    assert_eq!(outputs[0].0, "grep_call");
-    assert_eq!(outputs[1].0, "read_call");
-    assert!(outputs[0].1["content"]["matches"][0]["path"] == "src.rs");
-    assert!(outputs[1].1["content"]["content"] == "1\tfn needle() {}\n");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools.iter().all(|tool| !tool.strict));
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].0, "grep_call");
+        assert_eq!(outputs[1].0, "read_call");
+        assert!(outputs[0].1["content"]["matches"][0]["path"] == "src.rs");
+        assert!(outputs[1].1["content"]["content"] == "1\tfn needle() {}\n");
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -1632,61 +1634,63 @@ async fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn glob_and_count_search_outputs_return_to_model() {
-    let root = temp_workspace("glob_count");
-    fs::write(root.join("one.rs"), "fn needle() {}\n").expect("write one");
-    fs::write(root.join("two.rs"), "fn needle() {}\n").expect("write two");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "glob_call".to_string(),
-                name: "glob".to_string(),
-                arguments: serde_json::json!({"pattern": "*.rs"}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "count_call".to_string(),
-                name: "grep".to_string(),
-                arguments: serde_json::json!({
-                    "pattern": "needle",
-                    "include": ["*.rs"],
-                    "output_mode": "count",
+#[test]
+fn glob_and_count_search_outputs_return_to_model() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("glob_count");
+        fs::write(root.join("one.rs"), "fn needle() {}\n").expect("write one");
+        fs::write(root.join("two.rs"), "fn needle() {}\n").expect("write two");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "glob_call".to_string(),
+                    name: "glob".to_string(),
+                    arguments: serde_json::json!({"pattern": "*.rs"}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "count_call".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({
+                        "pattern": "needle",
+                        "include": ["*.rs"],
+                        "output_mode": "count",
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("summarized".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("summarized".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn("summarize files".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("summarize files".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "glob_call");
-    assert_eq!(
-        outputs[0].1["content"]["paths"],
-        serde_json::json!(["one.rs", "two.rs"])
-    );
-    assert_eq!(outputs[1].0, "count_call");
-    assert_eq!(outputs[1].1["content"]["count"], 2);
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "glob_call");
+        assert_eq!(
+            outputs[0].1["content"]["paths"],
+            serde_json::json!(["one.rs", "two.rs"])
+        );
+        assert_eq!(outputs[1].0, "count_call");
+        assert_eq!(outputs[1].1["content"]["count"], 2);
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -3834,6 +3838,24 @@ async fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
 
 async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
     while rx.recv().await.is_some() {}
+}
+
+fn run_high_stack_async_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    std::thread::Builder::new()
+        .name("squeezy-agent-high-stack-test".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("build high-stack test runtime")
+                .block_on(future);
+        })
+        .expect("spawn high-stack test thread")
+        .join()
+        .expect("high-stack test thread panicked");
 }
 
 #[tokio::test]

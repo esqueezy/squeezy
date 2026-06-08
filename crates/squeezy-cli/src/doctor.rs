@@ -896,7 +896,7 @@ fn hook_shell_check(config: &AppConfig) -> Check {
     #[cfg(not(windows))]
     {
         let shell = std::path::Path::new("/bin/sh");
-        return if shell.exists() {
+        if shell.exists() {
             Check {
                 name: "hooks:shell".to_string(),
                 status: Status::Ok,
@@ -908,7 +908,7 @@ fn hook_shell_check(config: &AppConfig) -> Check {
                 status: Status::Warn,
                 detail: "hooks_enabled=true but /bin/sh was not found; skill hooks will fail-open when spawning".to_string(),
             }
-        };
+        }
     }
 
     #[cfg(windows)]
