@@ -65,6 +65,21 @@ fn flags_recursive_del() {
 }
 
 #[test]
+fn flags_del_quiet_force_without_recurse() {
+    // /Q /F together (no /S): suppresses prompt and forces deletion of
+    // read-only files. Intentionally flagged as destructive even without
+    // /S because the operation is non-interactive and hard to recover.
+    assert!(is_destructive_windows_segment(
+        "del /Q /F C:\\important.txt"
+    ));
+    // /Q alone (no /F) is not flagged — deleting with confirmation suppressed
+    // but without forcing read-only removal is borderline; keep narrow.
+    assert!(!is_destructive_windows_segment("del /Q C:\\file.txt"));
+    // /F alone is similarly not flagged.
+    assert!(!is_destructive_windows_segment("del /F C:\\file.txt"));
+}
+
+#[test]
 fn flags_recursive_rd() {
     assert!(is_destructive_windows_segment("rd /S /Q C:\\tmp"));
 }

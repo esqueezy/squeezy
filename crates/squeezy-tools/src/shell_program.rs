@@ -82,7 +82,18 @@ impl ShellProgram {
 
     fn resolve_override(spec: &str, command: &str) -> Self {
         match spec {
-            "gitbash" => Self::git_bash(command).unwrap_or_else(|| Self::unix_sh(command)),
+            "gitbash" => {
+                // `git_bash` is only available on unix and windows; on other
+                // targets, treat the request the same as the unix sh fallback.
+                #[cfg(any(unix, target_os = "windows"))]
+                {
+                    Self::git_bash(command).unwrap_or_else(|| Self::unix_sh(command))
+                }
+                #[cfg(not(any(unix, target_os = "windows")))]
+                {
+                    Self::unix_sh(command)
+                }
+            }
             _ => Self::custom_path(spec, command),
         }
     }
@@ -180,6 +191,12 @@ impl ShellProgram {
                 }
             }
         }
+        // On Unix, any `bash` found via PATH is acceptable. On Windows,
+        // `which::which("bash")` might resolve WSL or Cygwin bash, which is
+        // not Git Bash and uses a different dialect. Skip the PATH search on
+        // Windows to prevent `validate_override` from silently accepting a
+        // non-Git-Bash binary.
+        #[cfg(not(windows))]
         if let Ok(bash) = which::which("bash") {
             return Some(Self {
                 program: bash.to_string_lossy().into_owned(),

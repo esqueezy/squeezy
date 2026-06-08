@@ -15,6 +15,7 @@ fn powershell_bare_name_gets_powershell_args() {
     assert_eq!(args[0], "-NoLogo");
     assert_eq!(args[1], "-NoProfile");
     assert_eq!(args[2], "-Command");
+    assert_eq!(args[3], "echo hi");
 }
 
 #[test]

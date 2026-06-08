@@ -49,7 +49,12 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let flag_matches = |flag: &str| tokens.contains(&flag);
 
     match first {
-        "del" | "erase" => return flag_matches("/s") || flag_matches("/q") && flag_matches("/f"),
+        // `/S` triggers recursive deletion. `/Q /F` together suppress
+        // confirmation and force-delete read-only files; even without `/S`
+        // that is a non-interactive, hard-to-reverse destructive operation.
+        "del" | "erase" => {
+            return flag_matches("/s") || (flag_matches("/q") && flag_matches("/f"));
+        }
         "rd" | "rmdir" => return flag_matches("/s"),
         "format" | "diskpart" => return true,
         "vssadmin" => return flag_matches("delete"),
