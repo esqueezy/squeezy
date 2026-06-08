@@ -2069,12 +2069,12 @@ pub struct SkillHookHandler {
     matcher: Option<String>,
     spec: SkillHookSpec,
     base_dir: PathBuf,
-    /// Tracks whether a `once: true` hook has already succeeded in this
-    /// session. Set only after a successful exit so a failed first run is
-    /// retried. `AtomicBool` with `AcqRel` / `Acquire` ordering is used
-    /// rather than `Mutex<bool>` to close the TOCTOU gap where two
-    /// concurrent dispatches could both read `false` before either writes
-    /// `true`, and to avoid the silent-pass risk of a poisoned mutex.
+    /// Tracks whether a `once: true` hook is already claimed or has succeeded
+    /// in this session. A failed claimed run resets the flag so it can be
+    /// retried. `AtomicBool` with `AcqRel` / `Acquire` ordering is used rather
+    /// than `Mutex<bool>` to close the TOCTOU gap where two concurrent
+    /// dispatches could both read `false` before either writes `true`, and to
+    /// avoid the silent-pass risk of a poisoned mutex.
     fired: AtomicBool,
 }
 
@@ -2121,10 +2121,6 @@ impl HookHandler for SkillHookHandler {
             }
         }
 
-        if self.spec.once && self.fired.load(Ordering::Acquire) {
-            return HookResult::allow();
-        }
-
         let trimmed = self.spec.command.trim();
         if trimmed.is_empty() {
             warn!(
@@ -2134,6 +2130,19 @@ impl HookHandler for SkillHookHandler {
             );
             return HookResult::allow();
         }
+
+        let once_claimed = if self.spec.once {
+            if self
+                .fired
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return HookResult::allow();
+            }
+            true
+        } else {
+            false
+        };
 
         // Serialize the payload only after all cheap checks have passed.
         // Truncate oversized payloads to avoid Linux execve env-size limits
@@ -2192,6 +2201,9 @@ impl HookHandler for SkillHookHandler {
                     error = %error,
                     "skill hook failed to spawn"
                 );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
                 return if self.spec.fail_open {
                     HookResult::allow()
                 } else {
@@ -2236,13 +2248,8 @@ impl HookHandler for SkillHookHandler {
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(status)) if status.success() => {
-                // Only mark a `once: true` hook as fired once it has
-                // actually succeeded, so a failed first run can retry.
-                // compare_exchange from false → true so concurrent dispatches
-                // cannot both slip past the load-before-execute check.
-                if self.spec.once {
-                    self.fired.store(true, Ordering::Release);
-                }
+                // A claimed `once: true` hook stays marked after success; all
+                // unsuccessful outcomes below release the claim for retry.
                 HookResult::allow()
             }
             Ok(Ok(status)) => {
@@ -2264,6 +2271,9 @@ impl HookHandler for SkillHookHandler {
                     code = ?code,
                     "skill hook exited non-zero"
                 );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
                 HookResult::deny(detail)
             }
             Ok(Err(error)) => {
@@ -2273,6 +2283,9 @@ impl HookHandler for SkillHookHandler {
                     error = %error,
                     "skill hook wait() error"
                 );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
                 if self.spec.fail_open {
                     HookResult::allow()
                 } else {
@@ -2308,6 +2321,9 @@ impl HookHandler for SkillHookHandler {
                     timeout_secs = self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
                     "skill hook timed out"
                 );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
                 HookResult::deny(format!(
                     "skill `{}` hook timed out after {}s",
                     self.skill_name,
