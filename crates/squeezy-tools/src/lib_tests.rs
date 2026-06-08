@@ -12789,7 +12789,10 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // the `transitive` boolean schema property) buys one-call retrieval of the
     // whole transitive subtype closure, replacing the N follow-up `decl_search`
     // calls a model would otherwise issue to walk a deep hierarchy by hand.
-    const PREFIX_BYTES_BASELINE: usize = 25_230;
+    // 25_230 -> 26_191: deliberate bump for first-class `impact` and
+    // `inheritance_hierarchy` specs. Dispatch existed without advertised
+    // schemas, so the model could not discover the tools reliably.
+    const PREFIX_BYTES_BASELINE: usize = 26_191;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
@@ -12804,6 +12807,8 @@ fn core_tool_prefix_stays_within_byte_baseline() {
         (glob_spec(), &["pattern"]),
         (grep_spec(), &["pattern"]),
         (hierarchy_spec(), &[]),
+        (impact_spec(), &[]),
+        (inheritance_hierarchy_spec(), &[]),
         (notebook_edit_spec(), &["path", "expected_sha256"]),
         (plan_patch_spec(), &["objective"]),
         (read_file_spec(), &["path"]),
