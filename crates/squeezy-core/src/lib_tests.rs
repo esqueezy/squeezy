@@ -245,13 +245,39 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert_eq!(config.subagents, SubagentConfig::default());
     assert_eq!(config.telemetry, TelemetryConfig::default());
-    assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
-    assert!(
-        config
-            .skills
-            .compat_user_dir
-            .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
-    );
+    // On Unix the skills dirs use home-dotdir paths (`.squeezy/skills`,
+    // `.agents/skills`); on non-Unix they use config/data-dir-rooted paths
+    // (`squeezy/skills`, `agents/skills`) so they stay alongside settings.
+    #[cfg(unix)]
+    {
+        assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
+        assert!(
+            config
+                .skills
+                .compat_user_dir
+                .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(
+            config.skills.user_dir.ends_with("squeezy/skills")
+                || config.skills.user_dir.ends_with("squeezy\\skills")
+                || config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR),
+            "unexpected user_dir: {:?}",
+            config.skills.user_dir
+        );
+        assert!(
+            config.skills.compat_user_dir.ends_with("agents/skills")
+                || config.skills.compat_user_dir.ends_with("agents\\skills")
+                || config
+                    .skills
+                    .compat_user_dir
+                    .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR),
+            "unexpected compat_user_dir: {:?}",
+            config.skills.compat_user_dir
+        );
+    }
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "SQUEEZY_OPENAI_KEY");
