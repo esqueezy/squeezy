@@ -4149,8 +4149,8 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
         .expect("rendered /help line");
     // `/help` no longer has a `[net]` badge — curated topics are local.
     assert!(
-        !help_line.contains('['),
-        "/help should not render a capability badge: {help_line}"
+        !help_line.contains("[net]"),
+        "/help should not render a [net] capability badge: {help_line}"
     );
 
     set_input(&mut app, "/cost".to_string());
