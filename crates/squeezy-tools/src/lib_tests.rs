@@ -10380,6 +10380,13 @@ async fn decl_search_zero_hit_path_unknown_emits_case_near_match() {
     let fallback = &result.content["fallback"];
     assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
     assert_eq!(fallback["reason"].as_str(), Some("path_unknown"));
+    // The path field must echo the unresolved query path, not null and not
+    // the actual file path (which was not found by exact/suffix match).
+    assert_eq!(
+        fallback["path"].as_str(),
+        Some("src/Lib.rs"),
+        "path field must echo the unresolved query path; fallback={fallback}"
+    );
     // The fallback must include the case-insensitive near-match hint.
     assert_eq!(
         fallback["case_near_match"].as_str(),
@@ -10426,7 +10433,13 @@ async fn decl_search_zero_hit_backslash_path_reports_normalization_hint() {
         Some("supported_language_no_match"),
         "normalized backslash path should resolve to the indexed file; fallback={fallback}"
     );
-    // A normalization hint must be present showing the original backslash path.
+    // The path field must show the slash-normalized resolved path.
+    assert_eq!(
+        fallback["path"].as_str(),
+        Some("src/lib.rs"),
+        "path field must show the slash-normalized resolved path; fallback={fallback}"
+    );
+    // A normalization hint must be present showing the original backslash filter.
     assert_eq!(
         fallback["path_normalized_from"].as_str(),
         Some("src\\lib.rs"),

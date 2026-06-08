@@ -109,8 +109,10 @@ fn lowercase_query_prefers_lowercase_path_via_exact_case_overlap() {
 }
 
 #[test]
-fn exact_case_overlap_is_zero_for_fully_lowercase_paths() {
+fn exact_case_overlap_equals_overlap_for_fully_lowercase_paths() {
+    // When both the query and the path are entirely lowercase, every token
+    // that contributes to (case-insensitive) overlap also matches with exact
+    // case — so exact_case_overlap == overlap.
     let rank = path_rank("src/parser/lib.rs", "parser");
-    // Both query and path are lowercase; exact_case_overlap equals overlap.
     assert_eq!(rank.exact_case_overlap, rank.overlap);
 }

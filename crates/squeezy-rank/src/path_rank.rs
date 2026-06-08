@@ -81,10 +81,10 @@ fn path_rank_with_context(path: &str, context: &PathQueryContext) -> PathRank {
             trigram: 0.0,
         };
     }
-    // Use Vec instead of HashSet: the contains-substring check
-    // (p.contains(q) / q.contains(p)) provides no benefit from hashing,
-    // and Vec avoids the allocation overhead of building a hash table.
-    let path_token_vec: Vec<String> = path_tokens(path);
+    // Build both lowercase and case-preserving path token vectors in a single
+    // pass to avoid iterating over the path twice.
+    let (path_token_vec, path_token_raw) = path_split_both(path);
+
     let overlap = context
         .tokens
         .iter()
@@ -99,7 +99,6 @@ fn path_rank_with_context(path: &str, context: &PathQueryContext) -> PathRank {
     // appear verbatim in the path's case-preserving tokens.  This lets
     // `Foo.rs` rank above `foo.rs` when the query uses the uppercase form,
     // matching Linux case-sensitive filesystem semantics.
-    let path_token_raw: Vec<String> = path_tokens_preserving_case(path);
     let exact_case_overlap = context
         .raw_tokens
         .iter()
@@ -166,6 +165,32 @@ fn path_split_raw(input: &str, lowercase: bool) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+/// Returns `(lowercase_tokens, case_preserving_tokens)` in a single pass,
+/// avoiding two separate `path_split_raw` traversals per candidate path.
+fn path_split_both(input: &str) -> (Vec<String>, Vec<String>) {
+    let mut lc: Vec<String> = Vec::new();
+    let mut raw: Vec<String> = Vec::new();
+    let mut lc_cur = String::new();
+    let mut raw_cur = String::new();
+    for ch in input.chars() {
+        let is_sep = matches!(ch, '/' | '\\' | '_' | '-' | '.') || ch.is_whitespace();
+        if is_sep {
+            if !lc_cur.is_empty() {
+                lc.push(std::mem::take(&mut lc_cur));
+                raw.push(std::mem::take(&mut raw_cur));
+            }
+        } else {
+            lc_cur.extend(ch.to_lowercase());
+            raw_cur.push(ch);
+        }
+    }
+    if !lc_cur.is_empty() {
+        lc.push(lc_cur);
+        raw.push(raw_cur);
+    }
+    (lc, raw)
 }
 
 /// Jaccard similarity over the character-trigram sets of `a` and `b`,

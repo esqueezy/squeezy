@@ -1416,9 +1416,11 @@ fn graph_zero_hit_fallback(
                 .find(|file| path_matches_exact_or_suffix(&file.relative_path, p));
             match file {
                 Some(file) => {
+                    // `path_unknown` is reserved for the not-found case below so
+                    // the model can distinguish "exists but unindexable" from
+                    // "path not in graph at all".
                     let reason = match file.language {
-                        LanguageKind::Unsupported => "path_unsupported",
-                        LanguageKind::Unknown => "path_unknown",
+                        LanguageKind::Unsupported | LanguageKind::Unknown => "path_unsupported",
                         _ => "supported_language_no_match",
                     };
                     (
@@ -1431,15 +1433,22 @@ fn graph_zero_hit_fallback(
                 None => {
                     // No exact/suffix match.  Try a case-insensitive search so
                     // the caller can correct a Linux case typo without another
-                    // graph traversal.
+                    // graph traversal.  Use min_by_key for a deterministic
+                    // winner when a case-sensitive repo has multiple files that
+                    // differ only by case (e.g. both `src/Foo.rs` and
+                    // `src/foo.rs` match a query of `src/FOO.rs`).
                     let p_lower = p.to_lowercase();
-                    let near = graph.files.values().find(|f| {
-                        let rp_lower = f.relative_path.to_lowercase();
-                        rp_lower == p_lower
-                            || rp_lower
-                                .strip_suffix(p_lower.as_str())
-                                .is_some_and(|prefix| prefix.ends_with('/'))
-                    });
+                    let near = graph
+                        .files
+                        .values()
+                        .filter(|f| {
+                            let rp_lower = f.relative_path.to_lowercase();
+                            rp_lower == p_lower
+                                || rp_lower
+                                    .strip_suffix(p_lower.as_str())
+                                    .is_some_and(|prefix| prefix.ends_with('/'))
+                        })
+                        .min_by_key(|f| f.relative_path.as_str());
                     (
                         Value::String(p.to_string()),
                         Value::Null,
