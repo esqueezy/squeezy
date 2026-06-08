@@ -92,16 +92,15 @@ impl BedrockProvider {
         // the SECURITY note in `load_aws_config`) so we reject literal
         // metadata / link-local hosts eagerly to prevent SSRF credential
         // exfiltration on Linux cloud hosts where IMDS is reachable.
-        if let Some(url) = &config.base_url {
-            if let Some(host) = extract_url_host(url) {
-                if is_metadata_or_link_local_host(&host) {
-                    return Err(SqueezyError::Config(format!(
-                        "bedrock base_url {url:?} targets a cloud-metadata or \
-                         link-local host ({host}); refusing to configure to prevent \
-                         potential credential exfiltration via IMDS"
-                    )));
-                }
-            }
+        if let Some(url) = &config.base_url
+            && let Some(host) = extract_url_host(url)
+            && is_metadata_or_link_local_host(&host)
+        {
+            return Err(SqueezyError::Config(format!(
+                "bedrock base_url {url:?} targets a cloud-metadata or \
+                 link-local host ({host}); refusing to configure to prevent \
+                 potential credential exfiltration via IMDS"
+            )));
         }
         Ok(Self {
             region: config.region.clone(),
@@ -144,7 +143,7 @@ impl BedrockProvider {
 fn extract_url_host(url: &str) -> Option<String> {
     let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
     let authority = after_scheme.split('/').next()?;
-    let after_userinfo = authority.split('@').last().unwrap_or(authority);
+    let after_userinfo = authority.split('@').next_back().unwrap_or(authority);
     let host = if after_userinfo.starts_with('[') {
         // IPv6 literal: "[::1]" or "[::1]:8080" — strip brackets.
         let close = after_userinfo.find(']').unwrap_or(after_userinfo.len() - 1);
