@@ -476,12 +476,20 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // one append per second drowns the actual output.
                     app.note_active_tool_progress(&tool_name, elapsed_ms);
                 }
-                AgentEvent::Cancelled { session_cost, .. } => {
+                AgentEvent::Cancelled {
+                    cost, session_cost, ..
+                } => {
                     // Keep the session-cumulative cost on the status line after
                     // a mid-turn cancel (the partial round was already billed),
                     // instead of letting it go stale / blank.
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
+                    }
+                    // Emit the partial turn cost even on cancel — cancelled
+                    // rounds are billed for completed work.
+                    if cost.input_tokens.is_some() || cost.estimated_usd_micros.is_some() {
+                        let delta = format_turn_cost_delta(&cost);
+                        app.push_log(format!("cancelled · {delta}"));
                     }
                     app.clear_status_context_request_tokens();
                     let mut message = "cancelled; edit prompt or retry".to_string();
@@ -832,10 +840,16 @@ fn format_turn_cost_delta(cost: &squeezy_core::CostSnapshot) -> String {
     if let Some(usd) = cost.estimated_usd_micros {
         parts.push(format!("${:.6}", usd as f64 / 1_000_000.0));
     }
-    if let (Some(inp), Some(out)) = (cost.input_tokens, cost.output_tokens) {
-        parts.push(format!("in {inp} out {out}"));
-    } else if let Some(inp) = cost.input_tokens {
-        parts.push(format!("in {inp}"));
+    // Emit both input and output independently so neither is dropped when only
+    // one is present (some providers stream partial usage with only one field).
+    if let Some(inp) = cost.input_tokens {
+        if let Some(out) = cost.output_tokens {
+            parts.push(format!("in {inp} out {out}"));
+        } else {
+            parts.push(format!("in {inp}"));
+        }
+    } else if let Some(out) = cost.output_tokens {
+        parts.push(format!("out {out}"));
     }
     if let Some(r) = cost.cached_input_tokens
         && r > 0

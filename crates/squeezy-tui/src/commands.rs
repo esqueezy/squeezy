@@ -280,26 +280,37 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
     }
 
     // Budget policy summary: all configured enforcement limits in one place.
-    let policy = &snapshot.budget_policy;
-    let has_any_limit = policy.max_session_cost_usd_micros.is_some()
-        || policy.max_round_input_tokens.is_some()
-        || policy.disable_prompt_cache;
-    if has_any_limit || policy.max_tool_calls_per_turn > 0 {
+    // Always shown — even default values are useful for users debugging
+    // unexpected gating behavior. Explicit caps are highlighted.
+    {
+        let policy = &snapshot.budget_policy;
+        let cap_label = match policy.max_session_cost_usd_micros {
+            Some(cap) if cap > 0 => {
+                format!(
+                    "${:.4} ({})",
+                    cap as f64 / 1_000_000.0,
+                    style::accent("explicit")
+                )
+            }
+            _ => style::muted("none (uncapped)").to_string(),
+        };
+        let round_cap_label = match policy.max_round_input_tokens {
+            Some(tokens) => format!(
+                "{} ({})",
+                style::group_thousands(tokens),
+                style::accent("explicit")
+            ),
+            None => style::muted("none").to_string(),
+        };
         out.push('\n');
         out.push_str(&style::header("Budget policy"));
         out.push('\n');
         out.push_str(&format!(
             "  {} session_cap={} warn_at={}% round_input_cap={}\n",
             style::accent("⊛"),
-            match policy.max_session_cost_usd_micros {
-                Some(cap) if cap > 0 => format!("${:.4}", cap as f64 / 1_000_000.0),
-                _ => style::muted("none").to_string(),
-            },
+            cap_label,
             policy.cost_warn_percent,
-            match policy.max_round_input_tokens {
-                Some(tokens) => style::group_thousands(tokens),
-                None => style::muted("none").to_string(),
-            },
+            round_cap_label,
         ));
         out.push_str(&format!(
             "  {} max_tool_calls={} max_bytes_read={} max_search_files={}\n",
@@ -360,7 +371,11 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
             // reserve is the actionable ceiling for input content. Surface it
             // here so users see the number that gates compaction triggers and
             // cost-cap projections — not the wider full window.
-            if let Some(input_budget) = snapshot.transmitted_request.input_budget_tokens {
+            // Guard against budget=0 (max_output_tokens >= context window)
+            // which would produce NaN/Infinity in the percentage calculation.
+            if let Some(input_budget) = snapshot.transmitted_request.input_budget_tokens
+                && input_budget > 0
+            {
                 let budget_remaining = input_budget.saturating_sub(consumed);
                 let budget_used_pct = (consumed as f64 / input_budget as f64) * 100.0;
                 let budget_remaining_pct =

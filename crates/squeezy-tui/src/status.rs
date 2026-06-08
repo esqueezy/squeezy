@@ -606,11 +606,7 @@ pub(crate) fn format_cost_segment(
             let spent = cost.estimated_usd_micros.unwrap_or(0);
             // Use one decimal place so small movements near a low cap are
             // visible before a full percentage point changes.
-            let percent = if cap == 0 {
-                0.0
-            } else {
-                ((spent as f64) / (cap as f64) * 100.0).min(999.9)
-            };
+            let percent = ((spent as f64) / (cap as f64) * 100.0).min(999.9);
             format!(
                 "cost {} / ${:.2} ({:.1}%)",
                 format_cost(cost),

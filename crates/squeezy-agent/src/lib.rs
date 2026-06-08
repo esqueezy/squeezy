@@ -7107,9 +7107,20 @@ impl TurnRuntime {
             // landed at 124% of cap before the post-hoc check tripped).
             let cap_status = broker.session_cap_reached().or_else(|| {
                 // Include fixed request overhead (instructions + tool schemas)
-                // so the pre-flight estimate matches what we will actually send.
-                // `estimate_context` only walks conversation items; the overhead
-                // from the most-recent assembled request closes the gap.
+                // so the pre-flight cost estimate matches what will actually be
+                // billed. `estimate_context` only walks conversation items; the
+                // overhead from the most-recent assembled request closes the gap.
+                //
+                // Bootstrap note: `last_request_overhead_tokens` starts at 0
+                // and is only written after the first request body is assembled
+                // (see the `self.last_request_overhead_tokens.store(...)` call
+                // below). On the very first round of a fresh turn, overhead = 0,
+                // so the cap projection still under-counts instructions and tool
+                // schemas by one round. Every subsequent round uses the prior
+                // round's measured overhead and is accurate. A single-round
+                // overshoot on the first dispatch is acceptable; fully closing
+                // the gap would require assembling a skeleton request before the
+                // gate check, which is a larger refactor.
                 let overhead = self.last_request_overhead_tokens.load(Ordering::Relaxed);
                 let projected_input_tokens = estimate_context(&conversation)
                     .estimated_tokens
