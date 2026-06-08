@@ -8,8 +8,8 @@ use crate::web::{
     MAX_WEB_TIMEOUT_MS,
 };
 use crate::{
-    DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS, MAX_READ_LIMIT,
-    MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
+    DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
+    MAX_READ_LIMIT, MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
 };
 
 /// Strict-parse a first-party tool schema literal into [`JsonSchema`]. A
@@ -228,7 +228,7 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Return matching lines, only files containing matches, or only a count. Default content."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_FILES},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
-                "max_bytes_per_file": {"type": "integer", "minimum": 1, "description": "Maximum bytes to read from each file before pattern matching. Default 1 MB."},
+                "max_bytes_per_file": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_BYTES_PER_FILE, "description": "Maximum bytes to read from each file before pattern matching. Default 1 MB."},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."},
                 "context": {"type": "integer", "minimum": 0, "maximum": 50, "description": "Number of leading + trailing context lines to emit around each match (like rg -C N). Default 0. Only affects output_mode=content."}

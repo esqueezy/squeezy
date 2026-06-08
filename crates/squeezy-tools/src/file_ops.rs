@@ -953,6 +953,18 @@ impl ToolRegistry {
                 // The model's matches are byte-identical to a plain disk
                 // grep; everything below is purely ADDITIVE sibling fields.
                 object.insert("matches".to_string(), json!(matches));
+                // Always emit graph_augment_status in Content mode so the model
+                // can distinguish "this pattern never triggers augmentation" from
+                // "augmentation ran but the graph was unavailable". The default is
+                // overwritten below when augmentation actually runs.
+                metadata.insert(
+                    "graph_augment_status".to_string(),
+                    json!(if diff_only {
+                        "diff_only_skipped"
+                    } else {
+                        "not_applicable"
+                    }),
+                );
                 object.insert("metadata".to_string(), json!(metadata));
 
                 // Recall+cost augmentation: only when the grep is enumerating
@@ -963,10 +975,8 @@ impl ToolRegistry {
                     let augment_status = self
                         .augment_inheritance_grep(&detected, &matches, &mut object)
                         .await;
-                    // Surface whether augmentation was applied or the graph
-                    // was not ready within graph_augment_wait(). The model can
-                    // use this to decide whether to retry graph tools directly
-                    // versus proceeding with lexical evidence only.
+                    // Overwrite the default with the actual result: "applied",
+                    // "graph_not_ready", or "graph_unavailable".
                     object.entry("metadata").and_modify(|m| {
                         if let Value::Object(map) = m {
                             map.insert("graph_augment_status".to_string(), json!(augment_status));
@@ -1006,6 +1016,8 @@ impl ToolRegistry {
     /// - `"applied"` — graph declarations were inserted (or a `graph_hint` was emitted).
     /// - `"graph_not_ready"` — graph was not ready within [`graph_augment_wait()`]; the
     ///   model may retry the grep later or call graph tools directly.
+    /// - `"graph_unavailable"` — the graph failed to open (permanent); retrying will not
+    ///   help; fall through to graph tools such as `decl_search` if needed.
     async fn augment_inheritance_grep(
         &self,
         detected: &InheritanceGrep,
@@ -1013,7 +1025,13 @@ impl ToolRegistry {
         object: &mut serde_json::Map<String, Value>,
     ) -> &'static str {
         let Some(augment) = self.inheritance_graph_lookup(detected.clone()).await else {
-            return "graph_not_ready";
+            // Distinguish a permanent graph failure from a transient not-ready timeout
+            // so the model can decide whether retrying makes sense.
+            return if self.graph_open_error().is_some() {
+                "graph_unavailable"
+            } else {
+                "graph_not_ready"
+            };
         };
 
         let attribute = augment.attribute.clone();

@@ -12869,51 +12869,72 @@ fn core_tool_prefix_stays_within_byte_baseline() {
 }
 
 /// Schema/serde drift test: verify that every field accepted by the `Args`
-/// structs for `read_file` and `grep` is also declared in the advertised
-/// `ToolSpec` schema. This catches the class of bug where an implementation
-/// accepts a parameter but the schema omits it, so provider-side schema
-/// validation silently rejects valid model calls.
+/// structs for first-party tools is also declared in the advertised `ToolSpec`
+/// schema. This catches the class of bug where an implementation accepts a
+/// parameter but the schema omits it, so provider-side schema validation
+/// silently rejects valid model calls.
 #[test]
-fn read_file_and_grep_schemas_cover_all_accepted_fields() {
-    let read_file_params =
-        serde_json::to_string(&read_file_spec().parameters).expect("serialize read_file schema");
-    for field in [
-        "path",
-        "offset",
-        "limit",
-        "diff_only",
-        "start_line",
-        "end_line",
-    ] {
-        assert!(
-            read_file_params.contains(&format!("\"{field}\"")),
-            "read_file schema must declare field `{field}` (accepted by ReadFileArgs but not advertised); \
-             got: {read_file_params}"
-        );
-    }
+fn first_party_args_schemas_cover_all_accepted_fields() {
+    // (spec_fn, fields accepted by the Args struct that the schema must declare)
+    let cases: &[(fn() -> ToolSpec, &[&str])] = &[
+        (
+            read_file_spec,
+            &[
+                "path",
+                "offset",
+                "limit",
+                "diff_only",
+                "start_line",
+                "end_line",
+            ],
+        ),
+        (
+            grep_spec,
+            &[
+                "pattern",
+                "path",
+                "include",
+                "exclude",
+                "include_ignored",
+                "diff_only",
+                "output_mode",
+                "max_files",
+                "max_bytes_per_file",
+                "max_matches",
+                "output_byte_cap",
+                "offset",
+                "context",
+            ],
+        ),
+        (
+            glob_spec,
+            &[
+                "pattern",
+                "path",
+                "include_ignored",
+                "diff_only",
+                "max_paths",
+                "offset",
+            ],
+        ),
+        (
+            read_tool_output_spec,
+            &["handle", "path", "offset", "limit"],
+        ),
+    ];
 
-    let grep_params =
-        serde_json::to_string(&grep_spec().parameters).expect("serialize grep schema");
-    for field in [
-        "pattern",
-        "path",
-        "include",
-        "exclude",
-        "include_ignored",
-        "diff_only",
-        "output_mode",
-        "max_files",
-        "max_bytes_per_file",
-        "max_matches",
-        "output_byte_cap",
-        "offset",
-        "context",
-    ] {
-        assert!(
-            grep_params.contains(&format!("\"{field}\"")),
-            "grep schema must declare field `{field}` (accepted by GrepArgs but not advertised); \
-             got: {grep_params}"
-        );
+    for (spec_fn, fields) in cases {
+        let spec = spec_fn();
+        let params = serde_json::to_string(&spec.parameters)
+            .unwrap_or_else(|_| panic!("{} schema serialize failed", spec.name));
+        for field in *fields {
+            assert!(
+                params.contains(&format!("\"{field}\"")),
+                "{} schema must declare field `{field}` (accepted by the Args struct but not advertised); \
+                 got: {params}",
+                spec.name
+            );
+        }
     }
 }
 
