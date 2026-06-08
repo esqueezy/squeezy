@@ -16,15 +16,26 @@ fn scenario_named(name: &str) -> Scenario {
         .unwrap_or_else(|| panic!("scenario {name:?} is shipped"))
 }
 
-/// Redact the per-run scratch workspace path the status line embeds
-/// (`…/squeezy_termsim_<nonce>…`, truncated with an ellipsis) so the plain
-/// snapshot captures layout, not the unique nonce. insta's `filters`
-/// feature is not enabled in this workspace, so we redact by hand: replace
-/// any whitespace-delimited token containing `squeezy_termsim_` with a
-/// stable placeholder.
+/// Redact the per-run scratch workspace path the status line embeds so the
+/// plain snapshot captures layout, not the unique tempdir nonce. The status
+/// formatter may truncate the middle of the path before the `squeezy_termsim_*`
+/// marker appears, so replace the whole model/workspace/status segment instead
+/// of matching only the raw tempdir name.
 fn redact_workspace(text: &str) -> String {
+    const PREFIX: &str = "termsim-stub:termsim-model · ";
     text.split('\n')
         .map(|line| {
+            if let Some(start) = line.find(PREFIX) {
+                let workspace_start = start + PREFIX.len();
+                if let Some(rel_end) = line[workspace_start..].find(" · ") {
+                    let workspace_end = workspace_start + rel_end;
+                    let mut redacted = String::with_capacity(line.len());
+                    redacted.push_str(&line[..workspace_start]);
+                    redacted.push_str("<workspace>");
+                    redacted.push_str(&line[workspace_end..]);
+                    return redacted;
+                }
+            }
             line.split(' ')
                 .map(|tok| {
                     if tok.contains("squeezy_termsim_") {
@@ -38,6 +49,19 @@ fn redact_workspace(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn redact_workspace_handles_truncated_status_path() {
+    let text = concat!(
+        "termsim-stub:termsim-model · /var/folders/xx/T... · ru... Build mode\n",
+        "Enter send"
+    );
+
+    assert_eq!(
+        redact_workspace(text),
+        "termsim-stub:termsim-model · <workspace> · ru... Build mode\nEnter send"
+    );
 }
 
 /// Snapshot the fullscreen grid with the volatile scratch-workspace path
