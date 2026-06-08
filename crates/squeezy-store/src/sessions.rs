@@ -240,16 +240,10 @@ impl SessionStore {
     pub fn global_index_path() -> Option<PathBuf> {
         // Mirror the same resolution order as memory_path(): HOME first,
         // then USERPROFILE on Windows (where HOME may be absent in native shells).
-        let base = env::var_os("HOME").or_else(|| {
-            #[cfg(target_os = "windows")]
-            {
-                env::var_os("USERPROFILE")
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                None
-            }
-        })?;
+        let base = env::var_os("HOME");
+        #[cfg(target_os = "windows")]
+        let base = base.or_else(|| env::var_os("USERPROFILE"));
+        let base = base?;
         Some(
             PathBuf::from(base)
                 .join(".squeezy")
