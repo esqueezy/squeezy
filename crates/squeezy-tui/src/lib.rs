@@ -15660,15 +15660,6 @@ pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 
 impl Clipboard for Osc52Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
-        // Guard: OSC52 is a terminal-only escape sequence. When stdout is
-        // not a terminal the bytes would corrupt piped output or be silently
-        // discarded. This is an extra safety net — the TUI startup already
-        // refuses to run if stdout is not a terminal.
-        if !io::stdout().is_terminal() {
-            return Err(
-                "stdout is not a terminal; OSC52 clipboard sequence not emitted".to_string(),
-            );
-        }
         if text.len() > OSC52_MAX_PAYLOAD_BYTES {
             return Err(format!(
                 "payload {} bytes exceeds terminal clipboard cap of {} bytes",

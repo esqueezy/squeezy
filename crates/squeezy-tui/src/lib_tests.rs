@@ -9576,7 +9576,7 @@ async fn ctrl_y_copies_last_assistant_message() {
 
     assert_eq!(writes.lock().unwrap().as_slice(), ["answer"]);
     assert!(
-        app.status.contains("copied assistant message"),
+        app.status.contains("OSC52 clipboard sequence written"),
         "{}",
         app.status
     );
