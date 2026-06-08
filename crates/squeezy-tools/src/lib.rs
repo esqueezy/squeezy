@@ -263,6 +263,26 @@ pub(crate) fn graph_ready_wait() -> Duration {
             .unwrap_or(Duration::from_secs(30))
     })
 }
+
+/// Shorter graph-ready wait used for optional inheritance-grep augmentation.
+///
+/// Graph-first tools justify a full 30-second wait because they cannot
+/// produce a useful result without the graph. Grep augmentation is purely
+/// ADDITIVE: the grep result is complete and correct without it. A long
+/// wait would stall every inheritance-pattern grep call on a cold start.
+/// Override with `SQUEEZY_GRAPH_AUGMENT_WAIT_MS` when the graph typically
+/// finishes quickly or the workspace is small.
+pub(crate) fn graph_augment_wait() -> Duration {
+    use std::sync::OnceLock;
+    static WAIT: OnceLock<Duration> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("SQUEEZY_GRAPH_AUGMENT_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(5))
+    })
+}
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
 pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 50;
 pub(crate) const MAX_GRAPH_MAX_RESULTS: usize = 100;
@@ -1977,9 +1997,12 @@ impl ToolRegistry {
                 mcp_read_resource_spec(),
             ]);
         }
+        // `checkpoint_list` is always advertised so the model and UI can
+        // discover the disabled state (the handler returns `enabled:false`)
+        // rather than treating checkpoint tools as entirely absent.
+        specs.push(checkpoint_list_spec());
         if self.checkpoints.is_some() {
             specs.extend([
-                checkpoint_list_spec(),
                 checkpoint_revert_spec(),
                 checkpoint_show_spec(),
                 checkpoint_undo_spec(),
@@ -5102,10 +5125,13 @@ impl ToolOutputStore {
             return result;
         }
 
-        let output = result
-            .spill_model_output
-            .take()
-            .unwrap_or_else(|| model_output.clone());
+        // Compute the preview from the model-visible output before potentially
+        // moving `model_output` into the on-disk write buffer. This lets us
+        // avoid an O(n) clone when `spill_model_output` is absent.
+        let (preview, _) = truncate_middle_bytes(&model_output, self.preview_bytes);
+        // Move `model_output` into the write buffer when no pre-computed spill
+        // output was provided — avoids a second O(n) copy for large results.
+        let output = result.spill_model_output.take().unwrap_or(model_output);
         let sha256 = sha256_hex(output.as_bytes());
         let path = self.path_for(&sha256);
         if let Err(err) = fs::write(&path, output.as_bytes()) {
@@ -5116,8 +5142,6 @@ impl ToolOutputStore {
                 sha256_hex(serde_json::to_vec(&result.content).unwrap_or_default());
             return result;
         }
-
-        let (preview, _) = truncate_middle_bytes(&model_output, self.preview_bytes);
         let ToolResult {
             call_id,
             tool_name,

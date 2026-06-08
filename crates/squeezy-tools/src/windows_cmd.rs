@@ -23,7 +23,7 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         .unwrap_or("");
     let command_name = powershell_command
         .trim_matches(|ch| ch == '"' || ch == '\'')
-        .rsplit(|ch| ch == '\\' || ch == '/')
+        .rsplit(['\\', '/'])
         .next()
         .unwrap_or(powershell_command);
 
@@ -60,8 +60,8 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     {
         return true;
     }
-    if command_name == "start-process" && tokens.iter().any(|t| *t == "-verb") {
-        let has_runas = tokens.iter().any(|t| *t == "runas");
+    if command_name == "start-process" && tokens.contains(&"-verb") {
+        let has_runas = tokens.contains(&"runas");
         let launches_shell = tokens.iter().any(|t| {
             matches!(
                 *t,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
 };
 
@@ -21,7 +21,7 @@ use crate::{
     DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
     POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolOutputReplayKey, ToolOutputReplayServed,
     ToolOutputReplaySource, ToolRegistry, ToolResult, ToolStatus, build_include_set,
-    build_required_glob, diff_path_set, file_len, graph_ready_wait, is_secret_path, make_result,
+    build_required_glob, diff_path_set, file_len, graph_augment_wait, is_secret_path, make_result,
     read_prefix, read_range, sha256_file, tool_arg_error, tool_error, truncate_text,
     workspace_path,
 };
@@ -811,81 +811,107 @@ impl ToolRegistry {
                     }
                 }
             } else {
-                let lines: Vec<&str> = text.lines().collect();
-                for (line_index, line) in lines.iter().enumerate() {
-                    if !regex.is_match(line) {
-                        continue;
+                // Rolling context buffer: avoids allocating a Vec for every
+                // line in the file. `before_buf` holds the last `context`
+                // lines. Pending matches (entries waiting for their
+                // after-context lines) are queued and emitted once they have
+                // accumulated `context` after-lines or we reach EOF.
+                let context_usize = context as usize;
+                // (line_index, line_text) ring of the last `context` lines
+                let mut before_buf: VecDeque<(usize, String)> =
+                    VecDeque::with_capacity(context_usize + 1);
+                // Pending match entries: (partial map without context_after, after-lines so far)
+                let mut pending: VecDeque<(serde_json::Map<String, Value>, Vec<Value>)> =
+                    VecDeque::new();
+
+                for (line_index, line) in text.lines().enumerate() {
+                    // Accumulate after-context lines for each pending match.
+                    for (_, after_lines) in &mut pending {
+                        if after_lines.len() < context_usize {
+                            after_lines.push(json!({
+                                "line": line_index + 1,
+                                "text": truncate_text(line, 2000),
+                            }));
+                        }
                     }
-                    if skipped_matches < offset {
-                        skipped_matches += 1;
-                        continue;
+                    // Drain fully-satisfied pending matches.
+                    while pending
+                        .front()
+                        .map(|(_, a)| a.len() >= context_usize)
+                        .unwrap_or(false)
+                    {
+                        let (mut entry, after_lines) = pending.pop_front().unwrap();
+                        entry.insert("context_after".to_string(), Value::Array(after_lines));
+                        let next = Value::Object(entry);
+                        let next_len = serde_json::to_string(&next).map_or(0, |s| s.len());
+                        if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
+                            cost.truncated = true;
+                            stop_search = true;
+                            break;
+                        }
+                        cost.output_bytes += next_len as u64;
+                        cost.matches_returned += 1;
+                        matches.push(next);
+                        if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
+                            cost.truncated = true;
+                            stop_search = true;
+                            break;
+                        }
                     }
-                    count += 1;
-                    match output_mode {
-                        GrepOutputMode::Content => {
-                            let line_text = truncate_text(line, 2000);
-                            let mut next = serde_json::Map::new();
-                            next.insert("path".to_string(), json!(&rel_str));
-                            next.insert("line".to_string(), json!(line_index + 1));
-                            next.insert("text".to_string(), json!(line_text));
-                            let before_start = line_index.saturating_sub(context);
-                            let before_lines: Vec<Value> = lines[before_start..line_index]
+                    if stop_search {
+                        break;
+                    }
+
+                    if regex.is_match(line) {
+                        if skipped_matches < offset {
+                            skipped_matches += 1;
+                        } else {
+                            count += 1;
+                            let mut entry = serde_json::Map::new();
+                            entry.insert("path".to_string(), json!(&rel_str));
+                            entry.insert("line".to_string(), json!(line_index + 1));
+                            entry.insert("text".to_string(), json!(truncate_text(line, 2000)));
+                            let before_lines: Vec<Value> = before_buf
                                 .iter()
-                                .enumerate()
-                                .map(|(offset_idx, ctx_line)| {
+                                .map(|(idx, ctx_line)| {
                                     json!({
-                                        "line": before_start + offset_idx + 1,
+                                        "line": idx + 1,
                                         "text": truncate_text(ctx_line, 2000),
                                     })
                                 })
                                 .collect();
-                            let after_end = line_index
-                                .saturating_add(1)
-                                .saturating_add(context)
-                                .min(lines.len());
-                            let after_lines: Vec<Value> = lines[line_index + 1..after_end]
-                                .iter()
-                                .enumerate()
-                                .map(|(offset_idx, ctx_line)| {
-                                    json!({
-                                        "line": line_index + 2 + offset_idx,
-                                        "text": truncate_text(ctx_line, 2000),
-                                    })
-                                })
-                                .collect();
-                            next.insert("context_before".to_string(), Value::Array(before_lines));
-                            next.insert("context_after".to_string(), Value::Array(after_lines));
-                            let next = Value::Object(next);
-                            let next_len =
-                                serde_json::to_string(&next).map_or(0, |text| text.len());
-                            if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
-                                cost.truncated = true;
-                                stop_search = true;
-                                break;
-                            }
-                            cost.output_bytes += next_len as u64;
-                            cost.matches_returned += 1;
-                            matches.push(next);
-                        }
-                        GrepOutputMode::FilesWithMatches => {
-                            if paths.insert(rel_str.clone()) {
-                                cost.matches_returned += 1;
-                            }
-                        }
-                        GrepOutputMode::Count => {
-                            cost.matches_returned = count;
+                            entry.insert("context_before".to_string(), Value::Array(before_lines));
+                            // Park without context_after; filled as iteration continues.
+                            pending.push_back((entry, Vec::with_capacity(context_usize)));
                         }
                     }
-                    if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
-                        cost.truncated = true;
-                        stop_search = true;
-                        break;
+
+                    // Advance the rolling before-buffer.
+                    if before_buf.len() >= context_usize {
+                        before_buf.pop_front();
                     }
-                    if matches!(output_mode, GrepOutputMode::FilesWithMatches) {
-                        // The file is already recorded; files-with-matches only
-                        // reports each path once, so skip its remaining lines
-                        // instead of re-running the regex and re-cloning the path.
-                        break;
+                    before_buf.push_back((line_index, line.to_string()));
+                }
+
+                // Drain remaining pending entries (EOF — fewer than `context` after-lines).
+                if !stop_search {
+                    for (mut entry, after_lines) in pending {
+                        entry.insert("context_after".to_string(), Value::Array(after_lines));
+                        let next = Value::Object(entry);
+                        let next_len = serde_json::to_string(&next).map_or(0, |s| s.len());
+                        if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
+                            cost.truncated = true;
+                            stop_search = true;
+                            break;
+                        }
+                        cost.output_bytes += next_len as u64;
+                        cost.matches_returned += 1;
+                        matches.push(next);
+                        if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
+                            cost.truncated = true;
+                            stop_search = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -927,6 +953,18 @@ impl ToolRegistry {
                 // The model's matches are byte-identical to a plain disk
                 // grep; everything below is purely ADDITIVE sibling fields.
                 object.insert("matches".to_string(), json!(matches));
+                // Always emit graph_augment_status in Content mode so the model
+                // can distinguish "this pattern never triggers augmentation" from
+                // "augmentation ran but the graph was unavailable". The default is
+                // overwritten below when augmentation actually runs.
+                metadata.insert(
+                    "graph_augment_status".to_string(),
+                    json!(if diff_only {
+                        "diff_only_skipped"
+                    } else {
+                        "not_applicable"
+                    }),
+                );
                 object.insert("metadata".to_string(), json!(metadata));
 
                 // Recall+cost augmentation: only when the grep is enumerating
@@ -934,8 +972,16 @@ impl ToolRegistry {
                 // diff-scoped). Fails soft — graph unavailable / refresh error
                 // / no graph match leaves `matches` untouched.
                 if !diff_only && let Some(detected) = detect_inheritance_grep(&args.pattern) {
-                    self.augment_inheritance_grep(&detected, &matches, &mut object)
+                    let augment_status = self
+                        .augment_inheritance_grep(&detected, &matches, &mut object)
                         .await;
+                    // Overwrite the default with the actual result: "applied",
+                    // "graph_not_ready", or "graph_unavailable".
+                    object.entry("metadata").and_modify(|m| {
+                        if let Value::Object(map) = m {
+                            map.insert("graph_augment_status".to_string(), json!(augment_status));
+                        }
+                    });
                 }
                 Value::Object(object)
             }
@@ -964,14 +1010,28 @@ impl ToolRegistry {
     /// rather than `base:` attributes (C/C++, JS/TS, Go), the graph returns
     /// nothing for an attribute query — in that case we emit ONLY a
     /// `graph_hint` pointing at `reference_search`, claiming no completeness.
+    /// Returns a short status string that is placed in `metadata.graph_augment_status`
+    /// so callers can distinguish lexical-only results from graph-augmented ones.
+    ///
+    /// - `"applied"` — graph declarations were inserted (or a `graph_hint` was emitted).
+    /// - `"graph_not_ready"` — graph was not ready within [`graph_augment_wait()`]; the
+    ///   model may retry the grep later or call graph tools directly.
+    /// - `"graph_unavailable"` — the graph failed to open (permanent); retrying will not
+    ///   help; fall through to graph tools such as `decl_search` if needed.
     async fn augment_inheritance_grep(
         &self,
         detected: &InheritanceGrep,
         grep_matches: &[Value],
         object: &mut serde_json::Map<String, Value>,
-    ) {
+    ) -> &'static str {
         let Some(augment) = self.inheritance_graph_lookup(detected.clone()).await else {
-            return;
+            // Distinguish a permanent graph failure from a transient not-ready timeout
+            // so the model can decide whether retrying makes sense.
+            return if self.graph_open_error().is_some() {
+                "graph_unavailable"
+            } else {
+                "graph_not_ready"
+            };
         };
 
         let attribute = augment.attribute.clone();
@@ -994,7 +1054,7 @@ impl ToolRegistry {
                              continuation lines.",
                 }),
             );
-            return;
+            return "applied";
         }
 
         // De-dupe graph declarations against the grep's own matches by
@@ -1030,7 +1090,7 @@ impl ToolRegistry {
         // no recall gap — emit nothing so ordinary single-line greps stay
         // unchanged.
         if deduped.is_empty() {
-            return;
+            return "applied";
         }
 
         let matched = augment
@@ -1055,6 +1115,7 @@ impl ToolRegistry {
                          continuation line or sit deep in a large file.",
             }),
         );
+        "applied"
     }
 
     /// Run the actual graph lookup for an inheritance-enumeration grep.
@@ -1065,7 +1126,11 @@ impl ToolRegistry {
     /// uses (zero logic divergence). Returns `None` when the graph is not
     /// ready or unavailable so the caller keeps the full grep result.
     async fn inheritance_graph_lookup(&self, detected: InheritanceGrep) -> Option<GraphAugment> {
-        if !self.wait_for_graph_ready(graph_ready_wait()) {
+        // Use the shorter augment wait (default 5 s) rather than the full
+        // 30 s graph-first wait. Augmentation is purely additive — grep is
+        // already complete — so a long wait stalls every inheritance-pattern
+        // grep call on a cold start for no gain.
+        if !self.wait_for_graph_ready(graph_augment_wait()) {
             return None;
         }
         let registry = self.clone();

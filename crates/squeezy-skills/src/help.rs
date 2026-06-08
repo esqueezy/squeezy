@@ -1720,7 +1720,7 @@ pub fn relevant_docs_for_input(input: &str) -> Vec<BundledDoc> {
         .iter()
         .map(|&doc| (score_doc_for_tokens(&doc, &tokens), doc))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
 
     // If no doc scores anything, there is no lexical evidence to narrow down:
     // return the full corpus so DocHelp has maximum coverage.

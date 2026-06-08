@@ -9038,6 +9038,11 @@ fn tool_specs_are_sorted_by_name() {
         names,
         vec![
             "apply_patch",
+            // checkpoint_list is always advertised so the model and UI can
+            // discover the disabled state rather than treating checkpoint
+            // tools as entirely absent. The other three are gated on a
+            // live checkpoint provider.
+            "checkpoint_list",
             "decl_search",
             "definition_search",
             "diff_context",
@@ -12887,7 +12892,12 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // the `transitive` boolean schema property) buys one-call retrieval of the
     // whole transitive subtype closure, replacing the N follow-up `decl_search`
     // calls a model would otherwise issue to walk a deep hierarchy by hand.
-    const PREFIX_BYTES_BASELINE: usize = 25_230;
+    // 25_230 -> 25_700: deliberate bump for bug fixes — advertising previously
+    // implemented-only fields `read_file.start_line`, `read_file.end_line`, and
+    // `grep.max_bytes_per_file` in their respective schemas (schema/impl drift).
+    // The additions are purely corrective: providers that enforce the advertised
+    // schema were rejecting calls the handler was designed to accept.
+    const PREFIX_BYTES_BASELINE: usize = 25_700;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
@@ -12954,6 +12964,77 @@ fn core_tool_prefix_stays_within_byte_baseline() {
         "core tool prefix grew to {total} bytes, above the {PREFIX_BYTES_BASELINE}-byte baseline; \
          trim descriptions/schemas or bump the baseline deliberately",
     );
+}
+
+/// Schema/serde drift test: verify that every field accepted by the `Args`
+/// structs for first-party tools is also declared in the advertised `ToolSpec`
+/// schema. This catches the class of bug where an implementation accepts a
+/// parameter but the schema omits it, so provider-side schema validation
+/// silently rejects valid model calls.
+#[test]
+fn first_party_args_schemas_cover_all_accepted_fields() {
+    type SpecDriftCase = (fn() -> ToolSpec, &'static [&'static str]);
+    // (spec_fn, fields accepted by the Args struct that the schema must declare)
+    let cases: &[SpecDriftCase] = &[
+        (
+            read_file_spec,
+            &[
+                "path",
+                "offset",
+                "limit",
+                "diff_only",
+                "start_line",
+                "end_line",
+            ],
+        ),
+        (
+            grep_spec,
+            &[
+                "pattern",
+                "path",
+                "include",
+                "exclude",
+                "include_ignored",
+                "diff_only",
+                "output_mode",
+                "max_files",
+                "max_bytes_per_file",
+                "max_matches",
+                "output_byte_cap",
+                "offset",
+                "context",
+            ],
+        ),
+        (
+            glob_spec,
+            &[
+                "pattern",
+                "path",
+                "include_ignored",
+                "diff_only",
+                "max_paths",
+                "offset",
+            ],
+        ),
+        (
+            read_tool_output_spec,
+            &["handle", "path", "offset", "limit"],
+        ),
+    ];
+
+    for (spec_fn, fields) in cases {
+        let spec = spec_fn();
+        let params = serde_json::to_string(&spec.parameters)
+            .unwrap_or_else(|_| panic!("{} schema serialize failed", spec.name));
+        for field in *fields {
+            assert!(
+                params.contains(&format!("\"{field}\"")),
+                "{} schema must declare field `{field}` (accepted by the Args struct but not advertised); \
+                 got: {params}",
+                spec.name
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
