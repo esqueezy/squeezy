@@ -144,8 +144,12 @@ fn skip_env_prefix<'a>(mut iter: impl Iterator<Item = &'a str>) -> Option<Vec<&'
             break;
         }
         if tok.starts_with('-') {
-            // Options that consume the next argument: -u, -C, -S (simplified).
-            if matches!(tok, "-u" | "-C" | "-S") {
+            // Options that consume the next argument as a plain value: -u
+            // (unset), -C (chdir). -S / --split-string embeds a sub-command
+            // string that would require recursive parsing; skip it the same
+            // as a bare flag (discards just the flag token) so we don't
+            // silently drop the embedded command.
+            if matches!(tok, "-u" | "-C") {
                 i += 2;
             } else {
                 i += 1;

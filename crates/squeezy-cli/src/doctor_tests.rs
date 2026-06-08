@@ -422,14 +422,21 @@ fn state_store_check_fails_when_path_unwritable() {
 
 #[test]
 fn skills_roots_check_shows_resolved_paths() {
+    // Skip when HOME is absent; the warn path is covered by the next test.
+    if std::env::var_os("HOME").is_none() {
+        return;
+    }
     let root = skills_doctor_workspace("skills_roots_paths");
     let config = skills_doctor_config(&root);
     let check = skills_roots_check(&config);
-    // With HOME set (normal test environment) this should be Ok.
-    // The detail must mention the user and compat_user paths.
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(
-        check.detail.contains("user=") || check.status == Status::Warn,
-        "expected resolved paths in detail: {check:?}"
+        check.detail.contains("user="),
+        "expected resolved user path in detail: {check:?}"
+    );
+    assert!(
+        check.detail.contains("project="),
+        "expected resolved project path in detail: {check:?}"
     );
     let _ = std::fs::remove_dir_all(root);
 }

@@ -467,9 +467,10 @@ impl SkillCatalog {
         // XDG-aware user directory scanned right after the legacy user dir so
         // that skills placed in `$XDG_DATA_HOME/squeezy/skills` are
         // discoverable on Linux without requiring the user to set
-        // `SQUEEZY_SKILLS_USER_DIR`.  Skills already present from `user_dir`
-        // shadow same-name entries from the XDG path so the legacy directory
-        // always takes precedence on a name collision.
+        // `SQUEEZY_SKILLS_USER_DIR`.  All skills already present at this point
+        // (from both `compat_user_dir` and `user_dir`) shadow same-name
+        // entries from the XDG path so higher-priority legacy directories
+        // always take precedence on a name collision.
         if let Some(xdg_dir) = &config.xdg_user_dir {
             let shadow_set: BTreeSet<String> = catalog.skills.keys().cloned().collect();
             catalog.discover_dir_filtered(xdg_dir, SkillSource::User, Some(&shadow_set));

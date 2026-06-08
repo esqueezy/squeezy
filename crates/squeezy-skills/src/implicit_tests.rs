@@ -181,3 +181,95 @@ fn is_path_like_classifies_correctly() {
     assert!(!is_path_like("env"));
     assert!(!is_path_like("script.py"));
 }
+
+// ── env -S is treated as a bare flag, not consuming a payload token ───────────
+
+#[test]
+fn env_dash_s_is_treated_as_bare_flag() {
+    // `env -S "python3 script.py"` — the embedded split-string is opaque;
+    // we cannot extract the runner, so the result must be None rather than
+    // incorrectly treating the split-string token as the runner.
+    let tokens = vec![
+        "env".to_string(),
+        "-S".to_string(),
+        "python3 script.py".to_string(),
+    ];
+    // With -S treated as a bare flag, i advances by 1 (to consume the -S
+    // token), then "python3 script.py" (the split-string) is the next
+    // candidate runner — it is not in RUNNERS, so None.
+    let result = script_run_token(&tokens);
+    assert_eq!(
+        result, None,
+        "env -S with split-string should not produce a spurious activation"
+    );
+}
+
+// ── detect_for_command end-to-end with rg/fd reading SKILL.md ────────────────
+
+fn make_test_skill_entry(name: &str, doc_path: &std::path::Path) -> SkillEntry {
+    SkillEntry {
+        summary: SkillSummary {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            when_to_use: None,
+            source: crate::SkillSource::User,
+            location: doc_path.to_path_buf(),
+            disabled: false,
+            manifest: None,
+            context_mode: crate::SkillContextMode::Inline,
+        },
+        base_dir: doc_path.parent().unwrap_or(doc_path).to_path_buf(),
+        triggers: vec![],
+    }
+}
+
+#[test]
+fn detect_for_command_activates_skill_on_rg_skill_doc() {
+    let workdir = PathBuf::from("/repo");
+    let skill_doc = PathBuf::from("/repo/.squeezy/skills/nav/SKILL.md");
+
+    let mut by_doc_path = BTreeMap::new();
+    by_doc_path.insert(skill_doc.clone(), "nav".to_string());
+
+    let entry = make_test_skill_entry("nav", &skill_doc);
+    let mut skills = BTreeMap::new();
+    skills.insert("nav".to_string(), entry);
+
+    // `rg '' .squeezy/skills/nav/SKILL.md` should activate via doc-read path.
+    let result = detect_for_command(
+        "rg '' .squeezy/skills/nav/SKILL.md",
+        &workdir,
+        &BTreeMap::new(),
+        &by_doc_path,
+        &skills,
+    );
+    assert!(
+        result.is_some(),
+        "rg reading SKILL.md should activate the skill"
+    );
+}
+
+#[test]
+fn detect_for_command_activates_skill_on_fd_skill_doc() {
+    let workdir = PathBuf::from("/repo");
+    let skill_doc = PathBuf::from("/repo/.squeezy/skills/nav/SKILL.md");
+
+    let mut by_doc_path = BTreeMap::new();
+    by_doc_path.insert(skill_doc.clone(), "nav".to_string());
+
+    let entry = make_test_skill_entry("nav", &skill_doc);
+    let mut skills = BTreeMap::new();
+    skills.insert("nav".to_string(), entry);
+
+    let result = detect_for_command(
+        "fd SKILL.md .squeezy/skills/nav",
+        &workdir,
+        &BTreeMap::new(),
+        &by_doc_path,
+        &skills,
+    );
+    assert!(
+        result.is_some(),
+        "fd reading a skill dir should activate the skill"
+    );
+}

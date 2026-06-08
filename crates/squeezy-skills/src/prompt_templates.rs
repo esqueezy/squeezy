@@ -120,7 +120,9 @@ impl PromptTemplateCatalog {
     /// user-scope entries.
     pub fn discover(workspace_root: &Path) -> Self {
         let user_dir = home_prompts_dir();
-        let xdg_dir = xdg_prompts_dir();
+        // Delegate XDG resolution to squeezy-core to avoid duplicate logic.
+        // The core function already deduplicates against the legacy path.
+        let xdg_dir = squeezy_core::default_xdg_prompts_dir();
         let project_dir = workspace_root.join(PROJECT_PROMPTS_DIR);
         let mut catalog = Self::default();
         // Legacy path first so it is the lower-priority source.
@@ -634,29 +636,6 @@ fn home_prompts_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(USER_PROMPTS_SUBPATH))
-}
-
-/// Returns the XDG-aware user prompts directory when it differs from the
-/// legacy `~/.squeezy/prompts` path, or `None` when XDG is inapplicable.
-///
-/// Resolution:
-///   1. `$XDG_CONFIG_HOME/squeezy/prompts` when `XDG_CONFIG_HOME` is set.
-///   2. `$HOME/.config/squeezy/prompts` when `HOME` is set.
-///   3. `None` otherwise.
-fn xdg_prompts_dir() -> Option<PathBuf> {
-    let xdg = if let Some(xdg_cfg) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg_cfg).join("squeezy").join("prompts")
-    } else {
-        PathBuf::from(std::env::var_os("HOME")?)
-            .join(".config")
-            .join("squeezy")
-            .join("prompts")
-    };
-    // Avoid scanning the same directory twice.
-    if home_prompts_dir().is_some_and(|legacy| legacy == xdg) {
-        return None;
-    }
-    Some(xdg)
 }
 
 #[cfg(test)]

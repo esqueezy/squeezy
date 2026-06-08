@@ -761,38 +761,68 @@ fn skills_check(config: &AppConfig) -> Check {
 }
 
 /// Report resolved skill discovery roots with their configuration sources so
-/// Linux users can understand which directories will be scanned.  Warns when
-/// `HOME` is absent and defaults fall back to process-cwd-relative paths.
+/// Linux users can understand which directories will be scanned.  Warns per
+/// root when `HOME` is absent and that specific root resolved to a relative
+/// path (rather than blanket-warning whenever `HOME` is missing, which can be
+/// misleading when `XDG_DATA_HOME` provides absolute roots).
 fn skills_roots_check(config: &AppConfig) -> Check {
-    if skills_home_missing() {
+    let s = &config.skills;
+    let mut parts: Vec<String> = Vec::new();
+    let mut any_relative = false;
+
+    let mut push_root = |label: &str, path: &Path, parts: &mut Vec<String>, rel: &mut bool| {
+        if path.is_relative() {
+            *rel = true;
+            parts.push(format!("{label}={} (relative!)", path.display()));
+        } else {
+            parts.push(format!("{label}={}", path.display()));
+        }
+    };
+
+    push_root(
+        "compat_user",
+        &s.compat_user_dir,
+        &mut parts,
+        &mut any_relative,
+    );
+    push_root("user", &s.user_dir, &mut parts, &mut any_relative);
+
+    if let Some(xdg) = &s.xdg_user_dir {
+        push_root("xdg_user", xdg, &mut parts, &mut any_relative);
+    }
+
+    for extra in &s.extra_roots {
+        push_root("extra_root", extra, &mut parts, &mut any_relative);
+    }
+
+    // Project-local roots (workspace-relative, always shown).
+    parts.push(format!(
+        "project_compat={}",
+        config.workspace_root.join(".agents/skills").display()
+    ));
+    parts.push(format!(
+        "project={}",
+        config.workspace_root.join(".squeezy/skills").display()
+    ));
+
+    let detail = parts.join(" | ");
+
+    if any_relative {
         return Check {
             name: "skills_roots".to_string(),
             status: Status::Warn,
-            detail: "HOME is unset; skill roots default to relative paths (cwd-relative). \
-                     Set HOME or use SQUEEZY_SKILLS_USER_DIR / SQUEEZY_SKILLS_COMPAT_USER_DIR \
-                     to point to absolute directories."
-                .to_string(),
+            detail: format!(
+                "One or more skill roots resolved to relative paths (HOME likely unset). \
+                 Set HOME or override with SQUEEZY_SKILLS_USER_DIR / \
+                 SQUEEZY_SKILLS_COMPAT_USER_DIR. Roots: {detail}"
+            ),
         };
-    }
-
-    let s = &config.skills;
-    let mut parts: Vec<String> = Vec::new();
-
-    parts.push(format!("compat_user={}", s.compat_user_dir.display()));
-    parts.push(format!("user={}", s.user_dir.display()));
-
-    if let Some(xdg) = &s.xdg_user_dir {
-        parts.push(format!("xdg_user={}", xdg.display()));
-    }
-
-    for (i, extra) in s.extra_roots.iter().enumerate() {
-        parts.push(format!("extra[{i}]={}", extra.display()));
     }
 
     Check {
         name: "skills_roots".to_string(),
         status: Status::Ok,
-        detail: parts.join(" | "),
+        detail,
     }
 }
 

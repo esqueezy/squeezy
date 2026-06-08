@@ -8899,20 +8899,25 @@ impl SkillsConfig {
                     .map(|chars| SkillsBudgetMode::Chars { chars })
             })
             .unwrap_or_default();
+        let user_dir = expand_home_path(
+            var("SQUEEZY_SKILLS_USER_DIR")
+                .map(PathBuf::from)
+                .or(settings.user_dir)
+                .unwrap_or_else(default_squeezy_skills_dir),
+        );
+        // Dedup XDG against the fully-resolved user_dir (not just the static
+        // default) so that operators who point SQUEEZY_SKILLS_USER_DIR at the
+        // XDG location don't get the directory scanned twice.
+        let xdg_user_dir = default_xdg_skills_dir().filter(|xdg| xdg != &user_dir);
         Self {
-            user_dir: expand_home_path(
-                var("SQUEEZY_SKILLS_USER_DIR")
-                    .map(PathBuf::from)
-                    .or(settings.user_dir)
-                    .unwrap_or_else(default_squeezy_skills_dir),
-            ),
+            user_dir,
             compat_user_dir: expand_home_path(
                 var("SQUEEZY_SKILLS_COMPAT_USER_DIR")
                     .map(PathBuf::from)
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
-            xdg_user_dir: default_xdg_skills_dir(),
+            xdg_user_dir,
             extra_roots: settings
                 .extra_roots
                 .into_iter()
