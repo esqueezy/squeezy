@@ -359,7 +359,7 @@ impl SessionStore {
             // and the in-memory entries we already built are still valid.
             let locked = lock_file
                 .as_ref()
-                .map_or(true, |lf| lf.try_lock_exclusive().is_ok());
+                .is_none_or(|lf| lf.try_lock_exclusive().is_ok());
             if locked {
                 let _ = rewrite_global_index(&path, &ordered);
                 if let Some(ref lf) = lock_file {
