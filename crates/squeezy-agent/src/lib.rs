@@ -14396,19 +14396,18 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
         first_in_session,
         ..
     }) = shell_windows_degraded_from_result(result)
+        && first_in_session
     {
-        if first_in_session {
-            let _ = tx
-                .send(AgentEvent::ShellSandboxBestEffortFallback {
-                    turn_id,
-                    backend,
-                    // Windows degradation is not a runtime fallback; use 0
-                    // as the count sentinel so callers can distinguish it from
-                    // a Unix sandbox failure.
-                    fallback_count: 0,
-                })
-                .await;
-        }
+        let _ = tx
+            .send(AgentEvent::ShellSandboxBestEffortFallback {
+                turn_id,
+                backend,
+                // Windows degradation is not a runtime fallback; use 0
+                // as the count sentinel so callers can distinguish it from
+                // a Unix sandbox failure.
+                fallback_count: 0,
+            })
+            .await;
     }
 }
 
