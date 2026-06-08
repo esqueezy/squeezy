@@ -6112,8 +6112,7 @@ fn check_settings_file_permissions_detects_world_readable_file() {
     );
     assert!(
         issues[0].message.contains("0o644") || issues[0].message.contains("644"),
-        "issue message should mention the mode, got: {}",
-        issues[0].message
+        "issue message should mention the mode"
     );
 }
 
@@ -6134,7 +6133,6 @@ fn config_warning_emitted_for_squeezy_session_dir_with_tilde() {
         .any(|w| w.source == "SQUEEZY_SESSION_DIR" && w.field.contains("starts with '~'"));
     assert!(
         has_warning,
-        "expected a ConfigWarning for SQUEEZY_SESSION_DIR with tilde, got: {:?}",
-        config.config_warnings
+        "expected a ConfigWarning for SQUEEZY_SESSION_DIR with tilde"
     );
 }
