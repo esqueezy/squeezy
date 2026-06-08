@@ -3563,9 +3563,15 @@ pub fn paths_same(a: &str, b: &str) -> bool {
         if let (Some(ac), Some(bc)) = (a_canon, b_canon) {
             return ac == bc;
         }
-        return a
-            .trim_end_matches(['/', '\\'])
-            .eq_ignore_ascii_case(b.trim_end_matches(['/', '\\']));
+        // Canonicalization failed (path may not exist yet). Normalise
+        // separators (Windows accepts both `/` and `\`) and compare
+        // case-insensitively after trimming trailing separators.
+        let norm = |s: &str| -> String {
+            s.trim_end_matches(['/', '\\'])
+                .replace('/', "\\")
+                .to_ascii_lowercase()
+        };
+        return norm(a) == norm(b);
     }
     #[cfg(not(target_os = "windows"))]
     {
