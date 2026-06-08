@@ -34,6 +34,7 @@ use auth::handle_auth_command;
 use config_browse::handle_browse_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
+use squeezy_core::GraphConfig;
 use squeezy_parse::smoke_all_languages;
 use squeezy_store::{
     BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
@@ -44,7 +45,7 @@ use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
 };
 use squeezy_tools::{McpElicitationResponse, ToolCall, ToolResult, ToolStatus};
-use squeezy_workspace::WorkspaceCrawler;
+use squeezy_workspace::{CrawlOptions, IndexingPolicy, WorkspaceCrawler};
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
@@ -1724,14 +1725,34 @@ fn handle_repo_command(command: &RepoCommand, cli: &Cli) -> squeezy_core::Result
             print!("{}", loaded.profile.recommendations_toml());
             Ok(())
         }
-        RepoCommand::Languages { json } => handle_repo_languages(&config.workspace_root, *json),
+        RepoCommand::Languages { json } => {
+            handle_repo_languages(&config.workspace_root, &config.graph, *json)
+        }
     }
 }
 
-fn handle_repo_languages(root: &Path, json: bool) -> squeezy_core::Result<()> {
+fn crawl_options_from_graph(config: &GraphConfig) -> CrawlOptions {
+    CrawlOptions {
+        include_hidden: config.include_hidden,
+        max_file_bytes: config.max_file_bytes,
+        require_indexing_signal: config.require_indexing_signal,
+        policy: IndexingPolicy {
+            include: config.include.clone(),
+            exclude: config.exclude.clone(),
+            include_classes: config.include_classes.clone(),
+            exclude_classes: config.exclude_classes.clone(),
+        },
+    }
+}
+
+fn handle_repo_languages(
+    root: &Path,
+    graph_config: &GraphConfig,
+    json: bool,
+) -> squeezy_core::Result<()> {
     use squeezy_core::LanguageKind;
 
-    let snapshot = WorkspaceCrawler::new(squeezy_workspace::CrawlOptions::default())
+    let snapshot = WorkspaceCrawler::new(crawl_options_from_graph(graph_config))
         .crawl(root)
         .map_err(|e| SqueezyError::Tool(format!("workspace crawl failed: {e}")))?;
 
@@ -1754,11 +1775,16 @@ fn handle_repo_languages(root: &Path, json: bool) -> squeezy_core::Result<()> {
             *by_extension.entry(ext).or_default() += 1;
         }
 
-        // A plain `.h` file that was classified to C or C++ came through the
-        // refine_c_family_header_languages heuristic.
-        if file.relative_path.ends_with(".h")
-            && matches!(file.language, LanguageKind::C | LanguageKind::Cpp)
-        {
+        // A plain `.h` or `.H` file classified to C or C++ went through the
+        // refine_c_family_header_languages heuristic (or defaulted via project
+        // majority). Compare the extension case-insensitively so uppercase
+        // filenames (e.g. `HEADER.H`) on Linux are counted correctly.
+        let is_h = std::path::Path::new(&file.relative_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("h"))
+            .unwrap_or(false);
+        if is_h && matches!(file.language, LanguageKind::C | LanguageKind::Cpp) {
             header_heuristic += 1;
         }
     }
@@ -1829,6 +1855,11 @@ fn handle_parse_command(command: &ParseCommand) -> squeezy_core::Result<()> {
                     }))
                     .unwrap_or_default()
                 );
+                if !all_ok {
+                    let fail_count = results.iter().filter(|r| !r.ok).count();
+                    eprintln!("{fail_count} grammar(s) failed");
+                    std::process::exit(1);
+                }
             } else {
                 for r in &results {
                     let status = if r.ok { "ok  " } else { "FAIL" };

@@ -712,6 +712,9 @@ fn classify_language_normalises_uppercase_extensions_on_linux() {
         ("main.GO", LanguageKind::Go),
         ("runner.C", LanguageKind::C),
         ("widget.CPP", LanguageKind::Cpp),
+        // .H goes through header-refinement; in isolation (no sibling .c or .cpp)
+        // it defaults to Cpp per project-majority (no C files → default Cpp).
+        ("api.H", LanguageKind::Cpp),
         ("index.JS", LanguageKind::JavaScript),
         ("view.TS", LanguageKind::TypeScript),
         ("View.TSX", LanguageKind::Tsx),

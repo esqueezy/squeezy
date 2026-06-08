@@ -315,18 +315,7 @@ impl LanguageParser {
         &mut self,
         records: &[FileRecord],
     ) -> Result<(Vec<ParsedFile>, ParseSummary)> {
-        let env_cap = std::env::var(PARSE_WORKERS_ENV)
-            .ok()
-            .and_then(|val| val.parse::<usize>().ok())
-            .filter(|&n| n > 0);
-        let worker_count = std::thread::available_parallelism()
-            .map(|threads| threads.get())
-            .unwrap_or(1)
-            .min(records.len());
-        let worker_count = match env_cap {
-            Some(cap) => worker_count.min(cap),
-            None => worker_count,
-        };
+        let worker_count = effective_worker_count(records.len());
         if worker_count <= 1 {
             return self.parse_records_serial(records);
         }
@@ -429,6 +418,15 @@ impl LanguageParser {
         {
             let mut parsed = extract_language(record.clone(), &source, &cached.tree);
             parsed.changed_ranges = Vec::new();
+            append_source_diagnostics(&source, &mut parsed.diagnostics);
+            if cached.tree.root_node().has_error() {
+                parsed.diagnostics.push(ParseDiagnostic {
+                    message: "syntax_error: tree-sitter parse produced ERROR or MISSING nodes"
+                        .to_string(),
+                    span: None,
+                    confidence: Confidence::Partial,
+                });
+            }
             return Ok(parsed);
         }
 
@@ -565,6 +563,15 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
         Some(cached) if cached.language == record.language && cached.hash == record.hash => {
             let mut parsed = extract_language(record.clone(), &cached.source, &cached.tree);
             parsed.changed_ranges = Vec::new();
+            append_source_diagnostics(&cached.source, &mut parsed.diagnostics);
+            if cached.tree.root_node().has_error() {
+                parsed.diagnostics.push(ParseDiagnostic {
+                    message: "syntax_error: tree-sitter parse produced ERROR or MISSING nodes"
+                        .to_string(),
+                    span: None,
+                    confidence: Confidence::Partial,
+                });
+            }
             return Ok(ParseOutput {
                 index,
                 parsed,

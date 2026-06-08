@@ -87,6 +87,8 @@ fn classify_language_handles_uppercase_extensions_for_all_families() {
         ("main.GO", LanguageFamily::Go),
         ("runner.C", LanguageFamily::CFamily),
         ("widget.CPP", LanguageFamily::CFamily),
+        // .H is the important Linux case: it goes through header-refinement
+        ("api.H", LanguageFamily::CFamily),
         ("index.JS", LanguageFamily::JsTs),
         ("view.TS", LanguageFamily::JsTs),
         ("component.TSX", LanguageFamily::JsTs),
