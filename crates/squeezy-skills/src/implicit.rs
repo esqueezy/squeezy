@@ -174,7 +174,7 @@ fn skip_env_prefix<'a>(mut iter: impl Iterator<Item = &'a str>) -> Option<Vec<&'
 
 /// Recognises runner + optional flags + script from a `[runner, rest…]` slice
 /// where `rest` has already had the `env` prefix stripped.
-fn script_run_token_from_runner_and_rest<'a>(tokens: Vec<&'a str>) -> Option<&'a str> {
+fn script_run_token_from_runner_and_rest(tokens: Vec<&str>) -> Option<&str> {
     let runner = tokens.first()?;
     let runner_base = command_basename(runner).to_ascii_lowercase();
     let runner_base = runner_base.strip_suffix(".exe").unwrap_or(&runner_base);

@@ -653,7 +653,7 @@ fn xdg_prompts_dir() -> Option<PathBuf> {
             .join("prompts")
     };
     // Avoid scanning the same directory twice.
-    if home_prompts_dir().map_or(false, |legacy| legacy == xdg) {
+    if home_prompts_dir().is_some_and(|legacy| legacy == xdg) {
         return None;
     }
     Some(xdg)
