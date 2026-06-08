@@ -797,6 +797,36 @@ fn affinity_headers_absent_when_no_cache_key() {
 }
 
 #[test]
+fn affinity_headers_absent_when_retention_none_even_with_cache_key() {
+    // CacheRetention::None is the hard no-cache signal. Suppressing the body
+    // prompt_cache_key is not enough; the affinity headers must also stay off
+    // the wire so the request does not carry a cache identity.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("should-not-route-to-cache".to_string()),
+            retention: crate::CacheRetention::None,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    assert!(OpenAiProvider::affinity_headers(&request).is_empty());
+}
+
+#[test]
 fn request_body_omits_prompt_cache_retention_for_short_retention() {
     // Regression guard for the legacy-field migration path: callers that
     // still set the deprecated `cache_key` slot get `Short` retention via

@@ -442,7 +442,7 @@ impl OpenAiProvider {
     }
 
     /// Prompt-cache affinity headers attached to every Responses request
-    /// that carries a cache key. OpenAI's load balancer uses these to
+    /// that carries an active cache key. OpenAI's load balancer uses these to
     /// route the session to the same backend that warmed the cached
     /// prefix; without them, repeat turns can land on a cold node and
     /// silently miss cache even when `prompt_cache_key` matches. The
@@ -456,6 +456,9 @@ impl OpenAiProvider {
     /// from user-controlled session ids) would panic the request builder
     /// before the cap kicks in.
     pub(crate) fn affinity_headers(request: &LlmRequest) -> Vec<(&'static str, String)> {
+        if request.effective_cache_retention() == crate::CacheRetention::None {
+            return Vec::new();
+        }
         let Some(key) = request.effective_cache_spec().key else {
             return Vec::new();
         };
