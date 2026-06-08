@@ -552,6 +552,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // `• Noted ↪ routed …` line that severed the gutter.
                     app.push_note(format!("routed `{from}` → `{to}` ({reason})"));
                 }
+                // Citation annotations from provider streams: surfaced for future
+                // TUI rendering (source attribution panel); ignored for now.
+                AgentEvent::Citation { .. } => {}
+                // Control-tool trace events: useful for debugging and eval replay;
+                // not rendered in the TUI at this time.
+                AgentEvent::ControlToolTrace { .. } => {}
             }
         }
         if keep_rx {

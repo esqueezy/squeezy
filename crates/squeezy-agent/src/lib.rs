@@ -31,7 +31,7 @@ use squeezy_core::{
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheRetention, CacheSpec, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
+    CacheRetention, CacheSpec, CitationSource, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
     INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem,
     LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
     ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
@@ -5277,6 +5277,7 @@ async fn complete_squeezy_help_turn(
             stop_reason: None,
             reasoning_only_stop: false,
             session_cost: None,
+            early_stop_reason: None,
         })
         .await;
 }
@@ -5482,6 +5483,7 @@ async fn complete_local_tool_turn(
             stop_reason: None,
             reasoning_only_stop: false,
             session_cost: None,
+            early_stop_reason: None,
         })
         .await;
 }
@@ -7799,15 +7801,25 @@ impl TurnRuntime {
                     LlmEvent::ServerModel(model) => {
                         effective_model = Arc::from(model);
                     }
-                    // Known additive variants the main loop intentionally
-                    // does not act on yet. `Citation` (OpenAI annotations /
-                    // xAI Live Search sources) has no transcript recording
-                    // sink wired up here, and `ToolCallDelta` is a
-                    // progressive-args hint superseded by the canonical
-                    // `ToolCall` event the loop already consumes. Naming
-                    // them explicitly keeps the wildcard reserved for
-                    // genuinely unknown future variants.
-                    LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
+                    // `ToolCallDelta` is a progressive-args hint superseded
+                    // by the canonical `ToolCall` event the loop already
+                    // consumes; ignore it.
+                    LlmEvent::ToolCallDelta { .. } => {}
+                    // Forward citation annotations (OpenAI source
+                    // annotations, xAI Live Search citations) as a
+                    // first-class agent event so the TUI / transcript can
+                    // surface source attribution when the provider supplies
+                    // it.
+                    LlmEvent::Citation { text_index, source } => {
+                        let _ = self
+                            .tx
+                            .send(AgentEvent::Citation {
+                                turn_id: self.turn_id,
+                                text_index,
+                                source,
+                            })
+                            .await;
+                    }
                     // `LlmEvent` is `#[non_exhaustive]`; unknown future
                     // variants flow past without disturbing the turn — they
                     // get a dedicated arm once consumers are taught about
@@ -7980,6 +7992,7 @@ impl TurnRuntime {
                         stop_reason: stop_reason.clone(),
                         reasoning_only_stop,
                         session_cost: Some(broker.session_cost_snapshot()),
+                        early_stop_reason: None,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -8526,6 +8539,7 @@ impl TurnRuntime {
                         stop_reason: stop_reason.clone(),
                         reasoning_only_stop,
                         session_cost: Some(broker.session_cost_snapshot()),
+                        early_stop_reason: None,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -8624,6 +8638,7 @@ impl TurnRuntime {
                     broker.calibration.clone(),
                     stop_reason.clone(),
                     &task_title,
+                    Some("loop_guard".to_string()),
                 )
                 .await;
                 return Ok(());
@@ -8858,6 +8873,7 @@ impl TurnRuntime {
             // loop-scoped and the turn ended by hitting MAX_TOOL_ROUNDS.
             None,
             &task_title,
+            Some("max_rounds".to_string()),
         )
         .await;
         Ok(())
@@ -9222,6 +9238,7 @@ impl TurnRuntime {
         token_calibration: squeezy_llm::TokenCalibration,
         stop_reason: Option<StopReason>,
         task_title: &str,
+        early_stop_reason: Option<String>,
     ) {
         // Compose the visible answer: the model's own text first (if any),
         // then a one-line note explaining the early finish. When the model
@@ -9278,6 +9295,7 @@ impl TurnRuntime {
                 stop_reason,
                 reasoning_only_stop: false,
                 session_cost: Some(self.persisted_session_cost().await),
+                early_stop_reason,
             })
             .await;
         self.finish_turn(metrics).await;
@@ -11115,6 +11133,9 @@ async fn run_subagent_rounds(
         let mut tool_calls = Vec::new();
         let mut completed = false;
         let mut context_overflow_seen = false;
+        // Accumulate model-refusal text so it can be surfaced in the error
+        // when the stream closes with `StopReason::Refusal` and no tool calls.
+        let mut refusal_text = String::new();
         loop {
             let event = match next_llm_stream_event(
                 &mut stream,
@@ -11214,6 +11235,34 @@ async fn run_subagent_rounds(
                             transcript: Vec::new(),
                         };
                     }
+                    // Surface model refusals so the parent can see *why* the
+                    // subagent stopped instead of receiving an empty summary.
+                    // Refusal prose arrives on `LlmEvent::Refusal` deltas
+                    // accumulated in `refusal_text`; the `StopReason::Refusal`
+                    // terminal here gates the early return.
+                    if matches!(stop_reason, Some(StopReason::Refusal)) && tool_calls.is_empty() {
+                        broker.metrics.redactions += assistant_stream.total_redactions();
+                        let detail = if refusal_text.is_empty() {
+                            "subagent model refused the request".to_string()
+                        } else {
+                            format!(
+                                "subagent model refused: {}",
+                                compact_text(&refusal_text, 512)
+                            )
+                        };
+                        return SubagentExecution {
+                            status: ToolStatus::Error,
+                            summary: compact_text(&refusal_text, 512),
+                            status_label: "refusal",
+                            error: Some(detail),
+                            metrics: broker.metrics.clone(),
+                            supporting_receipts: std::mem::take(supporting_receipts),
+                            model,
+                            structured_output: None,
+                            files_touched: Vec::new(),
+                            transcript: Vec::new(),
+                        };
+                    }
                     if cost.estimated_usd_micros.is_none() {
                         cost.estimated_usd_micros =
                             estimate_cost(parent.provider.name(), &effective_model, &cost);
@@ -11243,15 +11292,17 @@ async fn run_subagent_rounds(
                 LlmEvent::ServerModel(model) => {
                     effective_model = Arc::from(model);
                 }
-                // Known additive variants the subagent loop does not act on:
-                // `Refusal` text and `Citation` sources have no sink here
-                // (the subagent only accumulates assistant text + tool
-                // calls), and `ToolCallDelta` is superseded by the canonical
-                // `ToolCall` event. Named explicitly so the wildcard stays
-                // reserved for genuinely unknown future variants.
-                LlmEvent::Refusal { .. }
-                | LlmEvent::Citation { .. }
-                | LlmEvent::ToolCallDelta { .. } => {}
+                // Accumulate refusal text so it can surface in the subagent
+                // error when the stream terminates with StopReason::Refusal.
+                LlmEvent::Refusal { content } => {
+                    refusal_text.push_str(&content);
+                }
+                // `Citation` sources and `ToolCallDelta` incremental args
+                // have no sink in the subagent accumulator; `ToolCallDelta`
+                // is superseded by the canonical `ToolCall` event. Named
+                // explicitly so the wildcard stays reserved for genuinely
+                // unknown future variants.
+                LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
                 // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
                 // are silently passed over in the subagent loop until a
                 // dedicated arm exists.
@@ -12796,12 +12847,44 @@ async fn execute_tool_calls(
             );
         }
         if call.name == TASK_STATE_TOOL_NAME {
-            results[index] = Some(handle_task_state_call(&context, call).await);
+            let result = handle_task_state_call(&context, call).await;
+            // Emit a compact trace event so debuggers and eval replay can
+            // observe task-state mutations without a full tool card.
+            let _ = context
+                .tx
+                .send(AgentEvent::ControlToolTrace {
+                    turn_id: context.turn_id,
+                    tool_name: TASK_STATE_TOOL_NAME.to_string(),
+                    label: "task state updated".to_string(),
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
-            results[index] = Some(handle_load_tool_schema_call(&context, call).await);
+            let result = handle_load_tool_schema_call(&context, call).await;
+            // Build a compact label showing which tool schema was loaded (or
+            // why it was refused), so debugging lazy-schema turns is easier.
+            let schema_name = call
+                .arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let label = if result.status == ToolStatus::Success {
+                format!("schema attached: {schema_name}")
+            } else {
+                format!("schema load failed: {schema_name}")
+            };
+            let _ = context
+                .tx
+                .send(AgentEvent::ControlToolTrace {
+                    turn_id: context.turn_id,
+                    tool_name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
+                    label,
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
@@ -13418,13 +13501,125 @@ async fn flush_parallel_batch(
         }
         return;
     }
-    // Run the reads *concurrently* (independent reads must not serialize
-    // behind one another — that one-at-a-time `.await` per read dominated
-    // turn latency), then fold them back with incremental per-turn budget
-    // enforcement. See [`fold_parallel_read_completions`].
-    let order: Vec<(usize, ToolCall, u64)> = calls.clone();
-    let completions = dispatch_parallel_reads(context, calls).await;
+
+    // Pre-budget check: if the per-turn budget is already exhausted before we
+    // dispatch, deny every call in this batch immediately without paying for
+    // any I/O. This avoids reads that would be thrown away by
+    // `fold_parallel_read_completions` anyway.
+    if broker.enforces_result_budgets()
+        && let Some(reason) = broker.deny_reason()
+    {
+        for (index, call, tool_sequence) in calls {
+            let result = budget_denied_result(&call, reason.clone());
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &call,
+                &result,
+                Duration::ZERO,
+            );
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+            results[index] = Some(result);
+        }
+        return;
+    }
+
+    // Deduplicate exact parallel-safe calls before dispatch so identical
+    // grep / read_file / graph calls within the same assistant response do
+    // not pay twice for the same I/O. The first occurrence of each
+    // `(tool_name, args_sha256)` key is dispatched; later occurrences
+    // receive a synthetic result that references the canonical call_id and
+    // carries the same content, avoiding both the round-trip and the byte
+    // accounting for the duplicate read.
+    //
+    // `canonical_key_to_results_index` maps a unique `(tool_name, args_sha)` key
+    // to the results-slice index of the first (canonical) occurrence. After
+    // dispatch, that index can be used to look up the canonical ToolResult.
+    let mut canonical_key_to_results_index: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // For each position in `calls`, stores the canonical results-slice index
+    // when the call is a duplicate, or `None` when it is canonical itself.
+    let mut dupe_canonical_results_index: Vec<Option<usize>> = vec![None; calls.len()];
+    let mut dispatch_calls: Vec<(usize, ToolCall, u64)> = Vec::with_capacity(calls.len());
+
+    for (pos, (index, call, tool_sequence)) in calls.iter().enumerate() {
+        if let Some(args_sha) = tool_call_args_sha256(call) {
+            let key = (call.name.clone(), args_sha);
+            match canonical_key_to_results_index.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(*index);
+                    dispatch_calls.push((*index, call.clone(), *tool_sequence));
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    dupe_canonical_results_index[pos] = Some(*slot.get());
+                }
+            }
+        } else {
+            dispatch_calls.push((*index, call.clone(), *tool_sequence));
+        }
+    }
+
+    let order: Vec<(usize, ToolCall, u64)> = dispatch_calls.clone();
+    let completions = dispatch_parallel_reads(context, dispatch_calls).await;
+
+    // Build a snapshot of canonical results (keyed by results-slice index)
+    // *before* fold_parallel_read_completions consumes them, so duplicates can
+    // clone the canonical output.
+    let canonical_results_by_idx: std::collections::HashMap<usize, ToolResult> = completions
+        .iter()
+        .map(|(idx, r)| (*idx, r.clone()))
+        .collect();
+
+    // Fold canonical completions through the budget enforcement path.
     fold_parallel_read_completions(context, broker, results, order, completions).await;
+
+    // Synthesise results for duplicate calls by cloning the canonical
+    // result, stamping `duplicate_of`, and recording without re-running I/O.
+    for (pos, (index, call, tool_sequence)) in calls.iter().enumerate() {
+        let Some(canonical_idx) = dupe_canonical_results_index[pos] else {
+            continue;
+        };
+        // Derive the duplicate's result from the canonical, then overwrite
+        // `call_id` so the model's function-call-output routing works correctly.
+        let result = if let Some(r) = canonical_results_by_idx.get(&canonical_idx) {
+            let mut r = r.clone();
+            let canonical_call_id = r.call_id.clone();
+            r.call_id = call.call_id.clone();
+            if let Some(obj) = r.content.as_object_mut() {
+                obj.insert("duplicate_of".to_string(), json!(canonical_call_id));
+                obj.entry("hint").or_insert_with(|| {
+                    json!(
+                        "This call is identical to an earlier call in the same response. \
+                         Do not issue duplicate tool calls; reuse the earlier output."
+                    )
+                });
+            }
+            r
+        } else {
+            // Canonical was budget-denied or cancelled; treat the duplicate
+            // as denied so the model-visible semantics stay consistent.
+            budget_denied_result(call, "duplicate of budget-denied read".to_string())
+        };
+        emit_tool_telemetry(
+            context.config,
+            &context.telemetry,
+            context.turn_id,
+            *tool_sequence,
+            call,
+            &result,
+            Duration::ZERO,
+        );
+        record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+        let _ = context
+            .tx
+            .send(AgentEvent::ToolCallCompleted {
+                turn_id: context.turn_id,
+                result: result.clone(),
+            })
+            .await;
+        results[*index] = Some(result);
+    }
 }
 
 /// Fold concurrently dispatched parallel-read completions back into the
@@ -14928,7 +15123,29 @@ async fn permission_decision_for_request(
         )
         .await
     {
-        verdict = classifier;
+        // Fold the classifier's billable LLM spend into persisted session
+        // cost so `/cost`, the per-model ledger, and session-cap checks all
+        // see this spend. Mirrors the AI-reviewer accounting path directly
+        // above. KNOWN LIMITATION: the active turn's CostBroker is not
+        // available on the permission path, so the *current* turn's live
+        // status-line snapshot and cap checks don't see this spend until
+        // the next turn re-seeds the broker from `state.cost`.
+        if (classifier.cost.estimated_usd_micros.is_some()
+            || classifier.cost.input_tokens.is_some()
+            || classifier.cost.output_tokens.is_some())
+            && let Some(conversation_state) = &context.conversation_state
+        {
+            let mut state = conversation_state.lock().await;
+            merge_cost(&mut state.cost, &classifier.cost);
+            merge_cost(&mut state.metrics.provider, &classifier.cost);
+            state.metrics.model_ledger.record(
+                context.provider.name(),
+                &context.config.model,
+                CostOrigin::Main,
+                &classifier.cost,
+            );
+        }
+        verdict = classifier.verdict;
     }
     log_permission_verdict(&request, &verdict);
     // Emit permission_decided telemetry for auto-evaluated verdicts (Allow/Deny
@@ -15491,12 +15708,19 @@ fn should_classify_shell(
         && verdict.action == PermissionAction::Ask
 }
 
+/// Result of the out-of-band shell-classifier LLM call: verdict plus the
+/// cost snapshot so the caller can fold the spend into session accounting.
+struct ClassifierResult {
+    verdict: PermissionVerdict,
+    cost: CostSnapshot,
+}
+
 async fn classify_ambiguous_shell(
     provider: Arc<dyn LlmProvider>,
     config: &AppConfig,
     request: &PermissionRequest,
     cancel: CancellationToken,
-) -> Option<PermissionVerdict> {
+) -> Option<ClassifierResult> {
     let command = request.metadata.get("command")?;
     let prompt = format!(
         "Classify this shell command for a coding agent permission gate.\n\
@@ -15528,15 +15752,20 @@ Working target: {:?}",
         beta_headers: std::sync::Arc::from(Vec::new()),
         ..LlmRequest::default()
     };
+    let model = Arc::from(config.model.as_str());
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
+    let mut cost = CostSnapshot::default();
     while let Some(event) = next_llm_stream_event(&mut stream, &cancel, config.stream_idle_timeout)
         .await
         .ok()?
     {
         match event {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
-            LlmEvent::Completed { .. } => break,
+            LlmEvent::Completed { cost: snap, .. } => {
+                cost = snap;
+                break;
+            }
             LlmEvent::Cancelled => return None,
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
@@ -15556,7 +15785,14 @@ Working target: {:?}",
             _ => { /* future variant */ }
         }
     }
-    Some(parse_classifier_verdict(&text))
+    // Fill in estimated cost when the provider did not return a token count.
+    if cost.estimated_usd_micros.is_none() {
+        cost.estimated_usd_micros = estimate_cost(provider.name(), &model, &cost);
+    }
+    Some(ClassifierResult {
+        verdict: parse_classifier_verdict(&text),
+        cost,
+    })
 }
 
 /// Parse the classifier's textual response into a verdict. Only `deny` can
@@ -17488,6 +17724,28 @@ pub enum AgentEvent {
         limit: usize,
         active: usize,
     },
+    /// A source citation received from the provider stream (OpenAI
+    /// annotations, xAI Live Search). `text_index` is the byte offset in
+    /// the running assistant-text buffer the citation refers to. Consumers
+    /// that do not display source attribution can ignore this event.
+    Citation {
+        turn_id: TurnId,
+        text_index: u32,
+        source: CitationSource,
+    },
+    /// A hidden control-plane tool completed without consuming normal tool
+    /// budget. Emitted for `load_tool_schema` and `update_task_state` so
+    /// debuggers and eval replay can observe control-plane activity without
+    /// adding noisy user-facing tool cards.
+    ControlToolTrace {
+        turn_id: TurnId,
+        /// Stable tool name token, e.g. `"load_tool_schema"` or
+        /// `"update_task_state"`.
+        tool_name: String,
+        /// Short human-readable summary, e.g. `"schema attached: grep"` or
+        /// `"task state updated"`.
+        label: String,
+    },
     AiReviewerTripped {
         turn_id: TurnId,
         reason: String,
@@ -17523,6 +17781,14 @@ pub enum AgentEvent {
         /// `CostBroker` handle (help / local-tool turns); the TUI then keeps
         /// the last known cumulative value rather than blanking.
         session_cost: Option<CostSnapshot>,
+        /// Agent-level early-stop signal separate from the provider's
+        /// `stop_reason`. Set when the turn loop itself decided to stop
+        /// early rather than the provider: e.g. `"max_rounds"`,
+        /// `"compaction_retry_exhausted"`, `"reasoning_only_retry"`.
+        /// `None` for normal content or tool-call completions. Stable
+        /// string tokens are used so eval / replay consumers can assert
+        /// without parsing prose.
+        early_stop_reason: Option<String>,
     },
     /// Emitted at most once per session, the first time the running provider
     /// cost crosses `cost_warn_percent` of the configured
