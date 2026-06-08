@@ -758,7 +758,13 @@ impl ToolRegistry {
                         )));
                     }
                     Err(err) => {
-                        return Err(ShellRunError::Io(std::io::Error::other(err.to_string())));
+                        // Non-required Windows sandbox spawn failure: degrade
+                        // the same way as the Linux pre_exec path so the
+                        // caller can retry on the unsandboxed direct path.
+                        return Err(ShellRunError::SpawnFallback(format!(
+                            "shell sandbox backend {} spawn failed: {err}",
+                            sandbox_plan.backend
+                        )));
                     }
                 };
                 pty_master = None;

@@ -47,8 +47,15 @@ pub(crate) struct ShellSandboxHealth {
     /// same degraded backend. The telemetry counter above keeps ticking.
     best_effort_warning_emitted: AtomicBool,
     /// macOS SBPL profile cache: computed once per session per `allow_network`
-    /// value (deny=0, allow=1). The profile string is deterministic for a
-    /// fixed (root, config) pair, so we pay the build cost at most twice.
+    /// value (deny=index 0, allow=index 1). The profile string is
+    /// deterministic for a fixed `(root, config)` pair. **Invariant**: this
+    /// `ShellSandboxHealth` must not be shared across different roots or
+    /// across config reloads — the profile depends on `config.read_roots`,
+    /// `config.write_roots`, `config.protected_metadata_names`,
+    /// `config.sensitive_path_patterns`, and
+    /// `config.macos_socket_domain_allowlist`. The `ToolRegistry` satisfies
+    /// this invariant by constructing a fresh health instance alongside every
+    /// new `(root, shell_sandbox)` pair.
     #[cfg(target_os = "macos")]
     pub(crate) sbpl_profile_cache: [OnceLock<String>; 2],
     /// Allowlisted environment map cache. `apply_shell_environment_policy`
@@ -465,7 +472,20 @@ where
     match health.status(backend) {
         Some(ShellSandboxBackendStatus::Available) => return Ok(plan),
         Some(ShellSandboxBackendStatus::Unavailable(reason)) => {
-            return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+            if config.mode == ShellSandboxMode::Required {
+                // Required mode: deny without incrementing the fallback
+                // counter — a denial is not a best_effort degradation.
+                return Err(format!(
+                    "required shell sandbox backend {backend} unavailable: {reason}"
+                ));
+            }
+            // Tick the fallback counter even for cached-unavailable calls so
+            // the telemetry counter stays in step with every degraded shell
+            // invocation (not just the first probe failure).
+            let record = health.record_best_effort_fallback();
+            return shell_sandbox_backend_unavailable_plan(
+                command, config, backend, &reason, record,
+            );
         }
         None => {}
     }
@@ -473,30 +493,39 @@ where
     let probe_input = plan.clone();
     if let Some(reason) = probe_failure(probe_input, SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT).await {
         health.mark_unavailable(backend, reason.clone());
-        return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+        if config.mode == ShellSandboxMode::Required {
+            return Err(format!(
+                "required shell sandbox backend {backend} unavailable: {reason}"
+            ));
+        }
+        // First probe failure in best_effort mode: record and emit the
+        // session-level latch.
+        let record = health.record_best_effort_fallback();
+        return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason, record);
     }
 
     health.mark_available(backend);
     Ok(plan)
 }
 
+/// Build a best_effort fallback plan for a degraded sandbox backend.
+/// The caller is responsible for having already verified that the mode is
+/// NOT required (required-mode callers should return `Err` instead of
+/// calling this), and for having called `record_best_effort_fallback`.
 pub(crate) fn shell_sandbox_backend_unavailable_plan(
     command: &str,
     config: &ShellSandboxConfig,
     backend: &'static str,
     reason: &str,
+    record: ShellSandboxFallbackRecord,
 ) -> std::result::Result<ShellSandboxPlan, String> {
-    if config.mode == ShellSandboxMode::Required {
-        return Err(format!(
-            "required shell sandbox backend {backend} unavailable: {reason}"
-        ));
-    }
-
-    Ok(ShellSandboxPlan::direct_with_fallback(
+    let fallback_reason = shell_sandbox_backend_disabled_reason(backend, reason);
+    Ok(ShellSandboxPlan::direct_with_fallback_record(
         command,
         config.mode,
         config,
-        Some(shell_sandbox_backend_disabled_reason(backend, reason)),
+        Some(fallback_reason),
+        Some((backend, record)),
     ))
 }
 
@@ -708,7 +737,11 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     #[cfg(target_os = "macos")]
     {
         if macos_sandbox_exec_available {
-            let allow_network = network != "denied";
+            // Only `allowed_approved` means the sandbox should actually open
+            // its network namespace. Both `denied` (non-network command) and
+            // `denied_classified` (network-classified but policy is
+            // deny_by_default) must keep the sandbox network-closed.
+            let allow_network = network == "allowed_approved";
             let profile = {
                 let cache_idx = usize::from(allow_network);
                 health.sbpl_profile_cache[cache_idx]

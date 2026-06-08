@@ -792,6 +792,15 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
             sb.mode.as_str(),
             sb.network.as_str()
         ));
+        // On Windows, surface the configured sandbox level so operators can
+        // see when it differs from the doctor-reported backend. Notably,
+        // `windows_sandbox_level=disabled` selects the job-object-only backend
+        // at runtime, which is more limited than the restricted-token default.
+        #[cfg(target_os = "windows")]
+        detail.push_str(&format!(
+            " windows_sandbox_level={}",
+            sb.windows_sandbox_level.as_str()
+        ));
         // Explain squeezy ask socket availability under Linux direct-syscalls:
         // the seccomp filter denies AF_UNIX, so in-shell approval escalation
         // is unavailable. Show a note when the backend is active.
