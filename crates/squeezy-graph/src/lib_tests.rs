@@ -1970,7 +1970,11 @@ fn graph_manager_refresh_converges_for_csharp_changes_and_ignores_unsupported_on
     assert!(!unsupported.refreshed);
     assert_eq!(unsupported.reparsed_files, 0);
     assert_eq!(unsupported.changed_paths_from_events, 0);
-    assert_eq!(unsupported.unchanged_event_paths, 1);
+    // notes.txt changed and its event path matched the changed unsupported record,
+    // so it is NOT reported as an unmatched event path. An unchanged_event_paths > 0
+    // signals a genuine path-spelling or symlink mismatch, not a changed-but-
+    // non-supported file.
+    assert_eq!(unsupported.unchanged_event_paths, 0);
 
     thread::sleep(Duration::from_millis(2));
     fs::write(
