@@ -255,7 +255,7 @@ enum McpCommand {
         json: bool,
     },
     #[command(about = "Add an MCP server to user or project settings")]
-    Add(McpAddArgs),
+    Add(Box<McpAddArgs>),
     #[command(about = "Enable a configured MCP server")]
     Enable(McpNameScope),
     #[command(about = "Disable a configured MCP server")]
@@ -1154,18 +1154,18 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                         // macOS/Linux depending on the system hosts file and
                         // firewall configuration. Prefer explicit `127.0.0.1` or
                         // `[::1]` for predictable behavior.
-                        if let Some(url) = args.url.as_deref() {
-                            if let Some(host_part) = url.find("://").map(|p| &url[p + 3..]) {
-                                let host_end = host_part.find('/').unwrap_or(host_part.len());
-                                let host = &host_part[..host_end];
-                                let bare_host = host.rfind(':').map(|p| &host[..p]).unwrap_or(host);
-                                if bare_host.eq_ignore_ascii_case("localhost") {
-                                    eprintln!(
-                                        "warning: URL uses `localhost` which may resolve \
-                                         differently on Windows (IPv4 vs IPv6 loopback). \
-                                         Consider using `127.0.0.1` or `[::1]` explicitly."
-                                    );
-                                }
+                        if let Some(url) = args.url.as_deref()
+                            && let Some(host_part) = url.find("://").map(|p| &url[p + 3..])
+                        {
+                            let host_end = host_part.find('/').unwrap_or(host_part.len());
+                            let host = &host_part[..host_end];
+                            let bare_host = host.rfind(':').map(|p| &host[..p]).unwrap_or(host);
+                            if bare_host.eq_ignore_ascii_case("localhost") {
+                                eprintln!(
+                                    "warning: URL uses `localhost` which may resolve \
+                                     differently on Windows (IPv4 vs IPv6 loopback). \
+                                     Consider using `127.0.0.1` or `[::1]` explicitly."
+                                );
                             }
                         }
                     }
