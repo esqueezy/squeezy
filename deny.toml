@@ -101,6 +101,11 @@ skip = [
     # is confined to the optional snapshot-testing stack. Revisit when `insta`
     # upgrades to `similar 3`.
     { crate = "similar:2.7.0", reason = "insta (term-matrix snapshot tests) pins similar 2.7 while the workspace uses similar 3.x" },
+    # `alacritty_terminal` (a `term-matrix`-gated dependency of squeezy-tui)
+    # pulls `signal-hook 0.4` while `crossterm` stays on `signal-hook 0.3`.
+    # The older copy is confined to crossterm's terminal backend; the newer
+    # one only to the optional emulator stack. Revisit when crossterm upgrades.
+    { crate = "signal-hook:0.4.4", reason = "alacritty_terminal (term-matrix) pulls signal-hook 0.4 while crossterm stays on 0.3" },
 ]
 skip-tree = []
 
