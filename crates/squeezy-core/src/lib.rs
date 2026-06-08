@@ -4735,6 +4735,12 @@ pub struct RoutingConfig {
     /// parent model rather than the cheap tier. `/cheap` overrides.
     /// Disable with `[routing].linux_sandbox_sensitive_parent = false`
     /// or `SQUEEZY_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT=false`.
+    ///
+    /// This guard applies on all platforms (macOS, Linux, Windows), not
+    /// only on Linux, because Docker, Podman, container runtimes, and
+    /// package managers require parent-model care regardless of the host
+    /// OS. The name reflects where the keywords originate, not where the
+    /// guard activates.
     pub linux_sandbox_sensitive_parent: bool,
 }
 

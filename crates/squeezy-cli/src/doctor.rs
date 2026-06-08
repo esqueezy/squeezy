@@ -50,8 +50,7 @@ pub struct DoctorArgs {
     /// Report detailed Linux shell-sandbox posture (user namespace support,
     /// Landlock support, seccomp support, required-mode viability) and exit.
     /// On non-Linux platforms, reports the active backend with a note that the
-    /// Linux detail only applies on Linux. Also included in standard `doctor`
-    /// output when run on Linux.
+    /// Linux detail only applies on Linux.
     #[arg(long)]
     pub linux_sandbox: bool,
 }
@@ -833,12 +832,15 @@ fn linux_sandbox_check_from_report(report: squeezy_tools::ShellSandboxDoctor) ->
         "backend={} available={} — {}",
         report.backend, report.available, report.detail
     );
+    // Use Fail (not Warn) so `--linux-sandbox` exits 1 on hosts where required
+    // mode would fail — CI gates written as `squeezy doctor --linux-sandbox`
+    // can rely on the exit code.
     Check {
         name: "linux-sandbox".to_string(),
         status: if report.available {
             Status::Ok
         } else {
-            Status::Warn
+            Status::Fail
         },
         detail,
     }

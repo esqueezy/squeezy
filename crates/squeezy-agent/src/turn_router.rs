@@ -149,12 +149,24 @@ const HEURISTIC_VERBS: &[&str] = &[
     "tag",
 ];
 
-/// Keywords that indicate the prompt touches Linux sandbox/container/kernel
-/// territory where cheap-model errors are expensive to recover from.
-/// When `routing.linux_sandbox_sensitive_parent` is enabled (the default),
-/// any prompt containing one of these terms bypasses cheap routing and goes
-/// to the parent model. An explicit `/cheap` override still wins.
-const LINUX_SANDBOX_SENSITIVE_TERMS: &[&str] = &[
+/// Substrings that unambiguously flag Linux sandbox-sensitive territory.
+/// These are either multi-word phrases, path prefixes, or hyphenated
+/// commands that cannot appear as part of unrelated words.
+const LINUX_SANDBOX_SENSITIVE_SUBSTRINGS: &[&str] = &[
+    "/proc",
+    "/sys",
+    "apt-get",
+    "network namespace",
+    "kernel policy",
+    "user namespace",
+    "pivot_root",
+    "overlayfs",
+];
+
+/// Single words that flag Linux sandbox-sensitive territory. Checked with
+/// whole-word matching so short names like "apt" do not false-positive on
+/// unrelated words (e.g. a hypothetical "captain").
+const LINUX_SANDBOX_SENSITIVE_WORDS: &[&str] = &[
     "unshare",
     "landlock",
     "seccomp",
@@ -162,38 +174,46 @@ const LINUX_SANDBOX_SENSITIVE_TERMS: &[&str] = &[
     "systemd",
     "docker",
     "podman",
-    "/proc",
-    "/sys",
-    "apt-get",
-    "apt ",
-    "yum ",
-    "dnf ",
     "pacman",
     "zypper",
-    " apk ",
-    "network namespace",
     "netns",
-    "kernel policy",
     "cgroup",
     "nsenter",
     "chroot",
-    "pivot_root",
-    "overlayfs",
     "containerd",
     "rootless",
-    "user namespace",
     "userns",
+    "apt",
+    "yum",
+    "dnf",
+    "apk",
 ];
 
 /// Returns `true` when `user_input` (case-insensitive) contains any
 /// Linux sandbox-sensitive keyword. Used by `classify_turn` to prevent
 /// the heuristic or judge from routing host-sensitive Linux work to
 /// the cheap model tier.
+///
+/// Prompts involving Docker, Podman, container runtimes, and package
+/// managers are treated as sandbox-sensitive even on macOS and Windows
+/// because those workflows require the parent model's care on any platform.
 pub(crate) fn is_linux_sandbox_sensitive(user_input: &str) -> bool {
     let lower = user_input.to_ascii_lowercase();
-    LINUX_SANDBOX_SENSITIVE_TERMS
+    if LINUX_SANDBOX_SENSITIVE_SUBSTRINGS
         .iter()
         .any(|term| lower.contains(term))
+    {
+        return true;
+    }
+    // Word-boundary check: split on non-alphanumeric, non-hyphen, non-underscore
+    // characters so "apt" matches "run apt install" but not "captain".
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    LINUX_SANDBOX_SENSITIVE_WORDS
+        .iter()
+        .any(|term| words.iter().any(|w| *w == *term))
 }
 
 const AMBIGUITY_MARKERS: &[&str] = &[

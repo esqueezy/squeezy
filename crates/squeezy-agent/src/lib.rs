@@ -15258,8 +15258,11 @@ fn load_session_mode(session_mode: &Arc<AtomicU8>) -> SessionMode {
 }
 
 /// Short hint about Build-mode shell-sandbox readiness for inclusion in
-/// Plan-mode denial messages. Calls `shell_sandbox_doctor()` which is
-/// cached after the first invocation (OnceLock), so repeated calls are free.
+/// Plan-mode denial messages. The underlying kernel probes
+/// (`linux_unshare_supported`, `linux_landlock_supported`) are OnceLock-cached
+/// so they are cheap after the first call; the `ShellSandboxDoctor` struct
+/// itself is allocated on each call (only `backend: &'static str` and
+/// `available: bool` are read from it here).
 fn build_mode_sandbox_hint() -> String {
     let doc = squeezy_tools::shell_sandbox_doctor();
     if doc.available {
