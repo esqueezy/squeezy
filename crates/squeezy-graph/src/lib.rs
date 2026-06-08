@@ -203,6 +203,13 @@ pub struct CargoDiagnostic {
     pub package_id: Option<String>,
     pub target_name: Option<String>,
     pub provenance: Provenance,
+    /// Raw path string from the compiler span, populated only when `file_id`
+    /// normalization failed (i.e. `file_id` is `None` and the span had a
+    /// non-empty, non-`<…>` file path). Lets callers report the raw path and
+    /// workspace root so users can diagnose container, symlink, or bind-mount
+    /// path-spelling mismatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_path: Option<String>,
 }
 
 /// Freshness verdict for the cached cargo compiler facts.
@@ -2153,6 +2160,7 @@ impl GraphManager {
             .map(|_| graph_store_metadata(&root, &crawl_options));
         let crawler = WorkspaceCrawler::new(crawl_options);
         let snapshot = crawler.crawl(&root)?;
+        warn_case_collisions(&snapshot.files);
         let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
@@ -2274,7 +2282,12 @@ impl GraphManager {
     /// will compare against. The single-blob import adjacency is mirrored
     /// from [`SemanticGraph::importers_by_file`]. Failures are swallowed
     /// so persistence errors cannot poison the in-memory graph.
+    ///
+    /// All per-file resolver entries are accumulated into a single
+    /// [`GraphWriteBatch`] and committed in one redb transaction instead of
+    /// one transaction per file, which was the previous behavior.
     fn persist_resolver_cache(&self, store: &GraphStore) {
+        let mut batch = GraphWriteBatch::new();
         for (file_id, file) in &self.graph.files {
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
                 continue;
@@ -2289,7 +2302,10 @@ impl GraphManager {
                 supertypes: slot.supertypes.clone(),
                 builder_snapshot: resolver_cache::BuilderSnapshot::default(),
             };
-            let _ = store.put_resolver_entry(file_id, &entry);
+            let _ = batch.upsert_resolver_entry(file_id, &entry);
+        }
+        if !batch.is_empty() {
+            let _ = store.apply_graph_batch(&batch);
         }
         let mut snapshot = resolver_cache::ResolverSnapshot::new();
         for (target, importers) in &self.graph.importers_by_file {
@@ -2413,6 +2429,10 @@ impl GraphManager {
             .lock()
             .map(|paths| paths.clone())
             .unwrap_or_default();
+        // Pre-compute canonical forms for all pending event paths once so the
+        // matching loops below do not repeatedly call canonicalize on the same
+        // event path.
+        let pending_canonicals = PendingCanonicals::from_paths(&pending_changed_paths);
         let mut supported_changed_records = current
             .values()
             .filter(|record| record.language != LanguageKind::Unsupported)
@@ -2461,30 +2481,48 @@ impl GraphManager {
         let changed_paths_from_events = changed_records
             .iter()
             .filter(|record| {
-                pending_changed_paths
-                    .iter()
-                    .any(|path| paths_match(path, &record.path))
+                let rec_can = std::fs::canonicalize(&record.path).ok();
+                pending_canonicals.matches_record(&record.path, rec_can.as_ref())
             })
             .count();
         let changed_paths_from_polling = changed_records
             .len()
             .saturating_sub(changed_paths_from_events);
-        let event_changed_or_removed = pending_changed_paths
-            .iter()
-            .filter(|path| {
-                changed_records
-                    .iter()
-                    .any(|record| paths_match(path, &record.path))
-                    || removed_files_all.iter().any(|id| {
-                        self.graph
-                            .files
-                            .get(id)
-                            .map(|old| paths_match(path, &old.path))
-                            .unwrap_or(false)
+        let event_changed_or_removed = {
+            // Pre-compute canonical paths for all current and removed record
+            // paths to avoid re-canonicalizing them per pending entry.
+            let changed_canonicals: Vec<(PathBuf, Option<PathBuf>)> = changed_records
+                .iter()
+                .map(|r| (r.path.clone(), std::fs::canonicalize(&r.path).ok()))
+                .collect();
+            let removed_canonicals: Vec<(PathBuf, Option<PathBuf>)> = removed_files_all
+                .iter()
+                .filter_map(|id| self.graph.files.get(id))
+                .map(|old| (old.path.clone(), std::fs::canonicalize(&old.path).ok()))
+                .collect();
+            pending_canonicals
+                .entries
+                .iter()
+                .filter(|(raw, canon)| {
+                    changed_canonicals.iter().any(|(rec_raw, rec_can)| {
+                        raw == rec_raw
+                            || canon
+                                .as_ref()
+                                .zip(rec_can.as_ref())
+                                .map(|(l, r)| l == r)
+                                .unwrap_or(false)
+                    }) || removed_canonicals.iter().any(|(rec_raw, rec_can)| {
+                        raw == rec_raw
+                            || canon
+                                .as_ref()
+                                .zip(rec_can.as_ref())
+                                .map(|(l, r)| l == r)
+                                .unwrap_or(false)
                     })
-            })
-            .count();
-        let unchanged_event_paths = pending_changed_paths
+                })
+                .count()
+        };
+        let unchanged_event_paths = pending_canonicals
             .len()
             .saturating_sub(event_changed_or_removed);
         // Accumulate persistence side effects across the refresh and flush in
@@ -2987,6 +3025,7 @@ fn parse_cargo_diagnostics(
                 package_id: event.package_id,
                 target_name: event.target.and_then(|target| target.name),
                 provenance: Provenance::new("cargo check", provenance.command.clone()),
+                raw_path: None,
             });
             continue;
         }
@@ -2998,11 +3037,24 @@ fn parse_cargo_diagnostics(
             let line_end = span.line_end.saturating_sub(1);
             let column_start = span.column_start.saturating_sub(1);
             let column_end = span.column_end.saturating_sub(1);
+            let file_id = normalize_cargo_file_id(root, &span.file_name).map(FileId::new);
+            // When the path cannot be mapped to a workspace-relative FileId,
+            // keep the raw compiler path so callers can report both the raw
+            // diagnostic path and the workspace root spelling, helping users
+            // spot container, symlink, or bind-mount path-spelling mismatches.
+            let raw_path = if file_id.is_none()
+                && !span.file_name.is_empty()
+                && !span.file_name.starts_with('<')
+            {
+                Some(span.file_name.clone())
+            } else {
+                None
+            };
             diagnostics.push(CargoDiagnostic {
                 level: message.level.clone(),
                 message: message.message.clone(),
                 code: message.code.as_ref().map(|code| code.code.clone()),
-                file_id: normalize_cargo_file_id(root, &span.file_name).map(FileId::new),
+                file_id,
                 span: Some(SourceSpan::new(
                     span.byte_start,
                     span.byte_end,
@@ -3013,6 +3065,7 @@ fn parse_cargo_diagnostics(
                 package_id: event.package_id.clone(),
                 target_name: event.target.as_ref().and_then(|target| target.name.clone()),
                 provenance: Provenance::new("cargo check", provenance.command.clone()),
+                raw_path,
             });
         }
     }
@@ -3053,7 +3106,21 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
     }
     let path = Path::new(path);
     let relative = if path.is_absolute() {
-        path.strip_prefix(root).ok()?.to_path_buf()
+        // Fast path: exact prefix match (the common case).
+        if let Ok(rel) = path.strip_prefix(root) {
+            rel.to_path_buf()
+        } else {
+            // Fallback: canonicalize both sides and retry. This handles
+            // symlinked workspaces, bind-mounted build environments, and
+            // container setups where cargo emits a different path spelling
+            // than the workspace root squeezy was opened with.
+            let canonical_root = std::fs::canonicalize(root).ok()?;
+            let canonical_path = std::fs::canonicalize(path).ok()?;
+            canonical_path
+                .strip_prefix(&canonical_root)
+                .ok()?
+                .to_path_buf()
+        }
     } else {
         path.to_path_buf()
     };
@@ -3479,13 +3546,45 @@ fn module_path_for_file(path: &str) -> Vec<String> {
     segments
 }
 
-fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || std::fs::canonicalize(left)
-            .ok()
-            .zip(std::fs::canonicalize(right).ok())
-            .map(|(left, right)| left == right)
-            .unwrap_or(false)
+/// Pre-computed canonical paths for a set of pending watcher event paths.
+///
+/// [`paths_match`] calls `canonicalize` twice per invocation. When matching
+/// `N` pending paths against `M` record paths, the naive approach calls
+/// `canonicalize` O(N×M) times. This struct computes each pending-path
+/// canonical form once at construction and reuses it for all subsequent
+/// `matches` calls, reducing the stat/readlink count to O(N + M).
+struct PendingCanonicals {
+    /// Each entry is `(raw_path, canonicalized_path_or_none)`.
+    entries: Vec<(PathBuf, Option<PathBuf>)>,
+}
+
+impl PendingCanonicals {
+    fn from_paths(paths: &HashSet<PathBuf>) -> Self {
+        let entries = paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::canonicalize(p).ok()))
+            .collect();
+        Self { entries }
+    }
+
+    /// Return `true` if `record_path` is covered by any pending event path.
+    /// `record_canonical` is the caller-supplied canonical form of the record
+    /// path (may be `None` if canonicalization failed, e.g. for a file that
+    /// was deleted after the crawl).
+    fn matches_record(&self, record_path: &Path, record_canonical: Option<&PathBuf>) -> bool {
+        self.entries.iter().any(|(raw, canon)| {
+            raw.as_path() == record_path
+                || canon
+                    .as_ref()
+                    .zip(record_canonical)
+                    .map(|(l, r)| l == r)
+                    .unwrap_or(false)
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 fn path_segments_suffix_match(left: &[String], right: &[String]) -> bool {
@@ -3707,6 +3806,30 @@ pub(crate) fn crate_underscore_alias_for_relative_path(path: &str) -> Option<Str
         return None;
     }
     Some(crate_dir.replace('-', "_"))
+}
+
+/// Warn when two indexed paths differ only in case. Linux filesystems
+/// preserve exact case-sensitive identity, so both paths are indexed
+/// correctly on ext4/xfs/btrfs. However, the same spellings may collide
+/// on macOS/Windows or on Linux case-insensitive mounts, and persisted
+/// cache entries keyed by the exact `FileId` string will be unusable after
+/// a checkout on those platforms. Emit one warning per collision pair at
+/// graph-build time so the information surfaces without halting indexing.
+fn warn_case_collisions(files: &[squeezy_workspace::FileRecord]) {
+    let mut lower_to_path: HashMap<String, &str> = HashMap::with_capacity(files.len());
+    for file in files {
+        let lower = file.relative_path.to_lowercase();
+        if let Some(existing) = lower_to_path.get(&lower) {
+            tracing::warn!(
+                "squeezy: case-collision: '{}' and '{}' fold to the same lowercase path; \
+                 cross-platform checkout or cached-entry reuse may be unreliable",
+                existing,
+                file.relative_path,
+            );
+        } else {
+            lower_to_path.insert(lower, &file.relative_path);
+        }
+    }
 }
 
 #[cfg(test)]

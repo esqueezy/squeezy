@@ -8841,3 +8841,71 @@ void main() {
         "app.dart must NOT attach to the unrelated c/d/thing.dart that only shares the leaf",
     );
 }
+
+#[test]
+fn normalize_cargo_file_id_strips_workspace_prefix() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, "/workspace/myproject/src/main.rs"),
+        Some("src/main.rs".to_string()),
+    );
+}
+
+#[test]
+fn normalize_cargo_file_id_passes_through_relative_path() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, "src/main.rs"),
+        Some("src/main.rs".to_string()),
+    );
+}
+
+#[test]
+fn normalize_cargo_file_id_returns_none_for_angle_bracket_paths() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(normalize_cargo_file_id(root, "<anon>"), None);
+    assert_eq!(normalize_cargo_file_id(root, "<macro expansion>"), None);
+}
+
+#[test]
+fn normalize_cargo_file_id_returns_none_for_path_outside_workspace() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, "/other/repo/src/lib.rs"),
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn normalize_cargo_file_id_fallback_via_symlink() {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    // Set up a real workspace dir and a symlink root that points to it.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let real_root = std::env::temp_dir().join(format!("squeezy-cargo-norm-real-{nonce}"));
+    let sym_root = std::env::temp_dir().join(format!("squeezy-cargo-norm-sym-{nonce}"));
+    fs::create_dir_all(real_root.join("src")).unwrap();
+    fs::write(real_root.join("src").join("main.rs"), "fn main() {}").unwrap();
+    std::os::unix::fs::symlink(&real_root, &sym_root).unwrap();
+
+    // cargo emits the path under the symlinked root; squeezy was opened
+    // with the real root. The exact prefix check fails; the canonical
+    // fallback must succeed.
+    let result =
+        normalize_cargo_file_id(&real_root, &sym_root.join("src/main.rs").to_string_lossy());
+    assert_eq!(
+        result,
+        Some("src/main.rs".to_string()),
+        "canonical fallback must resolve symlinked cargo path"
+    );
+
+    // Cleanup
+    let _ = fs::remove_dir_all(&real_root);
+    let _ = fs::remove_file(&sym_root);
+}

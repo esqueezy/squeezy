@@ -270,6 +270,10 @@ pub enum ExclusionReason {
     LargeFile,
     UserExclude,
     Hidden,
+    /// A symlink whose resolved target lies outside the workspace root.
+    /// The file is not indexed; this reason surfaces it in coverage output
+    /// so callers can explain why an expected source file is absent.
+    ExternalSymlink,
 }
 
 impl ExclusionReason {
@@ -285,6 +289,7 @@ impl ExclusionReason {
             Self::LargeFile => "large_file",
             Self::UserExclude => "user_exclude",
             Self::Hidden => "hidden",
+            Self::ExternalSymlink => "external_symlink",
         }
     }
 }
@@ -452,13 +457,24 @@ impl WorkspaceCrawler {
             if !metadata.is_file() {
                 continue;
             }
+            let size_bytes = metadata.len();
             if file_type.is_symlink() {
                 let target = fs::canonicalize(&path)?;
                 if !target.starts_with(&root) {
+                    // Symlink target lies outside the workspace root. Record it
+                    // in coverage so callers can explain why the file is absent,
+                    // rather than silently omitting it from the index.
+                    record_excluded_file(
+                        &mut excluded,
+                        &mut coverage,
+                        &path,
+                        relative_path,
+                        size_bytes,
+                        ExclusionReason::ExternalSymlink,
+                    );
                     continue;
                 }
             }
-            let size_bytes = metadata.len();
             let language = classify_language(&path);
             // Java source files frequently contain many nested declarations
             // in a single file, so we lift the default cap when the user has
