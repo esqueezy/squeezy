@@ -1199,7 +1199,7 @@ fn skills_show(cli: &Cli, name: &str, preview: bool) -> squeezy_core::Result<()>
             println!("tool_deps:    {}", manifest.tool_deps.join(", "));
         }
         if let Some(icon) = &manifest.icon {
-            println!("icon:         {icon}");
+            println!("icon:         {}", icon.display());
         }
         if let Some(hint) = &manifest.prompt_hint {
             println!("prompt_hint:  {hint}");
