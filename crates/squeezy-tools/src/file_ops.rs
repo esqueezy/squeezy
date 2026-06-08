@@ -21,9 +21,9 @@ use crate::{
     DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
     POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolOutputReplayKey, ToolOutputReplayServed,
     ToolOutputReplaySource, ToolRegistry, ToolResult, ToolStatus, build_include_set,
-    build_required_glob, diff_path_set, file_len, graph_augment_wait, graph_ready_wait,
-    is_secret_path, make_result, read_prefix, read_range, sha256_file, tool_arg_error, tool_error,
-    truncate_text, workspace_path,
+    build_required_glob, diff_path_set, file_len, graph_augment_wait, is_secret_path, make_result,
+    read_prefix, read_range, sha256_file, tool_arg_error, tool_error, truncate_text,
+    workspace_path,
 };
 
 pub(crate) const DEFAULT_MAX_MATCHES: usize = 250;
@@ -959,24 +959,19 @@ impl ToolRegistry {
                 // declarations by supertype, and only in content mode (not
                 // diff-scoped). Fails soft — graph unavailable / refresh error
                 // / no graph match leaves `matches` untouched.
-                if !diff_only {
-                    if let Some(detected) = detect_inheritance_grep(&args.pattern) {
-                        let augment_status = self
-                            .augment_inheritance_grep(&detected, &matches, &mut object)
-                            .await;
-                        // Surface whether augmentation was applied or the graph
-                        // was not ready within graph_augment_wait(). The model can
-                        // use this to decide whether to retry graph tools directly
-                        // versus proceeding with lexical evidence only.
-                        object.entry("metadata").and_modify(|m| {
-                            if let Value::Object(map) = m {
-                                map.insert(
-                                    "graph_augment_status".to_string(),
-                                    json!(augment_status),
-                                );
-                            }
-                        });
-                    }
+                if !diff_only && let Some(detected) = detect_inheritance_grep(&args.pattern) {
+                    let augment_status = self
+                        .augment_inheritance_grep(&detected, &matches, &mut object)
+                        .await;
+                    // Surface whether augmentation was applied or the graph
+                    // was not ready within graph_augment_wait(). The model can
+                    // use this to decide whether to retry graph tools directly
+                    // versus proceeding with lexical evidence only.
+                    object.entry("metadata").and_modify(|m| {
+                        if let Value::Object(map) = m {
+                            map.insert("graph_augment_status".to_string(), json!(augment_status));
+                        }
+                    });
                 }
                 Value::Object(object)
             }
