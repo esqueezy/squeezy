@@ -4134,8 +4134,8 @@ fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
 #[test]
 fn slash_suggestion_line_contents_match_command_capabilities() {
     // Build the menu lines directly and assert the badge follows the
-    // declared capabilities — covers both presence (`/help` → `net`) and
-    // absence (`/cost` → no badge).
+    // declared capabilities — covers both absence (`/help` → no badge after
+    // removing Network cap) and absence (`/cost` → no badge).
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/help".to_string());
     let lines = slash_suggestion_lines(&app, 120);
@@ -4147,7 +4147,11 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
         .iter()
         .find(|line| line.contains("/help"))
         .expect("rendered /help line");
-    assert!(help_line.contains("[net]"), "{help_line}");
+    // `/help` no longer has a `[net]` badge — curated topics are local.
+    assert!(
+        !help_line.contains("[net]"),
+        "/help should not render a [net] capability badge: {help_line}"
+    );
 
     set_input(&mut app, "/cost".to_string());
     let lines = slash_suggestion_lines(&app, 120);
@@ -5068,10 +5072,10 @@ async fn slash_attach_surfaces_unsupported_label_only_images() {
 }
 
 /// Drift test: every entry in `SLASH_COMMAND_HELP_TABLE` must correspond to a real
-/// slash command in the live `SLASH_COMMANDS` registry, so stale or invented names
-/// are caught at compile time.  Adding a new command to the registry does NOT
-/// automatically fail this test; add a help entry to `SLASH_COMMAND_HELP_TABLE` to
-/// cover it.
+/// slash command in the live `SLASH_COMMANDS` registry (no stale names), and every
+/// slash command in the registry must have a help entry (no uncovered commands).
+/// Adding a new slash command without a matching `SLASH_COMMAND_HELP_TABLE` entry
+/// fails this test until help is added.
 #[test]
 fn slash_help_table_entries_exist_in_registry() {
     use squeezy_skills::slash_command_help_names;
@@ -5079,12 +5083,20 @@ fn slash_help_table_entries_exist_in_registry() {
     // SLASH_COMMANDS is re-exported as pub(crate) from lib.rs via `use super::*`
     let registry_names: std::collections::HashSet<&str> =
         SLASH_COMMANDS.iter().map(|c| c.name).collect();
+    let help_names: std::collections::HashSet<&str> = slash_command_help_names().collect();
 
-    for help_name in slash_command_help_names() {
+    for help_name in &help_names {
         assert!(
             registry_names.contains(help_name),
             "SLASH_COMMAND_HELP_TABLE entry {help_name:?} does not exist in SLASH_COMMANDS; \
              either the command was removed/renamed or the help entry was mis-typed"
+        );
+    }
+    for registry_name in &registry_names {
+        assert!(
+            help_names.contains(registry_name),
+            "SLASH_COMMANDS entry {registry_name:?} has no entry in SLASH_COMMAND_HELP_TABLE; \
+             add a help entry before shipping this command"
         );
     }
 }
