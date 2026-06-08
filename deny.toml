@@ -96,6 +96,11 @@ skip = [
     { crate = "windows-targets:0.53.5", reason = "newer windows-sys split — coexists with 0.52" },
     { crate = "windows_x86_64_msvc:0.52.6", reason = "follows windows-targets 0.52 split" },
     { crate = "windows_x86_64_msvc:0.53.1", reason = "follows windows-targets 0.53 split" },
+    # `insta` (a `term-matrix`-gated dev dependency of squeezy-tui) still pins
+    # `similar 2.7`; the workspace otherwise uses `similar 3.x`. The older copy
+    # is confined to the optional snapshot-testing stack. Revisit when `insta`
+    # upgrades to `similar 3`.
+    { crate = "similar:2.7.0", reason = "insta (term-matrix snapshot tests) pins similar 2.7 while the workspace uses similar 3.x" },
 ]
 skip-tree = []
 
