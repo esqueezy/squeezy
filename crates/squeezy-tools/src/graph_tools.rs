@@ -572,7 +572,23 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
 /// still resolve. The fuzzy path was the source of cross-tree noise only
 /// when the model already wrote a real prefix; gating on `/` removes that
 /// noise without regressing the bareword UX.
+///
+/// Backslashes in the filter are normalized to forward slashes before
+/// matching so that paths copied from Windows-formatted output (e.g.
+/// `src\parser`) are treated as directory prefixes on Linux rather than
+/// falling through to loose fuzzy matching.
 fn path_matches_filter(path: &str, filter: &str) -> bool {
+    // Normalize backslashes to forward slashes for cross-platform paste
+    // compatibility.  A filter like `src\parser` pasted from Windows output
+    // should enter strict directory-prefix mode, not the bareword fuzzy path.
+    let normalized;
+    let filter = if filter.contains('\\') {
+        normalized = filter.replace('\\', "/");
+        normalized.as_str()
+    } else {
+        filter
+    };
+
     if filter.contains('/') {
         let filter = filter.trim_end_matches('/');
         if filter.is_empty() {
@@ -1361,6 +1377,11 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
 /// - `reason`: one of `supported_language_no_match`, `path_unsupported`,
 ///   `path_unknown`, `no_path_scope`
 /// - `path` / `language` (nullable)
+/// - `case_near_match`: nearest case-insensitive path candidate when reason
+///   is `path_unknown` and a case-insensitive match exists; helps the model
+///   correct a Linux case typo without a second graph traversal.
+/// - `path_normalized_from`: original filter when backslash normalization
+///   occurred; shows the slash-normalized path that was actually used.
 ///
 /// `suggested_tools` is intentionally omitted from the wire payload —
 /// recommending grep/decl_search retries was decoration the model already
@@ -1374,12 +1395,25 @@ fn graph_zero_hit_fallback(
     if packet_count > 0 {
         return Value::Null;
     }
-    let (path_value, language_value, reason) = match path {
-        Some(path) => {
+
+    // Normalize backslashes once so all branches see forward-slash paths.
+    // This mirrors path_matches_filter's normalization and ensures the file
+    // lookup succeeds even when the caller supplied a Windows-style path.
+    let path_norm_buf: String;
+    let normalized_path: Option<&str> = match path {
+        Some(p) if p.contains('\\') => {
+            path_norm_buf = p.replace('\\', "/");
+            Some(path_norm_buf.as_str())
+        }
+        other => other,
+    };
+
+    let (path_value, language_value, reason, case_near_match) = match normalized_path {
+        Some(p) => {
             let file = graph
                 .files
                 .values()
-                .find(|file| path_matches_exact_or_suffix(&file.relative_path, path));
+                .find(|file| path_matches_exact_or_suffix(&file.relative_path, p));
             match file {
                 Some(file) => {
                     let reason = match file.language {
@@ -1391,19 +1425,49 @@ fn graph_zero_hit_fallback(
                         Value::String(file.relative_path.clone()),
                         Value::String(file.language.display_name().to_string()),
                         reason,
+                        None,
                     )
                 }
-                None => (Value::String(path.to_string()), Value::Null, "path_unknown"),
+                None => {
+                    // No exact/suffix match.  Try a case-insensitive search so
+                    // the caller can correct a Linux case typo without another
+                    // graph traversal.
+                    let p_lower = p.to_lowercase();
+                    let near = graph.files.values().find(|f| {
+                        let rp_lower = f.relative_path.to_lowercase();
+                        rp_lower == p_lower
+                            || rp_lower
+                                .strip_suffix(p_lower.as_str())
+                                .is_some_and(|prefix| prefix.ends_with('/'))
+                    });
+                    (
+                        Value::String(p.to_string()),
+                        Value::Null,
+                        "path_unknown",
+                        near.map(|f| f.relative_path.clone()),
+                    )
+                }
             }
         }
-        None => (Value::Null, Value::Null, "no_path_scope"),
+        None => (Value::Null, Value::Null, "no_path_scope", None),
     };
-    json!({
-        "status": "no_graph_evidence",
-        "reason": reason,
-        "path": path_value,
-        "language": language_value,
-    })
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("status".to_string(), json!("no_graph_evidence"));
+    obj.insert("reason".to_string(), json!(reason));
+    obj.insert("path".to_string(), path_value);
+    obj.insert("language".to_string(), language_value);
+    if let Some(near) = case_near_match {
+        obj.insert("case_near_match".to_string(), json!(near));
+    }
+    // Surface a hint when the caller's filter contained backslashes so the
+    // slash-normalized interpretation is visible on Linux.
+    if let Some(orig) = path {
+        if orig.contains('\\') {
+            obj.insert("path_normalized_from".to_string(), json!(orig));
+        }
+    }
+    Value::Object(obj)
 }
 
 fn graph_status_for_language(language: LanguageKind) -> &'static str {
@@ -4285,6 +4349,32 @@ mod path_filter_tests {
         assert!(!path_matches_filter(
             "crates/squeezy-graph/src/lib.rs",
             "zzzznope",
+        ));
+    }
+
+    #[test]
+    fn backslash_filter_is_normalized_to_directory_prefix() {
+        // Linux bug fix: a path copied from Windows output like `src\parser`
+        // must enter strict directory-prefix mode (not bareword fuzzy) after
+        // backslash normalization.  Without normalization, `src\parser` has no
+        // `/` so it falls through to loose fuzzy matching and can admit
+        // cross-tree matches.
+        assert!(
+            path_matches_filter("src/parser/lib.rs", "src\\parser"),
+            "backslash filter should match as directory prefix"
+        );
+        assert!(
+            !path_matches_filter("src/parser_util/lib.rs", "src\\parser"),
+            "backslash filter must not bleed into directory-name substrings"
+        );
+        // Multi-segment backslash paths also normalize correctly.
+        assert!(path_matches_filter(
+            "crates/squeezy-graph/src/lib.rs",
+            "crates\\squeezy-graph\\src",
+        ));
+        assert!(!path_matches_filter(
+            "crates/squeezy-graph/tests/lib.rs",
+            "crates\\squeezy-graph\\src",
         ));
     }
 }

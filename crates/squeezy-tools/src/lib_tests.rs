@@ -10354,6 +10354,89 @@ async fn decl_search_zero_hit_no_path_scope() {
 // and the model picks its own retry tool.
 
 #[tokio::test]
+async fn decl_search_zero_hit_path_unknown_emits_case_near_match() {
+    // Linux case-sensitivity: when the exact path is not found but a
+    // case-insensitive candidate exists, the fallback includes `case_near_match`
+    // so the model can correct the typo without a second graph traversal.
+    let root = temp_workspace("graph_zero_hit_case_near");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Query with an incorrect case for the path component (`Lib.rs` vs `lib.rs`).
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "case_near".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "query": "no_such_symbol",
+                    "path": "src/Lib.rs",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
+    assert_eq!(fallback["reason"].as_str(), Some("path_unknown"));
+    // The fallback must include the case-insensitive near-match hint.
+    assert_eq!(
+        fallback["case_near_match"].as_str(),
+        Some("src/lib.rs"),
+        "expected case_near_match to point to src/lib.rs; fallback={fallback}"
+    );
+    assert!(
+        fallback.get("suggested_tools").is_none(),
+        "suggested_tools must be trimmed from the wire payload"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_backslash_path_reports_normalization_hint() {
+    // When the model supplies a Windows-style backslash path on Linux the
+    // fallback should include `path_normalized_from` showing the original
+    // backslash filter alongside the normalised forward-slash path used for
+    // matching.
+    let root = temp_workspace("graph_zero_hit_backslash");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "backslash_hint".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "query": "no_such_symbol",
+                    "path": "src\\lib.rs",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
+    // The normalized path should match the indexed file.
+    assert_eq!(
+        fallback["reason"].as_str(),
+        Some("supported_language_no_match"),
+        "normalized backslash path should resolve to the indexed file; fallback={fallback}"
+    );
+    // A normalization hint must be present showing the original backslash path.
+    assert_eq!(
+        fallback["path_normalized_from"].as_str(),
+        Some("src\\lib.rs"),
+        "path_normalized_from must preserve the original backslash filter; fallback={fallback}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn decl_search_non_empty_packets_keeps_null_fallback() {
     let root = temp_workspace("graph_fallback_null_when_hits");
     write_rust_crate(&root, "pub fn alpha() {}\n");
