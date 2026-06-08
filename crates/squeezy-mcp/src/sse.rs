@@ -122,13 +122,12 @@ impl Worker for SseClientWorker {
         );
 
         // Reconnect state: exponential back-off starting at 1 s, capped at
-        // 30 s, with a hard limit on consecutive failures. A successful
-        // reconnect (stream opens and delivers `event: endpoint`) resets the
+        // 30 s, with a hard limit on consecutive failures. The delay is
+        // computed from the attempt count so no separate mutable variable is
+        // needed. A successful reconnect (endpoint event received) resets the
         // counter. This prevents a Windows local service that exits immediately
-        // from spinning at 1 s intervals indefinitely while the session is held
-        // open by the agent.
+        // from spinning indefinitely while the session is held open by the agent.
         let mut reconnect_attempts: u32 = 0;
-        let mut reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
 
         loop {
             tokio::select! {
@@ -184,11 +183,18 @@ impl Worker for SseClientWorker {
                                     "SSE stream closed repeatedly; giving up after max reconnect attempts",
                                 ));
                             }
+                            // Compute back-off from attempt count: 1 s, 2 s,
+                            // 4 s, …, capped at SSE_RECONNECT_DELAY_MAX.
+                            let delay = {
+                                let exponent = reconnect_attempts.saturating_sub(1).min(5);
+                                (SSE_RECONNECT_DELAY_INITIAL * 2u32.pow(exponent))
+                                    .min(SSE_RECONNECT_DELAY_MAX)
+                            };
                             warn!(
                                 target: "squeezy::mcp::sse",
                                 sse_url = %self.sse_url,
                                 attempt = reconnect_attempts,
-                                delay_ms = reconnect_delay.as_millis(),
+                                delay_ms = delay.as_millis(),
                                 "SSE stream ended; reconnecting"
                             );
                             // Race the back-off sleep against cancellation so
@@ -198,9 +204,8 @@ impl Worker for SseClientWorker {
                                 _ = context.cancellation_token.cancelled() => {
                                     return Err(WorkerQuitReason::Cancelled);
                                 }
-                                _ = tokio::time::sleep(reconnect_delay) => {}
+                                _ = tokio::time::sleep(delay) => {}
                             }
-                            reconnect_delay = (reconnect_delay * 2).min(SSE_RECONNECT_DELAY_MAX);
                             let response = match self.open_stream().await {
                                 Ok(response) => response,
                                 Err(error) => {
@@ -215,12 +220,11 @@ impl Worker for SseClientWorker {
                                 Ok(new_endpoint) => {
                                     endpoint_url = new_endpoint;
                                     // The server is reachable again: reset the
-                                    // backoff state now, not only after a
-                                    // message arrives. Servers that never push
-                                    // proactively (only reply to calls) would
-                                    // otherwise never reset the counter.
+                                    // attempt counter so the next stream drop
+                                    // starts back-off from 1 s. Servers that
+                                    // never push proactively (only reply to
+                                    // tool calls) benefit from this reset too.
                                     reconnect_attempts = 0;
-                                    reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
                                 }
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
