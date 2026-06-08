@@ -213,7 +213,7 @@ pub(crate) fn is_linux_sandbox_sensitive(user_input: &str) -> bool {
         .collect();
     LINUX_SANDBOX_SENSITIVE_WORDS
         .iter()
-        .any(|term| words.iter().any(|w| *w == *term))
+        .any(|term| words.contains(term))
 }
 
 const AMBIGUITY_MARKERS: &[&str] = &[
