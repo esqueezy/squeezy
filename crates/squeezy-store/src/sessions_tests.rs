@@ -2892,24 +2892,32 @@ fn recall_returns_none_when_max_bytes_zero_or_missing() {
 #[test]
 fn memory_path_is_none_when_home_unset() {
     let _guard = HOME_LOCK.lock().expect("HOME lock");
-    let previous = std::env::var_os("HOME");
+    let previous_home = std::env::var_os("HOME");
+    // On Windows memory_path falls back to USERPROFILE when HOME is absent,
+    // so we must clear that too to reach the "no home directory" case.
+    let previous_userprofile = std::env::var_os("USERPROFILE");
     unsafe {
         std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
     }
     let path = SessionStore::memory_path();
     let recall = SessionStore::recall(8_192);
     let remember = SessionStore::remember("unused");
     unsafe {
-        match previous {
+        match previous_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        match previous_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
     }
-    assert!(path.is_none(), "HOME unset means no memory path");
-    assert!(recall.is_none(), "HOME unset means no recall body");
+    assert!(path.is_none(), "no home variables means no memory path");
+    assert!(recall.is_none(), "no home variables means no recall body");
     assert!(
         remember.is_err(),
-        "remember fails loudly when HOME is unset"
+        "remember fails loudly when no home directory is available"
     );
 }
 
