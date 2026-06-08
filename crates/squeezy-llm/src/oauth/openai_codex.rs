@@ -76,6 +76,13 @@ pub const OPENAI_CODEX_AUTH_FILE_NAME: &str = "openai-codex.json";
 /// keeps the next provider request from racing the expiry.
 const REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 
+/// How long to wait for the OAuth browser callback before giving up.
+/// Five minutes is generous enough for a user who needs to log in on
+/// another machine or navigate a consent screen, while still preventing
+/// the local TCP listener from holding a Linux TTY session open
+/// indefinitely when the browser flow was abandoned.
+const CODEX_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Number of random bytes the PKCE verifier and OAuth state nonce
 /// consume. RFC 7636 §4.1 recommends 32 bytes for the verifier so the
 /// base64url-encoded form lands at 43 chars; the state nonce uses 16
@@ -138,7 +145,29 @@ pub fn default_codex_auth_path() -> Option<PathBuf> {
 /// missing; surfaces a typed error for malformed JSON or filesystem
 /// trouble so the caller can fail loudly instead of silently logging
 /// the user out.
+///
+/// On Unix, refuses to read files that are group- or world-readable,
+/// matching the same defensive posture applied to the API-key
+/// credentials file in `credentials.rs`.
 pub fn load_codex_token(path: &Path) -> Result<Option<OpenAiCodexTokenSet>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    return Err(SqueezyError::ProviderNotConfigured(format!(
+                        "codex auth file {} has permissions {mode:03o}; \
+                         refusing to read (chmod 600 to enable)",
+                        path.display()
+                    )));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {}
+        }
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -609,7 +638,31 @@ where
 /// state and extract the `code` query parameter. Closes the socket
 /// after a one-shot HTML response so the browser tab can be safely
 /// closed by the user.
+///
+/// Bounded by [`CODEX_CALLBACK_TIMEOUT`] so an abandoned browser
+/// session or a headless Linux environment where no browser ever
+/// opens cannot leave a listening socket holding the TTY indefinitely.
 async fn wait_for_callback_code(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<String> {
+    timeout(
+        CODEX_CALLBACK_TIMEOUT,
+        wait_for_callback_code_inner(listener, expected_state),
+    )
+    .await
+    .map_err(|_| {
+        SqueezyError::ProviderNotConfigured(format!(
+            "OpenAI Codex OAuth callback timed out after {} seconds; \
+             re-run `squeezy auth codex login` to start a new session",
+            CODEX_CALLBACK_TIMEOUT.as_secs()
+        ))
+    })?
+}
+
+/// Inner loop for [`wait_for_callback_code`]: accepts connections until
+/// a valid OAuth callback arrives.
+async fn wait_for_callback_code_inner(
     listener: tokio::net::TcpListener,
     expected_state: &str,
 ) -> Result<String> {
