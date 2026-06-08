@@ -10306,10 +10306,12 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
     )?;
     // Warn when HOME is unset so user/project/skills paths that fell back to
     // process-relative locations do not silently misbehave in containers,
-    // systemd units, or CI environments.
+    // systemd units, or CI environments. Skip the warning when the operator
+    // already set SQUEEZY_SETTINGS_PATH, which is the documented escape hatch
+    // for HOME-less environments — warning in that case is a false positive.
     #[cfg(unix)]
     {
-        if env::var_os("HOME").is_none() {
+        if env::var_os("HOME").is_none() && env::var_os("SQUEEZY_SETTINGS_PATH").is_none() {
             warnings.push(ConfigWarning {
                 source: "environment".to_string(),
                 field: format!(
@@ -10482,11 +10484,17 @@ pub struct ConfigPaths {
     pub project_settings: Option<PathBuf>,
     /// Per-machine repo-local settings (`~/.squeezy/projects/<hash>/settings.toml`).
     pub repo_settings: PathBuf,
-    /// Directory where session JSONL logs are written (may be `None` when using defaults).
+    /// Session log directory as overridden by `SQUEEZY_SESSION_DIR`. `None` when the
+    /// env var is not set; note that `[session].log_dir` from TOML is **not** reflected
+    /// here. For the fully resolved log directory, see `AppConfig.session_logs.log_dir`.
     pub session_log_dir: Option<PathBuf>,
-    /// Primary user skills directory.
+    /// Default user skills directory (HOME-based or platform data dir).
+    /// Does not reflect `SQUEEZY_SKILLS_USER_DIR` or `[skills].user_dir` TOML overrides.
+    /// For the effective runtime value, see `AppConfig.skills`.
     pub squeezy_skills_dir: PathBuf,
-    /// Secondary agent-compat skills directory.
+    /// Default agent-compat skills directory (HOME-based or platform data dir).
+    /// Does not reflect `SQUEEZY_SKILLS_COMPAT_USER_DIR` overrides.
+    /// For the effective runtime value, see `AppConfig.skills`.
     pub agent_compat_skills_dir: PathBuf,
     /// Prompt-history ring file.
     pub prompt_history: PathBuf,
@@ -10506,9 +10514,12 @@ pub fn resolved_config_paths() -> ConfigPaths {
     let home_set = home.is_some();
 
     let user_settings = default_settings_path();
+    // Mirror the branch order in default_settings_path() so the source tag is
+    // accurate. On non-Unix, home_squeezy_subpath() always returns None, so
+    // HOME being set does not actually steer the path to the dotdir branch.
     let user_settings_source = if env::var_os("SQUEEZY_SETTINGS_PATH").is_some() {
         "env"
-    } else if home_set {
+    } else if cfg!(unix) && home_set {
         "home"
     } else if dirs::config_dir().is_some() {
         "xdg"

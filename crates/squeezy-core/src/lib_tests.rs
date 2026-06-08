@@ -5953,6 +5953,13 @@ fn session_metrics_merge_turn_folds_model_ledger() {
 
 // ── Linux/Unix path and settings tests ────────────────────────────────────────
 
+// Mutex protecting all tests that mutate process-wide environment variables.
+// The Rust test harness runs tests in a thread pool; env mutations without
+// synchronisation are a data race (std::env::set_var is not thread-safe in
+// Rust 1.80+). Hold this lock for the entire duration of any test that calls
+// set_var / remove_var.
+static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn expand_home_path_expands_tilde_slash() {
     // Verify that expand_home_path handles the ~/rest pattern used by
@@ -5987,7 +5994,7 @@ fn expand_home_path_bare_tilde() {
 #[test]
 fn resolved_config_paths_returns_absolute_user_settings_when_home_set() {
     // Smoke-test: when HOME is present the returned user settings path
-    // should be absolute (begins with the HOME prefix or another absolute).
+    // should be absolute.
     if std::env::var_os("HOME").is_some() {
         let paths = resolved_config_paths();
         assert!(
@@ -6010,8 +6017,7 @@ fn resolved_config_paths_home_field_matches_env() {
 
 #[test]
 fn session_log_dir_env_tilde_is_expanded() {
-    // The env-var closure path (used by tests and the real CLI) should
-    // expand a leading '~' in SQUEEZY_SESSION_DIR.
+    // The env-var closure path should expand a leading '~' in SQUEEZY_SESSION_DIR.
     let config =
         AppConfig::from_settings_and_env_vars(SettingsFile::default(), |name| match name {
             "SQUEEZY_SESSION_DIR" => Some("~/sessions".to_string()),
@@ -6028,10 +6034,27 @@ fn session_log_dir_env_tilde_is_expanded() {
 }
 
 #[test]
+fn default_squeezy_skills_dir_is_absolute_when_home_or_data_dir_available() {
+    // When either HOME or dirs::data_dir() is available, skills dirs should
+    // resolve to absolute paths so they don't bind to process cwd.
+    // This covers the spec bug: HOME-absent fallback to relative path.
+    if std::env::var_os("HOME").is_some() || dirs::data_dir().is_some() {
+        let skills = default_squeezy_skills_dir();
+        assert!(
+            skills.is_absolute(),
+            "squeezy skills dir should be absolute when HOME or data_dir is available, got {skills:?}"
+        );
+        let compat = default_agent_compat_skills_dir();
+        assert!(
+            compat.is_absolute(),
+            "agent compat skills dir should be absolute when HOME or data_dir is available, got {compat:?}"
+        );
+    }
+}
+
+#[test]
 fn check_settings_file_permissions_does_not_panic() {
-    // A path that doesn't exist should not produce any issues and must
-    // not panic. We can't assert the result is empty (the real user
-    // settings may exist with loose perms) but we confirm no panics.
+    // Verify the function handles missing files gracefully (no panic).
     let _ = check_settings_file_permissions();
 }
 
@@ -6042,16 +6065,15 @@ fn check_settings_file_permissions_detects_world_readable_file() {
     let tmp = std::env::temp_dir().join(format!("squeezy-perm-test-{}.toml", std::process::id()));
     std::fs::write(&tmp, b"[model]\n").unwrap();
     let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
-    // Set world-readable (0o644).
     perms.set_mode(0o644);
     std::fs::set_permissions(&tmp, perms).unwrap();
 
-    // Temporarily redirect user settings path via env so the checker
-    // picks up our test file. SAFETY: test binary is single-threaded by
-    // default; this env mutation is restored before returning.
+    // Hold the env mutex for the duration of the env mutation.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", tmp.to_str().unwrap()) };
     let issues = check_settings_file_permissions();
     unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
     let _ = std::fs::remove_file(&tmp);
 
     assert!(
@@ -6067,31 +6089,22 @@ fn check_settings_file_permissions_detects_world_readable_file() {
 
 #[test]
 fn config_warning_emitted_for_squeezy_session_dir_with_tilde() {
-    // The load_default_settings_sources path adds a ConfigWarning when
-    // SQUEEZY_SESSION_DIR starts with '~'. We verify this via the
-    // from_settings_and_env_vars closure path which mirrors the same
-    // warning-emitting logic.
-    //
-    // Note: the closure-based path does not exercise load_default_settings_sources
-    // directly, but the underlying expand_home_path fix and the tilde
-    // expansion are both tested by session_log_dir_env_tilde_is_expanded.
-    // This test exercises the warning via from_env_and_settings when
-    // SQUEEZY_SESSION_DIR is in the real env.
-    // SAFETY: test binary is single-threaded by default.
+    // Hold the env mutex for the duration of the env mutation.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "~/sessions") };
     let result = AppConfig::from_env_and_settings();
     unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
-    // from_env_and_settings may fail if no settings file exists in CI;
-    // that's fine — we just verify no panic and the warning structure.
-    if let Ok(config) = result {
-        let has_warning = config
-            .config_warnings
-            .iter()
-            .any(|w| w.source == "SQUEEZY_SESSION_DIR" && w.field.contains("starts with '~'"));
-        assert!(
-            has_warning,
-            "expected a ConfigWarning for SQUEEZY_SESSION_DIR with tilde, got: {:?}",
-            config.config_warnings
-        );
-    }
+    drop(_env_guard);
+
+    let config =
+        result.expect("from_env_and_settings should not fail when no settings file is present");
+    let has_warning = config
+        .config_warnings
+        .iter()
+        .any(|w| w.source == "SQUEEZY_SESSION_DIR" && w.field.contains("starts with '~'"));
+    assert!(
+        has_warning,
+        "expected a ConfigWarning for SQUEEZY_SESSION_DIR with tilde, got: {:?}",
+        config.config_warnings
+    );
 }
