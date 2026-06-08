@@ -425,6 +425,84 @@ fn checkpoint_rollback_restores_raw_crlf_worktree_bytes_despite_gitattributes() 
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn checkpoint_capture_skips_symlinked_workspace_entries() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("checkpoint_skip_symlinks");
+    let outside = temp_repo("checkpoint_skip_symlinks_outside");
+    fs::write(root.join("real.txt"), "real\n").expect("write real file");
+    fs::write(outside.join("outside.txt"), "outside\n").expect("write outside file");
+    fs::create_dir(outside.join("dir")).expect("create outside dir");
+    fs::write(outside.join("dir").join("nested.txt"), "nested\n").expect("write nested file");
+    symlink(outside.join("outside.txt"), root.join("linked.txt")).expect("symlink file");
+    symlink(outside.join("dir"), root.join("linked-dir")).expect("symlink dir");
+
+    let mut entries = Vec::new();
+    collect_workspace_file_entries(&root, &root, &mut entries).expect("collect workspace files");
+    let paths = entries
+        .iter()
+        .map(|entry| entry.rel.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, vec!["real.txt"]);
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_conflicts_on_symlink_replacement_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("checkpoint_rollback_symlink_replacement");
+    let outside = temp_repo("checkpoint_rollback_symlink_outside");
+    fs::write(root.join("a.txt"), "before\n").expect("write a");
+    fs::write(outside.join("target.txt"), "agent\n").expect("write outside target");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), "agent\n").expect("agent edit");
+    store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::remove_file(root.join("a.txt")).expect("remove a");
+    symlink(outside.join("target.txt"), root.join("a.txt")).expect("replace with symlink");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback latest");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(
+        rollback.conflicts[0].reason_code,
+        Some(RollbackConflictReason::ReparsePoint)
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("target.txt")).unwrap(),
+        "agent\n"
+    );
+    assert_eq!(
+        fs::read_link(root.join("a.txt")).expect("a remains symlink"),
+        outside.join("target.txt")
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
 #[test]
 fn atomic_rollback_leaves_all_files_unchanged_when_any_file_conflicts() {
     let root = temp_repo("checkpoint_atomic");

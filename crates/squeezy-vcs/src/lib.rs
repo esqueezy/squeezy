@@ -358,6 +358,7 @@ pub enum RollbackConflictReason {
     WouldBlock,
     ReadOnly,
     FileInUse,
+    ReparsePoint,
     Filesystem,
     ShadowRefreshFailed,
 }
@@ -1273,18 +1274,16 @@ impl CheckpointStore {
             }))?;
             return Ok(result);
         }
-        if mode == RollbackMode::Atomic {
-            result
-                .conflicts
-                .extend(self.preflight_filesystem_conflicts(&selected, &result.conflicts)?);
-            if !result.conflicts.is_empty() {
-                self.append_journal(json!({
-                    "kind": "rollback",
-                    "created_at_ms": now_ms(),
-                    "result": result,
-                }))?;
-                return Ok(result);
-            }
+        result
+            .conflicts
+            .extend(self.preflight_filesystem_conflicts(&selected, &result.conflicts)?);
+        if mode == RollbackMode::Atomic && !result.conflicts.is_empty() {
+            self.append_journal(json!({
+                "kind": "rollback",
+                "created_at_ms": now_ms(),
+                "result": result,
+            }))?;
+            return Ok(result);
         }
         for record in &selected {
             self.rollback_record(record, &mut result);
@@ -1493,28 +1492,44 @@ impl CheckpointStore {
                     Some(hash) => hash.clone(),
                     None => {
                         let path = self.root.join(&file.path);
-                        if path.exists() {
-                            match fs::read(&path) {
-                                Ok(bytes) => {
-                                    let hash = Some(sha256_hex(&bytes));
-                                    virtual_hashes.insert(identity.clone(), hash.clone());
-                                    hash
-                                }
-                                Err(err) => {
-                                    // Convert IO error to a conflict rather than aborting,
-                                    // so BestEffort rollback can continue past locked files.
-                                    conflicts.push(filesystem_rollback_conflict(
-                                        &record.id,
-                                        &file.path,
-                                        err,
-                                        "read for preflight hash",
-                                    ));
+                        match fs::symlink_metadata(&path) {
+                            Ok(metadata) => {
+                                if metadata_is_reparse_or_symlink(&metadata) {
+                                    conflicts.push(reparse_point_conflict(&record.id, &file.path));
                                     continue;
                                 }
+                                match fs::read(&path) {
+                                    Ok(bytes) => {
+                                        let hash = Some(sha256_hex(&bytes));
+                                        virtual_hashes.insert(identity.clone(), hash.clone());
+                                        hash
+                                    }
+                                    Err(err) => {
+                                        // Convert IO error to a conflict rather than aborting,
+                                        // so BestEffort rollback can continue past locked files.
+                                        conflicts.push(filesystem_rollback_conflict(
+                                            &record.id,
+                                            &file.path,
+                                            err,
+                                            "read for preflight hash",
+                                        ));
+                                        continue;
+                                    }
+                                }
                             }
-                        } else {
-                            virtual_hashes.insert(identity.clone(), None);
-                            None
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                virtual_hashes.insert(identity.clone(), None);
+                                None
+                            }
+                            Err(err) => {
+                                conflicts.push(filesystem_rollback_conflict(
+                                    &record.id,
+                                    &file.path,
+                                    err,
+                                    "inspect for preflight hash",
+                                ));
+                                continue;
+                            }
                         }
                     }
                 };
@@ -1569,8 +1584,7 @@ impl CheckpointStore {
                         from_path,
                     ) {
                         Ok(bytes) => {
-                            let restore_path = self.root.join(from_path);
-                            if let Err(err) = write_rollback_file(&restore_path, &bytes) {
+                            if let Err(err) = write_rollback_file(&self.root, from_path, &bytes) {
                                 result.conflicts.push(filesystem_rollback_conflict(
                                     &record.id,
                                     from_path,
@@ -1595,7 +1609,7 @@ impl CheckpointStore {
                 &file.path,
             ) {
                 Ok(bytes) => {
-                    if let Err(err) = write_rollback_file(&path, &bytes) {
+                    if let Err(err) = write_rollback_file(&self.root, &file.path, &bytes) {
                         result.conflicts.push(filesystem_rollback_conflict(
                             &record.id,
                             &file.path,
@@ -1721,7 +1735,7 @@ impl CheckpointStore {
                 for path in rollback_write_paths(file) {
                     let absolute = self.root.join(&path);
                     if let Some(conflict) =
-                        filesystem_preflight_conflict(&record.id, &path, &absolute)
+                        filesystem_preflight_conflict(&record.id, &path, &self.root, &absolute)
                     {
                         conflicts.push(conflict);
                     }
@@ -2455,13 +2469,17 @@ fn cleanup_stale_shadow_dirs(checkpoints_dir: &Path, retention_days: u64) {
         ) {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
         let Ok(modified) = metadata.modified() else {
             continue;
         };
         if modified >= cutoff {
+            continue;
+        }
+        if metadata_is_reparse_or_symlink(&metadata) {
+            let _ = fs::remove_file(&path).or_else(|_| fs::remove_dir(&path));
             continue;
         }
         if metadata.is_dir() {
@@ -2556,7 +2574,10 @@ fn collect_workspace_file_entries(
         {
             continue;
         }
-        let metadata = entry.metadata()?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata_is_reparse_or_symlink(&metadata) {
+            continue;
+        }
         if metadata.is_dir() {
             collect_workspace_file_entries(root, &path, entries)?;
         } else if metadata.is_file() {
@@ -2594,37 +2615,52 @@ fn rollback_before_virtual_hash(file: &CheckpointFile) -> Option<String> {
 fn filesystem_preflight_conflict(
     checkpoint_id: &str,
     path: &str,
+    root: &Path,
     absolute: &Path,
 ) -> Option<RollbackConflict> {
-    if let Ok(metadata) = fs::metadata(absolute) {
-        if metadata.permissions().readonly() {
-            return Some(RollbackConflict {
-                checkpoint_id: checkpoint_id.to_string(),
-                path: path.to_string(),
-                expected_sha256: None,
-                current_sha256: None,
-                expected_hash_basis: None,
-                current_hash_basis: None,
-                reason_code: Some(RollbackConflictReason::ReadOnly),
-                retryable: true,
-                reason: windows_retry_message(
-                    "file is read-only; rollback would not be able to overwrite or delete it",
-                ),
-            });
+    if let Some(conflict) = reparse_path_conflict(checkpoint_id, path, root, absolute) {
+        return Some(conflict);
+    }
+    match fs::symlink_metadata(absolute) {
+        Ok(metadata) => {
+            if metadata.permissions().readonly() {
+                return Some(RollbackConflict {
+                    checkpoint_id: checkpoint_id.to_string(),
+                    path: path.to_string(),
+                    expected_sha256: None,
+                    current_sha256: None,
+                    expected_hash_basis: None,
+                    current_hash_basis: None,
+                    reason_code: Some(RollbackConflictReason::ReadOnly),
+                    retryable: true,
+                    reason: windows_retry_message(
+                        "file is read-only; rollback would not be able to overwrite or delete it",
+                    ),
+                });
+            }
+            if metadata.is_file()
+                && let Err(err) = OpenOptions::new().write(true).open(absolute)
+            {
+                return Some(filesystem_rollback_conflict(
+                    checkpoint_id,
+                    path,
+                    err,
+                    "preflight file writability",
+                ));
+            }
         }
-        if metadata.is_file()
-            && let Err(err) = OpenOptions::new().write(true).open(absolute)
-        {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
             return Some(filesystem_rollback_conflict(
                 checkpoint_id,
                 path,
                 err,
-                "preflight file writability",
+                "preflight path metadata",
             ));
         }
+        Err(_) => {}
     }
     if let Some(parent) = absolute.parent()
-        && let Some(conflict) = parent_writability_conflict(checkpoint_id, path, parent)
+        && let Some(conflict) = parent_writability_conflict(checkpoint_id, path, root, parent)
     {
         return Some(conflict);
     }
@@ -2634,13 +2670,30 @@ fn filesystem_preflight_conflict(
 fn parent_writability_conflict(
     checkpoint_id: &str,
     path: &str,
+    root: &Path,
     parent: &Path,
 ) -> Option<RollbackConflict> {
     let mut current = parent;
-    while !current.exists() {
-        current = current.parent()?;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                current = current.parent()?;
+            }
+            Err(err) => {
+                return Some(filesystem_rollback_conflict(
+                    checkpoint_id,
+                    path,
+                    err,
+                    "preflight parent metadata",
+                ));
+            }
+        }
     }
-    let metadata = fs::metadata(current).ok()?;
+    if let Some(conflict) = reparse_path_conflict(checkpoint_id, path, root, current) {
+        return Some(conflict);
+    }
+    let metadata = fs::symlink_metadata(current).ok()?;
     if metadata.permissions().readonly() {
         return Some(RollbackConflict {
             checkpoint_id: checkpoint_id.to_string(),
@@ -2659,7 +2712,13 @@ fn parent_writability_conflict(
     None
 }
 
-fn write_rollback_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_rollback_file(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let path = root.join(rel);
+    if reparse_path_conflict("rollback", rel, root, &path).is_some() {
+        return Err(std::io::Error::other(
+            "refusing to follow symlink or reparse point during rollback",
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2707,6 +2766,71 @@ fn checkpoint_object_conflict(checkpoint_id: &str, path: &str, err: String) -> R
         retryable: false,
         reason: format!("checkpoint object is missing; leaving current content untouched: {err}"),
     }
+}
+
+fn reparse_path_conflict(
+    checkpoint_id: &str,
+    path: &str,
+    root: &Path,
+    absolute: &Path,
+) -> Option<RollbackConflict> {
+    let relative = absolute.strip_prefix(root).ok()?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata_is_reparse_or_symlink(&metadata) {
+                    return Some(reparse_point_conflict(checkpoint_id, path));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Some(filesystem_rollback_conflict(
+                    checkpoint_id,
+                    path,
+                    err,
+                    "inspect path for reparse point",
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn reparse_point_conflict(checkpoint_id: &str, path: &str) -> RollbackConflict {
+    RollbackConflict {
+        checkpoint_id: checkpoint_id.to_string(),
+        path: path.to_string(),
+        expected_sha256: None,
+        current_sha256: None,
+        expected_hash_basis: None,
+        current_hash_basis: None,
+        reason_code: Some(RollbackConflictReason::ReparsePoint),
+        retryable: false,
+        reason: "path is a symlink or filesystem reparse point; rollback will not follow it"
+            .to_string(),
+    }
+}
+
+fn metadata_is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    metadata_has_windows_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn metadata_has_windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_has_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn rollback_io_reason(err: &std::io::Error) -> RollbackConflictReason {
@@ -2776,9 +2900,12 @@ fn collect_gitattributes_inner(root: &Path, dir: &Path, paths: &mut Vec<String>)
         {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
+        if metadata_is_reparse_or_symlink(&metadata) {
+            continue;
+        }
         if metadata.is_dir() {
             collect_gitattributes_inner(root, &path, paths);
         } else if metadata.is_file() && name.to_str() == Some(".gitattributes") {
