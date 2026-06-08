@@ -1290,6 +1290,65 @@ fn project_init_target_resolves_ancestor_then_falls_back_to_cwd() {
 }
 
 #[test]
+fn config_explain_matches_concrete_wildcard_field_paths() {
+    let exact = find_config_field_for_path(&["model", "provider"]).expect("exact field");
+    assert_eq!(exact.toml_path, ["model", "provider"]);
+
+    let provider = find_config_field_for_path(&["providers", "openai", "cheap_model"])
+        .expect("provider field");
+    assert_eq!(provider.toml_path, ["providers", "*", "cheap_model"]);
+
+    let model_limit =
+        find_config_field_for_path(&["model_limits", "openai:gpt-5.5", "context_window"])
+            .expect("model limit field");
+    assert_eq!(
+        model_limit.toml_path,
+        ["model_limits", "*", "context_window"]
+    );
+
+    assert!(find_config_field_for_path(&["providers", "openai"]).is_none());
+}
+
+#[test]
+fn config_explain_resolves_wildcard_sources_with_concrete_path() {
+    use squeezy_core::{SeparatedSources, TierSource, config_schema::FieldSource};
+
+    let user_doc = "[providers.openai]\ncheap_model = \"user-mini\"\n"
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse user doc");
+    let repo_doc = "[providers.openai]\ncheap_model = \"local-mini\"\n"
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse local doc");
+    let sources = SeparatedSources {
+        user: Some(TierSource {
+            path: std::path::PathBuf::from("user.toml"),
+            doc: user_doc,
+        }),
+        project: None,
+        repo: Some(TierSource {
+            path: std::path::PathBuf::from("local.toml"),
+            doc: repo_doc,
+        }),
+        user_path_default: std::path::PathBuf::from("user.toml"),
+        project_path_default: std::path::PathBuf::from("squeezy.toml"),
+        repo_path_default: std::path::PathBuf::from("local.toml"),
+    };
+
+    let requested = ["providers", "openai", "cheap_model"];
+    let field = find_config_field_for_path(&requested).expect("provider field");
+    assert_eq!(
+        resolve_explain_field_source(&sources, field, &requested),
+        FieldSource::Repo
+    );
+
+    let other_provider = ["providers", "anthropic", "cheap_model"];
+    assert_eq!(
+        resolve_explain_field_source(&sources, field, &other_provider),
+        FieldSource::Default
+    );
+}
+
+#[test]
 fn skills_upsert_entry_inserts_when_no_match() {
     let mut entries = toml_edit::ArrayOfTables::new();
     let selector = SkillsSelector {

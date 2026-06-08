@@ -1089,16 +1089,9 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             Ok(())
         }
         Some(ConfigCommand::Explain { field: field_path }) => {
-            use squeezy_core::{
-                config_schema::{CONFIG_SECTIONS, FieldSource},
-                load_separated_settings_sources, resolve_field_source,
-            };
-            let parts: Vec<&str> = field_path.splitn(10, '.').collect();
-            let found = CONFIG_SECTIONS
-                .iter()
-                .flat_map(|s| s.fields.iter())
-                .find(|f| f.toml_path == parts.as_slice());
-            let Some(field_meta) = found else {
+            use squeezy_core::{config_schema::FieldSource, load_separated_settings_sources};
+            let parts: Vec<&str> = field_path.split('.').collect();
+            let Some(field_meta) = find_config_field_for_path(&parts) else {
                 return Err(SqueezyError::Config(format!(
                     "unknown config field {field_path:?}; \
                      use `squeezy config schema` to list all fields"
@@ -1108,7 +1101,7 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             let effective_value = (field_meta.get)(&config).as_display();
             let sources = load_separated_settings_sources()
                 .map_err(|e| SqueezyError::Config(format!("failed to load settings tiers: {e}")))?;
-            let winning_source = resolve_field_source(&sources, field_meta);
+            let winning_source = resolve_explain_field_source(&sources, field_meta, &parts);
             let source_path = match winning_source {
                 FieldSource::Env => field_meta
                     .env_override
@@ -1153,7 +1146,7 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
                 if src == winning_source {
                     continue;
                 }
-                if tier.is_some_and(|t| t.contains_path(field_meta.toml_path)) {
+                if tier.is_some_and(|t| t.contains_path(&parts)) {
                     if !printed_header {
                         println!("shadowed:");
                         printed_header = true;
@@ -1202,6 +1195,55 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             Ok(())
         }
     }
+}
+
+fn find_config_field_for_path(
+    requested_path: &[&str],
+) -> Option<&'static squeezy_core::config_schema::FieldMeta> {
+    use squeezy_core::config_schema::CONFIG_SECTIONS;
+
+    CONFIG_SECTIONS
+        .iter()
+        .flat_map(|s| s.fields.iter())
+        .find(|field| config_field_path_matches(field.toml_path, requested_path))
+}
+
+fn config_field_path_matches(schema_path: &[&str], requested_path: &[&str]) -> bool {
+    schema_path.len() == requested_path.len()
+        && schema_path
+            .iter()
+            .zip(requested_path.iter())
+            .all(|(schema, requested)| *schema == "*" || schema == requested)
+}
+
+fn resolve_explain_field_source(
+    sources: &squeezy_core::SeparatedSources,
+    field: &squeezy_core::config_schema::FieldMeta,
+    requested_path: &[&str],
+) -> squeezy_core::config_schema::FieldSource {
+    use squeezy_core::config_schema::FieldSource;
+
+    if let Some(var_name) = field.env_override
+        && std::env::var(var_name).is_ok()
+    {
+        return FieldSource::Env;
+    }
+    if let Some(repo) = &sources.repo
+        && repo.contains_path(requested_path)
+    {
+        return FieldSource::Repo;
+    }
+    if let Some(project) = &sources.project
+        && project.contains_path(requested_path)
+    {
+        return FieldSource::Project;
+    }
+    if let Some(user) = &sources.user
+        && user.contains_path(requested_path)
+    {
+        return FieldSource::User;
+    }
+    FieldSource::Default
 }
 
 /// Reads `path` and returns each non-comment line that has a string value
