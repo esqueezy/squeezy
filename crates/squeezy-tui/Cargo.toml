@@ -23,6 +23,7 @@ testing = []
 [dependencies]
 ansi-to-tui.workspace = true
 crossterm.workspace = true
+dirs.workspace = true
 ignore.workspace = true
 lru.workspace = true
 pulldown-cmark.workspace = true

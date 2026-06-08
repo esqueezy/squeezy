@@ -20,17 +20,27 @@ use crate::render::palette::{footer_fg, muted_fg};
 
 const MCP_STATUS_COLUMN_WIDTH: usize = 36;
 
-/// Pretty-print an absolute config path: replace `$HOME` with `~` so the
-/// tab subtitle stays compact, while still surfacing the per-machine
+/// Pretty-print an absolute config path: replace the home directory with `~`
+/// so the tab subtitle stays compact, while still surfacing the per-machine
 /// project hash for the Local tier so the user can grep `~/.squeezy/projects/`
 /// for the exact directory.
+///
+/// Uses `$HOME` first for Unix compatibility; falls back to `dirs::home_dir()`
+/// so Windows paths under `%USERPROFILE%` also shorten correctly.
 fn display_path(path: &std::path::Path) -> String {
     let full = path.display().to_string();
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-        && let Some(rest) = full.strip_prefix(&home)
-    {
-        return format!("~{rest}");
+    let home_candidate = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir);
+    if let Some(home) = home_candidate {
+        let home_str = home.display().to_string();
+        if !home_str.is_empty() {
+            if let Some(rest) = full.strip_prefix(&home_str) {
+                return format!("~{rest}");
+            }
+        }
     }
     full
 }
