@@ -141,10 +141,10 @@ impl SessionStore {
         fs::create_dir_all(&self.root)?;
         let path = self.calibration_path();
         let new_bytes = serde_json::to_vec_pretty(calibration).map_err(json_error)?;
-        if let Ok(existing) = fs::read(&path) {
-            if existing == new_bytes {
-                return Ok(());
-            }
+        if let Ok(existing) = fs::read(&path)
+            && existing == new_bytes
+        {
+            return Ok(());
         }
         write_json(&path, calibration)
     }
