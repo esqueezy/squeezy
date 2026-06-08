@@ -2306,7 +2306,6 @@ async fn completed_transcript_is_plan_free_after_stream_extraction() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -2366,7 +2365,6 @@ async fn unterminated_proposed_plan_block_does_not_duplicate_at_completion() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10001,7 +9999,6 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10050,7 +10047,6 @@ async fn successful_edit_turn_hides_undo_hint_when_checkpointing_disabled() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10093,7 +10089,6 @@ async fn readonly_turn_does_not_push_undo_hint() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10141,7 +10136,6 @@ async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10258,7 +10252,6 @@ async fn completion_clears_cancelled_prompt() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10471,7 +10464,6 @@ async fn send_completed_with_estimate(app: &mut TuiApp, turn: u64, estimate: Con
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10699,7 +10691,6 @@ async fn completed_event_preserves_scroll_offset_in_history() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10755,7 +10746,6 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10816,7 +10806,6 @@ async fn completed_event_keeps_substantive_assistant_summary_after_tool_output()
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10887,7 +10876,6 @@ async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -13632,7 +13620,6 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -13670,7 +13657,6 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -13713,7 +13699,6 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send completed");

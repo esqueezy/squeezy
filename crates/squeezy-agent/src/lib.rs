@@ -5277,7 +5277,6 @@ async fn complete_squeezy_help_turn(
             stop_reason: None,
             reasoning_only_stop: false,
             session_cost: None,
-            early_stop_reason: None,
         })
         .await;
 }
@@ -5483,7 +5482,6 @@ async fn complete_local_tool_turn(
             stop_reason: None,
             reasoning_only_stop: false,
             session_cost: None,
-            early_stop_reason: None,
         })
         .await;
 }
@@ -7993,7 +7991,6 @@ impl TurnRuntime {
                         stop_reason: stop_reason.clone(),
                         reasoning_only_stop,
                         session_cost: Some(broker.session_cost_snapshot()),
-                        early_stop_reason: None,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -8540,7 +8537,6 @@ impl TurnRuntime {
                         stop_reason: stop_reason.clone(),
                         reasoning_only_stop,
                         session_cost: Some(broker.session_cost_snapshot()),
-                        early_stop_reason: None,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -8639,7 +8635,6 @@ impl TurnRuntime {
                     broker.calibration.clone(),
                     stop_reason.clone(),
                     &task_title,
-                    Some("loop_guard".to_string()),
                 )
                 .await;
                 return Ok(());
@@ -8874,7 +8869,6 @@ impl TurnRuntime {
             // loop-scoped and the turn ended by hitting MAX_TOOL_ROUNDS.
             None,
             &task_title,
-            Some("max_rounds".to_string()),
         )
         .await;
         Ok(())
@@ -9239,7 +9233,6 @@ impl TurnRuntime {
         token_calibration: squeezy_llm::TokenCalibration,
         stop_reason: Option<StopReason>,
         task_title: &str,
-        early_stop_reason: Option<String>,
     ) {
         // Compose the visible answer: the model's own text first (if any),
         // then a one-line note explaining the early finish. When the model
@@ -9296,7 +9289,6 @@ impl TurnRuntime {
                 stop_reason,
                 reasoning_only_stop: false,
                 session_cost: Some(self.persisted_session_cost().await),
-                early_stop_reason,
             })
             .await;
         self.finish_turn(metrics).await;
@@ -17689,14 +17681,6 @@ pub enum AgentEvent {
         /// `CostBroker` handle (help / local-tool turns); the TUI then keeps
         /// the last known cumulative value rather than blanking.
         session_cost: Option<CostSnapshot>,
-        /// Agent-level early-stop signal separate from the provider's
-        /// `stop_reason`. Set when the turn loop itself decided to stop
-        /// early rather than the provider: e.g. `"max_rounds"`,
-        /// `"compaction_retry_exhausted"`, `"reasoning_only_retry"`.
-        /// `None` for normal content or tool-call completions. Stable
-        /// string tokens are used so eval / replay consumers can assert
-        /// without parsing prose.
-        early_stop_reason: Option<String>,
     },
     /// Emitted at most once per session, the first time the running provider
     /// cost crosses `cost_warn_percent` of the configured
