@@ -3177,6 +3177,7 @@ dependencies = [
 name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "redb",
  "serde",
  "serde_json",
