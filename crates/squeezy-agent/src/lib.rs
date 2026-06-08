@@ -14509,6 +14509,7 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
         backend,
         fallback_count,
         first_in_session,
+        fallback_reason,
     }) = shell_best_effort_fallback_from_result(result)
     else {
         return;
@@ -14521,6 +14522,7 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
             turn_id,
             backend,
             fallback_count,
+            fallback_reason,
         })
         .await;
 }
@@ -17708,11 +17710,14 @@ pub enum AgentEvent {
     /// failure, runtime sandbox_apply error, etc.). The TUI surfaces a
     /// warning so users see the degradation; the per-call telemetry counter
     /// `approval.best_effort.fallback{tool=shell}` keeps ticking on every
-    /// fallback for backend dashboards.
+    /// fallback for backend dashboards. `fallback_reason` carries the
+    /// human-readable root cause so the TUI can explain the specific failure
+    /// (e.g. spawn/pre-exec blocked, probe signal, cached unavailable).
     ShellSandboxBestEffortFallback {
         turn_id: TurnId,
         backend: String,
         fallback_count: u64,
+        fallback_reason: Option<String>,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

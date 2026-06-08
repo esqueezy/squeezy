@@ -9643,6 +9643,7 @@ async fn shell_sandbox_fallback_warns_tui_exactly_once_per_session() {
         turn_id,
         backend,
         fallback_count,
+        ..
     } = &events[0]
     else {
         panic!("expected AgentEvent::ShellSandboxBestEffortFallback");

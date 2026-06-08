@@ -11450,11 +11450,13 @@ fn prepare_sandbox_plan_with_probes(
     linux_available: bool,
 ) -> std::result::Result<ShellSandboxPlan, String> {
     let analysis = analyze_shell_command(command);
+    let health = ShellSandboxHealth::default();
     prepare_shell_sandbox_plan_with_probe(
         command,
         &analysis,
         Path::new("/tmp"),
         config,
+        &health,
         macos_available,
         linux_available,
         true,
@@ -11705,7 +11707,7 @@ fn shell_sandbox_plan_network_posture_denied_non_network() {
 
 #[test]
 #[cfg(unix)]
-fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
+fn shell_best_effort_does_not_retry_signal_exit_without_output() {
     use std::os::unix::process::ExitStatusExt;
 
     let plan = fake_sandbox_plan("macos-sandbox-exec", false);
@@ -11717,13 +11719,15 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stderr_bytes: Vec::new(),
         stderr_truncated: false,
         raw_spillover: None,
+        win_job_object_status: None,
     };
 
-    let reason =
-        shell_sandbox_direct_fallback_reason(&plan, &run).expect("best effort fallback reason");
+    let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run);
 
-    assert!(reason.contains("signal 6"), "{reason}");
-    assert!(reason.contains("best_effort"), "{reason}");
+    assert!(
+        reason.is_none(),
+        "a signal-only command result must not be retried outside the sandbox: {reason:?}"
+    );
 }
 
 #[test]
@@ -11869,6 +11873,7 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
         stderr_truncated: false,
         raw_spillover: None,
+        win_job_object_status: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)

@@ -23,8 +23,10 @@ use squeezy_core::sensitive_pattern_base;
 use squeezy_core::{ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy};
 use tokio::process::Command;
 
+#[cfg(target_os = "macos")]
+use crate::shell_exit_signal;
 use crate::shell_program::ShellProgram;
-use crate::{ShellPermissionAnalysis, ShellRunOutcome, shell_exit_signal};
+use crate::{ShellPermissionAnalysis, ShellRunOutcome};
 
 pub(crate) const SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -46,6 +48,24 @@ pub(crate) struct ShellSandboxHealth {
     /// per session, even when several shell calls in a row land on the
     /// same degraded backend. The telemetry counter above keeps ticking.
     best_effort_warning_emitted: AtomicBool,
+    /// macOS SBPL profile cache: computed once per session per `allow_network`
+    /// value (deny=index 0, allow=index 1). The profile string is
+    /// deterministic for a fixed `(root, config)` pair. **Invariant**: this
+    /// `ShellSandboxHealth` must not be shared across different roots or
+    /// across config reloads — the profile depends on `config.read_roots`,
+    /// `config.write_roots`, `config.protected_metadata_names`,
+    /// `config.sensitive_path_patterns`, and
+    /// `config.macos_socket_domain_allowlist`. The `ToolRegistry` satisfies
+    /// this invariant by constructing a fresh health instance alongside every
+    /// new `(root, shell_sandbox)` pair.
+    #[cfg(target_os = "macos")]
+    pub(crate) sbpl_profile_cache: [OnceLock<String>; 2],
+    /// Allowlisted environment map cache. `apply_shell_environment_policy`
+    /// scans all env vars and filters by the allowlist on every shell call;
+    /// since the agent process environment and the allowlist are both stable
+    /// per session, we compute this once and clone it per call instead.
+    pub(crate) preserved_env_cache:
+        OnceLock<std::collections::BTreeMap<String, std::ffi::OsString>>,
 }
 
 /// Outcome of `ShellSandboxHealth::record_best_effort_fallback`. The agent
@@ -145,12 +165,15 @@ pub(crate) struct ShellSandboxPlan {
 /// Side-table that accompanies a best_effort fallback plan. The agent
 /// reads these fields to (a) tick the `approval.best_effort.fallback`
 /// telemetry counter and (b) decide whether to publish the once-per-session
-/// TUI banner.
-#[derive(Debug, Clone, Copy)]
+/// TUI banner. `fallback_reason` is surfaced in the TUI warning so users
+/// see whether the degradation came from a probe timeout, a spawn/pre-exec
+/// error, a signal-killed probe child, or a cached-unavailable backend.
+#[derive(Debug, Clone)]
 pub(crate) struct BestEffortFallback {
     pub(crate) backend: &'static str,
     pub(crate) fallback_count: u64,
     pub(crate) first_in_session: bool,
+    pub(crate) fallback_reason: Option<String>,
 }
 
 impl ShellSandboxPlan {
@@ -191,12 +214,13 @@ impl ShellSandboxPlan {
             configured_write_roots: config.write_roots.clone(),
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
-            fallback_reason,
             best_effort_fallback: best_effort.map(|(backend, record)| BestEffortFallback {
                 backend,
                 fallback_count: record.fallback_count,
                 first_in_session: record.first_in_session,
+                fallback_reason: fallback_reason.clone(),
             }),
+            fallback_reason,
         }
     }
 
@@ -230,12 +254,12 @@ impl ShellSandboxPlan {
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
         });
-        if let Some(record) = self.best_effort_fallback
+        if let Some(record) = &self.best_effort_fallback
             && let Some(object) = payload.as_object_mut()
         {
             object.insert(
                 "best_effort_fallback".to_string(),
-                best_effort_fallback_json(record),
+                best_effort_fallback_json(record.clone()),
             );
         }
         payload
@@ -244,11 +268,14 @@ impl ShellSandboxPlan {
     /// Build the audit metadata row at the fallback EMISSION site, where
     /// the plan still references the failing backend (so `backend`,
     /// `filesystem`, etc. describe the attempt that was abandoned) but
-    /// the caller already has the counter snapshot in hand.
+    /// the caller already has the counter snapshot in hand. `reason` is the
+    /// human-readable degradation reason forwarded into `fallback_reason` so
+    /// the TUI warning can explain the root cause to the user.
     pub(crate) fn metadata_with_best_effort_fallback(
         &self,
         degraded_backend: &'static str,
         record: &ShellSandboxFallbackRecord,
+        reason: Option<&str>,
     ) -> Value {
         let mut payload = self.metadata();
         if let Some(object) = payload.as_object_mut() {
@@ -258,6 +285,7 @@ impl ShellSandboxPlan {
                     backend: degraded_backend,
                     fallback_count: record.fallback_count,
                     first_in_session: record.first_in_session,
+                    fallback_reason: reason.map(str::to_owned),
                 }),
             );
         }
@@ -290,6 +318,7 @@ fn best_effort_fallback_json(record: BestEffortFallback) -> Value {
         "backend": record.backend,
         "fallback_count": record.fallback_count,
         "first_in_session": record.first_in_session,
+        "fallback_reason": record.fallback_reason,
     })
 }
 
@@ -412,12 +441,14 @@ pub(crate) fn prepare_shell_sandbox_plan(
     analysis: &ShellPermissionAnalysis,
     root: &Path,
     config: &ShellSandboxConfig,
+    health: &ShellSandboxHealth,
 ) -> std::result::Result<ShellSandboxPlan, String> {
     prepare_shell_sandbox_plan_with_probe(
         command,
         analysis,
         root,
         config,
+        health,
         macos_sandbox_exec_supported(),
         linux_unshare_supported(),
         linux_landlock_supported(),
@@ -443,7 +474,20 @@ where
     match health.status(backend) {
         Some(ShellSandboxBackendStatus::Available) => return Ok(plan),
         Some(ShellSandboxBackendStatus::Unavailable(reason)) => {
-            return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+            if config.mode == ShellSandboxMode::Required {
+                // Required mode: deny without incrementing the fallback
+                // counter — a denial is not a best_effort degradation.
+                return Err(format!(
+                    "required shell sandbox backend {backend} unavailable: {reason}"
+                ));
+            }
+            // Tick the fallback counter even for cached-unavailable calls so
+            // the telemetry counter stays in step with every degraded shell
+            // invocation (not just the first probe failure).
+            let record = health.record_best_effort_fallback();
+            return shell_sandbox_backend_unavailable_plan(
+                command, config, backend, &reason, record,
+            );
         }
         None => {}
     }
@@ -451,30 +495,39 @@ where
     let probe_input = plan.clone();
     if let Some(reason) = probe_failure(probe_input, SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT).await {
         health.mark_unavailable(backend, reason.clone());
-        return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+        if config.mode == ShellSandboxMode::Required {
+            return Err(format!(
+                "required shell sandbox backend {backend} unavailable: {reason}"
+            ));
+        }
+        // First probe failure in best_effort mode: record and emit the
+        // session-level latch.
+        let record = health.record_best_effort_fallback();
+        return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason, record);
     }
 
     health.mark_available(backend);
     Ok(plan)
 }
 
+/// Build a best_effort fallback plan for a degraded sandbox backend.
+/// The caller is responsible for having already verified that the mode is
+/// NOT required (required-mode callers should return `Err` instead of
+/// calling this), and for having called `record_best_effort_fallback`.
 pub(crate) fn shell_sandbox_backend_unavailable_plan(
     command: &str,
     config: &ShellSandboxConfig,
     backend: &'static str,
     reason: &str,
+    record: ShellSandboxFallbackRecord,
 ) -> std::result::Result<ShellSandboxPlan, String> {
-    if config.mode == ShellSandboxMode::Required {
-        return Err(format!(
-            "required shell sandbox backend {backend} unavailable: {reason}"
-        ));
-    }
-
-    Ok(ShellSandboxPlan::direct_with_fallback(
+    let fallback_reason = shell_sandbox_backend_disabled_reason(backend, reason);
+    Ok(ShellSandboxPlan::direct_with_fallback_record(
         command,
         config.mode,
         config,
-        Some(shell_sandbox_backend_disabled_reason(backend, reason)),
+        Some(fallback_reason),
+        Some((backend, record)),
     ))
 }
 
@@ -631,11 +684,13 @@ fn windows_restricted_plan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     command: &str,
     analysis: &ShellPermissionAnalysis,
     root: &Path,
     config: &ShellSandboxConfig,
+    health: &ShellSandboxHealth,
     macos_sandbox_exec_available: bool,
     linux_unshare_available: bool,
     linux_landlock_available: bool,
@@ -644,7 +699,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     // below; reference the others so the non-matching targets (and the Windows
     // CI `clippy -D warnings` gate) don't flag them as unused.
     #[cfg(not(target_os = "macos"))]
-    let _ = macos_sandbox_exec_available;
+    let _ = (macos_sandbox_exec_available, health);
     #[cfg(not(target_os = "linux"))]
     let _ = (linux_unshare_available, linux_landlock_available);
 
@@ -684,11 +739,22 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     #[cfg(target_os = "macos")]
     {
         if macos_sandbox_exec_available {
+            // Only `allowed_approved` means the sandbox should actually open
+            // its network namespace. Both `denied` (non-network command) and
+            // `denied_classified` (network-classified but policy is
+            // deny_by_default) must keep the sandbox network-closed.
+            let allow_network = network == "allowed_approved";
+            let profile = {
+                let cache_idx = usize::from(allow_network);
+                health.sbpl_profile_cache[cache_idx]
+                    .get_or_init(|| macos_shell_sandbox_profile(root, config, allow_network))
+                    .clone()
+            };
             return Ok(ShellSandboxPlan {
                 program: "/usr/bin/sandbox-exec".to_string(),
                 args: vec![
                     "-p".to_string(),
-                    macos_shell_sandbox_profile(root, config, network != "denied"),
+                    profile,
                     "sh".to_string(),
                     "-lc".to_string(),
                     command.to_string(),
@@ -945,7 +1011,8 @@ pub(crate) fn macos_shell_sandbox_profile(
         // WindowServer, etc. via `nc -U`. Each allowed entry is matched
         // as a path subpath so prefixes like `/private/tmp/agent.sock`
         // cover sockets created beneath them.
-        for entry in MACOS_AF_UNIX_ALLOWLIST {
+        // Use the per-config allowlist (promoted from the old empty constant).
+        for entry in &config.macos_socket_domain_allowlist {
             let escaped = sandbox_profile_string(entry);
             profile.push_str(&format!(
                 "(allow network* (local unix-socket (subpath {escaped})))\n"
@@ -958,14 +1025,8 @@ pub(crate) fn macos_shell_sandbox_profile(
     profile
 }
 
-/// Subpath-qualified AF_UNIX socket allowlist used when the network
-/// posture is denied. An empty list means AF_UNIX is denied entirely
-/// when network is denied; the default Seatbelt `(deny default)` rule
-/// supplies the actual deny. A future ticket can promote this to a
-/// `ShellSandboxConfig::socket_domain_allowlist` field; the constant
-/// keeps the policy site visible in one place.
-#[cfg(target_os = "macos")]
-const MACOS_AF_UNIX_ALLOWLIST: &[&str] = &[];
+// MACOS_AF_UNIX_ALLOWLIST has been promoted to `ShellSandboxConfig::macos_socket_domain_allowlist`
+// with conservative defaults (empty) and per-workspace config support.
 
 /// Read-only roots every shell needs to look at: system libraries, the
 /// dynamic linker, certificate stores, the toolchain prefix, and the user's
@@ -1144,33 +1205,11 @@ pub(crate) fn shell_sandbox_runtime_unavailable_with_probe(
     }
 }
 
-pub(crate) fn shell_sandbox_direct_fallback_reason(
-    sandbox_plan: &ShellSandboxPlan,
-    run: &ShellRunOutcome,
-) -> Option<String> {
-    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
-        return None;
-    }
-    if !run.stdout_bytes.is_empty() || !run.stderr_bytes.is_empty() {
-        return None;
-    }
-    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
-    if exit_code.is_some() {
-        return None;
-    }
-    let signal = shell_exit_signal(run.exit_status.as_ref())?;
-    Some(format!(
-        "shell sandbox backend {} terminated by signal {signal} with no output; retried without OS sandbox because mode is best_effort",
-        sandbox_plan.backend
-    ))
-}
-
 pub(crate) fn shell_sandbox_best_effort_fallback_reason(
     sandbox_plan: &ShellSandboxPlan,
     run: &ShellRunOutcome,
 ) -> Option<String> {
-    shell_sandbox_direct_fallback_reason(sandbox_plan, run)
-        .or_else(|| shell_sandbox_runtime_fallback_reason(sandbox_plan, run))
+    shell_sandbox_runtime_fallback_reason(sandbox_plan, run)
 }
 
 pub(crate) fn shell_sandbox_runtime_fallback_reason(

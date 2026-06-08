@@ -243,7 +243,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         checks.push(cache_check(config, args.prune_cache));
     }
 
-    checks.push(sandbox_check());
+    checks.push(sandbox_check(config.as_ref()));
     checks.push(update_check(update::check_for_update().await));
 
     // Warnings (e.g. missing optional API keys, missing sandbox tool) print as
@@ -1172,13 +1172,40 @@ fn update_check(status: UpdateStatus) -> Check {
     }
 }
 
-/// Report the active shell-sandbox backend. Delegates to
-/// `squeezy_tools::shell_sandbox_doctor`, the single source of truth shared
+/// Report the active shell-sandbox backend and configured mode/network. Delegates
+/// to `squeezy_tools::shell_sandbox_doctor`, the single source of truth shared
 /// with the runtime — so this row reflects the backend the sandbox actually
 /// uses (e.g. Linux `linux-direct-syscalls`, not the long-stale `bwrap` proxy),
-/// and the Windows restricted-token / elevated tiers.
-fn sandbox_check() -> Check {
+/// plus the configured `mode` and `network` policy from the loaded config when
+/// available, so operators can verify what the session will enforce.
+fn sandbox_check(config: Option<&AppConfig>) -> Check {
     let report = squeezy_tools::shell_sandbox_doctor();
+    let mut detail = format!("backend {}: {}", report.backend, report.detail);
+    if let Some(cfg) = config {
+        let sb = &cfg.permissions.shell_sandbox;
+        detail.push_str(&format!(
+            "; configured mode={} network={}",
+            sb.mode.as_str(),
+            sb.network.as_str()
+        ));
+        // On Windows, surface the configured sandbox level so operators can
+        // see when it differs from the doctor-reported backend. Notably,
+        // `windows_sandbox_level=disabled` selects the job-object-only backend
+        // at runtime, which is more limited than the restricted-token default.
+        #[cfg(target_os = "windows")]
+        detail.push_str(&format!(
+            " windows_sandbox_level={}",
+            sb.windows_sandbox_level.as_str()
+        ));
+        // Explain squeezy ask socket availability under Linux direct-syscalls:
+        // the seccomp filter denies AF_UNIX, so in-shell approval escalation
+        // is unavailable. Show a note when the backend is active.
+        if report.backend == "linux-direct-syscalls" && report.available {
+            detail.push_str(
+                "; note: squeezy ask (in-shell approval) is unavailable — seccomp denies AF_UNIX sockets under linux-direct-syscalls",
+            );
+        }
+    }
     Check {
         name: "sandbox".to_string(),
         status: if report.available {
@@ -1186,7 +1213,7 @@ fn sandbox_check() -> Check {
         } else {
             Status::Warn
         },
-        detail: format!("backend {}: {}", report.backend, report.detail),
+        detail,
     }
 }
 
