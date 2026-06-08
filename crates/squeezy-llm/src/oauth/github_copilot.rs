@@ -302,13 +302,16 @@ pub fn write_tokens(path: &Path, tokens: &PersistedGitHubCopilotTokens) -> Resul
     }
     #[cfg(windows)]
     {
-        tracing::warn!(
-            "GitHub Copilot OAuth token saved to {} without Windows ACL hardening; \
-             the file's access permissions depend on your profile directory's default ACLs. \
-             Restrict it manually if your profile directory is shared, synced, or \
-             enterprise-managed.",
-            path.display()
-        );
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "GitHub Copilot OAuth token saved without Windows ACL hardening; \
+                 the file's access permissions depend on your profile directory's default ACLs. \
+                 Restrict it manually if your profile directory is shared, synced, or \
+                 enterprise-managed."
+            );
+        }
     }
     Ok(())
 }

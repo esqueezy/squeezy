@@ -273,17 +273,12 @@ fn read_credentials_file(path: &Path) -> Option<HashMap<String, String>> {
             {
                 // Windows does not expose Unix mode bits. File access is
                 // governed by ACLs which we cannot inspect portably here.
-                // Emit a one-shot warning so users in shared or
-                // enterprise-managed profile directories know the file is
-                // not protected by squeezy.
-                warn_once(
-                    path,
-                    format!(
-                        "credentials file {} is being read on Windows; squeezy cannot \
-                         verify its ACLs. Ensure the file and its parent directory \
-                         are restricted to your user account only.",
-                        path.display()
-                    ),
+                // Log at debug level: the `[file-backed]` annotation in
+                // `auth status` already surfaces this information at the
+                // right layer without looking like an error.
+                tracing::debug!(
+                    "credentials file {} is being read on Windows; ACL inspection unavailable",
+                    path.display()
                 );
             }
             // Suppress unused warning on non-unix / non-windows without

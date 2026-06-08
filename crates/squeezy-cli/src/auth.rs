@@ -16,7 +16,7 @@ use squeezy_llm::{
     OpenAiCodexLoginOutcome, PersistedTokens, codex_auth_file_path, exchange_authorization_code,
     generate_pkce, github_copilot_auth_file_path, github_copilot_read_tokens,
     login_github_copilot_interactive, login_openai_codex_interactive, login_openai_codex_manual,
-    normalize_github_domain, parse_authorization_input,
+    login_openai_codex_with_auto_fallback, normalize_github_domain, parse_authorization_input,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -395,6 +395,21 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
         .map_err(|err| SqueezyError::Config(format!("tokio runtime build failed: {err}")))?;
 
     let auth_path_for_login = auth_path.clone();
+
+    // Shared paste-input reader: used by both the --manual path and the
+    // auto-fallback path inside login_openai_codex_with_auto_fallback.
+    let read_paste_input = || {
+        eprint!("Paste redirect URL or code: ");
+        let _ = io::stderr().flush();
+        let mut buf = String::new();
+        BufReader::new(io::stdin())
+            .read_line(&mut buf)
+            .map_err(|err| {
+                SqueezyError::Config(format!("failed to read authorization input: {err}"))
+            })?;
+        Ok(buf)
+    };
+
     let outcome: OpenAiCodexLoginOutcome = if manual {
         // --manual: skip the localhost listener entirely and accept a
         // pasted redirect URL or bare code. Useful on Windows when the
@@ -409,84 +424,75 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
                     eprintln!("    {url}");
                     eprintln!();
                     eprintln!("After approving the consent screen, paste the full redirect URL");
-                    eprintln!("  (http://localhost:1455/auth/callback?code=...&state=...) or the");
+                    eprintln!("  (http://localhost:1455/auth/callback?code=…&state=…) or the");
                     eprintln!("  bare authorization code here:");
                     if !no_browser {
-                        match open_browser(url) {
-                            Ok(()) => eprintln!("Browser launched."),
-                            Err(err) => {
-                                eprintln!("Could not launch browser ({err}). Copy the URL above.");
-                            }
+                        if !try_open_browser(url) {
+                            eprintln!("Could not launch browser. Copy the URL above.");
                         }
                     } else {
                         eprintln!("(--no-browser: not launching a browser)");
                     }
                     Ok(())
                 },
-                || {
-                    eprint!("Paste redirect URL or code: ");
-                    let _ = io::stderr().flush();
-                    let mut buf = String::new();
-                    BufReader::new(io::stdin())
-                        .read_line(&mut buf)
-                        .map_err(|err| {
-                            SqueezyError::Config(format!(
-                                "failed to read authorization input: {err}"
-                            ))
-                        })?;
-                    Ok(buf)
-                },
+                read_paste_input,
             )
             .await
         })?
     } else {
-        // Interactive path: bind 127.0.0.1:1455 and wait for the browser
-        // callback. If the bind fails (port in use, firewall, WSL boundary,
-        // or enterprise endpoint software) print an actionable message and
-        // suggest --manual.
+        // Interactive path with automatic in-session fallback:
+        // - Show the URL and try to open a browser.
+        // - Bind 127.0.0.1:1455 and wait for the OAuth callback.
+        // - On port bind failure or timeout, fall back to the paste flow
+        //   in the same invocation, reusing the same URL so the user
+        //   does not need to start over.
         runtime.block_on(async move {
-            match login_openai_codex_interactive(&originator, &auth_path_for_login, |url| {
-                eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
-                eprintln!();
-                eprintln!("    {url}");
-                eprintln!();
-                eprintln!(
-                    "Squeezy is listening for the OAuth callback on \
-                     http://localhost:1455/auth/callback"
-                );
-                #[cfg(target_os = "windows")]
-                eprintln!(
-                    "(Windows: if your browser or firewall blocks localhost callbacks, \
-                     re-run with --manual to paste the code instead)"
-                );
-                if no_browser {
-                    eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
-                    return Ok(());
-                }
-                match open_browser(url) {
-                    Ok(()) => eprintln!("Browser launched. Waiting for callback…"),
-                    Err(err) => {
-                        eprintln!("Could not launch browser ({err}). Open the URL manually.");
-                        eprintln!(
-                            "Tip: if the browser opened but the tab is stuck, make sure \
-                             nothing else is using port 1455."
-                        );
+            login_openai_codex_with_auto_fallback(
+                &originator,
+                &auth_path_for_login,
+                |url| {
+                    eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+                    eprintln!();
+                    eprintln!("    {url}");
+                    eprintln!();
+                    eprintln!(
+                        "Squeezy is listening for the OAuth callback on \
+                         http://localhost:1455/auth/callback"
+                    );
+                    #[cfg(target_os = "windows")]
+                    eprintln!(
+                        "(Windows: if your browser or firewall blocks localhost callbacks, \
+                         squeezy will automatically fall back to the paste flow)"
+                    );
+                    if no_browser {
+                        eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
+                        return Ok(());
                     }
-                }
-                Ok(())
-            })
+                    if !try_open_browser(url) {
+                        eprintln!("Could not launch browser. Open the URL above manually.");
+                        eprintln!(
+                            "Waiting for the callback on port 1455, or it will fall back \
+                             to the paste flow after {} seconds.",
+                            squeezy_llm::OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS
+                        );
+                    } else {
+                        eprintln!("Browser launched. Waiting for callback…");
+                    }
+                    Ok(())
+                },
+                |url, reason| {
+                    eprintln!();
+                    eprintln!(
+                        "Falling back to paste flow ({reason}). \
+                         The authorize URL above is still valid."
+                    );
+                    eprintln!("    {url}");
+                    eprintln!();
+                    eprintln!("After approving, paste the full redirect URL or bare code here:");
+                },
+                read_paste_input,
+            )
             .await
-            {
-                Ok(outcome) => Ok(outcome),
-                Err(SqueezyError::ProviderNotConfigured(msg)) if msg.contains("could not bind") => {
-                    Err(SqueezyError::ProviderNotConfigured(format!(
-                        "{msg}\n\n\
-                         Tip: re-run with `--manual` to use the paste flow and bypass \
-                         the localhost callback server entirely."
-                    )))
-                }
-                Err(err) => Err(err),
-            }
         })?
     };
 
