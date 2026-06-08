@@ -311,7 +311,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::AiReviewerTripped { reason, .. } => {
                     app.status = "approval review paused".to_string();
-                    app.push_log(format!("AI approval reviewer paused: {reason}"));
+                    app.push_log(format!(
+                        "AI reviewer unavailable ({reason}); asking you directly."
+                    ));
                 }
                 AgentEvent::ApprovalRequested {
                     request,

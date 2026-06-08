@@ -13165,6 +13165,90 @@ fn detect_inheritance_grep_negatives() {
     assert!(detect_inheritance_grep("error: class missing").is_none());
 }
 
+/// Numeric risk level for [`PermissionCapability`] used by the consistency
+/// test. Maps each capability to a gate level so the test can assert that the
+/// runtime classification is never *weaker* than the spec advertises. Higher
+/// values require more permission to run.
+fn capability_risk_level(cap: PermissionCapability) -> u8 {
+    match cap {
+        PermissionCapability::Read => 0,
+        PermissionCapability::Search => 1,
+        PermissionCapability::Git => 2,
+        PermissionCapability::Compiler => 2,
+        PermissionCapability::Network => 3,
+        PermissionCapability::Mcp => 3,
+        PermissionCapability::Edit => 4,
+        PermissionCapability::Shell => 5,
+        PermissionCapability::Destructive => 6,
+    }
+}
+
+#[test]
+fn tool_spec_capability_matches_permission_request_baseline() {
+    // For every non-MCP first-party spec, a baseline ToolCall (empty or
+    // minimal arguments) must produce a PermissionRequest whose capability
+    // is at least as restrictive as the spec advertises.
+    //
+    // This guards against drift: if someone adds a tool with
+    // `ToolSpec.capability = Edit` but forgets to add a branch in
+    // `permission_request`, the default `Read` fallback would let the
+    // tool run in read-only sessions. This test catches that at CI time.
+    let tmp = std::env::temp_dir().join(format!(
+        "sqz_cap_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let registry = registry_with_shell_sandbox_off(&tmp);
+    let specs = registry.specs();
+    // Only test first-party tools (not MCP server tools whose names begin
+    // with "mcp__" — those are dynamically discovered and use the Mcp branch).
+    let first_party: Vec<_> = specs
+        .iter()
+        .filter(|s| !s.name.starts_with("mcp__"))
+        .collect();
+    assert!(
+        !first_party.is_empty(),
+        "registry must expose at least one first-party spec"
+    );
+    // Provide a non-empty command for `shell` so `analyze_shell_command`
+    // can classify it rather than returning an empty-command fallback.
+    let arguments_for = |name: &str| -> serde_json::Value {
+        match name {
+            "shell" => json!({"command": "echo test"}),
+            "grep" => json!({"pattern": "test"}),
+            "glob" => json!({"pattern": "*.rs"}),
+            "apply_patch" => json!({"patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n+line\n"}),
+            _ => json!({}),
+        }
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for spec in &first_party {
+        let call = ToolCall {
+            call_id: "test-consistency".to_string(),
+            name: spec.name.clone(),
+            arguments: arguments_for(&spec.name),
+        };
+        let request = registry.permission_request(&call);
+        let spec_level = capability_risk_level(spec.capability);
+        let runtime_level = capability_risk_level(request.capability);
+        if runtime_level < spec_level {
+            failures.push(format!(
+                "tool {:?}: spec.capability={:?} (level {}) but permission_request.capability={:?} (level {}); runtime is weaker than advertised",
+                spec.name, spec.capability, spec_level, request.capability, runtime_level
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "tool spec / permission_request capability mismatch(es):\n{}",
+        failures.join("\n")
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn detect_inheritance_grep_extraction() {
     // Generic args stripped.

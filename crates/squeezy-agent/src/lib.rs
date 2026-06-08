@@ -13000,7 +13000,13 @@ async fn execute_tool_calls(
             continue;
         }
 
-        match permission_decision(call, &context).await {
+        let outcome = permission_decision(call, &context).await;
+        // Fold any out-of-band reviewer spend into the active broker so the
+        // live session-cost snapshot and cap checks stay accurate within this
+        // turn (the persisted `state.cost` is already updated by the reviewer
+        // path; this call keeps the broker's copy in sync).
+        broker.record_out_of_band_session_cost(outcome.reviewer_usd_micros);
+        match outcome.decision {
             ApprovalDecision::Approved => approved.push((index, call.clone(), tool_sequence)),
             ApprovalDecision::Denied(reason) => {
                 let result = ToolResult::denied(call, reason);
@@ -14677,9 +14683,9 @@ fn approval_context_excerpt(value: &str) -> Option<String> {
 async fn permission_decision(
     call: &ToolCall,
     context: &ToolExecutionContext<'_>,
-) -> ApprovalDecision {
+) -> PermissionOutcome {
     if is_direct_user_shell_call(call) {
-        return ApprovalDecision::Approved;
+        return PermissionOutcome::no_reviewer_cost(ApprovalDecision::Approved);
     }
     let runtime = PermissionDecisionContext::from_tool_context(context);
     let request = runtime.tools.permission_request(call);
@@ -14690,7 +14696,8 @@ async fn permission_decision_for_request(
     context: &PermissionDecisionContext,
     call: &ToolCall,
     request: PermissionRequest,
-) -> ApprovalDecision {
+) -> PermissionOutcome {
+    let mut reviewer_usd_micros: u64 = 0;
     // PermissionRequest fires once per decision attempt, before any
     // verdict is computed. Lets audit handlers record every gated
     // request — including those resolved by an auto-allow rule or
@@ -14718,12 +14725,16 @@ async fn permission_decision_for_request(
                         &verdict.reason,
                     );
                 }
-                return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
+                return PermissionOutcome::no_reviewer_cost(ApprovalDecision::Denied(
+                    verdict_deny_reason_for_model(context, &verdict),
+                ));
             }
             PermissionAction::Ask => {
                 mode_ask_verdict = Some(verdict);
             }
-            PermissionAction::Allow => return approved_decision(context, &request),
+            PermissionAction::Allow => {
+                return PermissionOutcome::no_reviewer_cost(approved_decision(context, &request));
+            }
         }
     }
     let session_rules = snapshot_session_rules(&context.session_rules);
@@ -14775,7 +14786,7 @@ async fn permission_decision_for_request(
                     };
                 }
             }
-            ShellPreClassification::AutoDeny { reason } => {
+            ShellPreClassification::RequiresApproval { reason } => {
                 // Tighten permissive verdicts into a gate so the command cannot
                 // run silently. Existing Ask/Deny verdicts already carry the
                 // desired user or policy boundary and should not be escalated
@@ -14833,21 +14844,12 @@ async fn permission_decision_for_request(
             telemetry: context.telemetry.clone(),
         })
         .await;
-        // The reviewer's LLM call is real billable spend, but there is no
-        // `CostBroker` on the permission path. Record it straight into the
-        // persisted session cost + per-model ledger (keyed by the reviewer
-        // model, main-origin), keeping `state.cost` and `state.metrics.provider`
-        // in lockstep so the `/cost` headline and the By-model drill agree.
-        //
-        // KNOWN LIMITATION: this bypasses the active turn's `CostBroker`, so
-        // the *current* turn's cap checks and live status-line snapshot (both
-        // read from the broker) don't see this reviewer spend until the next
-        // turn re-seeds the broker from `state.cost`. The gap is bounded by a
-        // single turn's reviewer spend — cheap-tier calls capped at
-        // `max_output_tokens: 120` — and persisted `/cost` accounting is always
-        // correct. Closing it fully needs out-of-band LLM cost to flow back to
-        // the round-loop broker (also true of the shell classifier), a
-        // separable change.
+        // The reviewer's LLM call is real billable spend. Record it into
+        // the persisted session cost + per-model ledger so `/cost` and
+        // the By-model drill are always correct. Also accumulate the USD
+        // micros in `reviewer_usd_micros` so the turn loop can fold this
+        // spend into the active `CostBroker`, keeping the live
+        // session-cost snapshot and cap checks accurate within the turn.
         if (reviewer_result.cost.estimated_usd_micros.is_some()
             || reviewer_result.cost.input_tokens.is_some()
             || reviewer_result.cost.output_tokens.is_some())
@@ -14863,6 +14865,8 @@ async fn permission_decision_for_request(
                 &reviewer_result.cost,
             );
         }
+        reviewer_usd_micros = reviewer_usd_micros
+            .saturating_add(reviewer_result.cost.estimated_usd_micros.unwrap_or(0));
         match reviewer_result.outcome {
             ai_reviewer::AiReviewerOutcome::Verdict(reviewed) => {
                 log_session_event(
@@ -14947,7 +14951,9 @@ async fn permission_decision_for_request(
         ));
     }
     match verdict.action {
-        PermissionAction::Allow => approved_decision(context, &request),
+        PermissionAction::Allow => {
+            PermissionOutcome::no_reviewer_cost(approved_decision(context, &request))
+        }
         PermissionAction::Deny => {
             if verdict.silent {
                 log_silent_deny(context, &request, &verdict);
@@ -14961,7 +14967,12 @@ async fn permission_decision_for_request(
                     &verdict.reason,
                 );
             }
-            ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict))
+            PermissionOutcome {
+                decision: ApprovalDecision::Denied(verdict_deny_reason_for_model(
+                    context, &verdict,
+                )),
+                reviewer_usd_micros,
+            }
         }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
@@ -14998,18 +15009,31 @@ async fn permission_decision_for_request(
             });
             let send_result = match send_approval.or_cancel(&context.cancel).await {
                 Ok(result) => result,
-                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
+                Err(CancelErr::Cancelled) => {
+                    return PermissionOutcome {
+                        decision: ApprovalDecision::Cancelled,
+                        reviewer_usd_micros,
+                    };
+                }
             };
             if send_result.is_err() {
                 let reason = "approval channel closed".to_string();
                 if let Some(registry) = context.hooks.as_ref() {
                     dispatch_permission_denied(registry, context.turn_id, call, &request, &reason);
                 }
-                return ApprovalDecision::Denied(reason);
+                return PermissionOutcome {
+                    decision: ApprovalDecision::Denied(reason),
+                    reviewer_usd_micros,
+                };
             }
             let decision = match decision_rx.or_cancel(&context.cancel).await {
                 Ok(decision) => decision,
-                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
+                Err(CancelErr::Cancelled) => {
+                    return PermissionOutcome {
+                        decision: ApprovalDecision::Cancelled,
+                        reviewer_usd_micros,
+                    };
+                }
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -15179,7 +15203,10 @@ async fn permission_decision_for_request(
                 approval_decision_token,
                 "user",
             ));
-            outcome
+            PermissionOutcome {
+                decision: outcome,
+                reviewer_usd_micros,
+            }
         }
     }
 }
@@ -15207,7 +15234,12 @@ fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAs
                 }),
             };
             let permission = runtime.tools.permission_request(&synthetic_call);
-            match permission_decision_for_request(&runtime, &synthetic_call, permission).await {
+            // reviewer_usd_micros is not folded into a broker here because
+            // shell_ask callbacks run outside the main turn loop and have no
+            // broker reference; the spend is already persisted to state.cost.
+            let outcome =
+                permission_decision_for_request(&runtime, &synthetic_call, permission).await;
+            match outcome.decision {
                 ApprovalDecision::Approved => ShellAskDecision::allow(),
                 ApprovalDecision::Denied(reason) => ShellAskDecision::deny(reason),
                 ApprovalDecision::Cancelled => {
@@ -17290,6 +17322,30 @@ enum ApprovalDecision {
     Approved,
     Denied(String),
     Cancelled,
+}
+
+/// Return value of [`permission_decision`] and
+/// [`permission_decision_for_request`]. Carries the gate outcome together
+/// with any out-of-band LLM cost incurred by the AI reviewer during this
+/// decision so the caller can fold it into the active turn's [`CostBroker`]
+/// without a separate channel.
+struct PermissionOutcome {
+    decision: ApprovalDecision,
+    /// Total reviewer spend in USD micros recorded during this permission
+    /// evaluation. Zero when the reviewer did not run or had no priced
+    /// response. Must be folded into the active [`CostBroker`] by the
+    /// turn loop so the live session-cost snapshot and cap checks stay
+    /// accurate within the turn.
+    reviewer_usd_micros: u64,
+}
+
+impl PermissionOutcome {
+    fn no_reviewer_cost(decision: ApprovalDecision) -> Self {
+        Self {
+            decision,
+            reviewer_usd_micros: 0,
+        }
+    }
 }
 
 /// Request payload sent to the TUI when the model calls

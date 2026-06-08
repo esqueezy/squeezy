@@ -11966,3 +11966,106 @@ async fn mcp_background_queue_serves_issued_tickets_in_order() {
 
     assert_eq!(&*events.lock().await, &["first", "second"]);
 }
+
+// ---------------------------------------------------------------------------
+// Cross-surface redaction tests (Idea 3)
+// ---------------------------------------------------------------------------
+
+/// Synthetic secret that triggers the built-in bearer-token pattern.
+/// Format: `Authorization: Bearer <value>` — covered by the built-in regex.
+const SYNTHETIC_SECRET: &str = "sk-testkey-abcdefghijklmnopqrstuvwxyz0123";
+
+fn test_redactor() -> Arc<Redactor> {
+    let config = squeezy_core::RedactionConfig::default();
+    Arc::new(config.redactor().expect("redactor"))
+}
+
+/// Build a minimal PermissionRequest that embeds the synthetic secret in
+/// metadata so we can verify `redact_permission_request` strips it.
+fn secret_permission_request() -> PermissionRequest {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "command".to_string(),
+        format!("OPENAI_API_KEY={SYNTHETIC_SECRET} cargo build"),
+    );
+    metadata.insert("description".to_string(), SYNTHETIC_SECRET.to_string());
+    PermissionRequest {
+        call_id: "test-redact".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: format!("shell:echo {SYNTHETIC_SECRET}"),
+        risk: PermissionRisk::High,
+        summary: format!("run shell with secret {SYNTHETIC_SECRET}"),
+        metadata,
+        suggested_rules: vec![],
+    }
+}
+
+#[test]
+fn redact_permission_request_strips_secret_from_metadata_target_and_summary() {
+    // Approval prompts are redacted before display to the user and before
+    // being emitted in session-log approval events. This test checks that
+    // the synthetic secret is absent from every surface the user or a log
+    // reader might see.
+    let redactor = test_redactor();
+    let request = secret_permission_request();
+
+    // Sanity: the raw request contains the secret.
+    assert!(
+        request.target.contains(SYNTHETIC_SECRET)
+            || request.summary.contains(SYNTHETIC_SECRET)
+            || request
+                .metadata
+                .values()
+                .any(|v| v.contains(SYNTHETIC_SECRET)),
+        "test precondition: secret must appear in raw request"
+    );
+
+    let redacted = redact_permission_request(request, &redactor);
+
+    assert!(
+        !redacted.target.contains(SYNTHETIC_SECRET),
+        "secret must be redacted from target; got: {:?}",
+        redacted.target
+    );
+    assert!(
+        !redacted.summary.contains(SYNTHETIC_SECRET),
+        "secret must be redacted from summary; got: {:?}",
+        redacted.summary
+    );
+    for (key, value) in &redacted.metadata {
+        assert!(
+            !value.contains(SYNTHETIC_SECRET),
+            "secret must be redacted from metadata[{key}]; got: {value:?}"
+        );
+    }
+}
+
+#[test]
+fn redact_tool_call_arguments_strips_secret() {
+    // Tool-call arguments are redacted before being stored in the session log
+    // and before the model sees them as function-call outputs on re-reads.
+    let redactor = test_redactor();
+    let call = ToolCall {
+        call_id: "test-redact-call".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({
+            "command": format!("curl -H 'Authorization: Bearer {SYNTHETIC_SECRET}' https://api.example.com"),
+            "description": format!("authenticate with {SYNTHETIC_SECRET}")
+        }),
+    };
+
+    // Sanity: raw call contains secret.
+    let raw = call.arguments.to_string();
+    assert!(
+        raw.contains(SYNTHETIC_SECRET),
+        "test precondition: secret must appear in raw arguments"
+    );
+
+    let redacted = redact_tool_call(call, &redactor);
+    let redacted_str = redacted.arguments.to_string();
+    assert!(
+        !redacted_str.contains(SYNTHETIC_SECRET),
+        "secret must be absent from redacted tool-call arguments; got: {redacted_str:?}"
+    );
+}
