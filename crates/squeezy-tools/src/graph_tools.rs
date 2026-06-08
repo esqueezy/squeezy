@@ -3421,17 +3421,16 @@ impl ToolRegistry {
         // Collect the set of changed file IDs from the arguments.
         let mut changed: HashSet<FileId> = HashSet::new();
 
-        if let Some(id) = args.symbol_id.as_deref() {
-            if let Some(sym) = graph.symbols.get(&SymbolId::new(id)) {
-                changed.insert(sym.file_id.clone());
-            }
-        } else if let Some(q) = args.query.as_deref() {
-            if let Some(sym) = graph_symbol_search(graph, Some(q), None, None, None, None, None)
+        if let Some(id) = args.symbol_id.as_deref()
+            && let Some(sym) = graph.symbols.get(&SymbolId::new(id))
+        {
+            changed.insert(sym.file_id.clone());
+        } else if let Some(q) = args.query.as_deref()
+            && let Some(sym) = graph_symbol_search(graph, Some(q), None, None, None, None, None)
                 .into_iter()
                 .next()
-            {
-                changed.insert(sym.file_id.clone());
-            }
+        {
+            changed.insert(sym.file_id.clone());
         }
         if let Some(path) = args.path.as_deref() {
             for file in graph.files.values() {
