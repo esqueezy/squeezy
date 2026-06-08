@@ -49,7 +49,7 @@ use squeezy_vcs::{
     canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// One connected MCP tool's contribution to the request framing, surfaced by
 /// [`ToolRegistry::mcp_tool_schema_infos`] for the `/context` accounting view.
@@ -2003,8 +2003,17 @@ impl ToolRegistry {
             }
         }
         // `mcp_tool_spec` already compacts at construction; append after the
-        // first-party loop to avoid double work.
-        specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
+        // first-party loop to avoid double work.  Annotate tools belonging to
+        // stale servers so the model knows it is calling an external tool
+        // whose palette may not reflect the server's current capability.
+        let mcp_status = self.mcp.status_snapshot();
+        specs.extend(self.mcp.tools().into_iter().map(|tool| {
+            let is_stale = matches!(
+                mcp_status.per_server.get(&tool.server),
+                Some(McpServerStatus::Stale { .. })
+            );
+            mcp_tool_spec(tool, is_stale)
+        }));
         // Partition first-party before MCP, alphabetic within each group. The
         // contiguous first-party prefix lets the Anthropic adapter place its
         // tools-array `cache_control` breakpoint on the last first-party tool,
@@ -2103,6 +2112,10 @@ impl ToolRegistry {
         self.mcp.status_snapshot()
     }
 
+    pub fn mcp_tool_list_changed_notify(&self) -> Arc<Notify> {
+        self.mcp.tool_list_changed_notify()
+    }
+
     /// Per-tool accounting view for `/context`: every connected MCP tool with
     /// its owning server, first-line description, and both its lazy stub cost
     /// (the `<tools_index>` line, always present) and its full schema cost (the
@@ -2133,8 +2146,10 @@ impl ToolRegistry {
                 )
                 .len();
                 // Full schema sized exactly as advertised to the model — same
-                // ToolSpec shape produced for the live request.
-                let full_bytes = serde_json::to_string(&mcp_tool_spec(tool))
+                // ToolSpec shape produced for the live request.  Stale state
+                // is unknown at this call site (diagnostic only); pass false
+                // so the schema bytes exclude the stale notice suffix.
+                let full_bytes = serde_json::to_string(&mcp_tool_spec(tool, false))
                     .map(|json| json.len())
                     .unwrap_or(0);
                 McpToolSchemaInfo {

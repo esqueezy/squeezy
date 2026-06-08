@@ -35,7 +35,7 @@ use squeezy_core::{McpServerConfig, McpTransport, PermissionMode};
 use squeezy_store::SqueezyStore;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    sync::{Mutex as TokioMutex, watch},
+    sync::{Mutex as TokioMutex, Notify, watch},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -330,6 +330,11 @@ pub struct McpClientRegistry {
     pause_state: ElicitationPauseState,
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
     resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
+    /// Fired whenever any connected MCP server sends a `tools/list_changed`
+    /// notification.  External components (e.g. the agent turn loop) can
+    /// `await` this to learn that a server's tool palette may have changed
+    /// and schedule a targeted re-discovery via `refresh_one_server_tools`.
+    tool_list_changed: Arc<Notify>,
 }
 
 impl Default for McpClientRegistry {
@@ -364,6 +369,7 @@ impl McpClientRegistry {
             pause_state: ElicitationPauseState::default(),
             resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
             resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+            tool_list_changed: Arc::new(Notify::new()),
         };
         registry.load_cached_tools();
         registry
@@ -458,6 +464,94 @@ impl McpClientRegistry {
 
     pub fn status_watch(&self) -> watch::Receiver<McpStatusSnapshot> {
         self.status_tx.subscribe()
+    }
+
+    /// Returns the `Notify` that is signalled whenever **any** connected
+    /// server sends a `tools/list_changed` notification.  The notification
+    /// carries no server identity; callers that need a precise refresh should
+    /// maintain their own server mapping, otherwise run a full discovery pass.
+    /// `notify_one()` is used so the signal survives a brief gap between
+    /// `notified()` calls; at most one permit is queued at a time.
+    pub fn tool_list_changed_notify(&self) -> Arc<Notify> {
+        self.tool_list_changed.clone()
+    }
+
+    /// Re-discover tools for a single named server and merge the result into
+    /// the shared cache and status snapshot.  Intended for handling
+    /// `tools/list_changed` notifications: call this instead of the full
+    /// `refresh_tools` to avoid unnecessary work on unchanged servers.
+    /// Because `tool_list_changed_notify()` carries no server identity, this
+    /// helper is only useful to callers that learned the changed server from
+    /// another source.
+    ///
+    /// If the server is not configured or is disabled the call is a no-op.
+    /// On discovery failure the server entry is moved to `Stale` using the
+    /// existing cached tools (consistent with `refresh_tools` behaviour).
+    pub async fn refresh_one_server_tools(&self, server_name: &str, cancel: CancellationToken) {
+        let servers = self.servers_snapshot();
+        let Some(server) = servers.get(server_name) else {
+            return;
+        };
+        if !server.enabled {
+            return;
+        }
+        let result = self.discover_one(server_name, server, cancel).await;
+        match result {
+            Ok(tools) => {
+                self.write_tool_cache(server_name, &tools);
+                let tools_count = tools.len();
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.retain(|_, t| t.server != server_name);
+                    cache.extend(normalize_palette(tools));
+                }
+                let mut snapshot = self.status_snapshot();
+                snapshot.per_server.insert(
+                    server_name.to_string(),
+                    McpServerStatus::Ready {
+                        tools_count,
+                        cached: false,
+                    },
+                );
+                snapshot.generated_unix_millis = unix_millis();
+                self.publish_status(snapshot);
+                tracing::info!(
+                    target: "squeezy::mcp",
+                    server = %server_name,
+                    tools_count,
+                    "re-discovered tools after tool_list_changed notification"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "squeezy::mcp",
+                    server = %server_name,
+                    error = %error,
+                    "failed to re-discover tools after tool_list_changed notification; retaining stale cache"
+                );
+                let stale_count = self
+                    .cache
+                    .lock()
+                    .map(|c| c.values().filter(|t| t.server == server_name).count())
+                    .unwrap_or(0);
+                let outcome = if matches!(error, McpError::Cancelled { .. }) {
+                    McpStaleOutcome::Cancelled
+                } else {
+                    McpStaleOutcome::Failed {
+                        error: error.to_string(),
+                    }
+                };
+                let mut snapshot = self.status_snapshot();
+                snapshot.per_server.insert(
+                    server_name.to_string(),
+                    McpServerStatus::Stale {
+                        tools_count: stale_count,
+                        outcome,
+                    },
+                );
+                snapshot.generated_unix_millis = unix_millis();
+                self.publish_status(snapshot);
+            }
+        }
     }
 
     pub async fn refresh_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
@@ -1053,6 +1147,7 @@ impl McpClientRegistry {
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
             resource_declarations: self.resource_declarations.clone(),
+            tool_list_changed: self.tool_list_changed.clone(),
         };
         let entry = match server.transport {
             McpTransport::Stdio => {
@@ -1238,6 +1333,7 @@ impl McpClientRegistry {
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
             resource_declarations: self.resource_declarations.clone(),
+            tool_list_changed: self.tool_list_changed.clone(),
         }
     }
 
@@ -1588,6 +1684,10 @@ struct SqueezyMcpClientHandler {
     /// Shared with `McpClientRegistry` so resource-list changes invalidate the
     /// declaration gate cache alongside cached reads.
     resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
+    /// Shared with `McpClientRegistry`; notified when the server signals that
+    /// its tool list has changed so the registry (or an observing agent layer)
+    /// can schedule a targeted re-discovery via `refresh_one_server_tools`.
+    tool_list_changed: Arc<Notify>,
 }
 
 impl SqueezyMcpClientHandler {
@@ -1794,8 +1894,12 @@ impl ClientHandler for SqueezyMcpClientHandler {
         tracing::info!(
             target: "squeezy::mcp",
             server = %self.server_name,
-            "MCP server tool list changed"
+            "MCP server tool list changed; signalling registry for re-discovery"
         );
+        // `notify_one()` stores a permit so the signal survives a brief gap
+        // between poll cycles (unlike `notify_waiters()` which drops the
+        // event if no waiter is currently blocked).
+        self.tool_list_changed.notify_one();
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -2949,6 +3053,37 @@ fn uri_template_placeholder_allows_slashes(placeholder: &str) -> bool {
 }
 
 fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
+    // Hash secret values before including them in the fingerprint so the key
+    // is safe to store in the on-disk DB while still invalidating when a
+    // credential rotates.  We include enough signal to detect any auth/header
+    // change without embedding the raw secrets:
+    //   - env key → SHA-256-prefix(value) — env values are runtime secrets.
+    //   - static header key → SHA-256-prefix(value) — header values may be
+    //     tokens; hashed so the key is safe to persist.
+    //   - bearer_token_env_var name — static config, safe to store as-is.
+    //   - env_http_headers key → env-var-name pairs — both the HTTP header
+    //     name and the env-var name that backs it are static config. If an
+    //     operator changes `{ "X-Auth" = "OLD_TOKEN_VAR" }` to
+    //     `{ "X-Auth" = "NEW_TOKEN_VAR" }`, the fingerprint must change.
+    let env_value_hashes: Vec<(&str, String)> = server
+        .env
+        .iter()
+        .map(|(k, v)| (k.as_str(), sha256_hex_prefix(v.as_bytes(), 16)))
+        .collect();
+    let header_value_hashes: Vec<(&str, String)> = server
+        .http_headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), sha256_hex_prefix(v.as_bytes(), 16)))
+        .collect();
+    // `env_http_headers` maps HTTP-header-name → env-var-name.  Both parts
+    // are static config that affect which credential is loaded at session
+    // start; include both so renaming either the header or the env-var
+    // triggers cache eviction.
+    let env_http_headers_pairs: Vec<(&str, &str)> = server
+        .env_http_headers
+        .iter()
+        .map(|(header, env_var)| (header.as_str(), env_var.as_str()))
+        .collect();
     let fingerprint = json!({
         "schema": MCP_TOOL_CACHE_SCHEMA_VERSION,
         "server": server_name,
@@ -2960,9 +3095,12 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         "timeout_ms": server.timeout_ms,
         "discovery_timeout_ms": server.discovery_timeout_ms,
         "tool_call_timeout_ms": server.tool_call_timeout_ms,
-        "env_keys": server.env.keys().collect::<Vec<_>>(),
+        "env_value_hashes": env_value_hashes,
         "enabled_tools": &server.enabled_tools,
         "disabled_tools": &server.disabled_tools,
+        "bearer_token_env_var": &server.bearer_token_env_var,
+        "header_value_hashes": header_value_hashes,
+        "env_http_headers": env_http_headers_pairs,
     });
     format!(
         "{server_name}\0{}",

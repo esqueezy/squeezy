@@ -59,6 +59,7 @@ fn fixture_client_handler(server_name: &str) -> SqueezyMcpClientHandler {
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(Notify::new()),
     }
 }
 
@@ -550,6 +551,72 @@ fn tool_cache_key_changes_when_palette_filters_change() {
 }
 
 #[test]
+fn tool_cache_key_changes_when_env_value_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server
+        .env
+        .insert("MY_VAR".to_string(), "value-one".to_string());
+    let base = tool_cache_key("docs", &server);
+    server
+        .env
+        .insert("MY_VAR".to_string(), "value-two".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing an env value must invalidate the cache key"
+    );
+}
+
+#[test]
+fn tool_cache_key_changes_when_bearer_token_env_var_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server.bearer_token_env_var = Some("OLD_TOKEN_VAR".to_string());
+    let base = tool_cache_key("docs", &server);
+    server.bearer_token_env_var = Some("NEW_TOKEN_VAR".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing bearer_token_env_var name must invalidate the cache key"
+    );
+}
+
+#[test]
+fn tool_cache_key_changes_when_http_header_value_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server
+        .http_headers
+        .insert("X-Api-Key".to_string(), "secret-one".to_string());
+    let base = tool_cache_key("docs", &server);
+    server
+        .http_headers
+        .insert("X-Api-Key".to_string(), "secret-two".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing a static HTTP header value must invalidate the cache key"
+    );
+}
+
+#[test]
+fn tool_cache_key_changes_when_env_http_header_env_var_name_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server
+        .env_http_headers
+        .insert("X-Auth".to_string(), "OLD_TOKEN_ENV".to_string());
+    let base = tool_cache_key("docs", &server);
+    // Renaming the backing env-var changes which credential is loaded at
+    // session start — the cache must be evicted.
+    server
+        .env_http_headers
+        .insert("X-Auth".to_string(), "NEW_TOKEN_ENV".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing the env-var name in env_http_headers must invalidate the cache key"
+    );
+}
+
+#[test]
 fn registry_loads_cached_tools_from_store_on_startup() {
     let root = temp_root("mcp-tool-cache");
     let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
@@ -913,6 +980,7 @@ async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint(
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     let (auth_header, custom_headers) =
         resolve_http_auth_and_headers("sse-server", &server, |name| match name {
@@ -1028,6 +1096,7 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     // The serve call will fail because we hang up after one round trip — that
     // is fine, we only need it to issue the initialize POST so the listener
@@ -1231,6 +1300,7 @@ fn client_info_advertises_squeezy_identity_and_elicitation_capability() {
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     let info = ClientHandler::get_info(&handler);
     assert_eq!(info.client_info.name, env!("CARGO_PKG_NAME"));
@@ -1333,6 +1403,7 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     let (auth_header, custom_headers) = resolve_http_auth_and_headers("fixture", &server, |_| None);
     let worker =

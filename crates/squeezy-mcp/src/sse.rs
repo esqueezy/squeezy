@@ -34,7 +34,7 @@ use rmcp::{
 };
 use tracing::{debug, warn};
 
-/// Number of consecutive reconnect failures before the worker gives up.
+/// Number of consecutive reconnect attempts before the worker gives up.
 /// A Windows service that closes immediately would otherwise spin forever.
 const SSE_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 /// Base reconnect delay for the first SSE stream reconnect attempt.
@@ -153,6 +153,10 @@ impl Worker for SseClientWorker {
                                 );
                                 continue;
                             }
+                            // A successful message resets the back-off so a
+                            // healthy server that briefly drops never suffers
+                            // growing reconnect penalties.
+                            reconnect_attempts = 0;
                             let Some(payload) = data else {
                                 continue;
                             };
@@ -178,23 +182,22 @@ impl Worker for SseClientWorker {
                             }
                         }
                         None => {
-                            // Stream ended; reopen after jittered exponential
-                            // backoff. Each new session re-advertises its POST
-                            // endpoint, so replace the stale URL rather than
-                            // reusing it.
-                            reconnect_attempts = reconnect_attempts.saturating_add(1);
-                            if reconnect_attempts > SSE_RECONNECT_MAX_ATTEMPTS {
+                            // Stream ended; reopen the GET after jittered
+                            // exponential backoff. Each new session
+                            // re-advertises its POST endpoint, so replace the
+                            // stale URL rather than reusing it.
+                            if reconnect_attempts >= SSE_RECONNECT_MAX_ATTEMPTS {
                                 return Err(WorkerQuitReason::fatal(
                                     SseTransportError::Closed,
                                     "SSE stream closed repeatedly; giving up after max reconnect attempts",
                                 ));
                             }
-                            let delay_ms =
-                                sse_reconnect_delay_ms(reconnect_attempts.saturating_sub(1));
+                            let attempt = reconnect_attempts.saturating_add(1);
+                            let delay_ms = sse_reconnect_delay_ms(reconnect_attempts);
                             warn!(
                                 target: "squeezy::mcp::sse",
                                 sse_url = %self.sse_url,
-                                attempt = reconnect_attempts,
+                                attempt,
                                 delay_ms,
                                 "SSE stream ended; reconnecting"
                             );
@@ -207,6 +210,7 @@ impl Worker for SseClientWorker {
                                 }
                                 _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                             }
+                            reconnect_attempts = reconnect_attempts.saturating_add(1);
                             let response = match self.open_stream().await {
                                 Ok(response) => response,
                                 Err(error) => {
@@ -220,12 +224,6 @@ impl Worker for SseClientWorker {
                             match read_endpoint(&self.sse_url, &mut frames).await {
                                 Ok(new_endpoint) => {
                                     endpoint_url = new_endpoint;
-                                    // The server is reachable again: reset the
-                                    // attempt counter so the next stream drop
-                                    // starts back-off from 1 s. Servers that
-                                    // never push proactively (only reply to
-                                    // tool calls) benefit from this reset too.
-                                    reconnect_attempts = 0;
                                 }
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
