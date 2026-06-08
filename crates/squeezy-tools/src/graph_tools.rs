@@ -1462,10 +1462,10 @@ fn graph_zero_hit_fallback(
     }
     // Surface a hint when the caller's filter contained backslashes so the
     // slash-normalized interpretation is visible on Linux.
-    if let Some(orig) = path {
-        if orig.contains('\\') {
-            obj.insert("path_normalized_from".to_string(), json!(orig));
-        }
+    if let Some(orig) = path
+        && orig.contains('\\')
+    {
+        obj.insert("path_normalized_from".to_string(), json!(orig));
     }
     Value::Object(obj)
 }
