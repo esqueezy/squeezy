@@ -1818,7 +1818,11 @@ struct StdioProcessHandle {
     /// `cmd.exe`, PowerShell, `npx`, etc.) is terminated when this handle
     /// drops. Direct `TerminateProcess` is used as a fallback if Job Object
     /// assignment fails.
+    ///
+    /// This field exists purely for its Drop side-effect (RAII guard); the
+    /// value itself is never read after construction.
     #[cfg(windows)]
+    #[allow(dead_code)]
     win_job: Option<win_job::McpJob>,
 }
 
