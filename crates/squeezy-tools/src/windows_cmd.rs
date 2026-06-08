@@ -12,61 +12,75 @@
 /// never trigger.
 pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
+    // Pre-tokenise once for both PowerShell and cmd.exe checks.
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let first = tokens.first().copied().unwrap_or("");
 
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
-    let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
-    let has_recursive_force =
-        (flag_matches("-recurse") || flag_matches("-r")) && flag_matches("-force");
+    let powershell_command = tokens
+        .iter()
+        .copied()
+        .find(|token| *token != "&")
+        .unwrap_or("");
+    let command_name = powershell_command
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .rsplit(|ch| ch == '\\' || ch == '/')
+        .next()
+        .unwrap_or(powershell_command);
 
-    // PowerShell cmdlets / aliases where the dangerous shape is unambiguous
-    // in the raw text. Each needle is a contiguous substring that does not
-    // appear inside benign commands.
+    // Remove-Item / ri (PowerShell).
+    // Destructive when any of:
+    //   - -Recurse or its short alias -r is present (any parameter position)
+    //   - -Confirm:$false suppresses the safety prompt
     //
-    // `ri` is the built-in alias for `Remove-Item`.  We only flag it when
-    // combined with recurse/force so that `ri` alone (tab completion, etc.)
-    // is not a false positive.
-    for needle in [
-        // Execution policy change
-        "set-executionpolicy",
-        // User / identity mutation
-        "new-localuser",
-        "remove-localuser",
-        "disable-localuser",
-        // Storage / volume destruction
-        "clear-recyclebin",
-        "format-volume",
-        // Elevation via Start-Process
-        "start-process powershell -verb runas",
-        "start-process pwsh -verb runas",
-        "start-process cmd -verb runas",
-        "start-process cmd.exe -verb runas",
-        // Shutdown / restart (destructive at the session level)
-        "stop-computer",
-        "restart-computer",
-        // Service and scheduled-task deletion
-        "remove-service",
-        "unregister-scheduledtask",
-    ] {
-        if lower.contains(needle) {
+    // The `ri` check matches the built-in PowerShell alias; `rm` / `rmdir`
+    // are already flagged by the POSIX destructive-verb list in
+    // `destructive_shell_segment_reason`.
+    let is_remove_item = command_name == "remove-item" || command_name == "ri";
+    if is_remove_item {
+        let has_recurse = tokens.iter().any(|t| *t == "-recurse" || *t == "-r");
+        if has_recurse || lower.contains("-confirm:$false") {
             return true;
         }
     }
-    if has_recursive_force
-        && tokens.iter().any(|token| {
-            token.eq_ignore_ascii_case("remove-item") || token.eq_ignore_ascii_case("ri")
-        })
+
+    // Other unambiguously destructive PowerShell cmdlets.
+    if [
+        "set-executionpolicy",
+        "new-localuser",
+        "remove-localuser",
+        "disable-localuser",
+        "clear-recyclebin",
+        "format-volume",
+        "stop-computer",
+        "restart-computer",
+        "remove-service",
+        "unregister-scheduledtask",
+    ]
+    .contains(&command_name)
     {
         return true;
     }
+    if command_name == "start-process" && tokens.iter().any(|t| *t == "-verb") {
+        let has_runas = tokens.iter().any(|t| *t == "runas");
+        let launches_shell = tokens.iter().any(|t| {
+            matches!(
+                *t,
+                "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
+            )
+        });
+        if has_runas && launches_shell {
+            return true;
+        }
+    }
 
-    // cmd.exe destructive commands. Tokenise to avoid matching substrings
-    // inside paths.
-    let first = tokens.first().copied().unwrap_or("").to_ascii_lowercase();
+    // cmd.exe destructive commands.
+    // Tokenise to avoid matching substrings inside paths.
+    let flag_matches = |flag: &str| tokens.contains(&flag);
 
-    match first.as_str() {
-        // `del /S` alone (recursive) or `del /Q /F` (quiet + force-delete
-        // read-only, without confirmation) are both treated as destructive.
-        // Parentheses make the intended precedence explicit.
+    match first {
+        // `/S` triggers recursive deletion. `/Q /F` together suppress
+        // confirmation and force-delete read-only files; even without `/S`
+        // that is a non-interactive, hard-to-reverse destructive operation.
         "del" | "erase" => {
             return flag_matches("/s") || (flag_matches("/q") && flag_matches("/f"));
         }

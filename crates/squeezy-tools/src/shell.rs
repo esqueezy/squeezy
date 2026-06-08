@@ -40,6 +40,7 @@ use crate::shell_parse::{
     analyze_shell_command, dequote_token, expand_wrapper_segments, is_destructive_shell_segment,
     parse_shell_command, shell_coverage_warnings, shell_segments, tokenize_shell_segment,
 };
+use crate::shell_program::ShellProgram;
 use crate::shell_sandbox::{
     ShellSandboxPlan, configure_linux_shell_sandbox, configure_shell_process_group,
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_runtime_unavailable,
@@ -230,6 +231,27 @@ impl ToolRegistry {
             &self.shell_sandbox.protected_metadata_names,
         ) {
             let reason = format!("shell command writes protected metadata directory {name:?}");
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                shell_sandbox_status_metadata(&self.shell_sandbox, "denied"),
+                timeout_ms,
+                output_cap,
+                "denied",
+                Some(&reason),
+                None,
+                &[],
+                &[],
+            );
+            return shell_policy_denied(call, &analysis, reason);
+        }
+
+        // Validate the SQUEEZY_SHELL override before constructing any plan so
+        // that a missing Git Bash (or similar unresolvable shell) produces a
+        // clear tool error even for the direct_user_shell TUI fast path.
+        if let Err(reason) = ShellProgram::validate_override() {
             self.audit_shell(
                 call,
                 &args,

@@ -11,9 +11,15 @@ fn flags_powershell_recursive_force_remove() {
 }
 
 #[test]
-fn flags_remove_item_literalpath() {
+fn flags_remove_item_literalpath_recurse() {
     assert!(is_destructive_windows_segment(
         "Remove-Item -LiteralPath C:\\Users\\foo -Recurse -Force"
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -LiteralPath C:\\x -Recurse -Force"
+    ));
+    assert!(is_destructive_windows_segment(
+        "remove-item -literalpath C:\\x -r"
     ));
 }
 
@@ -21,6 +27,17 @@ fn flags_remove_item_literalpath() {
 fn flags_remove_item_path_flag() {
     assert!(is_destructive_windows_segment(
         "Remove-Item -Path C:\\tmp\\logs -Force -Recurse"
+    ));
+}
+
+#[test]
+fn flags_remove_item_confirm_false() {
+    // -Confirm:$false suppresses safety prompt; treated as destructive.
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse -Confirm:$false C:\\logs"
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item C:\\file -Confirm:$false"
     ));
 }
 
@@ -33,6 +50,31 @@ fn flags_ri_alias_recurse_force() {
         "ri -Force -Recurse C:\\data"
     ));
     assert!(is_destructive_windows_segment("ri -r -Force C:\\data"));
+    // `ri` is the built-in PowerShell alias for Remove-Item.
+    assert!(is_destructive_windows_segment("ri -r C:\\tmp"));
+    assert!(is_destructive_windows_segment("ri -Recurse C:\\data"));
+    assert!(is_destructive_windows_segment(
+        "ri C:\\file -Confirm:$false"
+    ));
+}
+
+#[test]
+fn flags_remove_item_short_recurse_alias() {
+    // -r is the short alias for -Recurse in PowerShell.
+    assert!(is_destructive_windows_segment("Remove-Item -r C:\\foo"));
+    assert!(is_destructive_windows_segment(
+        "remove-item -force -r C:\\bar"
+    ));
+}
+
+#[test]
+fn flags_invoked_and_module_qualified_remove_item() {
+    assert!(is_destructive_windows_segment(
+        "& Remove-Item -Recurse C:\\tmp"
+    ));
+    assert!(is_destructive_windows_segment(
+        "Microsoft.PowerShell.Management\\Remove-Item -r C:\\tmp"
+    ));
 }
 
 #[test]
@@ -162,6 +204,21 @@ fn flags_recursive_del() {
 }
 
 #[test]
+fn flags_del_quiet_force_without_recurse() {
+    // /Q /F together (no /S): suppresses prompt and forces deletion of
+    // read-only files. Intentionally flagged as destructive even without
+    // /S because the operation is non-interactive and hard to recover.
+    assert!(is_destructive_windows_segment(
+        "del /Q /F C:\\important.txt"
+    ));
+    // /Q alone (no /F) is not flagged — deleting with confirmation suppressed
+    // but without forcing read-only removal is borderline; keep narrow.
+    assert!(!is_destructive_windows_segment("del /Q C:\\file.txt"));
+    // /F alone is similarly not flagged.
+    assert!(!is_destructive_windows_segment("del /F C:\\file.txt"));
+}
+
+#[test]
 fn flags_recursive_rd() {
     assert!(is_destructive_windows_segment("rd /S /Q C:\\tmp"));
 }
@@ -196,4 +253,18 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("schtasks /query /fo LIST"));
     // shutdown with only /t must not trigger.
     assert!(!is_destructive_windows_segment("shutdown /t 60"));
+    // `ri` without recursive/confirm-suppress flags is not flagged.
+    assert!(!is_destructive_windows_segment("ri C:\\foo\\bar.txt"));
+    // Remove-Item without -Recurse/-r or -Confirm:$false is not flagged.
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item C:\\logs\\app.log"
+    ));
+    // Cmdlet names mentioned as ordinary arguments must not trigger the
+    // destructive classifier.
+    assert!(!is_destructive_windows_segment(
+        "Write-Output remove-item -Confirm:$false"
+    ));
+    assert!(!is_destructive_windows_segment(
+        "Write-Output set-executionpolicy"
+    ));
 }
