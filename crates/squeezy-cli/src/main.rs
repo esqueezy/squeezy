@@ -13,11 +13,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
+use squeezy_core::settings_writer::write_settings_atomic;
 use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
     ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
     SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
-    per_repo_settings_path, project_settings_template, user_settings_template,
+    local_settings_template, per_repo_settings_path, project_settings_template,
+    user_settings_template,
 };
 use squeezy_llm::{
     LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
@@ -230,6 +232,36 @@ enum ConfigCommand {
         )]
         with_bundled_skills: bool,
     },
+    #[command(
+        about = "Validate the active settings files for unknown fields",
+        long_about = "Validate the active settings files for unknown fields.\n\
+                      By default (without --strict), unknown fields are warnings.\n\
+                      With --strict, any unknown field is treated as an error."
+    )]
+    Validate {
+        #[arg(
+            long,
+            help = "Treat unknown config fields as errors instead of warnings"
+        )]
+        strict: bool,
+    },
+    #[command(
+        about = "Show the winning tier and shadowed values for a config field",
+        long_about = "Show which tier owns a config field and whether lower tiers are \
+                      shadowed.\n\
+                      Example: squeezy config explain model.provider"
+    )]
+    Explain {
+        /// Dotted TOML path, e.g. `model.provider` or `tui.tick_rate_ms`.
+        field: String,
+    },
+    #[command(
+        about = "Emit the config schema as JSON for external tooling",
+        long_about = "Print the CONFIG_SECTIONS schema as a JSON array. Each entry \
+                      describes a section with its fields, TOML paths, editor kinds, \
+                      apply tiers, env overrides, and default display values."
+    )]
+    Schema,
 }
 
 #[derive(Debug, Args, Default)]
@@ -245,6 +277,11 @@ struct InitScope {
     user: bool,
     #[arg(long, help = "Write the project-level settings file")]
     project: bool,
+    #[arg(
+        long,
+        help = "Write the per-machine repo-local settings file (~/.squeezy/projects/<hash>/settings.toml)"
+    )]
+    local: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -900,7 +937,39 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
         }
         Some(ConfigCommand::Inspect) => {
             let config = config_from_cli(cli)?;
-            print!("{}", config.inspect_redacted());
+            let output = config.inspect_redacted();
+            // Warn when any config string value starts with '!' (shell-escape
+            // execution).  These execute at config-load time before sandboxing
+            // or permission policy and warrant explicit visibility.
+            let shell_escape_fields: Vec<String> = config
+                .config_warnings
+                .iter()
+                .filter(|w| w.field.starts_with('!'))
+                .map(|w| format!("  {}: {}", w.source, w.field))
+                .collect();
+            if !shell_escape_fields.is_empty() {
+                eprintln!(
+                    "warning: the following config values begin with '!' and will be executed \
+                     as shell commands at config-load time (before sandboxing):"
+                );
+                for line in &shell_escape_fields {
+                    eprintln!("{line}");
+                }
+            }
+            // Also scan the effective config output for '!' prefixed values
+            // so they are surfaced even if not captured as structured warnings.
+            for line in output.lines() {
+                if let Some(rest) = line.split_once('=') {
+                    let val = rest.1.trim().trim_matches('"');
+                    if val.starts_with('!') {
+                        eprintln!(
+                            "warning: shell-escape value detected in config: {}",
+                            line.trim()
+                        );
+                    }
+                }
+            }
+            print!("{output}");
             Ok(())
         }
         Some(ConfigCommand::Init {
@@ -910,6 +979,9 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
         }) => {
             let (path, template) = if scope.user {
                 (default_settings_path(), user_settings_template())
+            } else if scope.local {
+                let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                (per_repo_settings_path(&cwd), local_settings_template())
             } else {
                 let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 (project_init_target(cwd), project_settings_template())
@@ -927,12 +999,10 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
                     path.display()
                 )));
             }
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&path, template)?;
+            // Use the hardened atomic writer so the settings file gets
+            // 0o600 permissions (and 0o700 parent dirs) even when it
+            // contains inline provider keys or MCP credentials.
+            write_settings_atomic(&path, template.as_bytes())?;
             println!("wrote {}", path.display());
             if *with_bundled_skills {
                 // scope.user is already verified above.
@@ -956,6 +1026,199 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
                 }
             }
             Ok(())
+        }
+        Some(ConfigCommand::Validate { strict }) => {
+            let config = config_from_cli(cli)?;
+            let unknown_field_warnings: Vec<&squeezy_core::ConfigWarning> = config
+                .config_warnings
+                .iter()
+                .filter(|w| {
+                    // Unknown field warnings have a dotted TOML path as their
+                    // `field`; provider/model compat warnings contain prose.
+                    !w.field.contains(' ')
+                })
+                .collect();
+            if unknown_field_warnings.is_empty() {
+                println!("config OK — no unknown fields found");
+                return Ok(());
+            }
+            for w in &unknown_field_warnings {
+                let prefix = if *strict { "error" } else { "warning" };
+                eprintln!(
+                    "{prefix}: unknown config field `{}` in {}",
+                    w.field, w.source
+                );
+            }
+            if *strict {
+                return Err(SqueezyError::Config(format!(
+                    "{} unknown config field(s) found (--strict mode)",
+                    unknown_field_warnings.len()
+                )));
+            }
+            Ok(())
+        }
+        Some(ConfigCommand::Explain { field: field_path }) => {
+            use squeezy_core::{
+                config_schema::{CONFIG_SECTIONS, FieldSource},
+                load_separated_settings_sources, resolve_field_source,
+            };
+            let parts: Vec<&str> = field_path.splitn(10, '.').collect();
+            let found = CONFIG_SECTIONS
+                .iter()
+                .flat_map(|s| s.fields.iter())
+                .find(|f| f.toml_path == parts.as_slice());
+            let Some(field_meta) = found else {
+                return Err(SqueezyError::Config(format!(
+                    "unknown config field {field_path:?}; \
+                     use `squeezy config schema` to list all fields"
+                )));
+            };
+            let config = config_from_cli(cli)?;
+            let effective_value = (field_meta.get)(&config).as_display();
+            let sources = load_separated_settings_sources()
+                .map_err(|e| SqueezyError::Config(format!("failed to load settings tiers: {e}")))?;
+            let winning_source = resolve_field_source(&sources, field_meta);
+            let source_path = match winning_source {
+                FieldSource::Env => field_meta
+                    .env_override
+                    .map(|v| format!("${v}"))
+                    .unwrap_or_else(|| "env".to_string()),
+                FieldSource::Repo => sources
+                    .repo
+                    .as_ref()
+                    .map(|t| t.path.display().to_string())
+                    .unwrap_or_else(|| "local tier".to_string()),
+                FieldSource::Project => sources
+                    .project
+                    .as_ref()
+                    .map(|t| t.path.display().to_string())
+                    .unwrap_or_else(|| "project tier".to_string()),
+                FieldSource::User => sources
+                    .user
+                    .as_ref()
+                    .map(|t| t.path.display().to_string())
+                    .unwrap_or_else(|| "user tier".to_string()),
+                FieldSource::Default => "(built-in default)".to_string(),
+            };
+            println!("field:   {field_path}");
+            println!("value:   {effective_value}");
+            println!("source:  {} ({})", winning_source.badge(), source_path);
+            if let Some(env_var) = field_meta.env_override {
+                if winning_source != FieldSource::Env {
+                    println!("env:     ${env_var} (not set — would override if set)");
+                } else {
+                    println!("env:     ${env_var} (active)");
+                }
+            }
+            println!("apply:   {}", field_meta.tier.label());
+            // Show which lower tiers also define this field (they are shadowed).
+            let tier_entries: [(FieldSource, &str, Option<&squeezy_core::TierSource>); 3] = [
+                (FieldSource::Repo, "local", sources.repo.as_ref()),
+                (FieldSource::Project, "repo", sources.project.as_ref()),
+                (FieldSource::User, "user", sources.user.as_ref()),
+            ];
+            let mut printed_header = false;
+            for (src, label, tier) in tier_entries {
+                if src == winning_source {
+                    continue;
+                }
+                if tier.is_some_and(|t| t.contains_path(field_meta.toml_path)) {
+                    if !printed_header {
+                        println!("shadowed:");
+                        printed_header = true;
+                    }
+                    let path_str = tier
+                        .map(|t| t.path.display().to_string())
+                        .unwrap_or_default();
+                    println!("  {label}: {path_str}");
+                }
+            }
+            Ok(())
+        }
+        Some(ConfigCommand::Schema) => {
+            use squeezy_core::config_schema::CONFIG_SECTIONS;
+            let sections: Vec<serde_json::Value> = CONFIG_SECTIONS
+                .iter()
+                .map(|section| {
+                    let fields: Vec<serde_json::Value> = section
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            let kind_json = field_kind_to_json(&f.kind);
+                            serde_json::json!({
+                                "label": f.label,
+                                "toml_path": f.toml_path,
+                                "kind": kind_json,
+                                "apply_tier": f.tier.label(),
+                                "default_display": f.default_display,
+                                "help": f.help,
+                                "env_override": f.env_override,
+                                "secret": f.secret,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "id": section.id.slug(),
+                        "label": section.label,
+                        "description": section.description,
+                        "fields": fields,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sections).unwrap_or_default()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn field_kind_to_json(kind: &squeezy_core::config_schema::FieldKind) -> serde_json::Value {
+    use squeezy_core::config_schema::FieldKind;
+    match kind {
+        FieldKind::Bool => serde_json::json!({"type": "bool"}),
+        FieldKind::Integer { min, max, suffix } => serde_json::json!({
+            "type": "integer", "min": min, "max": max, "suffix": suffix
+        }),
+        FieldKind::OptionalInteger { min, max, suffix } => serde_json::json!({
+            "type": "optional_integer", "min": min, "max": max, "suffix": suffix
+        }),
+        FieldKind::OptionalFloat { min, max } => serde_json::json!({
+            "type": "optional_float", "min": min, "max": max
+        }),
+        FieldKind::Enum { options } => serde_json::json!({
+            "type": "enum", "options": options
+        }),
+        FieldKind::OptionalEnum { options } => serde_json::json!({
+            "type": "optional_enum", "options": options
+        }),
+        FieldKind::String { multiline } => serde_json::json!({
+            "type": "string", "multiline": multiline
+        }),
+        FieldKind::DurationMs => serde_json::json!({"type": "duration_ms"}),
+        FieldKind::StringList { min, max } => serde_json::json!({
+            "type": "string_list", "min": min, "max": max
+        }),
+        FieldKind::Path {
+            must_exist,
+            dir_only,
+        } => serde_json::json!({
+            "type": "path", "must_exist": must_exist, "dir_only": dir_only
+        }),
+        FieldKind::Secret { env_var } => serde_json::json!({
+            "type": "secret", "env_var": env_var
+        }),
+        FieldKind::Info => serde_json::json!({"type": "info"}),
+        FieldKind::ProviderSubTabs => serde_json::json!({"type": "provider_sub_tabs"}),
+        FieldKind::TableArray { kind } => {
+            use squeezy_core::config_schema::TableArrayKind;
+            match kind {
+                TableArrayKind::Keyed { .. } => serde_json::json!({"type": "table_array_keyed"}),
+                TableArrayKind::Ordered { .. } => {
+                    serde_json::json!({"type": "table_array_ordered"})
+                }
+            }
         }
     }
 }
@@ -1384,10 +1647,7 @@ fn update_skills_config(
         .map_err(|err| SqueezyError::Config(format!("{}: {err}", path.display())))?;
     let entries = ensure_skills_config_array(&mut doc)?;
     update(entries)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, doc.to_string())?;
+    write_settings_atomic(&path, doc.to_string().as_bytes())?;
     println!("updated {}", path.display());
     Ok(())
 }
@@ -1469,10 +1729,7 @@ fn update_mcp_settings(
         .map_err(|err| SqueezyError::Config(format!("{}: {err}", path.display())))?;
     let servers = ensure_mcp_servers_table(&mut doc)?;
     update(servers)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, doc.to_string())?;
+    write_settings_atomic(&path, doc.to_string().as_bytes())?;
     println!("updated {}", path.display());
     Ok(())
 }
@@ -2701,10 +2958,10 @@ fn save_startup_model_selection(
         }
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, doc.to_string())?;
+    // Use the hardened atomic writer: the startup selection file lives under
+    // ~/.squeezy/ and may contain inline api_key_env / base_url values that
+    // act as credentials, so owner-only permissions are required.
+    write_settings_atomic(path, doc.to_string().as_bytes())?;
     Ok(())
 }
 
