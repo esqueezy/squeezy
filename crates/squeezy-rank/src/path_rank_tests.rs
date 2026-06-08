@@ -65,10 +65,12 @@ fn rank_paths_is_stable_on_full_tie() {
 fn sort_key_orders_higher_overlap_first() {
     let high = PathRank {
         overlap: 3,
+        exact_case_overlap: 0,
         trigram: 0.1,
     };
     let low = PathRank {
         overlap: 1,
+        exact_case_overlap: 0,
         trigram: 0.9,
     };
     assert!(high.sort_key() < low.sort_key());
@@ -105,4 +107,45 @@ fn rank_paths_is_deterministic_with_path_tiebreaker() {
         paths[ranked[0].0], "aaa/widget.rs",
         "lexicographic tiebreaker must place aaa before zzz; ranked={ranked:?}"
     );
+}
+
+#[test]
+fn exact_case_query_prefers_matching_case_path_on_linux() {
+    // Linux case-sensitivity: when the query uses the uppercase form `Foo.rs`,
+    // `src/Foo.rs` should rank above `src/foo.rs` even though both paths have
+    // equal lowercase-token overlap.  The exact_case_overlap tiebreaker
+    // implements this preference.
+    let paths = ["src/foo.rs", "src/Foo.rs"];
+    let ranked = rank_paths(&paths, "Foo.rs");
+    assert_eq!(
+        paths[ranked[0].0], "src/Foo.rs",
+        "exact-case query should prefer Foo.rs over foo.rs; ranked={ranked:?}"
+    );
+}
+
+#[test]
+fn lowercase_query_prefers_lowercase_path_via_exact_case_overlap() {
+    // A lowercase query `foo` gives both paths equal case-insensitive overlap,
+    // but `src/foo.rs` gets exact_case_overlap=1 (token `foo` matches exactly)
+    // while `src/Foo.rs` gets exact_case_overlap=0.  So `src/foo.rs` wins,
+    // which is the correct Linux intent: lowercase query → lowercase path.
+    let paths = ["src/foo.rs", "src/Foo.rs"];
+    let ranked = rank_paths(&paths, "foo");
+    assert_eq!(
+        ranked[0].1.overlap, ranked[1].1.overlap,
+        "lowercase query should give equal case-insensitive overlap to both paths"
+    );
+    assert_eq!(
+        paths[ranked[0].0], "src/foo.rs",
+        "lowercase query should prefer lowercase path via exact-case overlap"
+    );
+}
+
+#[test]
+fn exact_case_overlap_equals_overlap_for_fully_lowercase_paths() {
+    // When both the query and the path are entirely lowercase, every token
+    // that contributes to (case-insensitive) overlap also matches with exact
+    // case — so exact_case_overlap == overlap.
+    let rank = path_rank("src/parser/lib.rs", "parser");
+    assert_eq!(rank.exact_case_overlap, rank.overlap);
 }
