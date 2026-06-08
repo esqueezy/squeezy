@@ -114,21 +114,18 @@ fn osc9_auto_resolves_to_concrete_backend_in_test_env() {
     );
 }
 
-fn make_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
-    |key: &str| {
-        pairs
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| OsString::from(*v))
-    }
-}
-
 #[test]
 fn osc9_detects_term_program_signals() {
     for program in &["iTerm.app", "Ghostty", "WezTerm", "kitty", "WarpTerminal"] {
-        let env = make_env(&[("TERM_PROGRAM", program)]);
+        let fixture: &[(&str, &str)] = &[("TERM_PROGRAM", program)];
+        let lookup = |key: &str| {
+            fixture
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(*v))
+        };
         assert!(
-            detect_osc9_support_from_env(env),
+            detect_osc9_support_from_env(lookup),
             "TERM_PROGRAM={program} should enable OSC9"
         );
     }
@@ -136,16 +133,23 @@ fn osc9_detects_term_program_signals() {
 
 #[test]
 fn osc9_detects_linux_env_var_signals() {
-    let signals: &[&str] = &[
-        "KITTY_WINDOW_ID",
-        "WEZTERM_PANE",
-        "WEZTERM_EXECUTABLE",
-        "GHOSTTY_RESOURCES_DIR",
+    let signals: &[(&str, &str)] = &[
+        ("KITTY_WINDOW_ID", "42"),
+        ("WEZTERM_PANE", "0"),
+        ("WEZTERM_EXECUTABLE", "/usr/local/bin/wezterm"),
+        ("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty"),
     ];
-    for signal in signals {
-        let env = make_env(&[(signal, "1")]);
+    for fixture in signals {
+        let signal = fixture.0;
+        let fixture_slice: &[(&str, &str)] = std::slice::from_ref(fixture);
+        let lookup = |key: &str| {
+            fixture_slice
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(*v))
+        };
         assert!(
-            detect_osc9_support_from_env(env),
+            detect_osc9_support_from_env(lookup),
             "{signal} should enable OSC9"
         );
     }
@@ -154,9 +158,15 @@ fn osc9_detects_linux_env_var_signals() {
 #[test]
 fn osc9_detects_linux_term_values() {
     for term in &["xterm-kitty", "ghostty", "wezterm", "foot"] {
-        let env = make_env(&[("TERM", term)]);
+        let fixture: &[(&str, &str)] = &[("TERM", term)];
+        let lookup = |key: &str| {
+            fixture
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(*v))
+        };
         assert!(
-            detect_osc9_support_from_env(env),
+            detect_osc9_support_from_env(lookup),
             "TERM={term} should enable OSC9"
         );
     }
@@ -167,9 +177,18 @@ fn osc9_off_for_unknown_terminals() {
     let empty = |_: &str| -> Option<OsString> { None };
     assert!(!detect_osc9_support_from_env(empty));
 
-    let dumb = make_env(&[("TERM", "dumb")]);
-    assert!(!detect_osc9_support_from_env(dumb));
+    let dumb: &[(&str, &str)] = &[("TERM", "dumb")];
+    assert!(!detect_osc9_support_from_env(|key: &str| {
+        dumb.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(*v))
+    }));
 
-    let screen = make_env(&[("TERM", "screen-256color")]);
-    assert!(!detect_osc9_support_from_env(screen));
+    let screen: &[(&str, &str)] = &[("TERM", "screen-256color")];
+    assert!(!detect_osc9_support_from_env(|key: &str| {
+        screen
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(*v))
+    }));
 }
