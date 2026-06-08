@@ -934,6 +934,13 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             }
             fs::write(&path, template)?;
             println!("wrote {}", path.display());
+            // On Windows, print a one-line PowerShell command for opening the
+            // settings file so users don't have to navigate to %APPDATA%
+            // manually.
+            #[cfg(target_os = "windows")]
+            if scope.user {
+                println!("  Open: Invoke-Item \"{}\"", path.display());
+            }
             if *with_bundled_skills {
                 // scope.user is already verified above.
                 let config = config_from_cli(cli)?;
@@ -1994,20 +2001,56 @@ fn confirm(prompt: &str) -> squeezy_core::Result<bool> {
 ///
 /// Kept pure (no I/O) so it round-trips cleanly in unit tests and can be
 /// reused by any future surface (e.g. TUI) that needs the same warning
-/// string. Trailing path separators are trimmed before comparison so a
-/// recorded `"/repo"` and a current `"/repo/"` are treated as equal —
-/// the message itself preserves the original strings so the operator
-/// can spot the discrepancy.
+/// string. Paths are normalized via [`normalize_cwd_for_compare`] before
+/// comparison so that Windows drive-letter case, slash direction, and
+/// verbatim/UNC prefixes do not trigger a spurious cross-project prompt.
+/// The message itself preserves the original strings so the operator can
+/// spot any real discrepancy.
 fn cross_project_resume_prompt(session_cwd: &str, current_cwd: &str) -> Option<String> {
-    fn normalize(value: &str) -> &str {
-        value.trim_end_matches(['/', std::path::MAIN_SEPARATOR])
-    }
-    if normalize(session_cwd) == normalize(current_cwd) {
+    if normalize_cwd_for_compare(session_cwd) == normalize_cwd_for_compare(current_cwd) {
         return None;
     }
     Some(format!(
         "Resume session from {session_cwd} in current cwd {current_cwd}? [y/N] "
     ))
+}
+
+/// Normalize a cwd string for equality comparisons across sessions.
+///
+/// Applies the following transformations so that the same filesystem
+/// location expressed in different forms compares equal:
+///
+/// 1. Strip Windows verbatim (`\\?\`) and UNC (`\\server\share` →
+///    `//server/share`) prefixes.
+/// 2. Fold backslashes to forward slashes.
+/// 3. Lower-case the drive letter on Windows (`C:/` → `c:/`).
+/// 4. Strip a trailing separator.
+///
+/// The function is intentionally cheap and allocation-based: it runs
+/// at most once per resume check, never on hot paths.
+fn normalize_cwd_for_compare(value: &str) -> String {
+    let mut s = value.to_string();
+
+    // Strip Windows verbatim prefix \\?\ or //?/
+    if s.starts_with(r"\\?\") || s.starts_with("//?/") {
+        s = s[4..].to_string();
+    }
+
+    // Normalize backslashes to forward slashes for uniform comparison.
+    s = s.replace('\\', "/");
+
+    // Fold drive-letter to lowercase: "C:/" → "c:/"
+    if s.len() >= 2 && s.as_bytes()[1] == b':' {
+        let drive = s.as_bytes()[0].to_ascii_lowercase() as char;
+        s = format!("{drive}{}", &s[1..]);
+    }
+
+    // Strip trailing separator.
+    while s.ends_with('/') && s.len() > 1 {
+        s.pop();
+    }
+
+    s
 }
 
 /// Drive a y/N confirmation through caller-supplied I/O. Returns `true`
@@ -2779,9 +2822,12 @@ fn resolve_resume_session(
             note: None,
         },
         ResumeFlag::Continue => {
+            let cwd_norm = normalize_cwd_for_compare(cwd_str);
             let pick = sessions
                 .iter()
-                .find(|meta| meta.resume_available && meta.cwd == cwd_str)
+                .find(|meta| {
+                    meta.resume_available && normalize_cwd_for_compare(&meta.cwd) == cwd_norm
+                })
                 .map(|meta| meta.session_id.clone());
             if pick.is_some() {
                 ResumeResolution {

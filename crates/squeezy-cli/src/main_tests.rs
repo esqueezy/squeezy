@@ -1347,3 +1347,75 @@ fn skills_upsert_entry_inserts_by_path_when_no_match() {
     assert_eq!(first.get("enabled").and_then(|v| v.as_bool()), Some(true));
     assert!(first.get("name").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Windows-specific path normalization tests (compile and run on all platforms
+// so regressions are caught in Linux/macOS CI too).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn normalize_cwd_strips_verbatim_prefix() {
+    // \\?\ verbatim prefix should be stripped before comparison.
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\C:\repo"),
+        normalize_cwd_for_compare(r"C:\repo"),
+    );
+}
+
+#[test]
+fn normalize_cwd_folds_drive_letter_case() {
+    assert_eq!(
+        normalize_cwd_for_compare(r"C:\Repo"),
+        normalize_cwd_for_compare(r"c:\repo"),
+        "drive-letter case difference must not trigger cross-project prompt"
+    );
+}
+
+#[test]
+fn normalize_cwd_normalizes_backslash_to_slash() {
+    assert_eq!(
+        normalize_cwd_for_compare(r"C:\Repo\sub"),
+        normalize_cwd_for_compare("C:/Repo/sub"),
+    );
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_windows_drive_case() {
+    // `C:\Repo` and `c:\repo` are the same directory on Windows.
+    assert!(cross_project_resume_prompt(r"C:\Repo", r"c:\repo").is_none());
+    assert!(cross_project_resume_prompt(r"C:/Repo", r"c:/repo").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_verbatim_prefix() {
+    assert!(cross_project_resume_prompt(r"\\?\C:\Repo", r"C:\Repo").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_mixed_separators() {
+    assert!(cross_project_resume_prompt(r"C:\Repo\sub", "C:/Repo/sub").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_fires_for_different_windows_paths() {
+    let prompt = cross_project_resume_prompt(r"C:\old", r"C:\new")
+        .expect("genuinely different paths should trigger a prompt");
+    assert!(prompt.contains(r"C:\old"));
+    assert!(prompt.contains(r"C:\new"));
+}
+
+#[test]
+fn resolve_resume_session_continue_matches_with_drive_case() {
+    use squeezy_store::SessionMetadata;
+    let mut meta = SessionMetadata::default();
+    meta.session_id = "abc123".to_string();
+    meta.cwd = r"C:\Repo".to_string();
+    meta.resume_available = true;
+    // Querying with lower-case drive letter should still match.
+    let result = resolve_resume_session(ResumeFlag::Continue, &[meta], r"c:\repo");
+    assert_eq!(
+        result.session_id.as_deref(),
+        Some("abc123"),
+        "drive-letter case must not prevent --continue from finding the session"
+    );
+}

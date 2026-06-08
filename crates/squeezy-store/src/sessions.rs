@@ -131,15 +131,26 @@ impl SessionStore {
         write_json(&self.calibration_path(), calibration)
     }
 
-    /// Path to the user-global memory file. Returns `None` when `HOME` is
-    /// unset — the same condition under which the agent's prompt-side
-    /// ingestion (`ingest_user_memory`) declines to do anything. The file
-    /// itself is the single static memory store described in
+    /// Path to the user-global memory file. Returns `None` when no
+    /// suitable home directory can be resolved. Resolution order:
+    ///
+    /// 1. `$HOME/.squeezy/memory.md` (Unix and Windows Git Bash / WSL)
+    /// 2. `$USERPROFILE\.squeezy\memory.md` (native Windows)
+    /// 3. `dirs::data_dir()/squeezy/memory.md` (platform data dir)
+    ///
+    /// The file is the single static memory store described in
     /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
     /// new directory or partition scheme.
     pub fn memory_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".squeezy").join("memory.md"))
+        if let Some(home) = env::var_os("HOME") {
+            return Some(PathBuf::from(home).join(".squeezy").join("memory.md"));
+        }
+        // Native Windows: USERPROFILE is always set when APPDATA/LOCALAPPDATA are.
+        if let Some(profile) = env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile).join(".squeezy").join("memory.md"));
+        }
+        // Final fallback: platform data directory (e.g. %APPDATA%\squeezy on Windows).
+        dirs::data_dir().map(|d| d.join("squeezy").join("memory.md"))
     }
 
     /// Append one normalized line to the user-global memory file
@@ -160,7 +171,9 @@ impl SessionStore {
         }
         let Some(path) = Self::memory_path() else {
             return Err(SqueezyError::Agent(
-                "remember requires HOME to be set to locate ~/.squeezy/memory.md".to_string(),
+                "remember: cannot locate user home directory (HOME, USERPROFILE, and \
+                 platform data dir all unavailable)"
+                    .to_string(),
             ));
         };
         if let Some(parent) = path.parent() {
