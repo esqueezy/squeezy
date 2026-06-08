@@ -3021,7 +3021,11 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         }
         file.sync_all()?;
     }
-    rename_with_retry(&tmp, path)
+    if let Err(err) = rename_with_retry(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

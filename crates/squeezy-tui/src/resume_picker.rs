@@ -430,7 +430,7 @@ impl ResumePickerState {
         // candidate rows live at indices 1..=N.
         let entry = self.candidates.get(self.cursor - 1)?;
         let cwd_str = self.cwd.display().to_string();
-        if entry.summary.cwd == cwd_str {
+        if paths_same(&entry.summary.cwd, &cwd_str) {
             Some(ResumeChoice::Resume {
                 session_id: entry.session_id().to_string(),
                 branch_tip: entry.branch_tip.as_ref().map(|tip| tip.tip_sequence),

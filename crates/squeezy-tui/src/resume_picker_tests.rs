@@ -587,6 +587,28 @@ fn picker_expands_branches_after_tab_toggle() {
 }
 
 #[test]
+fn picker_select_treats_trailing_slash_mismatch_as_same_project() {
+    // A session stored with a trailing separator and a cwd without one
+    // should be treated as the same directory. select_at_cursor must use
+    // paths_same (not ==) so the session resolves as Resume, not CrossProject.
+    let same_dir_with_slash = summary_at("s", "/work/repo/");
+    let mut state = ResumePickerState::new(vec![same_dir_with_slash], cwd());
+    // By default the scoped view should show this session because
+    // paths_same("/work/repo/", "/work/repo") == true.
+    assert_eq!(
+        state.candidates.len(),
+        1,
+        "session should be in scoped view"
+    );
+    state.dispatch(press(KeyCode::Down));
+    let choice = state.dispatch(press(KeyCode::Enter));
+    assert!(
+        matches!(choice, Some(ResumeChoice::Resume { .. })),
+        "trailing-slash mismatch must not dispatch as CrossProject; got: {choice:?}"
+    );
+}
+
+#[test]
 fn setup_resume_picker_left_goes_back_to_setup() {
     let mut state =
         ResumePickerState::with_setup_progress(vec![summary("first")], cwd(), Some((5, 5)));
