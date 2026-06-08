@@ -11971,9 +11971,14 @@ async fn mcp_background_queue_serves_issued_tickets_in_order() {
 // Cross-surface redaction tests (Idea 3)
 // ---------------------------------------------------------------------------
 
-/// Synthetic secret that triggers the built-in bearer-token pattern.
-/// Format: `Authorization: Bearer <value>` — covered by the built-in regex.
-const SYNTHETIC_SECRET: &str = "sk-testkey-abcdefghijklmnopqrstuvwxyz0123";
+/// Synthetic secret used in cross-surface redaction tests. Uses the
+/// `sk-` prefix so it matches the built-in OpenAI-key pattern
+/// (`sk-[A-Za-z0-9]{48}`) regardless of how it appears in a field (raw
+/// value in metadata, embedded in a command string, etc.). It is also
+/// long enough to match regardless of exact length checks in the regex.
+/// The `redact_tool_call` test additionally wraps it in an
+/// `Authorization: Bearer` header to exercise the bearer-token pattern.
+const SYNTHETIC_SECRET: &str = "sk-testkey-abcdefghijklmnopqrstuvwxyz012345678901";
 
 fn test_redactor() -> Arc<Redactor> {
     let config = squeezy_core::RedactionConfig::default();

@@ -13200,11 +13200,26 @@ fn tool_spec_capability_matches_permission_request_baseline() {
         !first_party.is_empty(),
         "registry must expose at least one first-party spec"
     );
+    // Provide minimal valid arguments for tools whose permission_request
+    // branch requires argument parsing to reach the correct capability.
+    // Tools not listed here get an empty object; if that causes a false
+    // pass (early Read escape before classification), the test comment
+    // below explains why that is still safe for the current set.
     let arguments_for = |name: &str| -> serde_json::Value {
         match name {
+            "apply_patch" => json!({"patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n+line\n"}),
+            "write_file" | "notebook_edit" => json!({"path": "src/foo.rs", "content": ""}),
+            "checkpoint_undo" | "checkpoint_revert" => json!({}),
+            "verify" => json!({}),
+            "refresh_compiler_facts" => json!({}),
+            "webfetch" => json!({"url": "https://example.com/"}),
+            "websearch" => json!({"query": "test"}),
+            "mcp_read_resource" => json!({"server": "test", "uri": "test://resource"}),
             "grep" => json!({"pattern": "test"}),
             "glob" => json!({"pattern": "*.rs"}),
-            "apply_patch" => json!({"patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n+line\n"}),
+            "decl_search" | "definition_search" | "reference_search" => {
+                json!({"query": "MyType"})
+            }
             _ => json!({}),
         }
     };

@@ -13164,6 +13164,11 @@ impl SubagentKindBucket {
 pub enum CostOrigin {
     Main,
     Subagent,
+    /// Spend from the AI reviewer or shell classifier LLM calls that run
+    /// on the permission path rather than as part of the main turn round.
+    /// Using a dedicated origin keeps reviewer spend separate from main-turn
+    /// spend in the by-model cost drill-down.
+    AiReviewer,
 }
 
 /// Per-`(provider, model)` cost bucket, split by [`CostOrigin`] so `/cost`
@@ -13181,20 +13186,29 @@ pub struct ModelCostBucket {
     pub main: CostSnapshot,
     #[serde(default)]
     pub subagent: CostSnapshot,
+    /// LLM spend attributed to the AI reviewer or shell classifier running
+    /// on the permission path. Stored separately so the `/cost --by-model`
+    /// drill-down can distinguish main-turn spend from permission-gate spend.
+    #[serde(default)]
+    pub reviewer: CostSnapshot,
 }
 
 impl ModelCostBucket {
     pub fn merge(&mut self, other: &ModelCostBucket) {
         merge_cost_snapshot(&mut self.main, &other.main);
         merge_cost_snapshot(&mut self.subagent, &other.subagent);
+        merge_cost_snapshot(&mut self.reviewer, &other.reviewer);
     }
 
-    /// Combined estimated USD across both origins (`None` only when neither
+    /// Combined estimated USD across all origins (`None` only when no
     /// slot carries a priced round).
     pub fn total_usd_micros(&self) -> Option<u64> {
         add_optional_u64(
-            self.main.estimated_usd_micros,
-            self.subagent.estimated_usd_micros,
+            add_optional_u64(
+                self.main.estimated_usd_micros,
+                self.subagent.estimated_usd_micros,
+            ),
+            self.reviewer.estimated_usd_micros,
         )
     }
 }
@@ -13230,6 +13244,7 @@ impl ModelLedger {
         let slot = match origin {
             CostOrigin::Main => &mut bucket.main,
             CostOrigin::Subagent => &mut bucket.subagent,
+            CostOrigin::AiReviewer => &mut bucket.reviewer,
         };
         merge_cost_snapshot(slot, cost);
     }
@@ -13264,6 +13279,7 @@ impl ModelLedger {
         for bucket in self.0.values() {
             merge_cost_snapshot(&mut total, &bucket.main);
             merge_cost_snapshot(&mut total, &bucket.subagent);
+            merge_cost_snapshot(&mut total, &bucket.reviewer);
         }
         total
     }

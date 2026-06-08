@@ -14861,7 +14861,7 @@ async fn permission_decision_for_request(
             state.metrics.model_ledger.record(
                 context.provider.name(),
                 &reviewer_result.model,
-                CostOrigin::Main,
+                CostOrigin::AiReviewer,
                 &reviewer_result.cost,
             );
         }
@@ -14924,15 +14924,21 @@ async fn permission_decision_for_request(
     }
     if !mode_forced_ask
         && should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
-        && let Some(classifier) = classify_ambiguous_shell(
+    {
+        if let Some((classifier, classifier_cost)) = classify_ambiguous_shell(
             context.provider.clone(),
             &context.config,
             &request,
             context.cancel.clone(),
         )
         .await
-    {
-        verdict = classifier;
+        {
+            // Accumulate classifier cost so the turn loop can fold it into
+            // the active CostBroker alongside reviewer spend.
+            reviewer_usd_micros = reviewer_usd_micros
+                .saturating_add(classifier_cost.estimated_usd_micros.unwrap_or(0));
+            verdict = classifier;
+        }
     }
     log_permission_verdict(&request, &verdict);
     // Emit permission_decided telemetry for auto-evaluated verdicts (Allow/Deny
@@ -15236,7 +15242,11 @@ fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAs
             let permission = runtime.tools.permission_request(&synthetic_call);
             // reviewer_usd_micros is not folded into a broker here because
             // shell_ask callbacks run outside the main turn loop and have no
-            // broker reference; the spend is already persisted to state.cost.
+            // broker reference. The spend IS already persisted to state.cost
+            // (and thus visible to the next turn's broker seed), so the
+            // cap-basis total is always eventually correct. The intra-turn
+            // live snapshot has a minor lag bounded by a single reviewer or
+            // classifier call (max_output_tokens: 120 / 80).
             let outcome =
                 permission_decision_for_request(&runtime, &synthetic_call, permission).await;
             match outcome.decision {
@@ -15523,12 +15533,16 @@ fn should_classify_shell(
         && verdict.action == PermissionAction::Ask
 }
 
+/// Returns `Some((verdict, cost))` when the classifier produces a response.
+/// `cost` carries the billable spend from the LLM round; callers must fold
+/// it into the active `CostBroker` so the live session-cost snapshot and cap
+/// checks reflect the spend within the turn.
 async fn classify_ambiguous_shell(
     provider: Arc<dyn LlmProvider>,
     config: &AppConfig,
     request: &PermissionRequest,
     cancel: CancellationToken,
-) -> Option<PermissionVerdict> {
+) -> Option<(PermissionVerdict, CostSnapshot)> {
     let command = request.metadata.get("command")?;
     let prompt = format!(
         "Classify this shell command for a coding agent permission gate.\n\
@@ -15562,13 +15576,17 @@ Working target: {:?}",
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
+    let mut classifier_cost = CostSnapshot::default();
     while let Some(event) = next_llm_stream_event(&mut stream, &cancel, config.stream_idle_timeout)
         .await
         .ok()?
     {
         match event {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
-            LlmEvent::Completed { .. } => break,
+            LlmEvent::Completed { cost, .. } => {
+                classifier_cost = cost;
+                break;
+            }
             LlmEvent::Cancelled => return None,
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
@@ -15588,7 +15606,7 @@ Working target: {:?}",
             _ => { /* future variant */ }
         }
     }
-    Some(parse_classifier_verdict(&text))
+    Some((parse_classifier_verdict(&text), classifier_cost))
 }
 
 /// Parse the classifier's textual response into a verdict. Only `deny` can

@@ -551,8 +551,11 @@ fn record_out_of_band_session_cost_advances_cap_basis_and_snapshot() {
     // Simulate a reviewer call costing 5_000 micros.
     broker.record_out_of_band_session_cost(5_000);
 
-    // Both the cap-basis total and the snapshot must advance.
+    // The cap-basis total (used by session_cap_reached / projected_session_cap_overrun
+    // / session_cost_snapshot) must advance.
     assert_eq!(broker.session_cost_usd_micros, 205_000);
+    // session_cost_snapshot unconditionally returns session_cost_usd_micros as
+    // the dollar field, so the snapshot also reflects the new total.
     assert_eq!(
         broker.session_cost_snapshot().estimated_usd_micros,
         Some(205_000)
