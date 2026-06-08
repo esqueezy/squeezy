@@ -49,7 +49,7 @@ pub use github_copilot::{
 pub use openai_codex::{
     OPENAI_CODEX_AUTH_FILE_NAME, OpenAiCodexLoginOutcome, OpenAiCodexOAuthSource,
     OpenAiCodexProvider, codex_auth_file_path, default_codex_auth_path, load_codex_token,
-    login_openai_codex_interactive, save_codex_token,
+    login_openai_codex_interactive, login_openai_codex_manual, save_codex_token,
 };
 pub use pkce::{PkceCodes, generate_pkce};
 pub use vertex::{DEFAULT_GCLOUD_COMMAND, GCLOUD_PRINT_TOKEN_ARGS, VertexOAuthSource};

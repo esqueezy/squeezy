@@ -15,8 +15,8 @@ use squeezy_llm::{
     GitHubCopilotDeviceCodeResponse, GitHubCopilotLoginHooks, GitHubCopilotLoginOutcome,
     OpenAiCodexLoginOutcome, PersistedTokens, codex_auth_file_path, exchange_authorization_code,
     generate_pkce, github_copilot_auth_file_path, github_copilot_read_tokens,
-    login_github_copilot_interactive, login_openai_codex_interactive, normalize_github_domain,
-    parse_authorization_input,
+    login_github_copilot_interactive, login_openai_codex_interactive, login_openai_codex_manual,
+    normalize_github_domain, parse_authorization_input,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -290,6 +290,17 @@ pub struct OpenAiCodexLoginArgs {
     /// waits for the callback — useful on headless hosts.
     #[arg(long, help = "Do not invoke a browser; print the URL only")]
     pub no_browser: bool,
+    /// Skip the localhost callback server entirely and accept the full
+    /// redirect URL or bare authorization code pasted from the browser.
+    /// Use this on locked-down Windows desktops where firewall rules,
+    /// browser isolation, or enterprise endpoint software blocks the
+    /// localhost callback, or in any environment where binding
+    /// 127.0.0.1:1455 is not possible.
+    #[arg(
+        long,
+        help = "Skip localhost callback; paste redirect URL or code instead (Windows/locked-down)"
+    )]
+    pub manual: bool,
 }
 
 #[derive(Debug, Args)]
@@ -373,6 +384,7 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
         .clone()
         .unwrap_or_else(|| "squeezy".to_string());
     let no_browser = args.no_browser;
+    let manual = args.manual;
 
     // Construct a runtime explicitly so this stays runnable from the
     // non-async `handle_auth_command` entry point without changing
@@ -383,37 +395,114 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
         .map_err(|err| SqueezyError::Config(format!("tokio runtime build failed: {err}")))?;
 
     let auth_path_for_login = auth_path.clone();
-    let outcome: OpenAiCodexLoginOutcome = runtime.block_on(async move {
-        login_openai_codex_interactive(&originator, &auth_path_for_login, |url| {
-            eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
-            eprintln!();
-            eprintln!("    {url}");
-            eprintln!();
-            if no_browser {
-                eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
-                return Ok(());
-            }
-            match open_browser(url) {
-                Ok(()) => {
-                    eprintln!("Browser launched. Waiting for callback…");
+    let outcome: OpenAiCodexLoginOutcome = if manual {
+        // --manual: skip the localhost listener entirely and accept a
+        // pasted redirect URL or bare code. Useful on Windows when the
+        // firewall or browser isolation blocks 127.0.0.1:1455.
+        runtime.block_on(async move {
+            login_openai_codex_manual(
+                &originator,
+                &auth_path_for_login,
+                |url| {
+                    eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+                    eprintln!();
+                    eprintln!("    {url}");
+                    eprintln!();
+                    eprintln!("After approving the consent screen, paste the full redirect URL");
+                    eprintln!("  (http://localhost:1455/auth/callback?code=...&state=...) or the");
+                    eprintln!("  bare authorization code here:");
+                    if !no_browser {
+                        match open_browser(url) {
+                            Ok(()) => eprintln!("Browser launched."),
+                            Err(err) => {
+                                eprintln!("Could not launch browser ({err}). Copy the URL above.");
+                            }
+                        }
+                    } else {
+                        eprintln!("(--no-browser: not launching a browser)");
+                    }
+                    Ok(())
+                },
+                || {
+                    eprint!("Paste redirect URL or code: ");
+                    let _ = io::stderr().flush();
+                    let mut buf = String::new();
+                    BufReader::new(io::stdin())
+                        .read_line(&mut buf)
+                        .map_err(|err| {
+                            SqueezyError::Config(format!(
+                                "failed to read authorization input: {err}"
+                            ))
+                        })?;
+                    Ok(buf)
+                },
+            )
+            .await
+        })?
+    } else {
+        // Interactive path: bind 127.0.0.1:1455 and wait for the browser
+        // callback. If the bind fails (port in use, firewall, WSL boundary,
+        // or enterprise endpoint software) print an actionable message and
+        // suggest --manual.
+        runtime.block_on(async move {
+            match login_openai_codex_interactive(&originator, &auth_path_for_login, |url| {
+                eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+                eprintln!();
+                eprintln!("    {url}");
+                eprintln!();
+                eprintln!(
+                    "Squeezy is listening for the OAuth callback on \
+                     http://localhost:1455/auth/callback"
+                );
+                #[cfg(target_os = "windows")]
+                eprintln!(
+                    "(Windows: if your browser or firewall blocks localhost callbacks, \
+                     re-run with --manual to paste the code instead)"
+                );
+                if no_browser {
+                    eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
+                    return Ok(());
                 }
-                Err(err) => {
-                    eprintln!("Could not launch browser ({err}). Open the URL manually.");
+                match open_browser(url) {
+                    Ok(()) => eprintln!("Browser launched. Waiting for callback…"),
+                    Err(err) => {
+                        eprintln!("Could not launch browser ({err}). Open the URL manually.");
+                        eprintln!(
+                            "Tip: if the browser opened but the tab is stuck, make sure \
+                             nothing else is using port 1455."
+                        );
+                    }
                 }
+                Ok(())
+            })
+            .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(SqueezyError::ProviderNotConfigured(msg)) if msg.contains("could not bind") => {
+                    Err(SqueezyError::ProviderNotConfigured(format!(
+                        "{msg}\n\n\
+                         Tip: re-run with `--manual` to use the paste flow and bypass \
+                         the localhost callback server entirely."
+                    )))
+                }
+                Err(err) => Err(err),
             }
-            Ok(())
-        })
-        .await
-    })?;
+        })?
+    };
 
     let expires_in = expires_in_human(outcome.expires_at_unix_ms);
+    #[cfg(unix)]
+    let protection_note = " (mode 0600)";
+    #[cfg(not(unix))]
+    let protection_note = " (file-backed; verify ACLs on shared/enterprise profiles)";
     println!(
-        "signed in to ChatGPT (account {}); token saved to {}{}",
+        "signed in to ChatGPT (account {}); token saved to {}{}{}",
         outcome.account_id,
         outcome.auth_file.display(),
         expires_in
             .map(|s| format!("; access token valid for ~{s}"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        protection_note
     );
     Ok(())
 }
@@ -1141,12 +1230,30 @@ struct StatusRow {
     env_set: bool,
     fallback_env_var: Option<&'static str>,
     fallback_env_set: bool,
+    /// Whether the inline key lives in a file-backed TOML tier (as
+    /// opposed to an env var). On Windows this is reported as
+    /// "file-backed" to distinguish it from a Credential Manager entry
+    /// that does not exist yet.
+    credentials_file_set: bool,
 }
 
 impl StatusRow {
     fn effective_source(&self) -> &'static str {
         if self.inline_tier.is_some() {
-            "inline"
+            // On Windows, distinguish file-backed from a hypothetical
+            // Credential Manager source. Currently all inline keys are
+            // file-backed (TOML or credentials.json).
+            if cfg!(windows) {
+                "inline (file-backed)"
+            } else {
+                "inline"
+            }
+        } else if self.credentials_file_set {
+            if cfg!(windows) {
+                "credentials.json (file-backed)"
+            } else {
+                "credentials.json"
+            }
         } else if self.env_set {
             "env"
         } else if self.fallback_env_set {
@@ -1166,6 +1273,7 @@ impl StatusRow {
             "env_set": self.env_set,
             "fallback_env_var": self.fallback_env_var,
             "fallback_env_set": self.fallback_env_set,
+            "credentials_file_set": self.credentials_file_set,
             "effective_source": self.effective_source(),
         })
     }
@@ -1203,6 +1311,11 @@ fn compute_status_row(
         .and_then(env_lookup)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
+    // Check if the provider key is available through credentials.json so
+    // `auth status` can distinguish "env-backed" from "file-backed" entries.
+    // We re-use the same env_var name the resolution chain uses.
+    let credentials_file_set =
+        squeezy_llm::resolve_api_key_from_credentials_file(provider.env).is_some();
     StatusRow {
         provider: provider.cli,
         section: provider.section,
@@ -1212,6 +1325,7 @@ fn compute_status_row(
         env_set,
         fallback_env_var: provider.fallback_env,
         fallback_env_set,
+        credentials_file_set,
     }
 }
 
@@ -1339,8 +1453,15 @@ async fn run_anthropic_oauth_login(args: &AnthropicLoginArgs) -> squeezy_core::R
     let now_ms = current_unix_ms();
     let tokens = PersistedTokens::from_token_response(&response, now_ms);
     squeezy_llm::oauth_anthropic_write_tokens(&storage_path, &tokens)?;
+    #[cfg(unix)]
     println!(
         "Saved Anthropic OAuth tokens to {} (mode 0600).",
+        storage_path.display()
+    );
+    #[cfg(not(unix))]
+    println!(
+        "Saved Anthropic OAuth tokens to {} \
+         (file-backed; verify ACLs on shared or enterprise-managed profiles).",
         storage_path.display()
     );
     Ok(())

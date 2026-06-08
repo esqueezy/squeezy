@@ -80,8 +80,8 @@ pub use contribution::{
 };
 pub use credentials::{
     ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
-    delete_api_key, fallback_env_var, resolve_api_key, resolve_api_key_with_inline,
-    resolve_api_key_with_inline_optional, static_api_key_source,
+    delete_api_key, fallback_env_var, resolve_api_key, resolve_api_key_from_credentials_file,
+    resolve_api_key_with_inline, resolve_api_key_with_inline_optional, static_api_key_source,
 };
 pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
@@ -111,9 +111,10 @@ pub use oauth::{
     exchange_authorization_code, generate_pkce, github_copilot_auth_file_path,
     github_copilot_base_url_from_token, github_copilot_read_tokens, github_copilot_write_tokens,
     is_anthropic_oauth_token, load_codex_token, login_github_copilot_interactive,
-    login_openai_codex_interactive, normalize_github_domain, parse_authorization_input,
-    poll_for_github_token, refresh_anthropic_token, refresh_copilot_token,
-    resolve_github_copilot_base_url, save_codex_token, start_github_copilot_device_flow,
+    login_openai_codex_interactive, login_openai_codex_manual, normalize_github_domain,
+    parse_authorization_input, poll_for_github_token, refresh_anthropic_token,
+    refresh_copilot_token, resolve_github_copilot_base_url, save_codex_token,
+    start_github_copilot_device_flow,
 };
 pub use ollama::{
     OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,

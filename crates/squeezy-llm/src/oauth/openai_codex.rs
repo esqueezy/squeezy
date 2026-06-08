@@ -76,6 +76,13 @@ pub const OPENAI_CODEX_AUTH_FILE_NAME: &str = "openai-codex.json";
 /// keeps the next provider request from racing the expiry.
 const REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 
+/// How long the interactive login waits for the browser to complete the
+/// OAuth callback before giving up. On Windows the firewall or browser
+/// isolation may block the localhost callback indefinitely; a bounded
+/// wait lets the error path surface a helpful message instead of
+/// hanging the terminal.
+const INTERACTIVE_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Number of random bytes the PKCE verifier and OAuth state nonce
 /// consume. RFC 7636 §4.1 recommends 32 bytes for the verifier so the
 /// base64url-encoded form lands at 43 chars; the state nonce uses 16
@@ -212,6 +219,16 @@ pub fn save_codex_token(path: &Path, token: &OpenAiCodexTokenSet) -> Result<()> 
             path.display()
         ))
     })?;
+    #[cfg(windows)]
+    {
+        tracing::warn!(
+            "OpenAI Codex OAuth token saved to {} without Windows ACL hardening; \
+             the file's access permissions depend on your profile directory's default ACLs. \
+             Restrict it manually if your profile directory is shared, synced, or \
+             enterprise-managed.",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -586,8 +603,90 @@ where
 
     on_open_url(&authorize_url)?;
 
-    let code = wait_for_callback_code(listener, &state).await?;
+    let code = tokio::time::timeout(
+        INTERACTIVE_LOGIN_TIMEOUT,
+        wait_for_callback_code(listener, &state),
+    )
+    .await
+    .map_err(|_| {
+        SqueezyError::ProviderNotConfigured(format!(
+            "OAuth callback timed out after {}s; the browser may not have opened or \
+             the localhost callback was not received on {}:{}. \
+             On Windows, check that your firewall allows localhost callbacks on that port, \
+             or re-run with --manual to use the paste flow instead.",
+            INTERACTIVE_LOGIN_TIMEOUT.as_secs(),
+            OPENAI_CODEX_CALLBACK_HOST,
+            OPENAI_CODEX_CALLBACK_PORT
+        ))
+    })??;
 
+    let client = shared_client(&ProviderTransportConfig::default());
+    let token = exchange_authorization_code(
+        &client,
+        OPENAI_CODEX_TOKEN_URL,
+        &code,
+        &pair.verifier,
+        OPENAI_CODEX_REDIRECT_URI,
+    )
+    .await?;
+    save_codex_token(auth_path, &token)?;
+    Ok(OpenAiCodexLoginOutcome {
+        account_id: token.account_id.clone(),
+        expires_at_unix_ms: token.expires_at_unix_ms,
+        auth_file: auth_path.to_path_buf(),
+    })
+}
+
+/// Drive the manual (stdin-paste) OAuth authorization-code flow.
+///
+/// Equivalent to Anthropic's paste flow — useful on Windows desktops
+/// where firewall rules, browser isolation, or enterprise endpoint
+/// software blocks the localhost callback that
+/// [`login_openai_codex_interactive`] relies on.
+///
+/// 1. Generate PKCE + state.
+/// 2. Call `on_open_url` with the authorize URL.
+/// 3. Call `read_input` to get the user-pasted redirect URL or bare code.
+/// 4. Parse the code + optional state from the input; validate state.
+/// 5. Exchange the code against the token endpoint.
+/// 6. Persist the token set to `auth_path`.
+pub async fn login_openai_codex_manual<F, R>(
+    originator: &str,
+    auth_path: &Path,
+    on_open_url: F,
+    read_input: R,
+) -> Result<OpenAiCodexLoginOutcome>
+where
+    F: FnOnce(&str) -> Result<()>,
+    R: FnOnce() -> Result<String>,
+{
+    let pair = generate_pkce()?;
+    let state = generate_state()?;
+    let authorize_url = build_authorize_url(&pair.challenge, &state, originator);
+    on_open_url(&authorize_url)?;
+    let raw = read_input()?;
+    // Reuse Anthropic's general-purpose authorization-input parser: it
+    // handles full callback URLs, bare codes, code#state pairs, and
+    // query-string fragments interchangeably.
+    let parsed = crate::oauth::anthropic::parse_authorization_input(&raw);
+    let code = parsed.code.ok_or_else(|| {
+        SqueezyError::ProviderNotConfigured(
+            "no `code` parameter found in the pasted input; paste either the full \
+             callback URL (http://localhost:1455/auth/callback?code=...&state=...), \
+             the bare authorization code, or a `code#state` pair"
+                .to_string(),
+        )
+    })?;
+    if let Some(pasted_state) = parsed.state {
+        if pasted_state != state {
+            return Err(SqueezyError::ProviderNotConfigured(
+                "OAuth state mismatch: the pasted `state` did not match the value squeezy \
+                 generated for this session. Re-run `squeezy auth openai-codex login --manual` \
+                 from scratch."
+                    .to_string(),
+            ));
+        }
+    }
     let client = shared_client(&ProviderTransportConfig::default());
     let token = exchange_authorization_code(
         &client,
