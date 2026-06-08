@@ -232,6 +232,7 @@ struct CachedParsedFile {
     language: LanguageKind,
     source: String,
     tree: Tree,
+    had_bom: bool,
 }
 
 pub struct LanguageParser {
@@ -355,20 +356,23 @@ impl LanguageParser {
             self.cache.remove(&record.id);
             return Ok(ParsedFile::unsupported(
                 record.clone(),
-                format!("unsupported language for {}", record.relative_path),
+                format!(
+                    "unsupported language {:?} for {}",
+                    record.language, record.relative_path
+                ),
             ));
         }
 
-        let source = match fs::read_to_string(&record.path) {
+        let source = match read_source_file(&record.path) {
             Ok(source) => source,
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            Err(SourceReadError::Encoding(hint)) => {
                 self.cache.remove(&record.id);
                 return Ok(ParsedFile::unsupported(
                     record.clone(),
-                    format!("non-UTF-8 source for {}", record.relative_path),
+                    format!("{} for {}", hint, record.relative_path),
                 ));
             }
-            Err(err) => return Err(err.into()),
+            Err(SourceReadError::Io(err)) => return Err(err.into()),
         };
         self.parse_source(record, source)
     }
@@ -378,9 +382,18 @@ impl LanguageParser {
             self.cache.remove(&record.id);
             return Ok(ParsedFile::unsupported(
                 record.clone(),
-                format!("unsupported language for {}", record.relative_path),
+                format!(
+                    "unsupported language {:?} for {}",
+                    record.language, record.relative_path
+                ),
             ));
         }
+
+        // Strip a UTF-8 BOM before all cache operations so byte offsets are
+        // relative to BOM-stripped content and the in-memory cache stays
+        // internally consistent.  The BOM flag is stored alongside the tree so
+        // cache hits can still emit the diagnostic without re-reading the file.
+        let (source, had_bom) = strip_utf8_bom(source);
 
         if let Some(cached) = self.cache.get(&record.id)
             && cached.language == record.language
@@ -388,6 +401,9 @@ impl LanguageParser {
         {
             let mut parsed = extract_language(record.clone(), &source, &cached.tree);
             parsed.changed_ranges = Vec::new();
+            if cached.had_bom {
+                parsed.diagnostics.push(utf8_bom_diagnostic());
+            }
             return Ok(parsed);
         }
 
@@ -430,6 +446,9 @@ impl LanguageParser {
 
         let mut parsed = extract_language(record.clone(), &source, &tree);
         parsed.changed_ranges = changed_ranges;
+        if had_bom {
+            parsed.diagnostics.push(utf8_bom_diagnostic());
+        }
         self.cache.insert(
             record.id.clone(),
             CachedParsedFile {
@@ -437,6 +456,7 @@ impl LanguageParser {
                 language: record.language,
                 source,
                 tree,
+                had_bom,
             },
         );
         Ok(parsed)
@@ -489,11 +509,19 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
     }
 }
 
+// `parse_job_chunk` uses a chunk-local `ParserPool` so that grammar objects
+// are reused across the files in each parallel chunk.  Reuse across separate
+// `parse_records_parallel` calls is not currently possible because
+// `std::thread::scope` spawns a brand-new OS thread per call, discarding any
+// thread-local state from previous calls.  When a persistent worker-thread
+// pool is introduced the pool should be stored in thread-local storage so
+// that grammar initialisation (an FFI operation, more expensive on Windows)
+// is amortised across workspace refreshes.
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
-    let mut parsers = ParserPool::default();
+    let mut pool = ParserPool::default();
     let mut outputs = Vec::with_capacity(jobs.len());
     for job in jobs {
-        outputs.push(parse_record_with_cache(&mut parsers, job)?);
+        outputs.push(parse_record_with_cache(&mut pool, job)?);
     }
     Ok(outputs)
 }
@@ -505,7 +533,10 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
             index,
             parsed: ParsedFile::unsupported(
                 record.clone(),
-                format!("unsupported language for {}", record.relative_path),
+                format!(
+                    "unsupported language {:?} for {}",
+                    record.language, record.relative_path
+                ),
             ),
             cache: None,
         });
@@ -513,8 +544,12 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
 
     let old = match old {
         Some(cached) if cached.language == record.language && cached.hash == record.hash => {
+            let had_bom = cached.had_bom;
             let mut parsed = extract_language(record.clone(), &cached.source, &cached.tree);
             parsed.changed_ranges = Vec::new();
+            if had_bom {
+                parsed.diagnostics.push(utf8_bom_diagnostic());
+            }
             return Ok(ParseOutput {
                 index,
                 parsed,
@@ -524,20 +559,22 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
         other => other,
     };
 
-    let source = match fs::read_to_string(&record.path) {
+    let source = match read_source_file(&record.path) {
         Ok(source) => source,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+        Err(SourceReadError::Encoding(hint)) => {
             return Ok(ParseOutput {
                 index,
                 parsed: ParsedFile::unsupported(
                     record.clone(),
-                    format!("non-UTF-8 source for {}", record.relative_path),
+                    format!("{} for {}", hint, record.relative_path),
                 ),
                 cache: None,
             });
         }
-        Err(err) => return Err(err.into()),
+        Err(SourceReadError::Io(err)) => return Err(err.into()),
     };
+
+    let (source, had_bom) = strip_utf8_bom(source);
 
     let old = old.filter(|cached| cached.language == record.language);
     let (tree, changed_ranges) = match old {
@@ -575,6 +612,9 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
 
     let mut parsed = extract_language(record.clone(), &source, &tree);
     parsed.changed_ranges = changed_ranges;
+    if had_bom {
+        parsed.diagnostics.push(utf8_bom_diagnostic());
+    }
     Ok(ParseOutput {
         index,
         parsed,
@@ -583,6 +623,7 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
             language: record.language,
             source,
             tree,
+            had_bom,
         }),
     })
 }
@@ -857,8 +898,66 @@ fn extract_language(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     }
     ParsedFile::unsupported(
         file.clone(),
-        format!("unsupported language for {}", file.relative_path),
+        format!(
+            "unsupported language {:?} for {}",
+            file.language, file.relative_path
+        ),
     )
+}
+
+/// Error variants returned by [`read_source_file`].
+enum SourceReadError {
+    /// The file exists but its encoding is not supported (e.g. UTF-16).
+    Encoding(&'static str),
+    /// An OS-level I/O error prevented reading the file.
+    Io(std::io::Error),
+}
+
+/// Read a source file as a UTF-8 string, providing encoding-specific error
+/// messages for common Windows encodings (UTF-16LE/UTF-16BE) instead of the
+/// generic "invalid data" I/O error.
+fn read_source_file(path: &std::path::Path) -> std::result::Result<String, SourceReadError> {
+    let bytes = fs::read(path).map_err(SourceReadError::Io)?;
+    if bytes.starts_with(b"\xFF\xFE") {
+        return Err(SourceReadError::Encoding(
+            "UTF-16LE source is not supported; convert the file to UTF-8",
+        ));
+    }
+    if bytes.starts_with(b"\xFE\xFF") {
+        return Err(SourceReadError::Encoding(
+            "UTF-16BE source is not supported; convert the file to UTF-8",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| SourceReadError::Encoding("non-UTF-8 source"))
+}
+
+/// Strips a UTF-8 BOM (`U+FEFF`, 3 bytes `\xEF\xBB\xBF`) from `source` if
+/// present and returns `(stripped_source, had_bom)`.  Stripping before parsing
+/// prevents the BOM from being treated as a syntax error by tree-sitter grammars
+/// that do not recognise it; byte offsets in the returned parse result are
+/// relative to the BOM-stripped content.
+fn strip_utf8_bom(source: String) -> (String, bool) {
+    const BOM: &str = "\u{FEFF}";
+    if let Some(stripped) = source.strip_prefix(BOM) {
+        (stripped.to_string(), true)
+    } else {
+        (source, false)
+    }
+}
+
+/// Returns a [`ParseDiagnostic`] that identifies a UTF-8 BOM at the start of
+/// the file and advises the user to save without BOM.  The span is `None`
+/// because the BOM has already been stripped: any byte offset in this
+/// `ParsedFile` is relative to the BOM-stripped content, so a span pointing
+/// at byte 0 would incorrectly identify the first real character of code.
+fn utf8_bom_diagnostic() -> ParseDiagnostic {
+    ParseDiagnostic {
+        message: "UTF-8 BOM at start of file; save as UTF-8 without BOM for reliable \
+                  parsing; byte offsets are relative to BOM-stripped content"
+            .to_string(),
+        span: None,
+        confidence: Confidence::Partial,
+    }
 }
 
 struct ExtractContext<'source> {
