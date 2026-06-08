@@ -1331,6 +1331,10 @@ where
     })
 }
 
+/// Shared, mutex-protected cache for the Ollama live context-window probe.
+/// Uses a type alias to satisfy the `type_complexity` lint.
+type OllamaWindowCache = Arc<tokio::sync::Mutex<Option<(Instant, Option<u64>)>>>;
+
 #[derive(Clone)]
 pub struct Agent {
     config: AppConfig,
@@ -1427,7 +1431,7 @@ pub struct Agent {
     /// `session_accounting_snapshot()` fires a blocking HTTP call for Ollama
     /// providers; caching avoids repeated network probes when `/cost` or
     /// `/context` is invoked in quick succession.
-    ollama_window_cache: Arc<tokio::sync::Mutex<Option<(Instant, Option<u64>)>>>,
+    ollama_window_cache: OllamaWindowCache,
 }
 
 #[derive(Clone)]
