@@ -1039,40 +1039,134 @@ pub(crate) fn graph_symbol_search(
         .collect::<Vec<_>>();
 
     // Fuzzy widening: when the trigram-anchored candidate pool is empty
-    // but a query was provided, run a fuzzy subsequence scan over all
-    // symbols so casual queries (`graphmgr → GraphManager`) still
-    // resolve. This only runs on a miss so high-confidence behaviour is
-    // unchanged.
+    // but a query was provided, run a fuzzy subsequence scan over a
+    // bounded candidate set so casual queries (`graphmgr → GraphManager`)
+    // still resolve. This only runs on a miss so high-confidence behaviour
+    // is unchanged.
+    //
+    // Prefilter: when the query has 3+ chars, use the first trigram as a
+    // seed for `signature_search` to leverage the trigram index and avoid
+    // scanning every symbol with the full fuzzy algorithm. If the seed cannot
+    // produce a ranked match, fall back to the full symbol map to preserve the
+    // previous fuzzy recall.
     if symbols.is_empty()
         && let Some(query) = query
     {
-        symbols = graph
-            .symbols
-            .values()
-            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
-            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
-            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
-            .filter(|symbol| symbol_matches_path_filter(symbol, path))
-            .filter(|symbol| language_matches(graph, symbol, language))
-            .filter(|symbol| {
-                let view = squeezy_rank::GraphSymbolView {
-                    name: symbol.name.as_str(),
-                    signature: symbol.signature.as_str(),
-                };
-                squeezy_rank::symbol_rank::rank_symbol(view, query).0
-                    != squeezy_rank::symbol_rank::RankTier::NoMatch
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let fuzzy_matches = |candidates: Vec<GraphSymbol>| {
+            candidates
+                .into_iter()
+                .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+                .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+                .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+                .filter(|symbol| symbol_matches_path_filter(symbol, path))
+                .filter(|symbol| language_matches(graph, symbol, language))
+                .filter(|symbol| {
+                    let view = squeezy_rank::GraphSymbolView {
+                        name: symbol.name.as_str(),
+                        signature: symbol.signature.as_str(),
+                    };
+                    squeezy_rank::symbol_rank::rank_symbol(view, query).0
+                        != squeezy_rank::symbol_rank::RankTier::NoMatch
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut used_seed_hits = false;
+        let candidates: Vec<GraphSymbol> = if query.len() >= 3 {
+            let seed_end = query.char_indices().nth(3).map_or(query.len(), |(i, _)| i);
+            let seed_hits = graph.signature_search(&SignatureQuery {
+                text: query[..seed_end].to_string(),
+                kind: None,
+                visibility: None,
+                attribute: None,
+            });
+            if seed_hits.is_empty() {
+                graph.symbols.values().cloned().collect()
+            } else {
+                used_seed_hits = true;
+                seed_hits
+            }
+        } else {
+            graph.symbols.values().cloned().collect()
+        };
+        symbols = fuzzy_matches(candidates);
+        if symbols.is_empty() && used_seed_hits {
+            symbols = fuzzy_matches(graph.symbols.values().cloned().collect());
+        }
     }
 
-    symbols.sort_by(|left, right| {
-        query
-            .map(|query| symbol_rank(left, query).cmp(&symbol_rank(right, query)))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(left.file_id.0.cmp(&right.file_id.0))
-            .then(left.span.start_byte.cmp(&right.span.start_byte))
+    // Precompute per-symbol sort keys once to avoid re-tokenizing the query
+    // inside the O(n log n) comparator. BM25 scores are computed here too
+    // so they can act as a within-tier tiebreaker without crossing tier
+    // boundaries.
+    //
+    // Sort key tuple: (tier, bm25_neg, lex_score, path_key)
+    //   tier      — lower value = better rank tier (usize)
+    //   bm25_neg  — negated fixed-point BM25 score (i64); symbols with
+    //               positive BM25 sort before zero-score ones within a tier;
+    //               zero when BM25 is not applicable
+    //   lex_score — fuzzy/token lexical score (i32); lower = better
+    //   path_key  — PathRank::sort_key() (i32, i32, i32); lower = better
+    type SortKey = (usize, i64, i32, (i32, i32, i32));
+
+    let bm25_scores: Vec<f32> = if let Some(query) = query
+        && query.split_whitespace().count() >= 2
+        && symbols.len() > 1
+    {
+        let doc_bufs: Vec<(String, String)> = symbols
+            .iter()
+            .map(|sym| (sym.docs.join(" "), sym.attributes.join(" ")))
+            .collect();
+        let bm25_docs: Vec<squeezy_rank::BM25Doc<'_>> = symbols
+            .iter()
+            .zip(doc_bufs.iter())
+            .map(|(sym, (docs, attrs))| squeezy_rank::BM25Doc {
+                signature: sym.signature.as_str(),
+                docs: docs.as_str(),
+                attributes: attrs.as_str(),
+            })
+            .collect();
+        let reranked = squeezy_rank::bm25_rerank(&bm25_docs, query, symbols.len());
+        let mut scores = vec![0.0f32; symbols.len()];
+        for (idx, score) in reranked {
+            scores[idx] = score;
+        }
+        scores
+    } else {
+        vec![0.0; symbols.len()]
+    };
+
+    let sort_keys: Vec<SortKey> = symbols
+        .iter()
+        .zip(bm25_scores.iter())
+        .map(|(sym, &bm25)| {
+            let (tier, lex_score) = query
+                .map(|q| symbol_rank(sym, q))
+                .unwrap_or((usize::MAX, 0));
+            let path_key = path
+                .map(|p| squeezy_rank::path_rank::path_rank(&sym.file_id.0, p).sort_key())
+                .unwrap_or((i32::MAX, i32::MAX, i32::MAX));
+            // Negate BM25 so higher score sorts first; 0.0 → 0 sorts after
+            // any positive-BM25 symbol.
+            let bm25_neg = -(bm25 * 1000.0).round() as i64;
+            (tier, bm25_neg, lex_score, path_key)
+        })
+        .collect();
+
+    let original = std::mem::take(&mut symbols);
+    let mut indices: Vec<usize> = (0..original.len()).collect();
+    indices.sort_by(|&i, &j| {
+        sort_keys[i]
+            .cmp(&sort_keys[j])
+            .then(original[i].file_id.0.cmp(&original[j].file_id.0))
+            .then(
+                original[i]
+                    .span
+                    .start_byte
+                    .cmp(&original[j].span.start_byte),
+            )
     });
+    symbols = indices.into_iter().map(|i| original[i].clone()).collect();
+
     symbols
 }
 
@@ -1314,18 +1408,34 @@ pub(crate) fn resolve_definition_candidates(
     graph_symbol_search(graph, Some(query), kind, path, language, None, None)
 }
 
-fn symbol_rank(symbol: &GraphSymbol, query: &str) -> usize {
+fn symbol_rank(symbol: &GraphSymbol, query: &str) -> (usize, i32) {
     // Preserve the historical exact > case-insensitive > signature-substring
     // ordering. `squeezy_rank` adds two extra tiers (token-bag, fuzzy) that
     // recover near-miss queries like `graphmgr → GraphManager` without
     // changing the relative ordering of existing high-confidence hits.
+    // The lexical score is kept as a secondary key so two fuzzy matches are
+    // ordered by closeness rather than file path.
     let view = squeezy_rank::GraphSymbolView {
         name: symbol.name.as_str(),
         signature: symbol.signature.as_str(),
     };
-    squeezy_rank::symbol_rank::rank_symbol(view, query)
-        .0
-        .as_usize()
+    let (tier, score) = squeezy_rank::symbol_rank::rank_symbol(view, query);
+    (tier.as_usize(), score)
+}
+
+fn symbol_rank_label(symbol: &GraphSymbol, query: &str) -> &'static str {
+    let view = squeezy_rank::GraphSymbolView {
+        name: symbol.name.as_str(),
+        signature: symbol.signature.as_str(),
+    };
+    match squeezy_rank::symbol_rank::rank_symbol(view, query).0 {
+        squeezy_rank::RankTier::Exact => "exact",
+        squeezy_rank::RankTier::CaseInsensitive => "case_insensitive",
+        squeezy_rank::RankTier::SignatureSubstring => "signature_substring",
+        squeezy_rank::RankTier::TokenBag => "token_bag",
+        squeezy_rank::RankTier::Fuzzy => "fuzzy",
+        squeezy_rank::RankTier::NoMatch => "no_match",
+    }
 }
 
 fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
@@ -1454,26 +1564,35 @@ fn graph_zero_hit_fallback(
     let path_norm_buf = path.map(|p| p.replace('\\', "/"));
     let normalized_path = path_norm_buf.as_deref();
 
-    let (path_value, language_value, reason, case_near_match) = match normalized_path {
+    let (path_value, language_value, reason, hint, case_near_match) = match normalized_path {
         Some(p) => {
             let file = graph
                 .files
                 .values()
-                .find(|file| path_matches_filter(&file.relative_path, p))
-                .or_else(|| graph.find_file_case_insensitive(p));
+                .find(|file| path_matches_filter(&file.relative_path, p));
+            #[cfg(target_os = "windows")]
+            let file = file.or_else(|| graph.find_file_case_insensitive(p));
             match file {
                 Some(file) => {
-                    // `path_unknown` is reserved for the not-found case below so
-                    // the model can distinguish "exists but unindexable" from
-                    // "path not in graph at all".
-                    let reason = match file.language {
-                        LanguageKind::Unsupported | LanguageKind::Unknown => "path_unsupported",
-                        _ => "supported_language_no_match",
+                    let (reason, hint) = match file.language {
+                        LanguageKind::Unsupported => (
+                            "path_unsupported",
+                            "use grep or read_slice for this file type",
+                        ),
+                        LanguageKind::Unknown => (
+                            "path_unknown",
+                            "check the path spelling or use a broader search",
+                        ),
+                        _ => (
+                            "supported_language_no_match",
+                            "try a different query or broader kind filter",
+                        ),
                     };
                     (
                         Value::String(file.relative_path.clone()),
                         Value::String(file.language.display_name().to_string()),
                         reason,
+                        hint,
                         None,
                     )
                 }
@@ -1500,17 +1619,25 @@ fn graph_zero_hit_fallback(
                         Value::String(p.to_string()),
                         Value::Null,
                         "path_unknown",
+                        "check the path spelling or use a broader search",
                         near.map(|f| f.relative_path.clone()),
                     )
                 }
             }
         }
-        None => (Value::Null, Value::Null, "no_path_scope", None),
+        None => (
+            Value::Null,
+            Value::Null,
+            "no_path_scope",
+            "try a different query or broader kind filter",
+            None,
+        ),
     };
 
     let mut obj = serde_json::Map::new();
     obj.insert("status".to_string(), json!("no_graph_evidence"));
     obj.insert("reason".to_string(), json!(reason));
+    obj.insert("hint".to_string(), json!(hint));
     obj.insert("path".to_string(), path_value);
     obj.insert("language".to_string(), language_value);
     if let Some(near) = case_near_match {
@@ -1572,7 +1699,7 @@ fn symbol_packet(
     graph: &squeezy_graph::SemanticGraph,
     symbol: &GraphSymbol,
     tool: &str,
-    next_action: Value,
+    rank_label: Option<&str>,
 ) -> Value {
     let mut packet = evidence_packet(
         format!(
@@ -1587,27 +1714,22 @@ fn symbol_packet(
             matches_returned: 1,
             ..ToolCostHint::default()
         },
-        next_action,
+        json!({}),
     );
     // The top-level `tool` mirror duplicates context the caller already knows
     // (the tool name is the call that produced this packet); the `symbol` body
     // identifies the symbol. Dropped to save tokens.
     let _ = tool;
     if let Some(object) = packet.as_object_mut() {
-        object.insert("symbol".to_string(), symbol_json(graph, symbol));
+        let mut sym = symbol_json(graph, symbol);
+        // Surface the rank tier when a query was provided so the model and TUI
+        // users can inspect why one result beat another without reading source.
+        if let (Some(label), Some(sym_obj)) = (rank_label, sym.as_object_mut()) {
+            sym_obj.insert("rank".to_string(), json!(label));
+        }
+        object.insert("symbol".to_string(), sym);
     }
     packet
-}
-
-fn symbol_next_action(symbol: &GraphSymbol) -> Value {
-    json!({
-        "tool": "symbol_context",
-        "arguments": {
-            "query": symbol.name,
-            "path": symbol.file_id.0
-        },
-        "reason": "expand this declaration with callers and references"
-    })
 }
 
 fn symbol_context_packet(
@@ -1615,19 +1737,7 @@ fn symbol_context_packet(
     symbol: &GraphSymbol,
     max_references: usize,
 ) -> Value {
-    let mut packet = symbol_packet(
-        graph,
-        symbol,
-        "symbol_context",
-        json!({
-            "tool": "read_slice",
-            "arguments": {
-                "symbol_id": symbol.id.0,
-                "span_kind": "body"
-            },
-            "reason": "read the exact symbol body if details are needed"
-        }),
-    );
+    let mut packet = symbol_packet(graph, symbol, "symbol_context", None);
     if let Some(object) = packet.as_object_mut() {
         // Insert each collection only when non-empty: the common case (a symbol
         // with no callers/callees/references/diagnostics) used to ship four
@@ -2094,7 +2204,7 @@ fn hierarchy_node_packet(
     tool: &str,
 ) -> Value {
     if let Some(symbol) = graph.symbols.get(&node.id) {
-        return symbol_packet(graph, symbol, tool, symbol_next_action(symbol));
+        return symbol_packet(graph, symbol, tool, None);
     }
     let mut packet = evidence_packet(
         format!("{:?} `{}` appears in hierarchy", node.kind, node.name),
@@ -2358,7 +2468,10 @@ fn unresolved_symbol_result(
     let packets = candidates
         .iter()
         .take(DEFAULT_GRAPH_MAX_RESULTS)
-        .map(|symbol| symbol_packet(graph, symbol, tool, symbol_next_action(symbol)))
+        .map(|symbol| {
+            let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
+            symbol_packet(graph, symbol, tool, rank_label)
+        })
         .collect::<Vec<_>>();
     let mut payload = graph_payload(tool, manager, refresh);
     payload.insert("resolved".to_string(), json!(false));
@@ -2429,7 +2542,14 @@ fn unresolved_hierarchy_result(
         )
         .into_iter()
         .take(DEFAULT_GRAPH_MAX_RESULTS)
-        .map(|symbol| symbol_packet(graph, &symbol, "hierarchy", symbol_next_action(&symbol)))
+        .map(|symbol| {
+            let rank_label = if query.is_empty() {
+                None
+            } else {
+                Some(symbol_rank_label(&symbol, query))
+            };
+            symbol_packet(graph, &symbol, "hierarchy", rank_label)
+        })
         .collect::<Vec<_>>()
     };
     let mut payload = graph_payload("hierarchy", manager, refresh);
@@ -2996,7 +3116,10 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         let packets = selected
             .iter()
-            .map(|symbol| symbol_packet(graph, symbol, "decl_search", symbol_next_action(symbol)))
+            .map(|symbol| {
+                let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
+                symbol_packet(graph, symbol, "decl_search", rank_label)
+            })
             .collect::<Vec<_>>();
         let confidence_distribution =
             ToolCostHint::confidence_distribution_from(selected.iter().map(|s| s.confidence));
@@ -3056,23 +3179,13 @@ impl ToolRegistry {
             args.language.as_deref(),
         );
         let truncated = symbols.len() > max_results;
+        let candidate_count = symbols.len();
         let selected = symbols.into_iter().take(max_results).collect::<Vec<_>>();
         let packets = selected
             .iter()
             .map(|symbol| {
-                symbol_packet(
-                    graph,
-                    symbol,
-                    "definition_search",
-                    json!({
-                        "tool": "read_slice",
-                        "arguments": {
-                            "symbol_id": symbol.id.0,
-                            "span_kind": "signature"
-                        },
-                        "reason": "read the exact declaration slice"
-                    }),
-                )
+                let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
+                symbol_packet(graph, symbol, "definition_search", rank_label)
             })
             .collect::<Vec<_>>();
         let packet_count = packets.len();
@@ -3090,6 +3203,7 @@ impl ToolRegistry {
             ),
         );
         payload.insert("truncated".to_string(), json!(truncated));
+        payload.insert("total_candidates".to_string(), json!(candidate_count));
         make_result(
             call,
             ToolStatus::Success,
