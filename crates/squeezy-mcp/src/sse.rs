@@ -239,12 +239,6 @@ impl Worker for SseClientWorker {
                             match read_endpoint(&self.sse_url, &mut frames).await {
                                 Ok(new_endpoint) => {
                                     endpoint_url = new_endpoint;
-                                    // The server is reachable again: reset the
-                                    // attempt counter so the next stream drop
-                                    // starts back-off from 1 s. Servers that
-                                    // never push proactively (only reply to
-                                    // tool calls) benefit from this reset too.
-                                    reconnect_attempts = 0;
                                 }
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
