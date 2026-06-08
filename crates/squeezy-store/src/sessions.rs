@@ -136,11 +136,10 @@ impl SessionStore {
     ///
     /// 1. `$HOME/.squeezy/memory.md` (Unix and Windows Git Bash / WSL)
     /// 2. `$USERPROFILE\.squeezy\memory.md` (native Windows only)
-    /// 3. `dirs::data_dir()/squeezy/memory.md` (Windows only; %APPDATA%\squeezy)
     ///
     /// On Unix/macOS only `$HOME` is consulted so behaviour is unchanged.
     /// On Windows, `$HOME` is not guaranteed even when `%USERPROFILE%` and
-    /// `%APPDATA%` are set, so the two Windows-specific fallbacks allow the
+    /// `%APPDATA%` are set, so the Windows-specific fallback allows the
     /// memory file to be located without requiring Git Bash / Cygwin.
     ///
     /// The file is the single static memory store described in
@@ -177,8 +176,8 @@ impl SessionStore {
         }
         let Some(path) = Self::memory_path() else {
             return Err(SqueezyError::Agent(
-                "remember: cannot locate user home directory (HOME, USERPROFILE, and \
-                 platform data dir all unavailable)"
+                "remember: cannot locate user home directory \
+                 (HOME is unset; on Windows also tried USERPROFILE)"
                     .to_string(),
             ));
         };
@@ -239,9 +238,20 @@ impl SessionStore {
     /// Returns `None` when `HOME` is unset — same condition under which
     /// the user-global memory file declines to operate.
     pub fn global_index_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
+        // Mirror the same resolution order as memory_path(): HOME first,
+        // then USERPROFILE on Windows (where HOME may be absent in native shells).
+        let base = env::var_os("HOME").or_else(|| {
+            #[cfg(target_os = "windows")]
+            {
+                env::var_os("USERPROFILE")
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                None
+            }
+        })?;
         Some(
-            PathBuf::from(home)
+            PathBuf::from(base)
                 .join(".squeezy")
                 .join("sessions")
                 .join("index.jsonl"),

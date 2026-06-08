@@ -2039,6 +2039,13 @@ fn normalize_cwd_for_compare(value: &str) -> String {
     // Normalize backslashes to forward slashes for uniform comparison.
     s = s.replace('\\', "/");
 
+    // After stripping verbatim prefix, \\?\UNC\server\share becomes UNC/server/share.
+    // Re-normalise to the bare UNC form //server/share so it compares equal to
+    // \\server\share (which becomes //server/share directly).
+    if let Some(rest) = s.strip_prefix("UNC/") {
+        s = format!("//{rest}");
+    }
+
     // Fold drive-letter to lowercase: "C:/" → "c:/"
     if s.len() >= 2 && s.as_bytes()[1] == b':' {
         let drive = s.as_bytes()[0].to_ascii_lowercase() as char;

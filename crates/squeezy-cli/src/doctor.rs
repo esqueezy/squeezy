@@ -40,12 +40,12 @@ pub struct DoctorArgs {
     /// prompt). Creates the hidden local sandbox users and installs the WFP
     /// network egress-block filters, enabling `windows_sandbox_level =
     /// "elevated"`. Performs the action and exits without running other checks.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "sandbox_teardown")]
     pub sandbox_setup: bool,
     /// Windows only: remove all elevated shell-sandbox machine state (sandbox
     /// users, WFP filters, registry entries, secrets). Performs the action and
     /// exits without running other checks.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "sandbox_setup")]
     pub sandbox_teardown: bool,
 }
 
@@ -454,7 +454,7 @@ fn session_store_check(config: &AppConfig) -> Check {
     }
 }
 
-fn probe_writable(root: &PathBuf) -> std::io::Result<()> {
+fn probe_writable(root: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(root)?;
     let probe = root.join(".squeezy-doctor-probe");
     fs::write(&probe, b"ok")?;
@@ -833,7 +833,11 @@ fn settings_location_check(config: &AppConfig) -> Check {
     let workspace = &config.workspace_root;
     // Treat the path as suspicious only when it is clearly inside the
     // workspace root (`.squeezy/...` relative form or an absolute sub-path).
-    let is_repo_local = settings.starts_with(workspace)
+    // On Windows, path components are compared case-insensitively so that
+    // `C:\Repo` and `c:\repo` are treated as the same root.
+    let settings_str = settings.to_string_lossy().to_lowercase();
+    let workspace_str = workspace.to_string_lossy().to_lowercase();
+    let is_repo_local = settings_str.starts_with(&*workspace_str)
         || settings
             .components()
             .next()

@@ -1363,6 +1363,15 @@ fn normalize_cwd_strips_verbatim_prefix() {
 }
 
 #[test]
+fn normalize_cwd_strips_verbatim_unc_prefix() {
+    // \\?\UNC\server\share should normalize to the same as \\server\share.
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\UNC\server\share\dir"),
+        normalize_cwd_for_compare(r"\\server\share\dir"),
+    );
+}
+
+#[test]
 fn normalize_cwd_folds_drive_letter_case() {
     // Only the drive letter (`C` vs `c`) differs; directory names are identical.
     assert_eq!(
@@ -1394,6 +1403,14 @@ fn cross_project_resume_prompt_skips_for_windows_drive_case() {
 #[test]
 fn cross_project_resume_prompt_skips_for_verbatim_prefix() {
     assert!(cross_project_resume_prompt(r"\\?\C:\Repo", r"C:\Repo").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_verbatim_unc() {
+    // \\?\UNC\server\share\dir and \\server\share\dir refer to the same location.
+    assert!(
+        cross_project_resume_prompt(r"\\?\UNC\server\share\dir", r"\\server\share\dir").is_none()
+    );
 }
 
 #[test]
