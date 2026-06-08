@@ -116,8 +116,8 @@ pub use oauth::{
     resolve_github_copilot_base_url, save_codex_token, start_github_copilot_device_flow,
 };
 pub use ollama::{
-    OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,
-    pull_model,
+    OllamaProvider, PullEvent, PullStream, api_endpoint_url as ollama_api_endpoint_url,
+    fetch_ollama_context_window, fetch_ollama_model_names, pull_model,
 };
 pub use openai::OpenAiProvider;
 pub use overflow::{OverflowSignal, Usage as OverflowUsage, classify_terminal};

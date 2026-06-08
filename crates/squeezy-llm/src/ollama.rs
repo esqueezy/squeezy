@@ -56,33 +56,46 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn from_config(config: &OllamaConfig) -> Self {
         let base_url = config.base_url.trim_end_matches('/').to_string();
+        // Resolve api_key: inline TOML field wins (guarded for blank values),
+        // then fall back to the configured env var (default: OLLAMA_API_KEY).
+        // A missing or empty env var produces `None` so plain no-auth local
+        // deployments continue working without a bearer-token header.
+        let api_key = config
+            .api_key
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                resolve_api_key_with_inline(None, &config.api_key_env)
+                    .ok()
+                    .map(|resolved| resolved.value)
+                    .filter(|v| !v.trim().is_empty())
+            });
         let compat = match config.route_style {
             OllamaRoute::Native => None,
             // OpenAI-compatible route → reuse the shared chat-completions
-            // client under the LM Studio preset. Ollama's `/v1` server does
-            // not authenticate by default, so we build the provider with a
-            // bypass-style empty static key rather than walking through
-            // `OpenAiCompatibleProvider::from_config` (which insists on
-            // resolving an env / inline key). Extra headers stay empty —
-            // the LM Studio preset has no defaults to merge.
-            OllamaRoute::OpenAiCompatible => Some(OpenAiCompatibleProvider::with_api_key_source(
-                OpenAiCompatiblePreset::LMStudio,
-                static_api_key_source(String::new(), OpenAiCompatiblePreset::LMStudio.as_str()),
-                openai_compat_base_url(&base_url),
-                BTreeMap::new(),
-                config.transport,
-            )),
+            // client under the LM Studio preset. When a bearer token is
+            // configured (Ollama Cloud / protected reverse proxy), forward it
+            // as a static key source so the compat path also sends the header.
+            // For plain no-auth local deployments the key is `None` and an
+            // empty static key preserves the bypass behavior.
+            OllamaRoute::OpenAiCompatible => {
+                let key_source = match api_key.clone() {
+                    Some(token) => static_api_key_source(token, "ollama"),
+                    None => static_api_key_source(
+                        String::new(),
+                        OpenAiCompatiblePreset::LMStudio.as_str(),
+                    ),
+                };
+                Some(OpenAiCompatibleProvider::with_api_key_source(
+                    OpenAiCompatiblePreset::LMStudio,
+                    key_source,
+                    openai_compat_base_url(&base_url),
+                    BTreeMap::new(),
+                    config.transport,
+                ))
+            }
         };
-        // Resolve api_key: inline TOML field wins, then fall back to the
-        // configured env var (default: OLLAMA_API_KEY). A missing or
-        // empty env var produces `None` so plain no-auth local deployments
-        // continue working without a bearer-token header.
-        let api_key = config.api_key.clone().or_else(|| {
-            resolve_api_key_with_inline(None, &config.api_key_env)
-                .ok()
-                .map(|resolved| resolved.value)
-                .filter(|v| !v.trim().is_empty())
-        });
         Self {
             client: shared_client(&config.transport),
             base_url,
@@ -439,7 +452,7 @@ pub(crate) fn ollama_host_root(base_url: &str) -> String {
 /// base shape and a bare endpoint name (e.g. `"chat"`, `"show"`, `"pull"`,
 /// `"tags"`). Always emits `<host_root>/api/<endpoint>` regardless of whether
 /// the caller's base URL ended in `/api`, `/v1`, a trailing slash, or nothing.
-pub(crate) fn api_endpoint_url(base_url: &str, endpoint: &str) -> String {
+pub fn api_endpoint_url(base_url: &str, endpoint: &str) -> String {
     let host = ollama_host_root(base_url);
     let path = endpoint.trim_start_matches('/');
     format!("{host}/api/{path}")

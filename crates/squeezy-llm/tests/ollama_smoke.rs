@@ -18,7 +18,9 @@ use squeezy_core::{
     DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, OllamaConfig, ProviderTransportConfig, Result,
     SqueezyError,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OllamaProvider};
+use squeezy_llm::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OllamaProvider, ollama_api_endpoint_url,
+};
 use tokio_util::sync::CancellationToken;
 
 const OPT_IN_ENV: &str = "SQUEEZY_OLLAMA_SMOKE";
@@ -116,7 +118,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
 }
 
 async fn is_reachable(base_url: &str) -> bool {
-    let url = format!("{}/tags", base_url.trim_end_matches('/'));
+    let url = ollama_api_endpoint_url(base_url, "tags");
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(750))
         .build()

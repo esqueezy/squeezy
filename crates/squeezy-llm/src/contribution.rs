@@ -20,6 +20,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -386,7 +387,10 @@ impl ProviderContribution for GoogleContribution {
 /// `api_key_env` / `api_key` / `keep_alive` map 1:1 to `OllamaConfig` and
 /// let users configure Ollama Cloud / reverse-proxy auth and the idle model
 /// retention window through the same contribution surface.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// M-63: custom `Debug` impl below redacts `api_key` so it matches the
+/// redaction contract applied to `OllamaConfig` and other key-bearing types.
+#[derive(Clone, Deserialize)]
 pub struct OllamaContributionConfig {
     #[serde(default = "default_ollama_base_url")]
     pub base_url: String,
@@ -400,6 +404,19 @@ pub struct OllamaContributionConfig {
     pub keep_alive: Option<String>,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
+}
+
+impl fmt::Debug for OllamaContributionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OllamaContributionConfig")
+            .field("base_url", &self.base_url)
+            .field("route_style", &self.route_style)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &self.api_key.as_deref().map(|_| "<redacted>"))
+            .field("keep_alive", &self.keep_alive)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 fn default_ollama_base_url() -> String {

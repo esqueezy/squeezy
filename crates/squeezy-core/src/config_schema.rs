@@ -644,6 +644,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 env_override: Some("SQUEEZY_STORE_RESPONSES"),
                 secret: false,
             },
+            FieldMeta {
+                label: "ollama_keep_alive",
+                toml_path: &["providers", "ollama", "keep_alive"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_ollama_keep_alive,
+                set: set_ollama_keep_alive,
+                default_display: "5m (server default)",
+                default: || FieldValue::String(String::new()),
+                help: "(Ollama only) How long the server keeps the model loaded between turns. Accepts duration strings (\"5m\", \"24h\"), integer seconds, \"0\" to evict immediately, or \"-1\" to pin indefinitely. Empty = server default (5 minutes). Also via OLLAMA_KEEP_ALIVE env var.",
+                env_override: Some("OLLAMA_KEEP_ALIVE"),
+                secret: false,
+            },
         ],
     },
     ConfigSectionMeta {
@@ -3753,6 +3766,26 @@ fn set_provider_expensive_models(
     let keep = filter == inherited;
     let slug = slug.to_string();
     cfg.providers.entry(slug).or_default().expensive_models = (!keep).then_some(filter);
+    Ok(())
+}
+
+fn get_ollama_keep_alive(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(
+        cfg.providers
+            .get("ollama")
+            .and_then(|p| p.keep_alive.clone())
+            .unwrap_or_default(),
+    )
+}
+fn set_ollama_keep_alive(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    cfg.providers
+        .entry("ollama".to_string())
+        .or_default()
+        .keep_alive = if s.trim().is_empty() { None } else { Some(s) };
     Ok(())
 }
 

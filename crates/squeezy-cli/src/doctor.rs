@@ -373,17 +373,16 @@ fn credential_check(inline: Option<&str>, env_name: &str) -> (Status, String) {
     }
 }
 
+const DEFAULT_OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
+
 /// Credential check for the Ollama provider. Ollama operates without auth by
-/// default, so no token is not a failure. When `api_key_env` is set (or an
-/// inline key is configured) we use the normal resolution chain so users
-/// running Ollama Cloud or a protected reverse proxy get the same clear
-/// feedback as any key-bearing provider.
+/// default, so an absent `OLLAMA_API_KEY` is not a failure. However, if a
+/// user has configured a *custom* `api_key_env` (e.g. pointing at an Ollama
+/// Cloud token) and that env var is unset, we surface a `Warn` so the
+/// misconfiguration is caught early rather than producing a silent 401.
 fn ollama_credential_check(c: &OllamaConfig) -> (Status, String) {
     let has_inline = c.api_key.as_deref().is_some_and(|v| !v.trim().is_empty());
-    let has_env = !c.api_key_env.is_empty();
-    if has_inline || has_env {
-        // Try to resolve through the normal chain; fall back to the local-only
-        // message rather than emitting a Warn when the env var is simply unset.
+    if has_inline || !c.api_key_env.is_empty() {
         match resolve_api_key_with_inline(c.api_key.as_deref(), &c.api_key_env) {
             Ok(resolved) => (
                 Status::Ok,
@@ -393,13 +392,29 @@ fn ollama_credential_check(c: &OllamaConfig) -> (Status, String) {
                     key_source_label(resolved.source, &c.api_key_env)
                 ),
             ),
-            Err(_) => (
-                Status::Ok,
-                format!(
-                    "base_url={} (no bearer token set; local auth-free deployment assumed)",
-                    c.base_url
-                ),
-            ),
+            Err(_) => {
+                // Only warn when the user explicitly configured a non-default
+                // key env — that signals they expect auth to be required.
+                // For the default OLLAMA_API_KEY case, absence is expected.
+                if c.api_key_env != DEFAULT_OLLAMA_API_KEY_ENV {
+                    (
+                        Status::Warn,
+                        format!(
+                            "base_url={} — {} is not set; set it or remove api_key_env to use \
+                             the default no-auth local Ollama path",
+                            c.base_url, c.api_key_env
+                        ),
+                    )
+                } else {
+                    (
+                        Status::Ok,
+                        format!(
+                            "base_url={} (OLLAMA_API_KEY unset; no-auth local deployment assumed)",
+                            c.base_url
+                        ),
+                    )
+                }
+            }
         }
     } else {
         (

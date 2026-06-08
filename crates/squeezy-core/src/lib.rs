@@ -3342,7 +3342,9 @@ impl fmt::Debug for AzureOpenAiConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// M-63: custom `Debug` below redacts `bearer_token` so logs and panic
+/// messages cannot leak the short-lived AWS bearer credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BedrockConfig {
     pub region: String,
     pub base_url: Option<String>,
@@ -3363,6 +3365,18 @@ pub struct BedrockConfig {
     #[serde(default)]
     pub request_metadata: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
+}
+
+impl fmt::Debug for BedrockConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BedrockConfig")
+            .field("region", &self.region)
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &RedactedOpt(&self.bearer_token))
+            .field("request_metadata", &self.request_metadata)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 /// M-63: redaction applies to the serde `Serialize` path only; the derived
@@ -3994,6 +4008,13 @@ pub struct ProviderSettings {
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
+    /// Ollama-only: `keep_alive` value forwarded on every native `/api/chat`
+    /// request to control how long the server retains the model between turns.
+    /// Accepts duration strings (`"5m"`, `"24h"`), integer seconds, `"0"` for
+    /// immediate eviction, or `"-1"` to pin the model indefinitely. Ignored by
+    /// every other provider. Can also be supplied via the `OLLAMA_KEEP_ALIVE`
+    /// env var (env var takes precedence over TOML).
+    pub keep_alive: Option<String>,
     /// Faux-only: path to a TOML script file consumed by the in-process
     /// faux provider. Other providers ignore this field.
     pub script: Option<String>,
@@ -4072,6 +4093,7 @@ impl ProviderSettings {
                 "request_metadata",
                 "deployment_name_map",
                 "route_style",
+                "keep_alive",
                 "script",
                 "use_entra_id",
                 "organization",
@@ -10611,6 +10633,7 @@ fn provider_setting(
         "vertex_project" => settings.vertex_project.as_ref(),
         "vertex_location" => settings.vertex_location.as_ref(),
         "route_style" => settings.route_style.as_ref(),
+        "keep_alive" => settings.keep_alive.as_ref(),
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         "script" => settings.script.as_ref(),
