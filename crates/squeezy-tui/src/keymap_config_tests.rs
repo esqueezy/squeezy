@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +17,45 @@ fn unique_temp_path(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("squeezy_keymap_cfg_{label}_{nonce}"));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir.join("keybindings.toml")
+}
+
+#[test]
+fn default_keybindings_path_uses_home_from_env() {
+    let path = default_keybindings_path_from_env(|key| {
+        (key == "HOME").then(|| OsString::from("/home/alice"))
+    });
+
+    assert_eq!(
+        path,
+        Some(PathBuf::from("/home/alice/.squeezy/keybindings.toml"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn default_keybindings_path_falls_back_to_userprofile_on_windows() {
+    let path = default_keybindings_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| OsString::from(r"C:\Users\Alice"))
+    });
+
+    assert_eq!(
+        path,
+        Some(
+            PathBuf::from(r"C:\Users\Alice")
+                .join(".squeezy")
+                .join("keybindings.toml")
+        )
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn default_keybindings_path_ignores_userprofile_off_windows() {
+    let path = default_keybindings_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| OsString::from("/Users/Alice"))
+    });
+
+    assert_eq!(path, None);
 }
 
 #[test]

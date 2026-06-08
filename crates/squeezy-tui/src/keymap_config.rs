@@ -235,11 +235,32 @@ impl KeybindingsFile {
 /// nor (on Windows) `$USERPROFILE` is set (CI sandboxes, some test
 /// harnesses), in which case the loader degrades to "no user overrides".
 pub(crate) fn default_keybindings_path() -> Option<PathBuf> {
-    // On Windows, HOME is often unset; USERPROFILE is the canonical home.
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)?;
-    Some(home.join(".squeezy").join("keybindings.toml"))
+    default_keybindings_path_from_env(|key| env::var_os(key))
+}
+
+fn default_keybindings_path_from_env<F>(env_get: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let home = match env_get("HOME") {
+        Some(home) => home,
+        None => {
+            // On Windows, HOME is often unset; USERPROFILE is the canonical home.
+            #[cfg(windows)]
+            {
+                env_get("USERPROFILE")?
+            }
+            #[cfg(not(windows))]
+            {
+                return None;
+            }
+        }
+    };
+    Some(
+        PathBuf::from(home)
+            .join(".squeezy")
+            .join("keybindings.toml"),
+    )
 }
 
 /// Merge `~/.squeezy/keybindings.toml` (when present) on top of the

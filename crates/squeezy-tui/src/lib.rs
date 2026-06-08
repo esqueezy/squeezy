@@ -15753,25 +15753,46 @@ fn parse_shortstat(text: &str) -> Option<(u32, u32)> {
 
 fn compact_path(path: &std::path::Path) -> String {
     let display = path.display().to_string();
-    // On Windows, HOME is often unset; fall back to USERPROFILE.
-    let Some(home) = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    else {
+    let Some(home) = home_path_from_env(|key| env::var_os(key)) else {
         return display;
     };
-    if let Ok(stripped) = path.strip_prefix(&home) {
+    compact_path_with_home(path, &home).unwrap_or(display)
+}
+
+fn home_path_from_env<F>(env_get: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let home = match env_get("HOME") {
+        Some(home) => home,
+        None => {
+            // On Windows, HOME is often unset; USERPROFILE is the canonical home.
+            #[cfg(windows)]
+            {
+                env_get("USERPROFILE")?
+            }
+            #[cfg(not(windows))]
+            {
+                return None;
+            }
+        }
+    };
+    Some(PathBuf::from(home))
+}
+
+fn compact_path_with_home(path: &Path, home: &Path) -> Option<String> {
+    if let Ok(stripped) = path.strip_prefix(home) {
         // Normalize to forward slashes for consistent display across
         // platforms. On Windows, `stripped.display()` would produce
         // backslashes, yielding a mixed `~/projects\foo` form.
         let normalized = stripped.to_string_lossy().replace('\\', "/");
-        if normalized.is_empty() {
+        Some(if normalized.is_empty() {
             "~".to_string()
         } else {
             format!("~/{normalized}")
-        }
+        })
     } else {
-        display
+        None
     }
 }
 

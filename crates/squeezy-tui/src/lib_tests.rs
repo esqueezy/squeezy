@@ -15190,6 +15190,50 @@ fn synchronized_output_auto_stays_off_for_unknown_terminals() {
     );
 }
 
+#[test]
+fn compact_path_with_home_uses_tilde_and_normalized_separators() {
+    let home = PathBuf::from("/home/alice");
+    let path = home.join("projects").join("squeezy");
+
+    assert_eq!(
+        super::compact_path_with_home(&path, &home).as_deref(),
+        Some("~/projects/squeezy")
+    );
+    assert_eq!(
+        super::compact_path_with_home(&home, &home).as_deref(),
+        Some("~")
+    );
+}
+
+#[test]
+fn compact_path_home_env_uses_home() {
+    let home = super::home_path_from_env(|key| {
+        (key == "HOME").then(|| std::ffi::OsString::from("/home/alice"))
+    });
+
+    assert_eq!(home, Some(PathBuf::from("/home/alice")));
+}
+
+#[cfg(windows)]
+#[test]
+fn compact_path_home_env_falls_back_to_userprofile_on_windows() {
+    let home = super::home_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| std::ffi::OsString::from(r"C:\Users\Alice"))
+    });
+
+    assert_eq!(home, Some(PathBuf::from(r"C:\Users\Alice")));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn compact_path_home_env_ignores_userprofile_off_windows() {
+    let home = super::home_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| std::ffi::OsString::from("/Users/Alice"))
+    });
+
+    assert_eq!(home, None);
+}
+
 #[tokio::test]
 async fn alt_one_skips_when_an_approval_is_pending() {
     // Modal-blocking states (approval, plan choice, config screen, …)
