@@ -3746,3 +3746,42 @@ fn global_index_cache_invalidates_when_append_changes_file() {
         );
     });
 }
+
+#[test]
+fn paths_same_exact_match() {
+    assert!(paths_same("/home/user/repo", "/home/user/repo"));
+    assert!(paths_same("C:\\Users\\dev\\repo", "C:\\Users\\dev\\repo"));
+}
+
+#[test]
+fn paths_same_trailing_separator() {
+    assert!(paths_same("/home/user/repo", "/home/user/repo/"));
+    assert!(paths_same("/home/user/repo/", "/home/user/repo"));
+}
+
+#[test]
+fn paths_same_different_paths() {
+    assert!(!paths_same("/home/user/repo", "/home/user/other"));
+    assert!(!paths_same("/a/b", "/a/c"));
+}
+
+#[test]
+fn paths_same_empty_strings() {
+    assert!(paths_same("", ""));
+    assert!(!paths_same("", "/some/path"));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn paths_same_windows_drive_case() {
+    // Drive-letter case variants should be treated as equal on Windows.
+    assert!(paths_same("C:\\Users\\dev\\repo", "c:\\users\\dev\\repo"));
+    assert!(paths_same("C:\\Repo", "c:\\repo"));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn paths_same_windows_slash_variants() {
+    // Forward and back slashes are interchangeable on Windows.
+    assert!(paths_same("C:\\Users\\dev", "C:/Users/dev"));
+}
