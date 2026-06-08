@@ -231,6 +231,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             checks.extend(probe_mcp_servers(&config.mcp_servers).await);
         }
         checks.push(skills_check(config));
+        checks.push(hook_shell_check(config));
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
         checks.push(cache_check(config, args.prune_cache));
@@ -712,6 +713,79 @@ fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
     match outcome {
         McpStaleOutcome::Failed { error } => format!("discovery failed: {error}"),
         McpStaleOutcome::Cancelled => "discovery was cancelled".to_string(),
+    }
+}
+
+/// Probe whether a program exists on `PATH` by walking the entries.
+///
+/// Used instead of spawning a process so the check stays offline-safe
+/// and fast. On Windows, also checks `<name>.exe` as a fallback.
+fn program_on_path(name: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        if dir.join(name).exists() {
+            return true;
+        }
+        #[cfg(windows)]
+        if dir.join(format!("{name}.exe")).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// When `[skills] hooks_enabled = true`, verify that the hook shell is
+/// reachable so Windows users get an explicit diagnostic instead of
+/// discovering the problem at hook fire time (where failures are
+/// silently fail-open).
+///
+/// - On Unix, checks for `sh`.
+/// - On Windows, checks for `pwsh`, then `powershell`, then `cmd`
+///   (matching the resolution order in the skill hook runner).
+fn hook_shell_check(config: &AppConfig) -> Check {
+    if !config.skills.hooks_enabled {
+        return Check {
+            name: "hooks:shell".to_string(),
+            status: Status::Ok,
+            detail: "hooks_enabled=false; shell check skipped".to_string(),
+        };
+    }
+
+    #[cfg(windows)]
+    let candidates: &[&str] = &["pwsh", "powershell", "cmd"];
+    #[cfg(not(windows))]
+    let candidates: &[&str] = &["sh"];
+
+    for &shell in candidates {
+        if program_on_path(shell) {
+            return Check {
+                name: "hooks:shell".to_string(),
+                status: Status::Ok,
+                detail: format!("hook shell available: {shell}"),
+            };
+        }
+    }
+
+    // Verify the shell isn't on the standard fixed path before warning.
+    #[cfg(not(windows))]
+    if std::path::Path::new("/bin/sh").exists() || std::path::Path::new("/usr/bin/sh").exists() {
+        return Check {
+            name: "hooks:shell".to_string(),
+            status: Status::Ok,
+            detail: "hook shell available: sh (fixed path)".to_string(),
+        };
+    }
+
+    let tried = candidates.join(", ");
+    Check {
+        name: "hooks:shell".to_string(),
+        status: Status::Warn,
+        detail: format!(
+            "hooks_enabled=true but no hook shell ({tried}) found on PATH; \
+             skill hooks will fail-open when spawning"
+        ),
     }
 }
 

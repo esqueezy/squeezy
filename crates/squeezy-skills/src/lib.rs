@@ -3,7 +3,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -1510,11 +1511,18 @@ fn parse_hook_event(name: &str) -> Option<HookEvent> {
         "PreTurn" | "pre_turn" => Some(HookEvent::PreTurn),
         "PreToolUse" | "pre_tool_use" => Some(HookEvent::PreToolUse),
         "PostToolUse" | "post_tool_use" => Some(HookEvent::PostToolUse),
+        "PostToolUseFailure" | "post_tool_use_failure" => Some(HookEvent::PostToolUseFailure),
         "PostTool" | "post_tool" => Some(HookEvent::PostTool),
         "PreCompact" | "pre_compact" => Some(HookEvent::PreCompact),
         "PostCompact" | "post_compact" => Some(HookEvent::PostCompact),
         "SubagentStart" | "subagent_start" => Some(HookEvent::SubagentStart),
+        "SubagentStop" | "subagent_stop" => Some(HookEvent::SubagentStop),
         "PermissionRequest" | "permission_request" => Some(HookEvent::PermissionRequest),
+        "PermissionDenied" | "permission_denied" => Some(HookEvent::PermissionDenied),
+        "UserPromptSubmit" | "user_prompt_submit" => Some(HookEvent::UserPromptSubmit),
+        "SessionStart" | "session_start" => Some(HookEvent::SessionStart),
+        "Stop" | "stop" => Some(HookEvent::Stop),
+        "Setup" | "setup" => Some(HookEvent::Setup),
         _ => None,
     }
 }
@@ -2005,6 +2013,59 @@ pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillMa
     toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
 }
 
+/// Maximum wall-clock time allowed for a single hook invocation.
+///
+/// Windows process start-up and antivirus interception can add significant
+/// latency; without a ceiling one stuck hook would block the synchronous
+/// dispatch path indefinitely. The timeout is enforced by polling
+/// `Child::try_wait` and killing the child if the deadline passes.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// JSON payload byte length above which the payload is written to a
+/// temporary file instead of (or in addition to) the environment variable.
+///
+/// Windows process environment blocks have practical size limits; large
+/// payloads (e.g. prompts or full tool metadata) can push past them.
+/// When the threshold is exceeded the handler writes the payload to a
+/// temp file, sets `SQUEEZY_HOOK_PAYLOAD_FILE` to that path, and still
+/// sets `SQUEEZY_HOOK_PAYLOAD` for scripts that read only the env var.
+const PAYLOAD_INLINE_THRESHOLD: usize = 8 * 1024;
+
+/// Resolve the shell program and arguments used to run a hook command
+/// string on the current platform.
+///
+/// On Unix, returns `("sh", ["-c"])`. On Windows, walks the candidates
+/// `pwsh`, `powershell`, and `cmd` in that order, returning the first
+/// one found on `PATH`. Returns `None` only when every candidate is
+/// absent — callers treat that as a spawn error and allow the action
+/// (fail-open) with a clear diagnostic.
+fn resolve_hook_shell_program() -> Option<(String, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        let candidates: &[(&str, &[&str])] = &[
+            ("pwsh", &["-NoProfile", "-Command"]),
+            ("powershell", &["-NoProfile", "-Command"]),
+            ("cmd", &["/C"]),
+        ];
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        for &(shell, args) in candidates {
+            let found = std::env::split_paths(&path_var)
+                .any(|dir| dir.join(format!("{shell}.exe")).exists() || dir.join(shell).exists());
+            if found {
+                return Some((
+                    shell.to_string(),
+                    args.iter().map(|s| s.to_string()).collect(),
+                ));
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        Some(("sh".to_string(), vec!["-c".to_string()]))
+    }
+}
+
 /// [`HookHandler`] implementation that fires a skill's declared shell
 /// command when its event matches.
 ///
@@ -2028,6 +2089,11 @@ pub struct SkillHookHandler {
     /// retried. Held behind a `Mutex` so the trait method stays `&self`
     /// while still allowing in-place mutation across dispatches.
     fired: Mutex<bool>,
+    /// Cached shell program and arguments for this handler, populated on
+    /// the first dispatch. Avoids re-walking PATH on every hook invocation
+    /// and makes the resolution cost visible (one OnceLock init per handler
+    /// rather than one per dispatch).
+    resolved_shell: OnceLock<Option<(String, Vec<String>)>>,
 }
 
 impl SkillHookHandler {
@@ -2045,6 +2111,7 @@ impl SkillHookHandler {
             spec,
             base_dir,
             fired: Mutex::new(false),
+            resolved_shell: OnceLock::new(),
         }
     }
 }
@@ -2084,47 +2151,145 @@ impl HookHandler for SkillHookHandler {
             );
             return HookResult::allow();
         }
+
+        // Resolve (and cache) the hook shell for this platform.
+        let shell_info = self.resolved_shell.get_or_init(resolve_hook_shell_program);
+        let (shell, shell_args) = match shell_info {
+            Some(pair) => (&pair.0, &pair.1),
+            None => {
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    "skill hook failed to spawn: no suitable hook shell found on \
+                     PATH (tried pwsh, powershell, cmd on Windows); \
+                     action is allowed because hooks are fail-open"
+                );
+                return HookResult::allow();
+            }
+        };
+
         let payload = payload_json.to_string();
-        let mut command = Command::new("sh");
+
+        // For payloads that exceed the inline threshold, write to a temp
+        // file and set SQUEEZY_HOOK_PAYLOAD_FILE so scripts can read from
+        // either source. The env var is still set for scripts that only
+        // read it; the file copy avoids exhausting the Windows environment
+        // block for large payloads.
+        let payload_file_path = if payload.len() > PAYLOAD_INLINE_THRESHOLD {
+            let path =
+                std::env::temp_dir().join(format!("squeezy_hook_{}.json", std::process::id()));
+            match fs::write(&path, &payload) {
+                Ok(()) => Some(path),
+                Err(error) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        skill = %self.skill_name,
+                        error = %error,
+                        "failed to write hook payload temp file; falling back to env-only delivery"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut command = Command::new(shell);
+        for arg in shell_args {
+            command.arg(arg);
+        }
         command
-            .arg("-c")
             .arg(trimmed)
             .current_dir(&self.base_dir)
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
-            .env("SQUEEZY_HOOK_PAYLOAD", payload);
-        match command.status() {
-            Ok(status) if status.success() => {
-                // Only mark a `once: true` hook as fired once it has
-                // actually succeeded, so a failed first run can retry.
-                if self.spec.once
-                    && let Ok(mut fired) = self.fired.lock()
-                {
-                    *fired = true;
-                }
-                HookResult::allow()
+            .env("SQUEEZY_HOOK_PAYLOAD", &payload);
+        if let Some(ref path) = payload_file_path {
+            command.env("SQUEEZY_HOOK_PAYLOAD_FILE", path);
+        }
+
+        let cleanup = |path: Option<&Path>| {
+            if let Some(p) = path {
+                let _ = fs::remove_file(p);
             }
-            Ok(status) => {
-                warn!(
-                    target: "squeezy_skills",
-                    skill = %self.skill_name,
-                    code = ?status.code(),
-                    "skill hook exited non-zero"
-                );
-                HookResult::deny(format!(
-                    "skill `{}` hook denied the action",
-                    self.skill_name
-                ))
+        };
+
+        let exit_status = match command.spawn() {
+            Ok(mut child) => {
+                // Enforce the per-hook wall-clock timeout by polling try_wait.
+                let start = Instant::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) if start.elapsed() >= HOOK_TIMEOUT => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            warn!(
+                                target: "squeezy_skills",
+                                skill = %self.skill_name,
+                                timeout_ms = HOOK_TIMEOUT.as_millis(),
+                                "skill hook timed out; action denied"
+                            );
+                            cleanup(payload_file_path.as_deref());
+                            return HookResult::deny(format!(
+                                "skill `{}` hook timed out after {}ms",
+                                self.skill_name,
+                                HOOK_TIMEOUT.as_millis()
+                            ));
+                        }
+                        Ok(None) => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(error) => {
+                            warn!(
+                                target: "squeezy_skills",
+                                skill = %self.skill_name,
+                                error = %error,
+                                "error waiting for skill hook; \
+                                 action is allowed because hooks are fail-open"
+                            );
+                            cleanup(payload_file_path.as_deref());
+                            return HookResult::allow();
+                        }
+                    }
+                }
             }
             Err(error) => {
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
+                    shell = %shell,
                     error = %error,
-                    "skill hook failed to spawn"
+                    "skill hook failed to spawn; \
+                     action is allowed because hooks are fail-open"
                 );
-                HookResult::allow()
+                cleanup(payload_file_path.as_deref());
+                return HookResult::allow();
             }
+        };
+
+        cleanup(payload_file_path.as_deref());
+
+        if exit_status.success() {
+            // Only mark a `once: true` hook as fired once it has
+            // actually succeeded, so a failed first run can retry.
+            if self.spec.once
+                && let Ok(mut fired) = self.fired.lock()
+            {
+                *fired = true;
+            }
+            HookResult::allow()
+        } else {
+            warn!(
+                target: "squeezy_skills",
+                skill = %self.skill_name,
+                code = ?exit_status.code(),
+                "skill hook exited non-zero"
+            );
+            HookResult::deny(format!(
+                "skill `{}` hook denied the action",
+                self.skill_name
+            ))
         }
     }
 }
