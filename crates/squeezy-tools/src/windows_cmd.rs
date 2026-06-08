@@ -36,10 +36,11 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     // Matches: Remove-Item, ri (alias). Requires BOTH a -Recurse (or
     // abbreviation / alias) AND a -Force (or abbreviation) flag to be present
     // anywhere in the token list, in any order.
-    if matches!(first.as_str(), "remove-item" | "ri") {
-        if powershell_has_recurse_flag(&tokens) && powershell_has_force_flag(&tokens) {
-            return true;
-        }
+    if matches!(first.as_str(), "remove-item" | "ri")
+        && powershell_has_recurse_flag(&tokens)
+        && powershell_has_force_flag(&tokens)
+    {
+        return true;
     }
 
     // `iex` is the PowerShell built-in alias for Invoke-Expression.

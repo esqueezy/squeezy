@@ -1903,12 +1903,9 @@ fn expand_env_vars(input: &str) -> String {
                     let resolved_name =
                         powershell_env_provider_var(&name).unwrap_or_else(|| name.clone());
                     if is_valid_var_name(&resolved_name) {
-                        match std::env::var(&resolved_name) {
-                            Ok(val) => {
-                                out.push_str(&val);
-                                continue;
-                            }
-                            Err(_) => {}
+                        if let Ok(val) = std::env::var(&resolved_name) {
+                            out.push_str(&val);
+                            continue;
                         }
                     }
                 }
