@@ -115,7 +115,9 @@ fn minimal_source(kind: LanguageKind) -> &'static str {
         LanguageKind::Swift => "func run() {}\n",
         LanguageKind::TypeScript => "function run(): void {}\n",
         LanguageKind::Tsx => "const element = <div />;\n",
-        LanguageKind::Unsupported | LanguageKind::Unknown => "",
+        LanguageKind::Unsupported | LanguageKind::Unknown => {
+            unreachable!("Unsupported and Unknown are not in any LanguageFamily::kinds() iteration")
+        }
     }
 }
 
@@ -152,6 +154,8 @@ fn extension_for_kind(kind: LanguageKind) -> &'static str {
         LanguageKind::Swift => "swift",
         LanguageKind::TypeScript => "ts",
         LanguageKind::Tsx => "tsx",
-        LanguageKind::Unsupported | LanguageKind::Unknown => "txt",
+        LanguageKind::Unsupported | LanguageKind::Unknown => {
+            unreachable!("Unsupported and Unknown are not in any LanguageFamily::kinds() iteration")
+        }
     }
 }

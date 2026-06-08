@@ -33,7 +33,9 @@ Parser-only feature coverage can be summarized from parsed files with
 `parser_feature_coverage_report`. The report groups each language's emitted
 declaration kinds, import kinds, call kinds, reference kinds, body-hit kinds,
 and confidence distribution without running graph resolution or benchmark
-oracles.
+oracles. The report shape (`ParserFeatureCoverageReport` and its per-language
+`ParserLanguageFeatureCoverage` rows) lives in
+`crates/squeezy-parse/src/lib.rs`.
 
 ## Rust
 

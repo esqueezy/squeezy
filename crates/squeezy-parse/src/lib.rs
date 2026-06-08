@@ -24,6 +24,18 @@ pub(crate) use languages::{
 pub const CRATE_NAME: &str = "squeezy-parse";
 const PARALLEL_PARSE_THRESHOLD: usize = 8;
 
+/// Maximum number of structured parse diagnostics that any single file may emit
+/// from either the parse-error helper or the missing-node visitor path. The
+/// two paths share the same budget shape so the per-file diagnostic vector
+/// stays bounded even on severely broken files.
+pub const MAX_PARSE_DIAGNOSTICS_PER_FILE: usize = 8;
+
+/// Maximum number of characters retained in a single `ParseDiagnostic` excerpt
+/// before it is truncated with a trailing ellipsis. Public so downstream
+/// packet writers and docs can quote the same number rather than duplicating
+/// the constant.
+pub const MAX_EXCERPT_CHARS: usize = 120;
+
 pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
@@ -237,6 +249,11 @@ pub struct ParseDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialParseSummary {
     pub parse_error_count: usize,
+    /// Confidence label for the partial-parse summary itself. Always
+    /// [`Confidence::Partial`] today — it intentionally mirrors the enclosing
+    /// [`ParseDiagnostic::confidence`] so downstream packet writers that
+    /// flatten a `PartialParseSummary` out of a parse diagnostic do not have
+    /// to re-derive the partial-trust signal from the diagnostic itself.
     pub confidence: Confidence,
     pub partially_trusted: bool,
 }
@@ -695,7 +712,11 @@ fn update_parse_summary(summary: &mut ParseSummary, parsed_file: &ParsedFile) {
 }
 
 fn increment_count(map: &mut BTreeMap<String, usize>, key: &'static str) {
-    *map.entry(key.to_string()).or_default() += 1;
+    if let Some(count) = map.get_mut(key) {
+        *count += 1;
+    } else {
+        map.insert(key.to_string(), 1);
+    }
 }
 
 fn symbol_kind_id(kind: SymbolKind) -> &'static str {
@@ -1036,6 +1057,24 @@ struct ExtractContext<'source> {
     body_hits: Vec<BodyHit>,
     diagnostics: Vec<ParseDiagnostic>,
     go_type_index: HashMap<String, SymbolId>,
+    missing_node_diagnostics_emitted: usize,
+}
+
+impl<'source> ExtractContext<'source> {
+    pub(crate) fn new(file: FileRecord, source: &'source str) -> Self {
+        Self {
+            file,
+            source,
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            calls: Vec::new(),
+            references: Vec::new(),
+            body_hits: Vec::new(),
+            diagnostics: Vec::new(),
+            go_type_index: HashMap::new(),
+            missing_node_diagnostics_emitted: 0,
+        }
+    }
 }
 
 fn record_parse_error_diagnostics(root: Node<'_>, ctx: &mut ExtractContext<'_>) {
@@ -1053,7 +1092,7 @@ fn record_parse_error_diagnostics(root: Node<'_>, ctx: &mut ExtractContext<'_>) 
         error_nodes.push(root);
     }
 
-    for node in error_nodes.into_iter().take(8) {
+    for node in error_nodes.into_iter().take(MAX_PARSE_DIAGNOSTICS_PER_FILE) {
         let node_kind = node.kind().to_string();
         let parent_kind = node.parent().map(|parent| parent.kind().to_string());
         ctx.diagnostics.push(ParseDiagnostic {
@@ -1078,14 +1117,23 @@ fn record_parse_error_diagnostics(root: Node<'_>, ctx: &mut ExtractContext<'_>) 
 }
 
 fn record_missing_node_diagnostic(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
+    if ctx.missing_node_diagnostics_emitted >= MAX_PARSE_DIAGNOSTICS_PER_FILE {
+        return;
+    }
     let node_kind = node.kind().to_string();
     let parent_kind = node.parent().map(|parent| parent.kind().to_string());
-    let parent_label = parent_kind.as_deref().unwrap_or("unknown parent");
-    ctx.diagnostics.push(ParseDiagnostic {
-        message: format!(
+    let message = match parent_kind.as_deref() {
+        Some(parent_label) => format!(
             "{} parse is missing {node_kind} under {parent_label}; partial parse facts remain available with partial confidence",
             ctx.file.language.display_name()
         ),
+        None => format!(
+            "{} parse is missing {node_kind}; partial parse facts remain available with partial confidence",
+            ctx.file.language.display_name()
+        ),
+    };
+    ctx.diagnostics.push(ParseDiagnostic {
+        message,
         span: Some(span_from_node(node)),
         confidence: Confidence::Partial,
         language: Some(ctx.file.language),
@@ -1099,6 +1147,7 @@ fn record_missing_node_diagnostic(node: Node<'_>, ctx: &mut ExtractContext<'_>) 
             partially_trusted: true,
         }),
     });
+    ctx.missing_node_diagnostics_emitted += 1;
 }
 
 fn count_parse_error_nodes(node: Node<'_>) -> usize {
@@ -1125,7 +1174,11 @@ fn collect_smallest_parse_error_nodes<'tree>(node: Node<'tree>, out: &mut Vec<No
             collect_smallest_parse_error_nodes(child, out);
         }
     }
-    if !child_with_error && (node.is_error() || node.is_missing()) {
+    // Emit a leaf only for genuine ERROR nodes; MISSING nodes are reported
+    // separately by each language's visitor via `record_missing_node_diagnostic`
+    // so we avoid emitting duplicate diagnostics at the same span when a file
+    // contains both ERROR and MISSING leaves.
+    if !child_with_error && node.is_error() {
         out.push(node);
     }
 }
@@ -1164,7 +1217,6 @@ fn compact_excerpt(raw: &str) -> Option<String> {
     if excerpt.is_empty() {
         return None;
     }
-    const MAX_EXCERPT_CHARS: usize = 120;
     if excerpt.chars().count() > MAX_EXCERPT_CHARS {
         excerpt = excerpt.chars().take(MAX_EXCERPT_CHARS).collect();
         excerpt.push_str("...");

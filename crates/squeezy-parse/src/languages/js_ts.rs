@@ -1,21 +1,9 @@
-use std::collections::HashMap;
-
 use crate::languages::python::{normalize_python_import_module, split_python_alias};
 use crate::languages::rust::*;
 use crate::*;
 
 pub(crate) fn extract_js_ts(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
-    let mut ctx = ExtractContext {
-        file: file.clone(),
-        source,
-        symbols: Vec::new(),
-        imports: Vec::new(),
-        calls: Vec::new(),
-        references: Vec::new(),
-        body_hits: Vec::new(),
-        diagnostics: Vec::new(),
-        go_type_index: HashMap::new(),
-    };
+    let mut ctx = ExtractContext::new(file.clone(), source);
     let root = tree.root_node();
     record_parse_error_diagnostics(root, &mut ctx);
 
