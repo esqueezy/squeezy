@@ -185,6 +185,7 @@ impl ShellProgram {
     /// tests (e.g. after a PATH change or before testing the
     /// `pwsh → powershell → cmd.exe` fallback chain).
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn reset_shell_cache() {
         if let Ok(mut guard) = SHELL_BASE_CACHE.lock() {
             *guard = None;
