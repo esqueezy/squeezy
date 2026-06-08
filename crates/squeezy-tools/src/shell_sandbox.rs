@@ -205,13 +205,13 @@ impl ShellSandboxPlan {
             configured_write_roots: config.write_roots.clone(),
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
-            fallback_reason,
             best_effort_fallback: best_effort.map(|(backend, record)| BestEffortFallback {
                 backend,
                 fallback_count: record.fallback_count,
                 first_in_session: record.first_in_session,
                 fallback_reason: fallback_reason.clone(),
             }),
+            fallback_reason,
         }
     }
 
