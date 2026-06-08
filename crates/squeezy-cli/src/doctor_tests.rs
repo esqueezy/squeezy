@@ -419,3 +419,27 @@ fn state_store_check_fails_when_path_unwritable() {
     let check = state_store_check(&config);
     assert_eq!(check.status, Status::Fail, "detail: {}", check.detail);
 }
+
+#[test]
+fn sandbox_check_includes_structured_extra() {
+    let check = sandbox_check();
+    let extra = check.extra.as_ref().expect("sandbox check must have extra");
+    let backend = extra.get("backend").expect("extra must have backend field");
+    assert!(backend.is_string(), "backend must be a string");
+    assert!(
+        extra.get("required_mode_supported").is_some(),
+        "extra must have required_mode_supported"
+    );
+}
+
+#[test]
+fn sandbox_check_extra_backend_matches_detail() {
+    let check = sandbox_check();
+    let extra = check.extra.as_ref().expect("sandbox check must have extra");
+    let backend = extra["backend"].as_str().expect("backend is a string");
+    assert!(
+        check.detail.contains(backend),
+        "detail should mention the backend; detail={:?} backend={backend:?}",
+        check.detail
+    );
+}

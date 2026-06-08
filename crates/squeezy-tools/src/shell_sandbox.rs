@@ -342,6 +342,12 @@ pub struct ShellSandboxDoctor {
     pub available: bool,
     /// Human-readable explanation for the doctor row.
     pub detail: String,
+    /// Linux only: whether unprivileged user namespaces (`CLONE_NEWUSER`) are
+    /// available. `None` on non-Linux platforms.
+    pub userns: Option<bool>,
+    /// Linux only: whether Landlock filesystem enforcement is available.
+    /// `None` on non-Linux platforms.
+    pub landlock: Option<bool>,
 }
 
 /// Probe the active shell-sandbox backend for `doctor`.
@@ -359,6 +365,8 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
                 "/usr/bin/sandbox-exec not found; required mode denies, best_effort degrades"
                     .to_string()
             },
+            userns: None,
+            landlock: None,
         }
     }
     #[cfg(target_os = "linux")]
@@ -370,22 +378,26 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
                 "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock + seccomp available".to_string()
             }
             (true, false) => {
-                "user namespaces available but Landlock filesystem enforcement is not; required mode denies"
+                "user namespaces available but Landlock filesystem enforcement is not; \
+                 required mode denies; hint: check kernel version (Landlock requires 5.13+)"
                     .to_string()
             }
-            (false, true) => {
-                "Landlock available but unprivileged user namespaces are disabled (unprivileged_userns_clone=0 or no /proc/self/ns/user); required mode denies"
-                    .to_string()
-            }
-            (false, false) => {
-                "neither unprivileged user namespaces nor Landlock available; required mode denies"
-                    .to_string()
-            }
+            (false, true) => "Landlock available but unprivileged user namespaces are disabled \
+                 (kernel.unprivileged_userns_clone=0 or no /proc/self/ns/user); \
+                 required mode denies; hint: set sysctl kernel.unprivileged_userns_clone=1 \
+                 or check container/seccomp policy"
+                .to_string(),
+            (false, false) => "neither unprivileged user namespaces nor Landlock available; \
+                 required mode denies; hint: check kernel.unprivileged_userns_clone sysctl, \
+                 container seccomp policy, and kernel version (Landlock requires 5.13+)"
+                .to_string(),
         };
         ShellSandboxDoctor {
             backend: "linux-direct-syscalls",
             available: userns && landlock,
             detail,
+            userns: Some(userns),
+            landlock: Some(landlock),
         }
     }
     #[cfg(target_os = "windows")]
@@ -395,6 +407,8 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             available: true,
             detail: "restricted-token tier enforces filesystem writes with no admin; the elevated tier (sensitive-read deny + WFP network egress control) is opt-in via `squeezy doctor --sandbox-setup` (one UAC prompt)"
                 .to_string(),
+            userns: None,
+            landlock: None,
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -403,6 +417,8 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             backend: "none",
             available: false,
             detail: "no OS shell-sandbox backend is available for this platform".to_string(),
+            userns: None,
+            landlock: None,
         }
     }
 }

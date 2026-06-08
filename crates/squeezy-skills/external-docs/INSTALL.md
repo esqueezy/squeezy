@@ -93,7 +93,27 @@ Tagged releases publish prebuilt archives and SHA-256 checksum files:
 
 Download the archive for your platform from
 `https://github.com/esqueezy/squeezy/releases`, verify the checksum, then put
-the `squeezy` binary on your `PATH`:
+the `squeezy` binary on your `PATH`.
+
+**Linux x86_64:**
+
+```sh
+sha256sum -c squeezy-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf squeezy-x86_64-unknown-linux-musl.tar.gz
+install -m 0755 squeezy /usr/local/bin/squeezy
+squeezy doctor
+```
+
+**Linux ARM64:**
+
+```sh
+sha256sum -c squeezy-aarch64-unknown-linux-musl.tar.gz.sha256
+tar -xzf squeezy-aarch64-unknown-linux-musl.tar.gz
+install -m 0755 squeezy /usr/local/bin/squeezy
+squeezy doctor
+```
+
+**macOS (Apple Silicon):**
 
 ```sh
 shasum -a 256 -c squeezy-aarch64-apple-darwin.tar.gz.sha256
@@ -102,8 +122,14 @@ install -m 0755 squeezy /usr/local/bin/squeezy
 squeezy doctor
 ```
 
-Replace the archive name with the Intel macOS, Linux x86_64, or Linux ARM64
-archive when needed.
+**macOS (Intel):**
+
+```sh
+shasum -a 256 -c squeezy-x86_64-apple-darwin.tar.gz.sha256
+tar -xzf squeezy-x86_64-apple-darwin.tar.gz
+install -m 0755 squeezy /usr/local/bin/squeezy
+squeezy doctor
+```
 
 On Windows, expand the zip and add the install location to `PATH`:
 

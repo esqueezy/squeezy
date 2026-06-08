@@ -36,6 +36,15 @@ pub struct DoctorArgs {
     /// Remove rotated redb schema backups after reporting cache health.
     #[arg(long)]
     pub prune_cache: bool,
+    /// Skip the repo-profile load. Useful for post-install smoke tests and
+    /// Linux package CI that do not have a full repository to scan, or for
+    /// fast binary-health checks where repo latency is undesirable.
+    #[arg(long)]
+    pub no_repo_profile: bool,
+    /// Skip the update-availability check. Useful in network-isolated CI
+    /// environments or when only local health checks are needed.
+    #[arg(long)]
+    pub no_update_check: bool,
     /// Windows only: provision the elevated shell-sandbox tier (one-time, UAC
     /// prompt). Creates the hidden local sandbox users and installs the WFP
     /// network egress-block filters, enabling `windows_sandbox_level =
@@ -71,6 +80,10 @@ struct Check {
     name: String,
     status: Status,
     detail: String,
+    /// Optional structured metadata included in `--json` output. Used by the
+    /// sandbox row to expose machine-readable platform fields (`backend`,
+    /// `userns`, `landlock`, `required_mode_supported`) without scraping prose.
+    extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -92,11 +105,21 @@ impl DoctorReport {
                 "ok": failures == 0,
                 "warnings": warnings,
                 "failures": failures,
-                "checks": self.checks.iter().map(|c| json!({
-                    "name": c.name,
-                    "status": c.status.as_str(),
-                    "detail": c.detail,
-                })).collect::<Vec<_>>(),
+                "checks": self.checks.iter().map(|c| {
+                    let mut obj = json!({
+                        "name": c.name,
+                        "status": c.status.as_str(),
+                        "detail": c.detail,
+                    });
+                    if let (Some(extra), Some(map)) = (c.extra.as_ref(), obj.as_object_mut()) {
+                        if let Some(extra_map) = extra.as_object() {
+                            for (k, v) in extra_map {
+                                map.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    obj
+                }).collect::<Vec<_>>(),
             });
             println!(
                 "{}",
@@ -177,6 +200,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                 name: "config".to_string(),
                 status: Status::Ok,
                 detail: format!("sources: {}", labels.join(", ")),
+                extra: None,
             });
             Some(config)
         }
@@ -185,27 +209,39 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                 name: "config".to_string(),
                 status: Status::Fail,
                 detail: format!("{error}"),
+                extra: None,
             });
             None
         }
     };
 
     if let Some(config) = config.as_ref() {
-        match ensure_repo_profile(&config.workspace_root, &config.graph) {
-            Ok(loaded) => checks.push(Check {
+        if args.no_repo_profile {
+            checks.push(Check {
                 name: "repo_profile".to_string(),
                 status: Status::Ok,
-                detail: format!(
-                    "status={} languages={}",
-                    loaded.status.as_str(),
-                    loaded.profile.languages.len()
-                ),
-            }),
-            Err(error) => checks.push(Check {
-                name: "repo_profile".to_string(),
-                status: Status::Warn,
-                detail: format!("{error}"),
-            }),
+                detail: "skipped (--no-repo-profile)".to_string(),
+                extra: None,
+            });
+        } else {
+            match ensure_repo_profile(&config.workspace_root, &config.graph) {
+                Ok(loaded) => checks.push(Check {
+                    name: "repo_profile".to_string(),
+                    status: Status::Ok,
+                    detail: format!(
+                        "status={} languages={}",
+                        loaded.status.as_str(),
+                        loaded.profile.languages.len()
+                    ),
+                    extra: None,
+                }),
+                Err(error) => checks.push(Check {
+                    name: "repo_profile".to_string(),
+                    status: Status::Warn,
+                    detail: format!("{error}"),
+                    extra: None,
+                }),
+            }
         }
 
         let (provider_name, provider_check) = provider_credential_check(&config.provider);
@@ -213,6 +249,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             name: format!("provider:{provider_name}"),
             status: provider_check.0,
             detail: provider_check.1,
+            extra: None,
         });
 
         checks.push(providers_check(&load_user_settings()));
@@ -223,6 +260,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                 name: format!("probe:{provider_name}"),
                 status,
                 detail,
+                extra: None,
             });
         }
 
@@ -237,7 +275,16 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     }
 
     checks.push(sandbox_check());
-    checks.push(update_check(update::check_for_update().await));
+    if args.no_update_check {
+        checks.push(Check {
+            name: "update".to_string(),
+            status: Status::Ok,
+            detail: "skipped (--no-update-check)".to_string(),
+            extra: None,
+        });
+    } else {
+        checks.push(update_check(update::check_for_update().await));
+    }
 
     // Warnings (e.g. missing optional API keys, missing sandbox tool) print as
     // such but do not fail the command: smoke tests in CI / brew test run in
@@ -401,11 +448,13 @@ fn session_store_check(config: &AppConfig) -> Check {
             name: "session_store".to_string(),
             status: Status::Ok,
             detail: format!("writable: {}", root.display()),
+            extra: None,
         },
         Err(error) => Check {
             name: "session_store".to_string(),
             status: Status::Fail,
             detail: format!("{}: {error}", root.display()),
+            extra: None,
         },
     }
 }
@@ -429,12 +478,14 @@ fn state_store_check(config: &AppConfig) -> Check {
                 name: "state_store".to_string(),
                 status: Status::Ok,
                 detail: format!("opened: {path}"),
+                extra: None,
             }
         }
         Err(error) => Check {
             name: "state_store".to_string(),
             status: Status::Fail,
             detail: format!("{error}"),
+            extra: None,
         },
     }
 }
@@ -448,6 +499,7 @@ fn cache_check(config: &AppConfig, prune: bool) -> Check {
                 name: "cache".to_string(),
                 status: Status::Fail,
                 detail: format!("{error}"),
+                extra: None,
             };
         }
     };
@@ -496,6 +548,7 @@ fn cache_check(config: &AppConfig, prune: bool) -> Check {
         name: "cache".to_string(),
         status,
         detail,
+        extra: None,
     }
 }
 
@@ -534,6 +587,7 @@ fn providers_check(settings: &SettingsFile) -> Check {
             name: "providers".to_string(),
             status: Status::Ok,
             detail: "no [providers.*] sections in settings.toml".to_string(),
+            extra: None,
         };
     };
     let mut detail = String::new();
@@ -557,6 +611,7 @@ fn providers_check(settings: &SettingsFile) -> Check {
         name: "providers".to_string(),
         status,
         detail,
+        extra: None,
     }
 }
 
@@ -590,6 +645,7 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
             name: "mcp".to_string(),
             status: Status::Ok,
             detail: "no MCP servers configured".to_string(),
+            extra: None,
         };
     }
     let mut enabled = 0usize;
@@ -642,12 +698,14 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
             name: "mcp".to_string(),
             status: Status::Ok,
             detail: summary,
+            extra: None,
         }
     } else {
         Check {
             name: "mcp".to_string(),
             status: Status::Warn,
             detail: format!("{summary}; {issues}"),
+            extra: None,
         }
     }
 }
@@ -703,6 +761,7 @@ async fn probe_mcp_servers(
                 name: format!("probe:mcp:{name}"),
                 status,
                 detail,
+                extra: None,
             }
         })
         .collect()
@@ -729,6 +788,7 @@ fn skills_check(config: &AppConfig) -> Check {
             name: "skills".to_string(),
             status: Status::Ok,
             detail: "no skills discovered".to_string(),
+            extra: None,
         };
     }
     let disabled = summaries.iter().filter(|s| s.disabled).count();
@@ -747,6 +807,7 @@ fn skills_check(config: &AppConfig) -> Check {
             name: "skills".to_string(),
             status: Status::Warn,
             detail,
+            extra: None,
         };
     }
     if config.skills.hooks_enabled {
@@ -756,6 +817,7 @@ fn skills_check(config: &AppConfig) -> Check {
         name: "skills".to_string(),
         status: Status::Ok,
         detail,
+        extra: None,
     }
 }
 
@@ -773,6 +835,7 @@ fn update_check(status: UpdateStatus) -> Check {
         name: "update".to_string(),
         status: row_status,
         detail: status.doctor_detail(),
+        extra: None,
     }
 }
 
@@ -781,8 +844,30 @@ fn update_check(status: UpdateStatus) -> Check {
 /// with the runtime — so this row reflects the backend the sandbox actually
 /// uses (e.g. Linux `linux-direct-syscalls`, not the long-stale `bwrap` proxy),
 /// and the Windows restricted-token / elevated tiers.
+///
+/// In `--json` mode the row includes structured fields (`backend`, `userns`,
+/// `landlock`, `required_mode_supported`) so distro/package smoke tests can
+/// gate on Linux readiness without scraping prose.
 fn sandbox_check() -> Check {
     let report = squeezy_tools::shell_sandbox_doctor();
+    let extra = {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "backend".to_string(),
+            serde_json::Value::String(report.backend.to_string()),
+        );
+        map.insert(
+            "required_mode_supported".to_string(),
+            serde_json::Value::Bool(report.available),
+        );
+        if let Some(userns) = report.userns {
+            map.insert("userns".to_string(), serde_json::Value::Bool(userns));
+        }
+        if let Some(landlock) = report.landlock {
+            map.insert("landlock".to_string(), serde_json::Value::Bool(landlock));
+        }
+        serde_json::Value::Object(map)
+    };
     Check {
         name: "sandbox".to_string(),
         status: if report.available {
@@ -791,6 +876,7 @@ fn sandbox_check() -> Check {
             Status::Warn
         },
         detail: format!("backend {}: {}", report.backend, report.detail),
+        extra: Some(extra),
     }
 }
 
@@ -801,6 +887,7 @@ fn sandbox_setup_action(config: Option<&AppConfig>) -> Check {
             name: "sandbox-setup".to_string(),
             status: Status::Fail,
             detail: "could not load configuration; cannot provision the sandbox".to_string(),
+            extra: None,
         };
     };
     match squeezy_tools::windows_sandbox_setup(
@@ -811,11 +898,13 @@ fn sandbox_setup_action(config: Option<&AppConfig>) -> Check {
             name: "sandbox-setup".to_string(),
             status: Status::Ok,
             detail,
+            extra: None,
         },
         Err(detail) => Check {
             name: "sandbox-setup".to_string(),
             status: Status::Fail,
             detail,
+            extra: None,
         },
     }
 }
@@ -827,11 +916,13 @@ fn sandbox_teardown_action() -> Check {
             name: "sandbox-teardown".to_string(),
             status: Status::Ok,
             detail,
+            extra: None,
         },
         Err(detail) => Check {
             name: "sandbox-teardown".to_string(),
             status: Status::Fail,
             detail,
+            extra: None,
         },
     }
 }
