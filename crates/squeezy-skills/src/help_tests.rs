@@ -529,4 +529,11 @@ fn relevant_docs_for_input_scopes_corpus() {
             .any(|d| d.path == "docs/external/AGENT_APPROACH.md"),
         "lexical fallback must always include anchor AGENT_APPROACH.md"
     );
+    assert!(
+        partial_docs.len() < bundled_docs().len(),
+        "lexical fallback for a topic with keyword evidence ({} docs) must be smaller than the \
+         full corpus ({} docs) — regression: scorer is returning the full corpus",
+        partial_docs.len(),
+        bundled_docs().len()
+    );
 }

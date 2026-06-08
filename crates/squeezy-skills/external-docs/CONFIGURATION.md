@@ -147,6 +147,8 @@ commented examples so that built-in defaults can evolve over time:
 # max_search_files_per_call = 1000000
 # max_model_rounds = 1000
 # max_summary_tokens = 64000
+# help_strict_local = false   # when true, /help refuses unknown topics instead of calling the
+                               # DocHelp subagent; env: SQUEEZY_HELP_STRICT_LOCAL
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"

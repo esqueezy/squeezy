@@ -1227,6 +1227,21 @@ fn parse_explicit_skill_command(input: &str) -> Option<(&str, &str)> {
     Some((name, task))
 }
 
+/// Return the trigger phrases declared in a `SKILL.md` file (normalised to
+/// lowercase), or an empty vec on parse error. Used by `squeezy skills show`
+/// to show only the triggers belonging to a specific skill.
+pub fn parse_skill_triggers(content: &str) -> Vec<String> {
+    parse_skill_file(content)
+        .map(|(meta, _)| {
+            meta.triggers
+                .into_iter()
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extended authoring lint for a single `SKILL.md` file.
 ///
 /// Returns a list of `(severity, message)` pairs where severity is either

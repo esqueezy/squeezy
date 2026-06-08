@@ -6431,11 +6431,18 @@ impl TurnRuntime {
                 // inside the per-turn activation hot path, which would increase
                 // the async future size and risk stack overflows on constrained
                 // platforms.
-                let _ = self.tx.try_send(AgentEvent::SkillActivationWarning {
+                if let Err(err) = self.tx.try_send(AgentEvent::SkillActivationWarning {
                     turn_id: self.turn_id,
                     name: skill.clone(),
                     message,
-                });
+                }) {
+                    tracing::error!(
+                        target: "squeezy_agent",
+                        skill = %skill,
+                        %err,
+                        "tool_deps warning event dropped: channel at capacity or closed"
+                    );
+                }
             }
             Some(format_skill_tool_dep_warnings(&missing_deps))
         };

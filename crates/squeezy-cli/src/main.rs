@@ -1210,20 +1210,34 @@ fn skills_show(cli: &Cli, name: &str, preview: bool) -> squeezy_core::Result<()>
             println!("prompt_hint:  {hint}");
         }
     }
-    // Note if there are catalog-wide ambiguous triggers (shared by multiple skills).
-    // run `squeezy skills validate` for per-skill details.
-    if !catalog.ambiguous_triggers().is_empty() {
-        println!(
-            "note: catalog has {} ambiguous trigger phrase(s); run `squeezy skills validate` for details",
-            catalog.ambiguous_triggers().len()
-        );
+    // Show any ambiguous trigger phrases declared by THIS skill.
+    let ambiguous_triggers = catalog.ambiguous_triggers();
+    if !ambiguous_triggers.is_empty() {
+        if let Ok(content) = fs::read_to_string(&summary.location) {
+            let skill_triggers = squeezy_skills::parse_skill_triggers(&content);
+            let ambiguous_for_skill: Vec<&String> = ambiguous_triggers
+                .iter()
+                .filter(|t| skill_triggers.iter().any(|s| s == t.as_str()))
+                .collect();
+            if !ambiguous_for_skill.is_empty() {
+                let listed = ambiguous_for_skill
+                    .iter()
+                    .map(|t| format!("`{t}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "ambiguous triggers: {listed} (declared by multiple skills; auto-activation skipped — use `/skill {name}` or `load_skill` to select explicitly)"
+                );
+            }
+        }
     }
     if preview {
         match catalog.load(name) {
             Ok(loaded) => {
                 let body = &loaded.body;
-                let shown = if body.len() > 400 {
-                    format!("{}…", &body[..400])
+                let shown = if body.chars().count() > 400 {
+                    let truncated: String = body.chars().take(400).collect();
+                    format!("{truncated}…")
                 } else {
                     body.clone()
                 };
@@ -1311,7 +1325,7 @@ fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
             "warning: ambiguous trigger phrase(s) declared by multiple skills — auto-activation skipped for {list}. Use `/skill <name>` or `load_skill` to select explicitly, or run `squeezy skills validate` for details.\n"
         );
     }
-    const DESC_MAX: usize = 48;
+    const DESC_MAX_CHARS: usize = 48;
     let mut rows: Vec<[String; 5]> = Vec::with_capacity(summaries.len() + 1);
     rows.push([
         "NAME".to_string(),
@@ -1328,10 +1342,11 @@ fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         } else {
             "enabled"
         };
-        let desc = if summary.description.len() <= DESC_MAX {
+        let desc = if summary.description.chars().count() <= DESC_MAX_CHARS {
             summary.description.clone()
         } else {
-            format!("{}…", &summary.description[..DESC_MAX])
+            let truncated: String = summary.description.chars().take(DESC_MAX_CHARS).collect();
+            format!("{truncated}…")
         };
         rows.push([
             summary.name.clone(),
@@ -1434,7 +1449,6 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
             errored += 1;
         } else if has_warnings {
             warned += 1;
-            ok += 1;
         } else {
             ok += 1;
         }
