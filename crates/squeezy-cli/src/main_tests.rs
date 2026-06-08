@@ -1321,6 +1321,81 @@ async fn print_mode_can_deny_ask_capability_in_strict_mode() {
 }
 
 #[tokio::test]
+async fn print_mode_fail_on_ask_returns_error_and_stops_loop() {
+    use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
+    use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    let permission = PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "rm -rf /".to_string(),
+        risk: PermissionRisk::High,
+        summary: "dangerous shell command".to_string(),
+        metadata: Default::default(),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default shell permission is ask".to_string(),
+        context: None,
+        preview: Vec::new(),
+    };
+    tx.send(squeezy_agent::AgentEvent::ApprovalRequested {
+        turn_id: squeezy_core::TurnId::new(0),
+        request,
+        decision_tx,
+    })
+    .await
+    .expect("send approval request");
+    // The loop should break before consuming this Completed event.
+    tx.send(squeezy_agent::AgentEvent::Completed {
+        turn_id: squeezy_core::TurnId::new(0),
+        message: squeezy_core::TranscriptItem::assistant(String::new()),
+        response_id: None,
+        cost: squeezy_core::CostSnapshot::default(),
+        metrics: squeezy_core::TurnMetrics::default(),
+        context_estimate: squeezy_core::ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let pump_result = pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::Fail,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await;
+
+    assert!(pump_result.is_err(), "fail-on-ask must return Err");
+    let decision = decision_rx.await.expect("approval decided");
+    assert!(
+        matches!(decision, ToolApprovalDecision::Denied),
+        "decision must be Denied for fail-on-ask"
+    );
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert!(
+        stderr_text.contains("approval: failing on shell"),
+        "stderr should announce the fail; got: {stderr_text:?}"
+    );
+}
+
+#[tokio::test]
 async fn pump_prompts_runs_bang_bang_prompt_in_text_mode_without_llm_context() {
     // A `--prompt "!!cmd"` value must execute locally while staying out
     // of the LLM transcript that follow-on prompts will see. We bake

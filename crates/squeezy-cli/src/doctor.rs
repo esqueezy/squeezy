@@ -301,7 +301,8 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         checks.push(update_check(update::check_for_update().await));
     }
 
-    let selector_failures = unmatched_selector_checks(args, &checks);
+    let config_failed = config.is_none() && needs_config(args);
+    let selector_failures = unmatched_selector_checks(args, &checks, config_failed);
     checks.extend(selector_failures.iter().cloned());
 
     // Warnings (e.g. missing optional API keys, missing sandbox tool) print as
@@ -356,7 +357,10 @@ fn check_name_matches(selector: &str, name: &str) -> bool {
     if selector.is_empty() {
         return false;
     }
-    name == selector || name.starts_with(&format!("{selector}:"))
+    name == selector
+        || (name.len() > selector.len()
+            && name.as_bytes().get(selector.len()) == Some(&b':')
+            && name.starts_with(selector))
 }
 
 fn filter_checks(args: &DoctorArgs, checks: Vec<Check>) -> Vec<Check> {
@@ -373,7 +377,11 @@ fn filter_checks(args: &DoctorArgs, checks: Vec<Check>) -> Vec<Check> {
         .collect()
 }
 
-fn unmatched_selector_checks(args: &DoctorArgs, checks: &[Check]) -> Vec<Check> {
+fn unmatched_selector_checks(
+    args: &DoctorArgs,
+    checks: &[Check],
+    config_failed: bool,
+) -> Vec<Check> {
     let unmatched = args
         .only
         .iter()
@@ -384,6 +392,7 @@ fn unmatched_selector_checks(args: &DoctorArgs, checks: &[Check]) -> Vec<Check> 
                     .iter()
                     .any(|check| check_name_matches(selector, &check.name))
                 || (selector == "update" && args.skip_update)
+                || (config_failed && !matches!(selector, "sandbox" | "update"))
             {
                 None
             } else {

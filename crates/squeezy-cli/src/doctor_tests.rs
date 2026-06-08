@@ -93,7 +93,7 @@ fn unmatched_only_selector_becomes_visible_failure() {
         detail: "ok".to_string(),
     }];
 
-    let selector_failures = unmatched_selector_checks(&args, &checks);
+    let selector_failures = unmatched_selector_checks(&args, &checks, false);
     assert_eq!(selector_failures.len(), 1);
     assert_eq!(selector_failures[0].status, Status::Fail);
     assert!(selector_failures[0].detail.contains("sesion_store"));

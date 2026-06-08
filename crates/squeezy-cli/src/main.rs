@@ -1109,43 +1109,57 @@ async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Re
             let mut server = server;
             server.enabled = true;
             servers.insert(name.clone(), server);
+            const MCP_TEST_TIMEOUT_SECS: u64 = 30;
             let registry = McpClientRegistry::new(servers);
-            let outcome = registry.refresh_tools(CancellationToken::new()).await;
+            let timed_out = tokio::time::timeout(
+                Duration::from_secs(MCP_TEST_TIMEOUT_SECS),
+                registry.refresh_tools(CancellationToken::new()),
+            )
+            .await;
             registry.shutdown().await;
-            let status = outcome.status.per_server.get(name);
-            let (status_label, detail, tools_count) = match status {
-                Some(McpServerStatus::Ready { tools_count, .. }) => (
-                    "ok",
-                    format!("handshake ok; {tools_count} tools advertised"),
-                    Some(*tools_count),
-                ),
-                Some(McpServerStatus::Stale {
-                    tools_count,
-                    outcome,
-                }) => (
+            let (status_label, detail, tools_count) = match timed_out {
+                Err(_) => (
                     "warn",
-                    format!(
-                        "handshake stale; serving {tools_count} cached tools after {}",
-                        mcp_stale_outcome_detail(outcome)
-                    ),
-                    Some(*tools_count),
-                ),
-                Some(McpServerStatus::Failed { error }) => {
-                    ("fail", format!("handshake failed: {error}"), None)
-                }
-                Some(McpServerStatus::Cancelled) => (
-                    "warn",
-                    "handshake timed out or was cancelled".to_string(),
+                    format!("handshake timed out after {MCP_TEST_TIMEOUT_SECS}s"),
                     None,
                 ),
-                Some(McpServerStatus::Starting) => {
-                    ("warn", "handshake did not complete".to_string(), None)
+                Ok(outcome) => {
+                    let status = outcome.status.per_server.get(name);
+                    match status {
+                        Some(McpServerStatus::Ready { tools_count, .. }) => (
+                            "ok",
+                            format!("handshake ok; {tools_count} tools advertised"),
+                            Some(*tools_count),
+                        ),
+                        Some(McpServerStatus::Stale {
+                            tools_count,
+                            outcome,
+                        }) => (
+                            "warn",
+                            format!(
+                                "handshake stale; serving {tools_count} cached tools after {}",
+                                mcp_stale_outcome_detail(outcome)
+                            ),
+                            Some(*tools_count),
+                        ),
+                        Some(McpServerStatus::Failed { error }) => {
+                            ("fail", format!("handshake failed: {error}"), None)
+                        }
+                        Some(McpServerStatus::Cancelled) => (
+                            "warn",
+                            "handshake timed out or was cancelled".to_string(),
+                            None,
+                        ),
+                        Some(McpServerStatus::Starting) => {
+                            ("warn", "handshake did not complete".to_string(), None)
+                        }
+                        None => (
+                            "warn",
+                            "server did not produce a probe status".to_string(),
+                            None,
+                        ),
+                    }
                 }
-                None => (
-                    "warn",
-                    "server did not produce a probe status".to_string(),
-                    None,
-                ),
             };
             if *json {
                 let body = serde_json::json!({
@@ -1911,6 +1925,9 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
                     "attachments": record.attachments,
                     "replay": replay,
                 });
+                // Discover any session IDs present only in resume_state/attachments
+                // before the final sanitization pass.
+                add_public_session_id_mappings_from_value(&body, &mut session_id_map);
                 sanitize_session_ids_in_value(&mut body, &session_id_map);
                 println!(
                     "{}",
@@ -3062,11 +3079,11 @@ fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<
         ));
     };
     object.remove("session_id");
-    object.insert(
-        "id".to_string(),
-        serde_json::to_value(PublicSessionHandle::for_store_id(&metadata.session_id))
-            .map_err(|err| SqueezyError::Parse(format!("failed to serialize session id: {err}")))?,
-    );
+    let public_id = session_id_map
+        .get(&metadata.session_id)
+        .cloned()
+        .unwrap_or_else(|| PublicSessionHandle::for_store_id(&metadata.session_id).0);
+    object.insert("id".to_string(), serde_json::Value::String(public_id));
     Ok(value)
 }
 
@@ -3164,24 +3181,31 @@ fn sanitize_session_ids_in_value(
     value: &mut serde_json::Value,
     session_id_map: &BTreeMap<String, String>,
 ) {
+    let mut replacements: Vec<(&String, &String)> = session_id_map.iter().collect();
+    replacements.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+    sanitize_session_ids_in_value_inner(value, &replacements);
+}
+
+fn sanitize_session_ids_in_value_inner(
+    value: &mut serde_json::Value,
+    replacements: &[(&String, &String)],
+) {
     match value {
         serde_json::Value::String(text) => {
-            let mut replacements = session_id_map.iter().collect::<Vec<_>>();
-            replacements.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
             for (raw, public) in replacements {
                 if raw != public {
-                    *text = text.replace(raw, public);
+                    *text = text.replace(raw.as_str(), public.as_str());
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                sanitize_session_ids_in_value(item, session_id_map);
+                sanitize_session_ids_in_value_inner(item, replacements);
             }
         }
         serde_json::Value::Object(object) => {
             for item in object.values_mut() {
-                sanitize_session_ids_in_value(item, session_id_map);
+                sanitize_session_ids_in_value_inner(item, replacements);
             }
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
@@ -3203,7 +3227,7 @@ fn resolve_session_show_id(store: &SessionStore, id: &str) -> squeezy_core::Resu
         }
     }
 
-    Ok(id.to_string())
+    Err(SqueezyError::Tool(format!("no session found for {id:?}")))
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {
@@ -3414,6 +3438,7 @@ where
                             "non-interactive prompt requested permission; rerun with --prompt-permission-mode auto-approve-ask or configure an explicit permission rule"
                                 .to_string(),
                         ));
+                        break;
                     }
                 }
             }
