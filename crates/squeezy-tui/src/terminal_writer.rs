@@ -44,9 +44,7 @@ pub(crate) enum TerminalWriter {
     /// without a module-wide allow that would hide dead code in the
     /// already-wired `Plain`/`Tee` variants.
     #[allow(dead_code)]
-    Capture {
-        sink: Arc<Mutex<Vec<u8>>>,
-    },
+    Capture { sink: Arc<Mutex<Vec<u8>>> },
 }
 
 impl TerminalWriter {

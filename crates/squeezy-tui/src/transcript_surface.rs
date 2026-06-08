@@ -395,10 +395,7 @@ mod tests {
     #[test]
     fn plain_text_of_spans_matches_line_projection() {
         let line = styled_line("alpha beta gamma");
-        assert_eq!(
-            plain_text_of_spans(&line.spans),
-            plain_text_of_line(&line)
-        );
+        assert_eq!(plain_text_of_spans(&line.spans), plain_text_of_line(&line));
     }
 
     #[test]
@@ -460,7 +457,10 @@ mod tests {
         // Round-trips every `crate::OverlayDetail` value through the owned
         // `DetailPolicy` mapping. If a variant is added upstream the EXHAUSTIVE
         // match below stops compiling, which is the drift guard.
-        for detail in [crate::OverlayDetail::Collapsed, crate::OverlayDetail::Expanded] {
+        for detail in [
+            crate::OverlayDetail::Collapsed,
+            crate::OverlayDetail::Expanded,
+        ] {
             let policy = DetailPolicy::from(detail);
             let expected = match detail {
                 crate::OverlayDetail::Collapsed => DetailPolicy::Collapsed,

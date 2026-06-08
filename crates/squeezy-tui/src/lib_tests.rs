@@ -5518,7 +5518,10 @@ fn is_wide_rendered_glyph_classifies_the_special_set() {
         assert!(is_wide_rendered_glyph(c), "{c:?} must be wide-rendered");
     }
     for c in ['✶', '✷', '✸', '✹', '✺', '✻', '✼', '✽'] {
-        assert!(is_wide_rendered_glyph(c), "spinner {c:?} must be wide-rendered");
+        assert!(
+            is_wide_rendered_glyph(c),
+            "spinner {c:?} must be wide-rendered"
+        );
     }
     // ...and false for ordinary text and for glyphs just outside the ranges.
     for c in ['a', 'Z', ' ', '好', '│', '◌', '✾'] {
@@ -5560,12 +5563,7 @@ fn footer_content_height_treats_colored_background_as_content() {
     // A row of only spaces but with a non-Reset background is NOT blank — it is
     // a painted bar (e.g. a highlighted composer row), so it counts as content.
     let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
-    buf.set_string(
-        0,
-        2,
-        "    ",
-        Style::default().bg(Color::Blue),
-    );
+    buf.set_string(0, 2, "    ", Style::default().bg(Color::Blue));
     assert_eq!(
         footer_content_height(&buf),
         3,
