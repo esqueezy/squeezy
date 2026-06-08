@@ -4870,12 +4870,12 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
     // of the agent-level `resolve_help_turn` path.
     let config_inspect = agent.config_snapshot().inspect_redacted();
     let help = SqueezyHelp::new(config_inspect);
-    if let Some(answer) = help.answer_for_input(&prompt) {
-        if answer.status == HelpStatus::Answered {
-            app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
-            app.status = format!("help: {}", answer.topic);
-            return;
-        }
+    if let Some(answer) = help.answer_for_input(&prompt)
+        && answer.status == HelpStatus::Answered
+    {
+        app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
+        app.status = format!("help: {}", answer.topic);
+        return;
     }
     // Topic not covered locally — fall back to a model turn.
     start_user_turn(app, agent, prompt);
