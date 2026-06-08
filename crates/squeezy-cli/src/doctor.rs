@@ -111,11 +111,11 @@ impl DoctorReport {
                         "status": c.status.as_str(),
                         "detail": c.detail,
                     });
-                    if let (Some(extra), Some(map)) = (c.extra.as_ref(), obj.as_object_mut()) {
-                        if let Some(extra_map) = extra.as_object() {
-                            for (k, v) in extra_map {
-                                map.insert(k.clone(), v.clone());
-                            }
+                    if let (Some(extra), Some(map)) = (c.extra.as_ref(), obj.as_object_mut())
+                        && let Some(extra_map) = extra.as_object()
+                    {
+                        for (k, v) in extra_map {
+                            map.insert(k.clone(), v.clone());
                         }
                     }
                     obj
