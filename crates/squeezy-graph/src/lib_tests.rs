@@ -8842,6 +8842,8 @@ void main() {
     );
 }
 
+/// Absolute path tests use Unix-style paths so are only run on Unix.
+#[cfg(unix)]
 #[test]
 fn normalize_cargo_file_id_strips_workspace_prefix() {
     let root = std::path::Path::new("/workspace/myproject");
@@ -8853,7 +8855,7 @@ fn normalize_cargo_file_id_strips_workspace_prefix() {
 
 #[test]
 fn normalize_cargo_file_id_passes_through_relative_path() {
-    let root = std::path::Path::new("/workspace/myproject");
+    let root = std::path::Path::new("myproject");
     assert_eq!(
         normalize_cargo_file_id(root, "src/main.rs"),
         Some("src/main.rs".to_string()),
@@ -8862,11 +8864,15 @@ fn normalize_cargo_file_id_passes_through_relative_path() {
 
 #[test]
 fn normalize_cargo_file_id_returns_none_for_angle_bracket_paths() {
-    let root = std::path::Path::new("/workspace/myproject");
+    let root = std::path::Path::new("myproject");
     assert_eq!(normalize_cargo_file_id(root, "<anon>"), None);
     assert_eq!(normalize_cargo_file_id(root, "<macro expansion>"), None);
 }
 
+/// Absolute path test: an absolute path outside the workspace root should
+/// return None. Only meaningful on Unix where the test paths are valid
+/// absolute paths.
+#[cfg(unix)]
 #[test]
 fn normalize_cargo_file_id_returns_none_for_path_outside_workspace() {
     let root = std::path::Path::new("/workspace/myproject");
