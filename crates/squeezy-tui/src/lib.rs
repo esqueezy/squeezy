@@ -44,10 +44,11 @@ use squeezy_agent::{
 use squeezy_core::{
     AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
     ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
-    PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
-    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiSynchronizedOutput, TurnMetrics,
-    context_attachment_storage_text, detect_context_attachment_kind, detect_image_mime,
+    PermissionCapability, PermissionPolicy, PermissionRequest, ResponseVerbosity, Result, Role,
+    SessionMode, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
+    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiSynchronizedOutput,
+    TurnMetrics, context_attachment_storage_text, detect_context_attachment_kind,
+    detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
@@ -6294,16 +6295,18 @@ fn capability_project_label(
         | PermissionCapability::Destructive => unreachable!(),
     };
     // On Windows, warn when the shell prefix being persisted is broad
-    // (covers all commands run via pwsh, cmd, etc.) because the unisolated
-    // sandbox means this Allow rule has an especially wide blast radius (Bug 6).
+    // (covers all commands run via pwsh, cmd, etc.) because the lower sandbox
+    // tiers leave approval as the boundary for reads and/or network.
     let windows_broad_warning = if permission.capability == PermissionCapability::Shell
-        && permission
-            .metadata
-            .get("windows_no_fs_sandbox")
-            .is_some_and(|v| v == "true")
         && is_broad_windows_shell_prefix(&scope)
     {
-        " ⚠ broad rule on unisolated Windows shell"
+        match windows_sandbox_posture(permission) {
+            Some("job-object-only") => " [broad rule on job-object-only Windows shell]",
+            Some("restricted-token-writes-only") => {
+                " [broad rule; Windows reads/network not isolated]"
+            }
+            _ => "",
+        }
     } else {
         ""
     };
@@ -6323,22 +6326,34 @@ fn is_broad_windows_shell_prefix(prefix: &str) -> bool {
     let lower = prefix.to_ascii_lowercase();
     // Strip rule-target suffix (`:*`) and any `.exe` extension so the match
     // covers both `pwsh:*` and `pwsh.exe:*` rule forms.
-    let bare = lower.trim_end_matches(":*").trim().trim_end_matches(".exe");
+    let target = lower.trim_end_matches(":*").trim();
+    let file_name = target.rsplit(['\\', '/']).next().unwrap_or(target);
+    let bare = file_name.trim_end_matches(".exe");
     matches!(bare, "pwsh" | "powershell" | "cmd" | "gitbash" | "shell")
+}
+
+fn windows_sandbox_posture(permission: &PermissionRequest) -> Option<&str> {
+    permission
+        .metadata
+        .get("windows_sandbox_posture")
+        .map(String::as_str)
+        .or_else(|| {
+            permission
+                .metadata
+                .get("windows_no_fs_sandbox")
+                .is_some_and(|v| v == "true")
+                .then_some("job-object-only")
+        })
 }
 
 /// Single-line status banner shown in the 1-line status bar. Compact by
 /// design so the status bar remains useful for non-approval traffic.
 pub(crate) fn format_approval_status_line(request: &ToolApprovalRequest) -> String {
     let permission = &request.permission;
-    let windows_suffix = if permission
-        .metadata
-        .get("windows_no_fs_sandbox")
-        .is_some_and(|v| v == "true")
-    {
-        " sandbox=job-object-only"
-    } else {
-        ""
+    let windows_suffix = match windows_sandbox_posture(permission) {
+        Some("job-object-only") => " sandbox=job-object-only",
+        Some("restricted-token-writes-only") => " sandbox=restricted-token-writes-only",
+        _ => "",
     };
     format!(
         "approval needed: {tool} risk={risk} target={target}{windows_suffix}",
