@@ -228,6 +228,7 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Return matching lines, only files containing matches, or only a count. Default content."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_FILES},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
+                "max_bytes_per_file": {"type": "integer", "minimum": 1, "description": "Maximum bytes to read from each file before pattern matching. Default 1 MB."},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."},
                 "context": {"type": "integer", "minimum": 0, "maximum": 50, "description": "Number of leading + trailing context lines to emit around each match (like rg -C N). Default 0. Only affects output_mode=content."}
@@ -280,7 +281,9 @@ pub(crate) fn read_file_spec() -> ToolSpec {
                 "path": {"type": "string", "description": "Workspace-relative file path."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Byte offset to start reading from."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT, "description": "Maximum bytes to return."},
-                "diff_only": {"type": "boolean", "description": "When true, refuse to read paths outside the current Git worktree diff. Default false."}
+                "diff_only": {"type": "boolean", "description": "When true, refuse to read paths outside the current Git worktree diff. Default false."},
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based first line to read; translated to a byte offset. Use with end_line for a line window. Ignored when byte offset is also set."},
+                "end_line": {"type": "integer", "minimum": 1, "description": "1-based last line, inclusive. Paired with start_line."}
             },
             "required": ["path"]
         })),
