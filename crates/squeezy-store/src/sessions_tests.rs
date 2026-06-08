@@ -1196,8 +1196,10 @@ fn load_global_calibration_with_source_hint_corrupt_file_returns_some_false() {
         ..AppConfig::default()
     };
     let store = SessionStore::open(&config);
-    // Write invalid JSON to the calibration path.
-    let cal_path = root.join("calibration.json");
+    // The calibration file lives under the session root, not workspace_root.
+    // Ensure the directory exists, then write invalid JSON directly.
+    let cal_path = store.root().join("calibration.json");
+    fs::create_dir_all(store.root()).expect("create session root");
     fs::write(&cal_path, b"not valid json {{{").expect("write corrupt calibration");
     let (cal, hint) = store.load_global_calibration_with_source_hint();
     assert!(
