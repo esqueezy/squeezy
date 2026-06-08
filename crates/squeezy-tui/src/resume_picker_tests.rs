@@ -172,6 +172,7 @@ fn summary_at(id: &str, cwd: &str) -> SessionSummary {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     }
 }
 
@@ -347,6 +348,7 @@ fn session_summary_label_keeps_long_prompts_for_wrapping() {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     };
     let label = summary.label();
     assert_eq!(label.chars().count(), 200);
@@ -453,6 +455,7 @@ fn project_hint_prefers_repo_root_basename() {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     };
     assert_eq!(s.project_hint(), "other");
 }
@@ -470,6 +473,7 @@ fn project_hint_falls_back_to_cwd_tail() {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     };
     assert_eq!(s.project_hint(), "sibling");
 }
@@ -580,6 +584,28 @@ fn picker_expands_branches_after_tab_toggle() {
     state.dispatch(press(KeyCode::Down));
     let choice = state.dispatch(press(KeyCode::Enter));
     assert!(matches!(choice, Some(ResumeChoice::CrossProject { .. })));
+}
+
+#[test]
+fn picker_select_treats_trailing_slash_mismatch_as_same_project() {
+    // A session stored with a trailing separator and a cwd without one
+    // should be treated as the same directory. select_at_cursor must use
+    // paths_same (not ==) so the session resolves as Resume, not CrossProject.
+    let same_dir_with_slash = summary_at("s", "/work/repo/");
+    let mut state = ResumePickerState::new(vec![same_dir_with_slash], cwd());
+    // By default the scoped view should show this session because
+    // paths_same("/work/repo/", "/work/repo") == true.
+    assert_eq!(
+        state.candidates.len(),
+        1,
+        "session should be in scoped view"
+    );
+    state.dispatch(press(KeyCode::Down));
+    let choice = state.dispatch(press(KeyCode::Enter));
+    assert!(
+        matches!(choice, Some(ResumeChoice::Resume { .. })),
+        "trailing-slash mismatch must not dispatch as CrossProject; got: {choice:?}"
+    );
 }
 
 #[test]

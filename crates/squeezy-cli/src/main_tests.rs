@@ -321,6 +321,27 @@ fn continue_flag_falls_back_with_stderr_note_when_no_match() {
 }
 
 #[test]
+fn continue_flag_emits_normalization_note_when_path_differs_but_same_location() {
+    // A session stored with a trailing separator is the same location as
+    // the current cwd without one. paths_same() matches them; the note
+    // surface should indicate that normalization was applied.
+    let sessions = vec![meta("s", "/repo/", 100, true)];
+
+    let resolved = resolve_resume_session(ResumeFlag::Continue, &sessions, "/repo");
+
+    assert_eq!(
+        resolved.session_id.as_deref(),
+        Some("s"),
+        "should match via normalization"
+    );
+    let note = resolved.note.expect("normalization note expected");
+    assert!(
+        note.contains("path normalization"),
+        "note should mention normalization; got: {note}"
+    );
+}
+
+#[test]
 fn explicit_session_flag_passes_id_through_unfiltered() {
     let sessions = vec![meta("s-only", "/repo", 100, true)];
 

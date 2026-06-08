@@ -23,6 +23,10 @@ use squeezy_core::{
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Process-global counter used to generate unique temp-file suffixes.
+/// Using a counter instead of pid-only prevents two concurrent writers
+/// inside the same process from colliding on the same temp path.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 /// Schema version stamped onto every `RolloutEvent` emitted by
 /// [`SessionStore::bundle_rollout_trace`]. The reducer is additive over
@@ -560,7 +564,7 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        fs::rename(&src, &dest)?;
+        rename_with_retry(&src, &dest).map_err(|e| enrich_lock_error(e, &src))?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
@@ -593,7 +597,7 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        fs::rename(&src, &dest)?;
+        rename_with_retry(&src, &dest).map_err(|e| enrich_lock_error(e, &src))?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
@@ -810,7 +814,7 @@ impl SessionStore {
                 if force_remove {
                     let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
                     if dir.exists() {
-                        fs::remove_dir_all(&dir)?;
+                        fs::remove_dir_all(&dir).map_err(|e| enrich_lock_error(e, &dir))?;
                     }
                     removed.push(metadata.session_id);
                     continue;
@@ -832,7 +836,7 @@ impl SessionStore {
                 if archived_at < archive_cutoff {
                     let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
                     if dir.exists() {
-                        fs::remove_dir_all(&dir)?;
+                        fs::remove_dir_all(&dir).map_err(|e| enrich_lock_error(e, &dir))?;
                     }
                     removed.push(metadata.session_id);
                 }
@@ -863,7 +867,7 @@ impl SessionStore {
                     CleanupMode::Purge => {
                         let dir = self.session_dir(&metadata.session_id);
                         if dir.exists() {
-                            fs::remove_dir_all(&dir)?;
+                            fs::remove_dir_all(&dir).map_err(|e| enrich_lock_error(e, &dir))?;
                         }
                         removed.push(metadata.session_id);
                     }
@@ -1065,8 +1069,16 @@ struct SessionLogAppend {
 
 enum SessionLogCmd {
     Append(SessionLogAppend),
-    Flush { ack: mpsc::Sender<Result<()>> },
-    Shutdown { ack: mpsc::Sender<Result<()>> },
+    /// Route `replay.jsonl` writes through the same queued writer as
+    /// `events.jsonl` so concurrent replay appends serialise their I/O
+    /// and avoid per-write open/close churn on Windows.
+    AppendReplay(SessionLogAppend),
+    Flush {
+        ack: mpsc::Sender<Result<()>>,
+    },
+    Shutdown {
+        ack: mpsc::Sender<Result<()>>,
+    },
 }
 
 #[derive(Debug)]
@@ -1097,6 +1109,14 @@ impl SessionLogWriter {
         self.check_failure()?;
         self.tx
             .send(SessionLogCmd::Append(append))
+            .map_err(|_| SqueezyError::Agent("session log writer stopped".to_string()))?;
+        self.check_failure()
+    }
+
+    fn append_replay(&self, append: SessionLogAppend) -> Result<()> {
+        self.check_failure()?;
+        self.tx
+            .send(SessionLogCmd::AppendReplay(append))
             .map_err(|_| SqueezyError::Agent("session log writer stopped".to_string()))?;
         self.check_failure()
     }
@@ -1158,8 +1178,12 @@ fn run_session_log_writer(
 ) {
     let path = dir.join("events.jsonl");
     let mut current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
+    let replay_path = dir.join("replay.jsonl");
+    let mut replay_current_size =
+        fs::metadata(&replay_path).map_or(0, |metadata| metadata.len() as usize);
     let mut terminal_failure: Option<String> = None;
     let mut truncated = false;
+    let mut replay_truncated = false;
     for command in rx {
         match command {
             SessionLogCmd::Append(append) => {
@@ -1172,6 +1196,25 @@ fn run_session_log_writer(
                     &path,
                     &mut current_size,
                     &mut truncated,
+                    append,
+                ) {
+                    let message = error.to_string();
+                    if let Some(writer) = writer.upgrade() {
+                        writer.record_failure(&message);
+                    }
+                    terminal_failure = Some(message);
+                }
+            }
+            SessionLogCmd::AppendReplay(append) => {
+                if terminal_failure.is_some() {
+                    continue;
+                }
+                if let Err(error) = write_replay_log_append(
+                    &store,
+                    &dir,
+                    &replay_path,
+                    &mut replay_current_size,
+                    &mut replay_truncated,
                     append,
                 ) {
                     let message = error.to_string();
@@ -1225,6 +1268,35 @@ fn write_session_log_append(
         return Ok(());
     }
     append_payload_with_recovery(path, &append.payload, current_size)?;
+    Ok(())
+}
+
+/// Writer-thread handler for `replay.jsonl` appends. Mirrors
+/// `write_session_log_append` but targets the replay file and uses the
+/// "replay trace exceeded" reason string on truncation, matching the
+/// message emitted by the old direct-write path.
+fn write_replay_log_append(
+    store: &SessionStore,
+    dir: &Path,
+    replay_path: &Path,
+    replay_current_size: &mut usize,
+    replay_truncated: &mut bool,
+    append: SessionLogAppend,
+) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    if replay_current_size.saturating_add(append.payload.len()) > store.max_session_bytes {
+        if !*replay_truncated {
+            update_metadata_file(dir, |metadata| {
+                metadata.status = SessionStatus::Truncated;
+                metadata.resume_available = false;
+                metadata.resume_unavailable_reason =
+                    Some("replay trace exceeded max_session_bytes".to_string());
+            })?;
+            *replay_truncated = true;
+        }
+        return Ok(());
+    }
+    append_payload_with_recovery(replay_path, &append.payload, replay_current_size)?;
     Ok(())
 }
 
@@ -1542,10 +1614,7 @@ impl SessionHandle {
         // Replay events describe model interaction; they are always
         // substantive enough to promote a pending session to live so
         // the events.jsonl + replay.jsonl pair stays consistent.
-        let _ = self.ensure_live()?;
-        let dir = self.dir();
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("replay.jsonl");
+        let writer = self.ensure_live()?;
         event.sequence = self.counters.replay_count.fetch_add(1, Ordering::Relaxed) + 1;
         let mut payload = to_json_vec(&event)?;
         if payload.len() > self.store.max_event_bytes {
@@ -1558,21 +1627,9 @@ impl SessionHandle {
             payload = to_json_vec(&event)?;
         }
         payload.push(b'\n');
-
-        let current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
-        if current_size.saturating_add(payload.len()) > self.store.max_session_bytes {
-            self.update_metadata(|metadata| {
-                metadata.status = SessionStatus::Truncated;
-                metadata.resume_available = false;
-                metadata.resume_unavailable_reason =
-                    Some("replay trace exceeded max_session_bytes".to_string());
-            })?;
-            return Ok(());
-        }
-
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(&payload)?;
-        Ok(())
+        // Route through the same per-session writer thread as events.jsonl
+        // to serialise I/O and avoid per-write open/close churn on Windows.
+        writer.append_replay(SessionLogAppend { payload })
     }
 
     pub fn write_resume_state(&self, state: &SessionResumeState) -> Result<()> {
@@ -2824,10 +2881,14 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    // Per-pid temp name so concurrent writers to the same path don't
-    // clobber each other's in-flight temp file before the rename.
+    // Include a pid+counter suffix so concurrent writers within the same
+    // process (e.g. multiple async tasks writing resume_state.json via
+    // different tokio workers) never share a temp path.  A pid-only suffix
+    // was vulnerable to same-process collision on Windows where the second
+    // writer fails or clobbers the first temp file while its handle is open.
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
+        Some(name) => path.with_file_name(format!(".{}.{}-{}.tmp", name, std::process::id(), seq)),
         None => path.with_extension("tmp"),
     };
     {
@@ -2839,7 +2900,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
-    if let Err(error) = fs::rename(&tmp, path) {
+    if let Err(error) = rename_with_retry(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(error.into());
     }
@@ -2922,11 +2983,28 @@ fn cache_global_index(path: &Path, entries: &[GlobalSessionIndexEntry]) {
 /// tmp + rename so concurrent readers never see a half-written file. The
 /// caller chooses the iteration order; readers re-sort by
 /// `started_at_ms`.
+///
+/// Uses a per-process unique temp name so two Squeezy processes running
+/// simultaneously on Windows do not collide on the same `index.jsonl.tmp`
+/// path. The rename is retried once on transient sharing-violation errors
+/// (common when antivirus / Windows Search indexes the directory).
 fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
+    // Unique-per-process temp name prevents two concurrent Squeezy
+    // processes from clobbering each other's in-flight temp file.
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let index_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("index.jsonl");
+    let tmp = path.with_file_name(format!(
+        ".{}.{}-{}.tmp",
+        index_name,
+        std::process::id(),
+        seq
+    ));
     {
         let mut file = OpenOptions::new()
             .create(true)
@@ -2943,7 +3021,11 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         }
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    if let Err(err) = rename_with_retry(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -3405,6 +3487,105 @@ fn serialize_event_payload(event: &SessionEvent, max_event_bytes: usize) -> Resu
 
 fn json_error(error: serde_json::Error) -> SqueezyError {
     SqueezyError::Tool(format!("session store JSON error: {error}"))
+}
+
+/// Perform `fs::rename(from, to)`, retrying once with a short sleep on
+/// transient sharing-violation errors that are common on Windows when an
+/// antivirus scanner, Windows Search indexer, or another process briefly
+/// holds an exclusive handle on the target path.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(first) if is_windows_sharing_violation(&first) => {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            match fs::rename(from, to) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(first),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns `true` for Windows ERROR_SHARING_VIOLATION (os error 32) or
+/// ERROR_LOCK_VIOLATION (os error 33). These are transient: a brief sleep
+/// and retry is usually enough.  Always returns `false` on non-Windows.
+fn is_windows_sharing_violation(error: &std::io::Error) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        matches!(error.raw_os_error(), Some(32) | Some(33))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Translate a filesystem error that occurred while renaming or removing
+/// session directory `dir` into a user-actionable message when the error
+/// looks like a Windows file-lock.  On non-Windows the original error is
+/// returned unchanged.
+fn enrich_lock_error(error: std::io::Error, dir: &Path) -> SqueezyError {
+    #[cfg(target_os = "windows")]
+    {
+        let is_lock = error.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(32) | Some(33));
+        if is_lock {
+            return SqueezyError::Tool(format!(
+                "session files in {} appear to be in use (os error: {}). \
+                 Close any other Squeezy window, terminal preview, editor, \
+                 or antivirus scan that may have the session open, then retry.",
+                dir.display(),
+                error.raw_os_error().unwrap_or(-1)
+            ));
+        }
+    }
+    let _ = dir;
+    SqueezyError::Io(error)
+}
+
+/// Returns `true` when the two path strings refer to the same filesystem
+/// location.
+///
+/// On Windows, first tries [`std::fs::canonicalize`] to resolve
+/// drive-letter case, UNC prefixes, junctions, and short-path spellings.
+/// Falls back to a case-insensitive trimmed comparison when
+/// canonicalization is unavailable (the directory may not exist yet).
+///
+/// On non-Windows, trims trailing `/` and compares bytes directly;
+/// case-sensitivity is a filesystem property on those platforms so we
+/// stay conservative and do not lower-case.
+pub fn paths_same(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    paths_same_platform(a, b)
+}
+
+#[cfg(target_os = "windows")]
+fn paths_same_platform(a: &str, b: &str) -> bool {
+    // Try canonical form first: resolves drive-letter case, UNC, junctions,
+    // short/long path spellings.
+    let a_canon = Path::new(a).canonicalize().ok();
+    let b_canon = Path::new(b).canonicalize().ok();
+    if let (Some(ac), Some(bc)) = (a_canon, b_canon) {
+        return ac == bc;
+    }
+    // Canonicalization failed (path may not exist yet). Normalise
+    // separators (Windows accepts both `/` and `\`) and compare
+    // case-insensitively after trimming trailing separators.
+    let norm = |s: &str| -> String {
+        s.trim_end_matches(['/', '\\'])
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn paths_same_platform(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 #[cfg(test)]

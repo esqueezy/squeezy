@@ -37,7 +37,7 @@ use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
     BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
     SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
-    parse_bug_report_section, refresh_repo_profile,
+    parse_bug_report_section, paths_same, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
@@ -2636,10 +2636,7 @@ fn confirm(prompt: &str) -> squeezy_core::Result<bool> {
 /// the message itself preserves the original strings so the operator
 /// can spot the discrepancy.
 fn cross_project_resume_prompt(session_cwd: &str, current_cwd: &str) -> Option<String> {
-    fn normalize(value: &str) -> &str {
-        value.trim_end_matches(['/', std::path::MAIN_SEPARATOR])
-    }
-    if normalize(session_cwd) == normalize(current_cwd) {
+    if paths_same(session_cwd, current_cwd) {
         return None;
     }
     Some(format!(
@@ -3416,14 +3413,25 @@ fn resolve_resume_session(
             note: None,
         },
         ResumeFlag::Continue => {
-            let pick = sessions
+            let found = sessions
                 .iter()
-                .find(|meta| meta.resume_available && meta.cwd == cwd_str)
-                .map(|meta| meta.session_id.clone());
-            if pick.is_some() {
+                .find(|meta| meta.resume_available && paths_same(&meta.cwd, cwd_str));
+            if let Some(meta) = found {
+                // Emit a hint when the match was via path normalization (e.g.
+                // drive-letter case on Windows) so the user can see which
+                // recorded path was resolved.
+                let note = if meta.cwd != cwd_str {
+                    Some(format!(
+                        "squeezy: --continue: resuming session recorded at {} \
+                         (matched current directory via path normalization)",
+                        meta.cwd
+                    ))
+                } else {
+                    None
+                };
                 ResumeResolution {
-                    session_id: pick,
-                    note: None,
+                    session_id: Some(meta.session_id.clone()),
+                    note,
                 }
             } else {
                 ResumeResolution {

@@ -268,6 +268,9 @@ fn replay_tape_round_trips_and_exports() {
         ))
         .expect("append completion");
 
+    // Replay events now go through the writer thread; flush before reading.
+    handle.flush_events().expect("flush replay");
+
     let tape = store.replay_tape(handle.session_id()).expect("read replay");
     assert_eq!(tape.schema_version, SESSION_REPLAY_SCHEMA_VERSION);
     assert_eq!(tape.session_id, handle.session_id());
@@ -310,6 +313,9 @@ fn open_session_seeds_replay_sequence_from_existing_jsonl() {
         .expect("append start");
 
     let session_id = handle.session_id().to_string();
+    // Flush the first handle so its replay events are on disk before the
+    // second open reads the count.
+    handle.flush_events().expect("flush initial replay");
     let reopened = store.open_session(session_id.clone());
     reopened
         .append_replay_event(SessionReplayEvent::new(
@@ -318,6 +324,8 @@ fn open_session_seeds_replay_sequence_from_existing_jsonl() {
             json!({"response_id": "resp_1", "cost": CostSnapshot::default()}),
         ))
         .expect("append completion after open");
+    // Flush the reopened handle before reading back.
+    reopened.flush_events().expect("flush reopened replay");
 
     let tape = store.replay_tape(&session_id).expect("read replay");
     let sequences: Vec<u64> = tape.events.iter().map(|event| event.sequence).collect();
@@ -369,6 +377,7 @@ fn bug_report_redacts_replay_tape() {
             json!({"text": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"}),
         ))
         .expect("append replay");
+    handle.flush_events().expect("flush replay");
 
     let bundle = store
         .build_bug_report(
@@ -2589,6 +2598,7 @@ fn bundle_rollout_trace_emits_replay_when_no_events() {
             json!({"response_id": "resp_1"}),
         ))
         .expect("append model completed");
+    handle.flush_events().expect("flush replay");
 
     let bundle = store
         .bundle_rollout_trace(handle.session_id())
@@ -3616,8 +3626,9 @@ fn write_json_is_atomic_no_stale_tmp_and_preserves_original() {
 
     // A pre-existing stale temp sibling (e.g. from a crashed prior write)
     // does not corrupt or block the next write: the good target survives
-    // and is replaced atomically.
-    let stale_tmp = root.join(format!(".metadata.json.{}.tmp", std::process::id()));
+    // and is replaced atomically. Use the new pid-counter format so the
+    // seeded path matches what a real crashed writer would have left.
+    let stale_tmp = root.join(format!(".metadata.json.{}-0.tmp", std::process::id()));
     fs::write(&stale_tmp, b"{ this is not valid json").expect("seed stale tmp");
     write_json(&path, &json!({ "k": "third" })).expect("rewrite over stale tmp");
     let value: serde_json::Value =
@@ -3745,4 +3756,43 @@ fn global_index_cache_invalidates_when_append_changes_file() {
             "local entries should preserve newest-first order after cache invalidation: {listed:?}"
         );
     });
+}
+
+#[test]
+fn paths_same_exact_match() {
+    assert!(paths_same("/home/user/repo", "/home/user/repo"));
+    assert!(paths_same("C:\\Users\\dev\\repo", "C:\\Users\\dev\\repo"));
+}
+
+#[test]
+fn paths_same_trailing_separator() {
+    assert!(paths_same("/home/user/repo", "/home/user/repo/"));
+    assert!(paths_same("/home/user/repo/", "/home/user/repo"));
+}
+
+#[test]
+fn paths_same_different_paths() {
+    assert!(!paths_same("/home/user/repo", "/home/user/other"));
+    assert!(!paths_same("/a/b", "/a/c"));
+}
+
+#[test]
+fn paths_same_empty_strings() {
+    assert!(paths_same("", ""));
+    assert!(!paths_same("", "/some/path"));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn paths_same_windows_drive_case() {
+    // Drive-letter case variants should be treated as equal on Windows.
+    assert!(paths_same("C:\\Users\\dev\\repo", "c:\\users\\dev\\repo"));
+    assert!(paths_same("C:\\Repo", "c:\\repo"));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn paths_same_windows_slash_variants() {
+    // Forward and back slashes are interchangeable on Windows.
+    assert!(paths_same("C:\\Users\\dev", "C:/Users/dev"));
 }
