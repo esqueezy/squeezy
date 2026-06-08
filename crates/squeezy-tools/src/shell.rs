@@ -75,6 +75,10 @@ pub(crate) struct ShellRunOutcome {
     /// when FS/network isolation is unavailable. `None` on all other
     /// platforms.
     pub(crate) win_job_object_status: Option<&'static str>,
+    /// True when `tty = true` was requested but the platform degraded to
+    /// non-TTY pipes (Windows without ConPTY). The caller surfaces this as a
+    /// note in the tool result.
+    pub(crate) tty_degraded: bool,
 }
 
 struct ShellRunRequest<'a> {
@@ -509,6 +513,7 @@ impl ToolRegistry {
             stderr_truncated,
             raw_spillover,
             win_job_object_status,
+            tty_degraded,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -624,6 +629,29 @@ impl ToolRegistry {
                 json!({ "best_effort_fallback": fallback }),
             );
         }
+        // Expose Windows Job Object process-tree cleanup status so the audit
+        // and the model can distinguish genuine cleanup from a degraded state.
+        // "assigned" = process covered; "not_assigned" = assignment failed
+        // (process may have raced to exit before assignment); "creation_failed"
+        // = Job Object could not be created at all.
+        if let Some(job_status) = win_job_object_status {
+            insert_content_field(
+                &mut raw_content,
+                "windows_process_tree",
+                json!({ "job_object": job_status }),
+            );
+        }
+        // Surface a note when tty=true was requested but the platform degraded
+        // to non-TTY pipe-backed stdio (Windows without ConPTY wired up).
+        if tty_degraded {
+            insert_content_field(
+                &mut raw_content,
+                "tty_note",
+                json!(
+                    "tty=true requested; ConPTY unavailable on this platform; ran with pipe-backed stdio"
+                ),
+            );
+        }
         if let Some(summary) = implicit_skill {
             insert_content_field(
                 &mut raw_content,
@@ -731,12 +759,21 @@ impl ToolRegistry {
         let pty_master: Option<std::fs::File>;
         let ask_server: Option<ShellAskServer>;
         let mut child: ShellChild;
+        // Tracking vars set by platform-gated cfg blocks below; `mut` is
+        // needed only on the relevant platform but must compile on all targets.
+        #[allow(unused_mut)]
+        let mut tty_degraded = false;
 
         if win_sandbox_backend {
             #[cfg(windows)]
             {
                 // The Windows sandbox owns its own pipes + scrubbed env; the PTY
                 // and `squeezy ask` socket paths do not apply on this backend.
+                // ConPTY is not wired for the sandbox path either, so record
+                // the same tty_degraded signal as the non-sandbox tokio path.
+                if tty {
+                    tty_degraded = true;
+                }
                 let _ = tty;
                 drop(shell_ask_approver);
                 let spec = build_win_spec(&self.shell_sandbox, &self.root, sandbox_plan);
@@ -800,6 +837,8 @@ impl ToolRegistry {
                     // Windows non-sandbox path: ConPTY is not yet wired up;
                     // degrade to non-TTY pipes. The shell still runs with the
                     // requested backend, just without a controlling terminal.
+                    // The outcome records `tty_degraded = true` so the caller
+                    // can surface a note to the user.
                     command
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -813,6 +852,15 @@ impl ToolRegistry {
                     .stderr(Stdio::piped());
                 None
             };
+            // On non-Unix platforms, tty=true degrades to pipes because
+            // ConPTY is not yet wired. Record this so the caller can surface
+            // a user-visible note.
+            if tty {
+                #[cfg(not(unix))]
+                {
+                    tty_degraded = true;
+                }
+            }
             configure_shell_process_group(&mut command);
             configure_linux_shell_sandbox(&mut command, sandbox_plan);
             apply_shell_environment_policy(
@@ -1010,6 +1058,7 @@ impl ToolRegistry {
             win_job_object_status: Some(win_job_object_status),
             #[cfg(not(windows))]
             win_job_object_status: None,
+            tty_degraded,
         })
     }
 }

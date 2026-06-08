@@ -11440,6 +11440,7 @@ fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan 
         filesystem_write_roots: Vec::new(),
         fallback_reason: None,
         best_effort_fallback: None,
+        selected_shell: None,
     }
 }
 
@@ -11720,6 +11721,7 @@ fn shell_best_effort_does_not_retry_signal_exit_without_output() {
         stderr_truncated: false,
         raw_spillover: None,
         win_job_object_status: None,
+        tty_degraded: false,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run);
@@ -11874,6 +11876,7 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stderr_truncated: false,
         raw_spillover: None,
         win_job_object_status: None,
+        tty_degraded: false,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
@@ -12099,6 +12102,17 @@ fn linux_seccomp_plan_does_not_export_ask_socket() {
     // so `squeezy ask` could never connect; the socket must not be exported.
     let seccomp_plan = fake_sandbox_plan("linux-direct-syscalls", true);
     assert!(!seccomp_plan.exports_ask_socket());
+
+    // The Windows sandbox backends spawn via raw Win32 with a scrubbed env
+    // and have no AF_UNIX `squeezy ask` transport; they must NOT export the
+    // socket so we don't advertise an unusable capability.
+    for backend in ["windows-restricted-token", "windows-elevated"] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            !plan.exports_ask_socket(),
+            "backend {backend} must not export the ask socket (no AF_UNIX transport)",
+        );
+    }
 
     // Backends without the AF_UNIX deny still advertise the ask socket.
     for backend in [

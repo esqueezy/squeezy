@@ -13,32 +13,63 @@
 pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
 
-    // PowerShell cmdlets where the dangerous shape is unambiguous in the
-    // raw text. Each needle is a contiguous substring that does not appear
-    // inside benign commands.
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
+    let has_recursive_force =
+        (flag_matches("-recurse") || flag_matches("-r")) && flag_matches("-force");
+
+    // PowerShell cmdlets / aliases where the dangerous shape is unambiguous
+    // in the raw text. Each needle is a contiguous substring that does not
+    // appear inside benign commands.
+    //
+    // `ri` is the built-in alias for `Remove-Item`.  We only flag it when
+    // combined with recurse/force so that `ri` alone (tab completion, etc.)
+    // is not a false positive.
     for needle in [
-        "remove-item -recurse -force",
-        "remove-item -r -force",
-        "remove-item -force -recurse",
-        "remove-item -force -r",
+        // Execution policy change
         "set-executionpolicy",
+        // User / identity mutation
         "new-localuser",
+        "remove-localuser",
+        "disable-localuser",
+        // Storage / volume destruction
         "clear-recyclebin",
         "format-volume",
+        // Elevation via Start-Process
+        "start-process powershell -verb runas",
+        "start-process pwsh -verb runas",
+        "start-process cmd -verb runas",
+        "start-process cmd.exe -verb runas",
+        // Shutdown / restart (destructive at the session level)
+        "stop-computer",
+        "restart-computer",
+        // Service and scheduled-task deletion
+        "remove-service",
+        "unregister-scheduledtask",
     ] {
         if lower.contains(needle) {
             return true;
         }
     }
+    if has_recursive_force
+        && tokens.iter().any(|token| {
+            token.eq_ignore_ascii_case("remove-item") || token.eq_ignore_ascii_case("ri")
+        })
+    {
+        return true;
+    }
 
     // cmd.exe destructive commands. Tokenise to avoid matching substrings
     // inside paths.
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
     let first = tokens.first().copied().unwrap_or("").to_ascii_lowercase();
-    let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
 
     match first.as_str() {
-        "del" | "erase" => return flag_matches("/s") || flag_matches("/q") && flag_matches("/f"),
+        // `del /S` alone (recursive) or `del /Q /F` (quiet + force-delete
+        // read-only, without confirmation) are both treated as destructive.
+        // Parentheses make the intended precedence explicit.
+        "del" | "erase" => {
+            return flag_matches("/s") || (flag_matches("/q") && flag_matches("/f"));
+        }
         "rd" | "rmdir" => return flag_matches("/s"),
         "format" | "diskpart" => return true,
         "vssadmin" => return flag_matches("delete"),
@@ -47,6 +78,18 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         }
         "reg" => return flag_matches("delete"),
         "cipher" => return flag_matches("/w"),
+        // Service deletion via sc.exe / net stop+delete
+        "sc" | "sc.exe" => return flag_matches("delete"),
+        // Scheduled task deletion
+        "schtasks" | "schtasks.exe" => return flag_matches("/delete"),
+        // Shutdown / restart from cmd
+        "shutdown" => {
+            return flag_matches("/s")
+                || flag_matches("/r")
+                || flag_matches("/h")
+                || flag_matches("-s")
+                || flag_matches("-r");
+        }
         _ => {}
     }
 
