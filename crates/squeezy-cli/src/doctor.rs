@@ -727,12 +727,21 @@ fn mcp_stdio_command_issue(command: &str) -> Option<String> {
     let path = std::path::Path::new(binary);
 
     // If the user specified an absolute or relative path, check it directly.
-    if path.is_absolute() || binary.contains(std::path::MAIN_SEPARATOR) {
+    // Accept both the platform-native separator and forward slash, so a config
+    // written with `/` on Windows (e.g. `bin/server.exe`) still routes through
+    // the direct-path branch instead of being treated as a bare PATH lookup.
+    if path.is_absolute() || binary.contains(std::path::MAIN_SEPARATOR) || binary.contains('/') {
         return mcp_stdio_path_issue(path);
     }
 
-    // Otherwise walk PATH looking for the binary.
-    let path_var = std::env::var_os("PATH")?;
+    // Otherwise walk PATH looking for the binary. If PATH is unset or
+    // unparseable we cannot resolve the command, so surface that explicitly
+    // rather than silently passing the check.
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Some(format!(
+            "PATH is unset; cannot resolve stdio command '{binary}'"
+        ));
+    };
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(binary);
         if candidate.exists() {

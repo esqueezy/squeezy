@@ -172,6 +172,28 @@ Provider and model choices can be changed with `SQUEEZY_PROVIDER`,
 `SQUEEZY_MODEL`, CLI flags, or `~/.squeezy/settings.toml`. See
 [`PROVIDERS.md`](PROVIDERS.md) and [`CONFIGURATION.md`](CONFIGURATION.md).
 
+## Headless / package CI
+
+Distro packagers and post-install smoke tests can run `squeezy doctor` in a
+network-isolated, repo-less environment by combining the `--json`,
+`--no-update-check`, and `--no-repo-profile` flags:
+
+```sh
+squeezy doctor --json --no-update-check --no-repo-profile
+```
+
+- `--json` emits a stable, machine-readable report (consumers can `jq` for
+  fields like `.checks[] | select(.name=="sandbox") | .backend`).
+- `--no-update-check` skips the GitHub update-availability probe, so the
+  command does not contact the network.
+- `--no-repo-profile` skips the repo-profile load, so the command does not
+  require a Squeezy workspace and stays fixed-cost on bare runners.
+
+Both flags preserve the row name in `--json` output (`update` and
+`repo_profile` respectively) with `status: "ok"` and a `detail` of
+`"skipped (--no-update-check)"` / `"skipped (--no-repo-profile)"`, so
+existing consumers keyed on those rows continue to work.
+
 ## Upgrade
 
 ```sh
