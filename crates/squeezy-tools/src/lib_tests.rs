@@ -11703,6 +11703,7 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stderr_truncated: false,
         raw_spillover: None,
         kill_meta: None,
+        ask_server_start_error: None,
     };
 
     let reason =
@@ -11856,6 +11857,7 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stderr_truncated: false,
         raw_spillover: None,
         kill_meta: None,
+        ask_server_start_error: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)

@@ -74,6 +74,10 @@ pub(crate) struct ShellRunOutcome {
     /// succeeded, whether the grace period expired, and whether a
     /// direct-child fallback kill was also issued.
     pub(crate) kill_meta: Option<ShellKillMeta>,
+    /// Set when `ShellAskServer::start` failed even though the sandbox backend
+    /// supports AF_UNIX ask sockets.  The string is a human-readable reason
+    /// suitable for the `nested_ask.reason` field in the JSON result.
+    pub(crate) ask_server_start_error: Option<String>,
 }
 
 /// Termination mechanics recorded when a Unix shell child was killed by
@@ -92,9 +96,12 @@ pub(crate) struct ShellKillMeta {
     pub(crate) sigkill_sent: bool,
     /// Whether `kill(-pgid, SIGKILL)` returned without error.
     pub(crate) sigkill_ok: bool,
-    /// Whether `child.kill()` was also called as a direct-child fallback
-    /// (always true when any signal path was taken, since the child.kill /
-    /// child.wait block runs unconditionally after the Unix signal block).
+    /// Whether `child.kill()` was also called as a direct-child fallback.
+    /// This is `true` only when SIGKILL escalation was required (grace period
+    /// expired) and `child.kill()` was issued as a supplemental direct-child
+    /// signal after the process-group SIGKILL. It is `false` when the child
+    /// exited during the SIGTERM grace period, in which case no SIGKILL or
+    /// direct-child kill was needed.
     pub(crate) direct_child_fallback: bool,
 }
 
@@ -116,7 +123,9 @@ pub(crate) struct ShellExecutionGuard {
 }
 
 enum ShellRunError {
-    Cancelled,
+    /// The shell turn was cancelled. Carries the kill metadata recorded by
+    /// `terminate_shell_child` so callers can include it in the audit row.
+    Cancelled(Option<ShellKillMeta>),
     SandboxStartDenied(String),
     Io(std::io::Error),
 }
@@ -297,7 +306,8 @@ impl ToolRegistry {
             .await
         {
             Ok(run) => run,
-            Err(ShellRunError::Cancelled) => {
+            Err(ShellRunError::Cancelled(kill_meta)) => {
+                let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
                 self.audit_shell(
                     call,
                     &args,
@@ -307,7 +317,7 @@ impl ToolRegistry {
                     timeout_ms,
                     output_cap,
                     "cancelled",
-                    Some("shell command cancelled"),
+                    Some(&error_msg),
                     None,
                     &[],
                     &[],
@@ -379,7 +389,8 @@ impl ToolRegistry {
                 .await
             {
                 Ok(run) => run,
-                Err(ShellRunError::Cancelled) => {
+                Err(ShellRunError::Cancelled(kill_meta)) => {
+                    let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
                     self.audit_shell(
                         call,
                         &args,
@@ -389,7 +400,7 @@ impl ToolRegistry {
                         timeout_ms,
                         output_cap,
                         "cancelled",
-                        Some("shell command cancelled"),
+                        Some(&error_msg),
                         None,
                         &[],
                         &[],
@@ -426,6 +437,7 @@ impl ToolRegistry {
             stderr_truncated,
             raw_spillover,
             kill_meta,
+            ask_server_start_error,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -527,11 +539,17 @@ impl ToolRegistry {
             );
         }
         // Inform the model and user when nested `squeezy ask` approvals are
-        // unavailable because the active sandbox policy forbids AF_UNIX
-        // sockets.  Without this field the child shell sees a missing
-        // `SQUEEZY_ASK_SOCKET` env var, which looks like a misconfiguration
-        // rather than an intentional sandbox policy.
-        if let Some(reason) = sandbox_plan.nested_ask_disabled_reason() {
+        // unavailable. The two cases are:
+        //   (a) sandbox policy forbids AF_UNIX sockets (e.g. linux-direct-syscalls)
+        //   (b) ShellAskServer::start failed at runtime even though the backend
+        //       supports AF_UNIX sockets (e.g. temp directory full)
+        // Without this field the child shell sees a missing SQUEEZY_ASK_SOCKET
+        // env var, which looks like a misconfiguration rather than an
+        // intentional sandbox policy or a transient startup error.
+        if let Some(reason) = sandbox_plan
+            .nested_ask_disabled_reason()
+            .or(ask_server_start_error)
+        {
             insert_content_field(
                 &mut raw_content,
                 "nested_ask",
@@ -663,6 +681,11 @@ impl ToolRegistry {
         let pty_master: Option<std::fs::File>;
         let ask_server: Option<ShellAskServer>;
         let mut child: ShellChild;
+        // Set to Some(reason) when ShellAskServer::start fails on a backend
+        // that otherwise supports AF_UNIX ask sockets, so the failure can be
+        // surfaced in the shell result JSON as nested_ask: { available: false }.
+        #[allow(unused_mut)]
+        let mut ask_server_start_error: Option<String> = None;
 
         if win_sandbox_backend {
             #[cfg(windows)]
@@ -765,7 +788,18 @@ impl ToolRegistry {
                         command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
                         Some(server)
                     }
-                    Err(_err) => None,
+                    Err(err) => {
+                        // Record the startup failure so it can be surfaced in
+                        // the shell result JSON as `nested_ask: { available:
+                        // false, reason: "…" }`.  The child will not have
+                        // SQUEEZY_ASK_SOCKET set even though the backend
+                        // supports AF_UNIX, so the model and user must know
+                        // that nested approvals are unavailable for this call.
+                        ask_server_start_error = Some(format!(
+                            "nested ask disabled: ask server failed to start: {err}"
+                        ));
+                        None
+                    }
                 }
             } else {
                 None
@@ -846,7 +880,8 @@ impl ToolRegistry {
 
         let status = tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                let cancel_kill_meta =
+                    terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
                 if let Some(job) = shell_job.as_ref() {
                     let _ = job.terminate(1);
@@ -854,7 +889,7 @@ impl ToolRegistry {
                 stdout_task.abort();
                 stderr_task.abort();
                 drop(ask_server);
-                return Err(ShellRunError::Cancelled);
+                return Err(ShellRunError::Cancelled(cancel_kill_meta));
             }
             result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
         };
@@ -910,6 +945,7 @@ impl ToolRegistry {
             stderr_truncated,
             raw_spillover,
             kill_meta,
+            ask_server_start_error,
         })
     }
 }
@@ -1061,6 +1097,27 @@ pub(crate) fn shell_termination_reason(
     exit_signal
         .map(|signal| format!("shell command terminated by signal {signal}"))
         .or_else(|| Some("shell command ended without an exit code".to_string()))
+}
+
+/// Build the error message string for a cancelled shell audit row.
+/// When kill metadata is available (Unix only), the message includes the
+/// process group id and key signal outcomes so the audit record captures
+/// whether pgid-based cleanup reached the child group.
+pub(crate) fn shell_cancelled_error_msg(kill_meta: Option<&ShellKillMeta>) -> String {
+    match kill_meta {
+        None => "shell command cancelled".to_string(),
+        Some(km) => {
+            let sigkill = if km.sigkill_sent {
+                format!(", sigkill_ok={}", km.sigkill_ok)
+            } else {
+                String::new()
+            };
+            format!(
+                "shell command cancelled: pgid={}, sigterm_ok={}{}",
+                km.pgid, km.sigterm_ok, sigkill,
+            )
+        }
+    }
 }
 
 pub(crate) fn shell_command_needs_checkpoint(
@@ -1552,15 +1609,27 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
         ShellChild::Tokio(child) => {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
+                // Record the actual runtime PGID before sending any signal.
+                // Normally equals `pid` (because configure_shell_process_group
+                // called process_group(0)), but if the child or a wrapper
+                // called setsid/setpgid before we reach here the PGID may
+                // differ.  actual_pgid falls back to pid on ESRCH.
+                let pgid = actual_pgid(pid);
                 let sigterm_ok = kill_process_group(pid, libc::SIGTERM);
-                let grace_expired = time::timeout(Duration::from_millis(grace_ms), child.wait())
-                    .await
-                    .is_err();
+                // Treat the grace-period wait as "not expired" only when the
+                // outer timeout returned Ok(Ok(_)) — meaning the child actually
+                // exited.  Ok(Err(_)) means child.wait() returned an IO error
+                // (e.g. ECHILD if the child was already reaped by a signal
+                // handler). In that case we conservatively treat the grace as
+                // expired and escalate to SIGKILL; the kill may be a no-op if
+                // the child is already gone, but that is safe.
+                let grace_wait = time::timeout(Duration::from_millis(grace_ms), child.wait()).await;
+                let grace_expired = !matches!(grace_wait, Ok(Ok(_)));
                 if !grace_expired {
-                    // Child exited within grace period; record what we did and
-                    // skip SIGKILL and the direct-child fallback.
+                    // Child exited cleanly within the grace period; no SIGKILL
+                    // or direct-child fallback is needed.
                     return Some(ShellKillMeta {
-                        pgid: pid,
+                        pgid,
                         sigterm_ok,
                         grace_expired: false,
                         sigkill_sent: false,
@@ -1572,7 +1641,7 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 return Some(ShellKillMeta {
-                    pgid: pid,
+                    pgid,
                     sigterm_ok,
                     grace_expired: true,
                     sigkill_sent: true,
@@ -1604,6 +1673,17 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
 #[cfg(unix)]
 fn kill_process_group(pid: u32, signal: libc::c_int) -> bool {
     unsafe { libc::kill(-(pid as libc::pid_t), signal) >= 0 }
+}
+
+/// Return the current process group id for `pid` via `getpgid(2)`.
+/// Falls back to `pid` when `getpgid` fails (e.g. the process already
+/// exited), since the caller uses the result only for diagnostic reporting
+/// in `ShellKillMeta.pgid`; the actual signal target is always `-(pid as
+/// pid_t)` regardless of what `getpgid` returns.
+#[cfg(unix)]
+fn actual_pgid(pid: u32) -> u32 {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid > 0 { pgid as u32 } else { pid }
 }
 
 /// Compute the env-allowlist-filtered environment that a sandboxed shell child
