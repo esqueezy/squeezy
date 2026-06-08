@@ -129,15 +129,38 @@ fn parse_copy_is_not_a_builtin_slash_command() {
 fn parse_compact_undo_flag() {
     assert_eq!(
         parse("/compact").unwrap(),
-        DispatchCommand::Compact { undo: false }
+        DispatchCommand::Compact {
+            undo: false,
+            history: false
+        }
     );
     assert_eq!(
         parse("/compact undo").unwrap(),
-        DispatchCommand::Compact { undo: true }
+        DispatchCommand::Compact {
+            undo: true,
+            history: false
+        }
     );
     assert_eq!(
         parse("/compact UNDO").unwrap(),
-        DispatchCommand::Compact { undo: true }
+        DispatchCommand::Compact {
+            undo: true,
+            history: false
+        }
+    );
+    assert_eq!(
+        parse("/compact history").unwrap(),
+        DispatchCommand::Compact {
+            undo: false,
+            history: true
+        }
+    );
+    assert_eq!(
+        parse("/compact HISTORY").unwrap(),
+        DispatchCommand::Compact {
+            undo: false,
+            history: true
+        }
     );
 }
 
@@ -410,7 +433,13 @@ fn slash_name_matches_input_command() {
         ("/help", DispatchCommand::Help { topic: None }),
         ("/cost", DispatchCommand::Cost),
         ("/diff", DispatchCommand::Diff),
-        ("/compact", DispatchCommand::Compact { undo: false }),
+        (
+            "/compact",
+            DispatchCommand::Compact {
+                undo: false,
+                history: false,
+            },
+        ),
         (
             "/theme",
             DispatchCommand::Theme {

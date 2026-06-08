@@ -218,6 +218,10 @@ impl PickerEntry {
         }
     }
 
+    /// Construct a picker row pinned to a specific branch tip. Not yet called
+    /// by `expand_entries` because branch-aware resume is not yet implemented;
+    /// retained here so the schema is ready when that feature lands.
+    #[allow(dead_code)]
     fn branched(summary: SessionSummary, branch_tip: EventBranchTip) -> Self {
         Self {
             summary,
@@ -480,25 +484,15 @@ pub(crate) fn has_scoped_candidates(all: &[SessionSummary], cwd: &Path) -> bool 
     all.iter().any(|summary| summary.cwd == cwd_str)
 }
 
-/// Flatten each summary into selectable rows: linear sessions emit a
-/// single `PickerEntry`, branched sessions emit one entry per branch tip
-/// so the user can pick either path. Sessions reach this function in
-/// newest-first order (set by `filter_inner`), and we preserve that
-/// order across branch expansion: tips inside one session stay grouped,
-/// with the newest tip first (already enforced by `detect_branches`).
+/// Flatten each summary into selectable rows. All sessions — including those
+/// with multiple branch tips — emit a single `PickerEntry` so the picker only
+/// shows resumable rows. Branch-aware resume (replaying up to a chosen
+/// `parent_event_sequence`) is not yet implemented; showing multiple per-tip
+/// rows and ignoring the selected tip would silently resume the wrong state,
+/// so branched sessions collapse to a single linear entry until that feature
+/// lands.
 fn expand_entries(summaries: Vec<SessionSummary>) -> Vec<PickerEntry> {
-    let mut entries = Vec::with_capacity(summaries.len());
-    for summary in summaries {
-        if summary.branches.len() < 2 {
-            entries.push(PickerEntry::linear(summary));
-            continue;
-        }
-        let tips = summary.branches.clone();
-        for tip in tips {
-            entries.push(PickerEntry::branched(summary.clone(), tip));
-        }
-    }
-    entries
+    summaries.into_iter().map(PickerEntry::linear).collect()
 }
 
 /// Pull recent resumable sessions across every cwd. The picker filters

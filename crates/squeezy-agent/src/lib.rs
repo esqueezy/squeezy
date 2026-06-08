@@ -3662,8 +3662,10 @@ impl Agent {
     /// existing helper while RPC/eval drivers see a structured value.
     pub async fn dispatch_command(&self, cmd: DispatchCommand) -> DispatchOutcome {
         match cmd {
-            DispatchCommand::Compact { undo } => {
-                if undo {
+            DispatchCommand::Compact { undo, history } => {
+                if history {
+                    DispatchOutcome::TuiOnly
+                } else if undo {
                     match self.compact_context_undo().await {
                         Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
                         Ok(None) => DispatchOutcome::CompactedUndo { restored: false },
@@ -11133,6 +11135,7 @@ async fn run_subagent_rounds(
                             &mut context_compaction,
                             &[],
                             None,
+                            None,
                             config,
                             ContextCompactionTrigger::Auto,
                             true,
@@ -11186,6 +11189,7 @@ async fn run_subagent_rounds(
                                 conversation,
                                 &mut context_compaction,
                                 &[],
+                                None,
                                 None,
                                 config,
                                 ContextCompactionTrigger::Auto,
@@ -14477,8 +14481,8 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
                 SlashArgShape::None
             }
         }
-        DispatchCommand::Compact { undo } => {
-            if *undo {
+        DispatchCommand::Compact { undo, history } => {
+            if *undo || *history {
                 SlashArgShape::FixedSubcommand
             } else {
                 SlashArgShape::None

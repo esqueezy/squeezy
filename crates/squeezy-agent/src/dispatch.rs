@@ -78,6 +78,9 @@ pub enum DispatchCommand {
     Attachments,
     Compact {
         undo: bool,
+        /// `true` when the user ran `/compact history` — show the per-session
+        /// compaction timeline rather than triggering a new compaction pass.
+        history: bool,
     },
     /// `/clear` — drop the live conversation and start a clean slate.
     /// The outgoing session stays resumable on disk; the next turn
@@ -275,10 +278,11 @@ impl DispatchCommand {
             }
             "/attachments" => Self::Attachments,
             "/compact" => {
-                let mut tokens = rest.split_whitespace();
-                let undo =
-                    matches!(tokens.next(), Some(token) if token.eq_ignore_ascii_case("undo"));
-                Self::Compact { undo }
+                let subcommand = rest.split_whitespace().next();
+                let undo = matches!(subcommand, Some(token) if token.eq_ignore_ascii_case("undo"));
+                let history =
+                    matches!(subcommand, Some(token) if token.eq_ignore_ascii_case("history"));
+                Self::Compact { undo, history }
             }
             "/clear" => Self::Clear,
             "/diff" => Self::Diff,
