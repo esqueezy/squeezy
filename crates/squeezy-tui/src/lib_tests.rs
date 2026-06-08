@@ -1800,6 +1800,7 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
@@ -1921,6 +1922,7 @@ async fn cancelled_turn_clears_live_status_context() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
@@ -1957,6 +1959,7 @@ async fn failed_turn_clears_live_status_context() {
         turn_id: TurnId::new(1),
         error: squeezy_core::SqueezyError::Agent("boom".to_string()),
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send failed");
@@ -1987,6 +1990,7 @@ async fn status_line_cost_not_clobbered_by_no_broker_failure() {
         turn_id: TurnId::new(1),
         error: squeezy_core::SqueezyError::Agent("boom".to_string()),
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send failed");
@@ -2306,6 +2310,7 @@ async fn completed_transcript_is_plan_free_after_stream_extraction() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -2365,6 +2370,7 @@ async fn unterminated_proposed_plan_block_does_not_duplicate_at_completion() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -9999,6 +10005,7 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10047,6 +10054,7 @@ async fn successful_edit_turn_hides_undo_hint_when_checkpointing_disabled() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10089,6 +10097,7 @@ async fn readonly_turn_does_not_push_undo_hint() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10136,6 +10145,7 @@ async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10183,6 +10193,7 @@ async fn failed_edit_turn_error_status_mentions_undo() {
         turn_id: TurnId::new(1),
         error: SqueezyError::Permission("denied".to_string()),
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send failed");
@@ -10252,6 +10263,7 @@ async fn completion_clears_cancelled_prompt() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10277,6 +10289,7 @@ async fn cancel_restores_prompt_into_composer() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
@@ -10308,6 +10321,7 @@ async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
@@ -10464,6 +10478,7 @@ async fn send_completed_with_estimate(app: &mut TuiApp, turn: u64, estimate: Con
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10691,6 +10706,7 @@ async fn completed_event_preserves_scroll_offset_in_history() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10746,6 +10762,7 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10806,6 +10823,7 @@ async fn completed_event_keeps_substantive_assistant_summary_after_tool_output()
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -10876,6 +10894,7 @@ async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -13620,6 +13639,7 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -13657,6 +13677,7 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
@@ -13699,6 +13720,7 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");

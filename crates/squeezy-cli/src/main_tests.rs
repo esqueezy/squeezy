@@ -1034,6 +1034,7 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
+        early_stop_reason: None,
     })
     .await
     .expect("send completed");
