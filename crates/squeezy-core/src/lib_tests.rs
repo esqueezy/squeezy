@@ -5950,3 +5950,43 @@ fn session_metrics_merge_turn_folds_model_ledger() {
         .expect("gpt-5.5 bucket");
     assert_eq!(bucket.main.estimated_usd_micros, Some(84));
 }
+
+#[cfg(windows)]
+#[test]
+fn default_squeezy_skills_dir_uses_appdata_on_windows() {
+    // Simulate a Windows environment where HOME is absent but APPDATA is set.
+    // We use a temp approach: just verify the function returns an APPDATA-relative
+    // path when APPDATA is present in the environment (standard CI runner).
+    // If neither APPDATA nor USERPROFILE is set, the function falls through to HOME.
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let dir = default_squeezy_skills_dir();
+        let expected = std::path::PathBuf::from(&appdata)
+            .join("squeezy")
+            .join("skills");
+        assert_eq!(dir, expected);
+    } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+        let dir = default_squeezy_skills_dir();
+        let expected = std::path::PathBuf::from(&userprofile)
+            .join(".squeezy")
+            .join("skills");
+        assert_eq!(dir, expected);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn default_agent_compat_skills_dir_uses_appdata_on_windows() {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let dir = default_agent_compat_skills_dir();
+        let expected = std::path::PathBuf::from(&appdata)
+            .join("squeezy")
+            .join("agent-skills");
+        assert_eq!(dir, expected);
+    } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+        let dir = default_agent_compat_skills_dir();
+        let expected = std::path::PathBuf::from(&userprofile)
+            .join(".agents")
+            .join("skills");
+        assert_eq!(dir, expected);
+    }
+}

@@ -28,38 +28,103 @@ fn tokenizer_preserves_quoted_paths() {
 
 #[test]
 fn doc_prefilter_rejects_unrelated_reader_tokens() {
-    let mut by_doc_path = BTreeMap::new();
-    by_doc_path.insert(
-        PathBuf::from("/repo/.squeezy/skills/nav/SKILL.md"),
-        "nav".to_string(),
-    );
+    let mut doc_filenames = BTreeSet::new();
+    doc_filenames.insert("skill.md".to_string());
 
-    assert!(!doc_token_may_match_indexed_path("a.rs", &by_doc_path));
-    assert!(!doc_token_may_match_indexed_path("README.md", &by_doc_path));
+    assert!(!doc_token_may_match_indexed_path("a.rs", &doc_filenames));
+    assert!(!doc_token_may_match_indexed_path(
+        "README.md",
+        &doc_filenames
+    ));
 }
 
 #[test]
 fn doc_prefilter_keeps_plausible_skill_doc_tokens() {
-    let mut by_doc_path = BTreeMap::new();
-    by_doc_path.insert(
-        PathBuf::from("/repo/.squeezy/skills/nav/SKILL.md"),
-        "nav".to_string(),
-    );
+    let mut doc_filenames = BTreeSet::new();
+    doc_filenames.insert("skill.md".to_string());
 
-    assert!(doc_token_may_match_indexed_path("SKILL.md", &by_doc_path));
+    // SKILL.md always matches via the early-return fast path.
+    assert!(doc_token_may_match_indexed_path("SKILL.md", &doc_filenames));
     assert!(doc_token_may_match_indexed_path(
         ".squeezy/skills/nav/SKILL.md",
-        &by_doc_path
+        &doc_filenames
     ));
 }
 
 #[test]
 fn doc_prefilter_keeps_skill_doc_tokens_when_canonical_target_differs() {
-    let mut by_doc_path = BTreeMap::new();
-    by_doc_path.insert(PathBuf::from("/repo/canonical/nav.md"), "nav".to_string());
+    // Even when the indexed path uses a different name, SKILL.md tokens
+    // should still pass via the fast-path early return.
+    let doc_filenames = BTreeSet::new();
 
     assert!(doc_token_may_match_indexed_path(
         ".squeezy/skills/nav/SKILL.md",
-        &by_doc_path
+        &doc_filenames
     ));
+}
+
+#[test]
+fn doc_prefilter_matches_non_skill_doc_by_filename() {
+    let mut doc_filenames = BTreeSet::new();
+    doc_filenames.insert("guide.md".to_string());
+
+    assert!(doc_token_may_match_indexed_path("guide.md", &doc_filenames));
+    assert!(doc_token_may_match_indexed_path(
+        "skills/guide.md",
+        &doc_filenames
+    ));
+    // Case-insensitive matching.
+    assert!(doc_token_may_match_indexed_path("GUIDE.MD", &doc_filenames));
+    assert!(!doc_token_may_match_indexed_path(
+        "other.md",
+        &doc_filenames
+    ));
+}
+
+#[test]
+fn powershell_readers_trigger_doc_read_detection() {
+    assert!(command_reads_file(&[
+        "Get-Content".to_string(),
+        "SKILL.md".to_string()
+    ]));
+    assert!(command_reads_file(&[
+        "gc".to_string(),
+        "SKILL.md".to_string()
+    ]));
+    assert!(command_reads_file(&[
+        "type".to_string(),
+        "SKILL.md".to_string()
+    ]));
+    // Non-reader should not match.
+    assert!(!command_reads_file(&[
+        "Invoke-WebRequest".to_string(),
+        "SKILL.md".to_string()
+    ]));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn tokenizer_treats_backslash_as_escape_on_unix() {
+    // On Unix, backslash escapes the next character.
+    let tokens = tokenize_command("cat foo\\ bar.txt");
+    assert_eq!(tokens, vec!["cat", "foo bar.txt"]);
+}
+
+#[cfg(windows)]
+#[test]
+fn tokenizer_preserves_windows_path_separators() {
+    // On Windows, backslash is a path separator, not an escape character.
+    let tokens = tokenize_command(r"pwsh -File .\.squeezy\skills\nav\scripts\init.ps1");
+    assert_eq!(tokens.len(), 3);
+    assert_eq!(tokens[0], "pwsh");
+    assert_eq!(tokens[1], "-File");
+    assert_eq!(tokens[2], r".\.squeezy\skills\nav\scripts\init.ps1");
+}
+
+#[cfg(windows)]
+#[test]
+fn tokenizer_preserves_absolute_windows_path() {
+    let tokens = tokenize_command(r#"pwsh -File "C:\Users\alice\SKILL.md""#);
+    assert_eq!(tokens.len(), 3);
+    assert_eq!(tokens[2], r"C:\Users\alice\SKILL.md");
 }

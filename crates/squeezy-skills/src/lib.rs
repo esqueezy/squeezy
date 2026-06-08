@@ -272,6 +272,17 @@ pub struct SkillHookMatcher {
     pub hooks: Vec<SkillHookSpec>,
 }
 
+/// What to do when a skill hook command fails to spawn (e.g. missing `sh` on
+/// Windows). Defaults to `Allow` to preserve existing behavior, but operators
+/// can set `Deny` for policy-enforcement hooks where a spawn failure must not
+/// silently become permissive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HookFailurePolicy {
+    #[default]
+    Allow,
+    Deny,
+}
+
 /// One concrete hook handler declaration.
 ///
 /// Today only the `command` kind is implemented: it shells out to the
@@ -283,6 +294,11 @@ pub struct SkillHookMatcher {
 pub struct SkillHookSpec {
     pub command: String,
     pub once: bool,
+    /// Policy applied when the hook command fails to spawn (e.g. shell not in
+    /// `PATH`). `Allow` (default) preserves backward compatibility. `Deny`
+    /// makes spawn failures behave like a non-zero exit, preventing a missing
+    /// shell from silently neutralizing a policy hook.
+    pub failure_policy: HookFailurePolicy,
 }
 
 impl LoadedSkill {
@@ -414,6 +430,12 @@ pub struct SkillCatalog {
     ambiguous_triggers: BTreeSet<String>,
     implicit_by_scripts_dir: BTreeMap<PathBuf, String>,
     implicit_by_doc_path: BTreeMap<PathBuf, String>,
+    /// Lowercase basenames of all indexed doc paths, kept in sync with
+    /// `implicit_by_doc_path`. Used as an O(log n) prefilter in
+    /// `doc_token_may_match_indexed_path` so we avoid a full key scan on
+    /// every reader token — especially helpful on Windows with large or
+    /// slow-mount catalogs.
+    implicit_doc_filenames: BTreeSet<String>,
     active_budget_chars: usize,
     active_body_cap_chars: usize,
     preamble_enabled: bool,
@@ -435,6 +457,7 @@ impl Default for SkillCatalog {
             ambiguous_triggers: BTreeSet::new(),
             implicit_by_scripts_dir: BTreeMap::new(),
             implicit_by_doc_path: BTreeMap::new(),
+            implicit_doc_filenames: BTreeSet::new(),
             active_budget_chars: defaults.active_budget_effective_chars(),
             active_body_cap_chars: defaults.active_body_cap_chars,
             preamble_enabled: defaults.preamble_enabled,
@@ -813,6 +836,7 @@ impl SkillCatalog {
             workdir,
             &self.implicit_by_scripts_dir,
             &self.implicit_by_doc_path,
+            &self.implicit_doc_filenames,
             &self.skills,
         )
     }
@@ -1110,14 +1134,18 @@ impl SkillCatalog {
     fn rebuild_implicit_indexes(&mut self) {
         self.implicit_by_scripts_dir.clear();
         self.implicit_by_doc_path.clear();
+        self.implicit_doc_filenames.clear();
         for entry in self.skills.values() {
             if entry.summary.disabled {
                 continue;
             }
-            self.implicit_by_doc_path.insert(
-                implicit::normalize_path(&entry.summary.location),
-                entry.summary.name.clone(),
-            );
+            let doc_path = implicit::normalize_path(&entry.summary.location);
+            if let Some(fname) = doc_path.file_name().and_then(|n| n.to_str()) {
+                self.implicit_doc_filenames
+                    .insert(fname.to_ascii_lowercase());
+            }
+            self.implicit_by_doc_path
+                .insert(doc_path, entry.summary.name.clone());
             self.implicit_by_scripts_dir.insert(
                 implicit::normalize_path(&entry.base_dir.join("scripts")),
                 entry.summary.name.clone(),
@@ -1140,6 +1168,7 @@ impl Clone for SkillCatalog {
             ambiguous_triggers: self.ambiguous_triggers.clone(),
             implicit_by_scripts_dir: self.implicit_by_scripts_dir.clone(),
             implicit_by_doc_path: self.implicit_by_doc_path.clone(),
+            implicit_doc_filenames: self.implicit_doc_filenames.clone(),
             active_budget_chars: self.active_budget_chars,
             active_body_cap_chars: self.active_body_cap_chars,
             preamble_enabled: self.preamble_enabled,
@@ -1462,6 +1491,7 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
             matcher.hooks.push(SkillHookSpec {
                 command: String::new(),
                 once: false,
+                failure_policy: HookFailurePolicy::Allow,
             });
             if let Some(spec) = matcher.hooks.last_mut() {
                 apply_spec_kv(spec, item);
@@ -1491,6 +1521,12 @@ fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
     match key.trim() {
         "command" => spec.command = value.to_string(),
         "once" => spec.once = matches!(value, "true" | "yes" | "1"),
+        "failure_policy" => {
+            spec.failure_policy = match value {
+                "deny" => HookFailurePolicy::Deny,
+                _ => HookFailurePolicy::Allow,
+            };
+        }
         "type" if value != "command" => {
             warn!(
                 target: "squeezy_skills",
@@ -2123,7 +2159,16 @@ impl HookHandler for SkillHookHandler {
                     error = %error,
                     "skill hook failed to spawn"
                 );
-                HookResult::allow()
+                // Respect the configured failure policy: a `deny` policy
+                // ensures that a missing shell (e.g. `sh` absent on Windows)
+                // cannot silently neutralize a policy-enforcement hook.
+                match self.spec.failure_policy {
+                    HookFailurePolicy::Deny => HookResult::deny(format!(
+                        "skill `{}` hook could not spawn (failure_policy=deny)",
+                        self.skill_name
+                    )),
+                    HookFailurePolicy::Allow => HookResult::allow(),
+                }
             }
         }
     }

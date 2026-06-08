@@ -751,12 +751,35 @@ fn skills_check(config: &AppConfig) -> Check {
     }
     if config.skills.hooks_enabled {
         detail.push_str("; hooks_enabled");
+        // On Windows, skill hooks run through `sh -c`. If `sh` is not in
+        // PATH (no Git Bash / MSYS), hooks will silently fail to spawn and
+        // fall back to allow — warn early before the first dispatch.
+        #[cfg(windows)]
+        if which_sh_missing() {
+            detail.push_str("; hooks_enabled but `sh` not found in PATH — hooks may not fire (install Git for Windows or set SQUEEZY_SHELL)");
+            return Check {
+                name: "skills".to_string(),
+                status: Status::Warn,
+                detail,
+            };
+        }
     }
     Check {
         name: "skills".to_string(),
         status: Status::Ok,
         detail,
     }
+}
+
+/// Returns `true` when `sh` is not reachable on the current `PATH`.
+#[cfg(windows)]
+fn which_sh_missing() -> bool {
+    std::process::Command::new("sh")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
 }
 
 /// Pull the result of `update::check_for_update()` into a doctor row. Newer

@@ -105,6 +105,31 @@ user_dir = "~/.squeezy/skills"
 hooks_enabled = true
 ```
 
+### Windows note
+
+Skill hook scripts run through **`sh -c`** on all platforms, including Windows.
+This means `.ps1` scripts cannot be used as hooks directly, even though implicit
+activation recognises PowerShell scripts. On Windows, `sh` must be available in
+`PATH` (provided by Git for Windows, MSYS2, or similar) for hooks to fire.
+
+If `sh` is absent and `hooks_enabled = true`, Squeezy will warn in `squeezy doctor`
+and hook dispatch will fail to spawn. To make a policy hook deny the action on
+spawn failure, add `failure_policy: deny` to the hook spec:
+
+```yaml
+hooks:
+  PreToolUse:
+    - matcher: shell
+      hooks:
+        - type: command
+          command: scripts/audit-shell.sh
+          failure_policy: deny
+```
+
+Without `failure_policy: deny`, a spawn failure silently allows the action
+(backward-compatible default). PowerShell-native hook support (`pwsh -File ...`)
+is on the roadmap.
+
 ## Environment Variables In Hook Scripts
 
 Scripts receive the following environment:

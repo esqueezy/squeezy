@@ -1207,6 +1207,15 @@ fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         );
         return Ok(());
     }
+    // Show the scanned roots preface so users (especially on Windows) can see
+    // exactly which directories Squeezy searched — network shares, OneDrive
+    // paths, %APPDATA%, and workspace roots all appear here.
+    let scan_dirs = squeezy_skills::skill_scan_dirs(&config.workspace_root, &config.skills);
+    println!("Scanned roots:");
+    for dir in &scan_dirs {
+        println!("  {}", dir.display());
+    }
+    println!();
     if summaries.is_empty() {
         println!("No skills discovered.");
         return Ok(());
