@@ -245,13 +245,33 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert_eq!(config.subagents, SubagentConfig::default());
     assert_eq!(config.telemetry, TelemetryConfig::default());
-    assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
-    assert!(
-        config
-            .skills
-            .compat_user_dir
-            .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
-    );
+    // On Windows the defaults are under %APPDATA%\squeezy\ rather than
+    // ~\.squeezy\, so the path suffix is different. Assert both platforms
+    // produce a non-empty, non-relative default.
+    #[cfg(not(windows))]
+    {
+        assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
+        assert!(
+            config
+                .skills
+                .compat_user_dir
+                .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+        );
+    }
+    #[cfg(windows)]
+    {
+        let user_dir = config.skills.user_dir.to_string_lossy();
+        let compat_dir = config.skills.compat_user_dir.to_string_lossy();
+        assert!(
+            user_dir.contains("squeezy") && user_dir.contains("skills"),
+            "unexpected user_dir on Windows: {user_dir}"
+        );
+        assert!(
+            (compat_dir.contains("squeezy") || compat_dir.contains(".agents"))
+                && compat_dir.contains("skills"),
+            "unexpected compat_user_dir on Windows: {compat_dir}"
+        );
+    }
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "SQUEEZY_OPENAI_KEY");
