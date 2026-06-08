@@ -53,29 +53,29 @@ impl ShellProgram {
     pub(crate) fn for_command(command: &str) -> Self {
         // Try the per-process cache when no override is configured. The
         // SQUEEZY_SHELL override paths are cheap and command-specific, so
-        // they bypass the cache.
-        if std::env::var_os("SQUEEZY_SHELL").is_none() {
-            if let Ok(mut guard) = SHELL_BASE_CACHE.lock() {
-                if let Some(ref cached) = *guard {
-                    let mut args = cached.arg_prefix.clone();
-                    args.push(command.to_string());
-                    return Self {
-                        program: cached.program.clone(),
-                        args,
-                    };
-                }
-                // Cache miss: resolve the default shell and store the result.
-                let resolved = Self::resolve_default(command);
-                // The command is always the last argument; store the prefix.
-                let arg_prefix: Vec<String> =
-                    resolved.args[..resolved.args.len().saturating_sub(1)].to_vec();
-                *guard = Some(CachedShellBase {
-                    program: resolved.program.clone(),
-                    arg_prefix,
-                });
-                return resolved;
+        // they bypass the cache. If the lock is poisoned we fall through to
+        // the uncached resolution path below.
+        if std::env::var_os("SQUEEZY_SHELL").is_none()
+            && let Ok(mut guard) = SHELL_BASE_CACHE.lock()
+        {
+            if let Some(ref cached) = *guard {
+                let mut args = cached.arg_prefix.clone();
+                args.push(command.to_string());
+                return Self {
+                    program: cached.program.clone(),
+                    args,
+                };
             }
-            // Lock failed (e.g. poisoned): fall through to uncached resolution.
+            // Cache miss: resolve the default shell and store the result.
+            let resolved = Self::resolve_default(command);
+            // The command is always the last argument; store the prefix.
+            let arg_prefix: Vec<String> =
+                resolved.args[..resolved.args.len().saturating_sub(1)].to_vec();
+            *guard = Some(CachedShellBase {
+                program: resolved.program.clone(),
+                arg_prefix,
+            });
+            return resolved;
         }
 
         if let Ok(custom) = std::env::var("SQUEEZY_SHELL") {

@@ -674,6 +674,12 @@ impl ToolRegistry {
         let pty_master: Option<std::fs::File>;
         let ask_server: Option<ShellAskServer>;
         let mut child: ShellChild;
+        // On Unix, `tty_downgraded` is never set to `true` (the ConPTY fallback
+        // only applies on non-Unix targets), so clippy would flag `mut` as
+        // unused. Use cfg-conditional mutability to avoid the lint.
+        #[cfg(unix)]
+        let tty_downgraded = false;
+        #[cfg(not(unix))]
         let mut tty_downgraded = false;
 
         if win_sandbox_backend {
