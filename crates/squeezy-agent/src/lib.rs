@@ -14924,21 +14924,19 @@ async fn permission_decision_for_request(
     }
     if !mode_forced_ask
         && should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
-    {
-        if let Some((classifier, classifier_cost)) = classify_ambiguous_shell(
+        && let Some((classifier, classifier_cost)) = classify_ambiguous_shell(
             context.provider.clone(),
             &context.config,
             &request,
             context.cancel.clone(),
         )
         .await
-        {
-            // Accumulate classifier cost so the turn loop can fold it into
-            // the active CostBroker alongside reviewer spend.
-            reviewer_usd_micros = reviewer_usd_micros
-                .saturating_add(classifier_cost.estimated_usd_micros.unwrap_or(0));
-            verdict = classifier;
-        }
+    {
+        // Accumulate classifier cost so the turn loop can fold it into
+        // the active CostBroker alongside reviewer spend.
+        reviewer_usd_micros =
+            reviewer_usd_micros.saturating_add(classifier_cost.estimated_usd_micros.unwrap_or(0));
+        verdict = classifier;
     }
     log_permission_verdict(&request, &verdict);
     // Emit permission_decided telemetry for auto-evaluated verdicts (Allow/Deny
