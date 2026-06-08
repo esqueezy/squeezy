@@ -271,6 +271,36 @@ fn mcp_check_is_ok_when_fields_match_transport() {
     assert!(check.detail.contains("enabled=2"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sandbox_detail_fails_when_required_backend_unavailable() {
+    let check = linux_sandbox_check_from_report(squeezy_tools::ShellSandboxDoctor {
+        backend: "linux-direct-syscalls",
+        available: false,
+        detail: "user namespaces disabled".to_string(),
+    });
+
+    assert_eq!(check.name, "linux-sandbox");
+    assert_eq!(check.status, Status::Fail);
+    assert!(check.detail.contains("linux-direct-syscalls"));
+    assert!(check.detail.contains("available=false"));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn linux_sandbox_detail_warns_on_non_linux_platforms() {
+    let check = linux_sandbox_check_from_report(squeezy_tools::ShellSandboxDoctor {
+        backend: "test-backend",
+        available: true,
+        detail: "active backend detail".to_string(),
+    });
+
+    assert_eq!(check.name, "linux-sandbox");
+    assert_eq!(check.status, Status::Warn);
+    assert!(check.detail.contains("only available on Linux"));
+    assert!(check.detail.contains("active backend=test-backend"));
+}
+
 #[test]
 fn providers_check_reports_no_sections() {
     let settings = SettingsFile::default();

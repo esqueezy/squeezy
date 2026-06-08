@@ -1914,13 +1914,17 @@ impl AppConfig {
             ));
         }
         if self.routing.extra_heuristic_verbs.is_empty() {
-            output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n\n");
+            output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n");
         } else {
             output.push_str(&format!(
-                "extra_heuristic_verbs = {}\n\n",
+                "extra_heuristic_verbs = {}\n",
                 toml_string_array(&self.routing.extra_heuristic_verbs)
             ));
         }
+        output.push_str(&format!(
+            "linux_sandbox_sensitive_parent = {}  # route Linux sandbox/container prompts to parent\n\n",
+            self.routing.linux_sandbox_sensitive_parent
+        ));
 
         output.push_str("[permissions]\n");
         output.push_str(&format!(
