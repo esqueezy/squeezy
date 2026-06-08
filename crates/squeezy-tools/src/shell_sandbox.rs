@@ -23,8 +23,10 @@ use squeezy_core::sensitive_pattern_base;
 use squeezy_core::{ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy};
 use tokio::process::Command;
 
+#[cfg(target_os = "macos")]
+use crate::shell_exit_signal;
 use crate::shell_program::ShellProgram;
-use crate::{ShellPermissionAnalysis, ShellRunOutcome, shell_exit_signal};
+use crate::{ShellPermissionAnalysis, ShellRunOutcome};
 
 pub(crate) const SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -1203,33 +1205,11 @@ pub(crate) fn shell_sandbox_runtime_unavailable_with_probe(
     }
 }
 
-pub(crate) fn shell_sandbox_direct_fallback_reason(
-    sandbox_plan: &ShellSandboxPlan,
-    run: &ShellRunOutcome,
-) -> Option<String> {
-    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
-        return None;
-    }
-    if !run.stdout_bytes.is_empty() || !run.stderr_bytes.is_empty() {
-        return None;
-    }
-    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
-    if exit_code.is_some() {
-        return None;
-    }
-    let signal = shell_exit_signal(run.exit_status.as_ref())?;
-    Some(format!(
-        "shell sandbox backend {} terminated by signal {signal} with no output; retried without OS sandbox because mode is best_effort",
-        sandbox_plan.backend
-    ))
-}
-
 pub(crate) fn shell_sandbox_best_effort_fallback_reason(
     sandbox_plan: &ShellSandboxPlan,
     run: &ShellRunOutcome,
 ) -> Option<String> {
-    shell_sandbox_direct_fallback_reason(sandbox_plan, run)
-        .or_else(|| shell_sandbox_runtime_fallback_reason(sandbox_plan, run))
+    shell_sandbox_runtime_fallback_reason(sandbox_plan, run)
 }
 
 pub(crate) fn shell_sandbox_runtime_fallback_reason(

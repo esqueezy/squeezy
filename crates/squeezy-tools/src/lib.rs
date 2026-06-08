@@ -211,9 +211,7 @@ pub fn windows_sandbox_teardown() -> std::result::Result<String, String> {
     }
 }
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-use shell_sandbox::{
-    shell_sandbox_best_effort_fallback_reason, shell_sandbox_direct_fallback_reason,
-};
+use shell_sandbox::shell_sandbox_best_effort_fallback_reason;
 use truncate::truncate_middle_bytes;
 pub use web::{DEFAULT_PARALLEL_MCP_URL, WebSearchProvider};
 #[cfg(test)]
