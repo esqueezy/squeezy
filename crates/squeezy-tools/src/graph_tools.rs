@@ -133,8 +133,12 @@ struct InheritanceHierarchyArgs {
     symbol_id: Option<String>,
     /// Text query to resolve to a class/struct/interface symbol.
     query: Option<String>,
-    /// When `true`, return subtypes (direct `UsesTrait`/`Extends`/`Implements`
-    /// children) instead of supertypes. Default: `false` (ancestors).
+    /// When `false` (default), return all transitive supertypes of the root
+    /// via a BFS over `UsesTrait`/`Extends`/`Implements` edges (ancestors).
+    /// When `true`, return only the **first-generation** direct subtypes
+    /// (symbols that carry an edge pointing *to* the root). A transitive
+    /// subtype walk is not available in a single tool call; issue multiple
+    /// calls using the returned symbols as new roots.
     subtypes: Option<bool>,
     /// Maximum results (default 50).
     max_results: Option<usize>,
@@ -3488,6 +3492,7 @@ impl ToolRegistry {
             .map(|f| json!({"file_id": f.id.0, "path": f.relative_path}))
             .collect();
 
+        let test_symbols_truncated = impact.affected_tests.len() > max_results;
         let test_symbols_json: Vec<Value> = impact
             .affected_tests
             .iter()
@@ -3514,6 +3519,9 @@ impl ToolRegistry {
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("test_symbols".to_string(), json!(test_symbols_json));
         payload.insert("truncated".to_string(), json!(truncated));
+        if test_symbols_truncated {
+            payload.insert("test_symbols_truncated".to_string(), json!(true));
+        }
         make_result(
             call,
             ToolStatus::Success,

@@ -834,7 +834,8 @@ impl GraphWriteBatch {
     }
 
     pub fn len(&self) -> usize {
-        self.upserts.len()
+        usize::from(self.metadata.is_some())
+            + self.upserts.len()
             + self.removals.len()
             + self.resolver_upserts.len()
             + self.resolver_removals.len()

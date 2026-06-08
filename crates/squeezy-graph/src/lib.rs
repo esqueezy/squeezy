@@ -2355,14 +2355,19 @@ impl GraphManager {
             loaded.parsed,
             parsed_missed,
         ));
-        // Warm-start: if all partitions were loaded from persistence (no
-        // re-parses), attempt to restore resolver-slot and importer-index state
-        // from the V2 resolver-cache tables. Fingerprint mismatches are silently
-        // skipped so a stale entry never corrupts the in-memory graph.
-        if let Some(store) = store.as_deref()
-            && let Ok((entries, snap)) = load_resolver_cache(store, &snapshot.files)
-        {
-            graph.apply_warm_resolver_cache(entries, snap);
+        // Warm-start: only when every partition was loaded from persistence
+        // (no files were re-parsed). If any file was re-parsed, `from_parsed`
+        // → `rebuild_importers_by_file` produced a fresh, correct importer
+        // index; overwriting it with the persisted snapshot would introduce
+        // stale edges for the changed files. Per-file slot entries are
+        // individually fingerprint-guarded inside `apply_warm_resolver_cache`,
+        // but the global snapshot replacement is not, so skip the whole
+        // warm-start on any re-parse.
+        if loaded.missed_records.is_empty() {
+            if let Some(store) = store.as_deref() {
+                let (entries, snap) = load_resolver_cache(store, &snapshot.files);
+                graph.apply_warm_resolver_cache(entries, snap);
+            }
         }
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
@@ -2810,9 +2815,10 @@ type ResolverCacheLoad = (
 
 /// Attempt to load V2 resolver-cache data for a warm start. Returns per-file
 /// `ResolverFileEntry` values (fingerprint will be checked by the caller) and
-/// the optional single-blob `ResolverSnapshot`. Both results are best-effort:
-/// missing or undecodable entries are silently omitted.
-fn load_resolver_cache(store: &GraphStore, records: &[FileRecord]) -> Result<ResolverCacheLoad> {
+/// the optional single-blob `ResolverSnapshot`. Best-effort: store I/O errors
+/// and decode failures are silently swallowed, returning empty collections so
+/// the caller always gets a usable (possibly empty) result.
+fn load_resolver_cache(store: &GraphStore, records: &[FileRecord]) -> ResolverCacheLoad {
     let file_ids: Vec<FileId> = records.iter().map(|r| r.id.clone()).collect();
     let entries = store
         .resolver_entries_for::<resolver_cache::ResolverFileEntry>(&file_ids)
@@ -2820,7 +2826,7 @@ fn load_resolver_cache(store: &GraphStore, records: &[FileRecord]) -> Result<Res
     let snapshot = store
         .import_graph::<resolver_cache::ResolverSnapshot>()
         .unwrap_or_default();
-    Ok((entries, snapshot))
+    (entries, snapshot)
 }
 
 fn load_persisted_partitions(
