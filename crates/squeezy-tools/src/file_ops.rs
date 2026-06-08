@@ -554,6 +554,17 @@ impl ToolRegistry {
             // Check for symlinks before is_dir/is_file since those calls follow
             // symlinks and would misclassify symlink→dir entries.
             if entry.path_is_symlink() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&canonical_root) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
                 if !follow_symlinks {
                     // Symlink to a dir was yielded but not expanded (follow_links=false);
                     // count it as skipped rather than as a visited directory.
@@ -561,22 +572,7 @@ impl ToolRegistry {
                         symlink_skipped_count += 1;
                     }
                     // Symlinks to files with follow_links=false fall through to normal
-                    // processing below (they appear as regular file entries).
-                } else {
-                    // follow_links=true: canonicalize and enforce workspace containment.
-                    // This check fires for EVERY symlinked entry (file or dir) to catch
-                    // out-of-workspace targets including those reached by following dirs.
-                    match path.canonicalize() {
-                        Ok(canonical) if !canonical.starts_with(&canonical_root) => {
-                            symlink_skipped_count += 1;
-                            continue;
-                        }
-                        Err(_) => {
-                            symlink_skipped_count += 1;
-                            continue;
-                        }
-                        _ => {}
-                    }
+                    // processing below only after the containment check above.
                 }
             }
             if path.is_dir() {
@@ -793,22 +789,19 @@ impl ToolRegistry {
             let path = entry.path();
             // Check for symlinks before is_dir/is_file since those follow symlinks.
             if entry.path_is_symlink() {
-                if !follow_symlinks {
-                    if !path.is_file() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&canonical_root_grep) => {
                         symlink_skipped_count += 1;
+                        continue;
                     }
-                } else {
-                    match path.canonicalize() {
-                        Ok(canonical) if !canonical.starts_with(&canonical_root_grep) => {
-                            symlink_skipped_count += 1;
-                            continue;
-                        }
-                        Err(_) => {
-                            symlink_skipped_count += 1;
-                            continue;
-                        }
-                        _ => {}
+                    Err(_) => {
+                        symlink_skipped_count += 1;
+                        continue;
                     }
+                    _ => {}
+                }
+                if !follow_symlinks && !path.is_file() {
+                    symlink_skipped_count += 1;
                 }
             }
             if path.is_dir() {

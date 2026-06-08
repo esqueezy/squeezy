@@ -1036,6 +1036,74 @@ async fn glob_follow_symlinks_respects_workspace_containment() {
     let _ = fs::remove_dir_all(&outside_dir);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn glob_default_skips_symlink_file_that_escapes_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("glob_symlink_file_escape");
+    fs::write(root.join("inside.rs"), "// inside\n").expect("write inside");
+    let outside_dir = temp_workspace("glob_symlink_file_outside");
+    fs::write(outside_dir.join("secret.rs"), "// secret\n").expect("write secret");
+    symlink(outside_dir.join("secret.rs"), root.join("leaked.rs")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-symlink-file-escape".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["paths"], json!(["inside.rs"]));
+    assert_eq!(
+        result.content["metadata"]["symlink_skipped_count"],
+        json!(1)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_default_skips_symlink_file_that_escapes_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("grep_symlink_file_escape");
+    fs::write(root.join("inside.rs"), "needle inside\n").expect("write inside");
+    let outside_dir = temp_workspace("grep_symlink_file_outside");
+    fs::write(outside_dir.join("secret.rs"), "needle secret\n").expect("write secret");
+    symlink(outside_dir.join("secret.rs"), root.join("leaked.rs")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep-symlink-file-escape".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(match_paths(&result), vec!["inside.rs"]);
+    assert_eq!(
+        result.content["metadata"]["symlink_skipped_count"],
+        json!(1)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
 /// Verify that `follow_symlinks=false` (default) reports `symlinks_not_followed: true`.
 #[tokio::test]
 async fn glob_default_reports_symlinks_not_followed() {
