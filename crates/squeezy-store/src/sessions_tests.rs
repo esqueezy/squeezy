@@ -268,6 +268,9 @@ fn replay_tape_round_trips_and_exports() {
         ))
         .expect("append completion");
 
+    // Replay events now go through the writer thread; flush before reading.
+    handle.flush_events().expect("flush replay");
+
     let tape = store.replay_tape(handle.session_id()).expect("read replay");
     assert_eq!(tape.schema_version, SESSION_REPLAY_SCHEMA_VERSION);
     assert_eq!(tape.session_id, handle.session_id());
@@ -310,6 +313,9 @@ fn open_session_seeds_replay_sequence_from_existing_jsonl() {
         .expect("append start");
 
     let session_id = handle.session_id().to_string();
+    // Flush the first handle so its replay events are on disk before the
+    // second open reads the count.
+    handle.flush_events().expect("flush initial replay");
     let reopened = store.open_session(session_id.clone());
     reopened
         .append_replay_event(SessionReplayEvent::new(
@@ -318,6 +324,8 @@ fn open_session_seeds_replay_sequence_from_existing_jsonl() {
             json!({"response_id": "resp_1", "cost": CostSnapshot::default()}),
         ))
         .expect("append completion after open");
+    // Flush the reopened handle before reading back.
+    reopened.flush_events().expect("flush reopened replay");
 
     let tape = store.replay_tape(&session_id).expect("read replay");
     let sequences: Vec<u64> = tape.events.iter().map(|event| event.sequence).collect();
@@ -369,6 +377,7 @@ fn bug_report_redacts_replay_tape() {
             json!({"text": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"}),
         ))
         .expect("append replay");
+    handle.flush_events().expect("flush replay");
 
     let bundle = store
         .build_bug_report(
@@ -2589,6 +2598,7 @@ fn bundle_rollout_trace_emits_replay_when_no_events() {
             json!({"response_id": "resp_1"}),
         ))
         .expect("append model completed");
+    handle.flush_events().expect("flush replay");
 
     let bundle = store
         .bundle_rollout_trace(handle.session_id())
