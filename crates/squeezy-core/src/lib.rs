@@ -6878,6 +6878,9 @@ pub struct ShellSandboxSettings {
     /// macOS-only: AF_UNIX socket subpath allowlist used when network is
     /// denied. Merged additively across config sources (same as `read_roots`).
     pub macos_socket_domain_allowlist: Option<Vec<String>>,
+    /// Linux-only: absolute path to the shell binary used for sandboxed commands
+    /// (e.g. `"/bin/bash"`). Defaults to `/bin/sh`. Ignored on other platforms.
+    pub linux_shell: Option<String>,
 }
 
 impl ShellSandboxSettings {
@@ -6897,6 +6900,7 @@ impl ShellSandboxSettings {
                 "replace_sensitive_path_patterns",
                 "windows_sandbox_level",
                 "macos_socket_domain_allowlist",
+                "linux_shell",
             ],
             source,
             path,
@@ -6959,6 +6963,7 @@ impl ShellSandboxSettings {
                 source,
                 &field(path, "macos_socket_domain_allowlist"),
             )?,
+            linux_shell: string_value(table, "linux_shell", source, &field(path, "linux_shell"))?,
         })
     }
 
@@ -6987,6 +6992,7 @@ impl ShellSandboxSettings {
             &mut self.macos_socket_domain_allowlist,
             next.macos_socket_domain_allowlist,
         );
+        replace_if_some(&mut self.linux_shell, next.linux_shell);
     }
 }
 
@@ -7104,6 +7110,9 @@ pub struct ShellSandboxConfig {
     /// when `network = allow_when_approved` or on non-macOS platforms.
     #[serde(default)]
     pub macos_socket_domain_allowlist: Vec<String>,
+    /// Linux-only: absolute path to the shell used for sandboxed commands.
+    /// `None` means use `/bin/sh`. Ignored on other platforms.
+    pub linux_shell: Option<String>,
 }
 
 impl Default for ShellSandboxConfig {
@@ -7120,6 +7129,7 @@ impl Default for ShellSandboxConfig {
             sensitive_path_patterns: default_sensitive_path_patterns(),
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
             macos_socket_domain_allowlist: Vec::new(),
+            linux_shell: None,
         }
     }
 }
@@ -7254,6 +7264,31 @@ impl ShellSandboxConfig {
                 }
             }
             config.macos_socket_domain_allowlist = allowlist;
+        }
+        if let Some(shell_path) = settings.linux_shell {
+            if shell_path.trim().is_empty() {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell must not be empty"
+                )));
+            }
+            if !shell_path.starts_with('/') {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell {shell_path:?} must be an \
+                     absolute path (e.g. \"/bin/bash\" or \"/usr/bin/fish\")"
+                )));
+            }
+            // On Linux, validate that the shell binary exists at config load
+            // time so a misconfigured path produces a clear error at startup
+            // rather than a cryptic spawn failure when the first shell command
+            // runs. On other platforms this config is ignored, so skip the
+            // check to avoid spurious failures in cross-platform test configs.
+            #[cfg(target_os = "linux")]
+            if !std::path::Path::new(&shell_path).exists() {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell {shell_path:?} does not exist"
+                )));
+            }
+            config.linux_shell = Some(shell_path);
         }
         reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
         Ok(config)

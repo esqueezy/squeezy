@@ -253,6 +253,20 @@ impl ShellSandboxPlan {
     }
 
     pub(crate) fn metadata(&self) -> Value {
+        #[cfg(target_os = "linux")]
+        let shell = if self.backend == "linux-direct-syscalls"
+            || (self.backend == "none" && self.program.starts_with('/'))
+        {
+            Some(self.program.as_str())
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let shell = if self.backend == "linux-direct-syscalls" {
+            Some(self.program.as_str())
+        } else {
+            None
+        };
         let mut payload = json!({
             "backend": self.backend,
             "mode": self.mode,
@@ -262,6 +276,9 @@ impl ShellSandboxPlan {
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
+            // Include the effective Linux shell even when best_effort has
+            // degraded to a direct spawn that still honors linux_shell.
+            "shell": shell,
         });
         if let Some(shell) = &self.selected_shell
             && let Some(object) = payload.as_object_mut()
@@ -408,22 +425,34 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
     {
         let userns = linux_unshare_supported();
         let landlock = linux_landlock_supported();
+        let abi = linux_landlock_abi_version();
+        // Read the kernel knob to surface the exact policy value.
+        let userns_knob = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+            .ok()
+            .map(|v| v.trim().to_string());
+        let userns_ns_present = std::path::Path::new("/proc/self/ns/user").exists();
+        let knob_str = userns_knob.as_deref().unwrap_or("absent");
+
         let detail = match (userns, landlock) {
-            (true, true) => {
-                "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock + seccomp available".to_string()
-            }
-            (true, false) => {
-                "user namespaces available but Landlock filesystem enforcement is not; required mode denies"
-                    .to_string()
-            }
-            (false, true) => {
-                "Landlock available but unprivileged user namespaces are disabled (unprivileged_userns_clone=0 or no /proc/self/ns/user); required mode denies"
-                    .to_string()
-            }
-            (false, false) => {
-                "neither unprivileged user namespaces nor Landlock available; required mode denies"
-                    .to_string()
-            }
+            (true, true) => format!(
+                "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock ABI {abi} + seccomp available; \
+                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}"
+            ),
+            (true, false) => format!(
+                "user namespaces available but Landlock filesystem enforcement is not \
+                 (Landlock ABI {abi}); required mode denies; \
+                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}"
+            ),
+            (false, true) => format!(
+                "Landlock available (ABI {abi}) but unprivileged user namespaces are disabled; \
+                 required mode denies; \
+                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}"
+            ),
+            (false, false) => format!(
+                "neither unprivileged user namespaces nor Landlock available (ABI {abi}); \
+                 required mode denies; \
+                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}"
+            ),
         };
         ShellSandboxDoctor {
             backend: "linux-direct-syscalls",
@@ -831,6 +860,22 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             fallback_reason =
                 Some("required shell sandbox unavailable: linux unshare failed".to_string());
         } else {
+            // In required mode, verify that every user-configured root
+            // actually exists at plan time. Optional default roots are
+            // checked lazily in linux_shell_read_roots; user-configured
+            // roots are validated here so that a missing path causes an
+            // immediate, clear error rather than a silently shorter
+            // Landlock allowlist in the audit log.
+            if required && linux_landlock_available {
+                for root_path in config.read_roots.iter().chain(config.write_roots.iter()) {
+                    if !root_path.exists() {
+                        return Err(format!(
+                            "required shell sandbox: configured root {} does not exist at spawn time",
+                            root_path.display()
+                        ));
+                    }
+                }
+            }
             let filesystem = if linux_landlock_available {
                 "enforced"
             } else if required {
@@ -838,8 +883,13 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             } else {
                 "best_effort_unavailable"
             };
+            let shell_program = config
+                .linux_shell
+                .as_deref()
+                .unwrap_or("/bin/sh")
+                .to_string();
             return Ok(ShellSandboxPlan {
-                program: "sh".to_string(),
+                program: shell_program,
                 args: vec!["-lc".to_string(), command.to_string()],
                 backend: "linux-direct-syscalls",
                 mode: config.mode.as_str(),
@@ -967,12 +1017,21 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             }
         }
 
-        Ok(ShellSandboxPlan::direct_with_fallback(
-            command,
-            config.mode,
-            config,
-            fallback_reason,
-        ))
+        let plan =
+            ShellSandboxPlan::direct_with_fallback(command, config.mode, config, fallback_reason);
+        // On Linux, respect the configured shell in the degraded path so that
+        // a project relying on Bash syntax or Fish/Zsh aliases does not
+        // silently switch to /bin/sh when the sandbox falls back.
+        #[cfg(target_os = "linux")]
+        let plan = {
+            let mut plan = plan;
+            if let Some(linux_shell) = &config.linux_shell {
+                plan.program = linux_shell.clone();
+                plan.args = vec!["-lc".to_string(), command.to_string()];
+            }
+            plan
+        };
+        Ok(plan)
     }
 }
 
@@ -1131,21 +1190,61 @@ pub(crate) fn shell_writable_roots(root: &Path, config: &ShellSandboxConfig) -> 
 
 #[cfg(target_os = "linux")]
 fn linux_shell_read_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = [
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/lib",
-        "/lib64",
-        "/etc",
-        "/opt",
-        "/nix/store",
-        "/dev",
-        "/proc",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect();
+    // Always-present system paths required for shell and compiler operation.
+    let mut roots: Vec<PathBuf> = ["/usr", "/bin", "/sbin", "/lib", "/etc"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    // Optional system paths: only included when they exist at plan time.
+    // /lib64 is absent on 32-bit and some musl targets; /opt is absent on
+    // many minimal containers; /nix/store is Nix-only.
+    for path in ["/lib64", "/opt", "/nix/store"] {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            roots.push(p);
+        }
+    }
+    // Narrow device access: only the non-symlink device nodes a sandboxed
+    // shell legitimately uses. Symlinks into /proc/self/fd (like /dev/fd,
+    // /dev/stdin, /dev/stdout, /dev/stderr) are excluded because they
+    // follow into the child's /proc namespace and can cause Landlock
+    // rule-add failures in the new namespace context. The broad /dev
+    // allowlist can expose readable device paths that build/test commands
+    // do not need.
+    for path in [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/full",
+        "/dev/tty",
+        "/dev/pts",
+        "/dev/ptmx",
+    ] {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            roots.push(p);
+        }
+    }
+    // Narrow /proc access: only the paths a sandboxed shell needs at
+    // runtime. Symlinks within /proc (like /proc/mounts → /proc/self/mounts
+    // and /proc/net → /proc/self/net) are excluded because they resolve into
+    // namespace-specific paths that may behave differently after unshare.
+    // /proc/self covers the child's own process entries. Broad /proc access
+    // can expose process metadata and host/container topology.
+    for path in [
+        "/proc/self",
+        "/proc/sys",
+        "/proc/version",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/filesystems",
+    ] {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            roots.push(p);
+        }
+    }
     for name in ["CARGO_HOME", "RUSTUP_HOME"] {
         if let Some(path) = env::var_os(name).map(PathBuf::from) {
             roots.push(path);
@@ -1420,6 +1519,12 @@ fn linux_landlock_supported() -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_landlock_abi_version() -> i32 {
+    static ABI: OnceLock<i32> = OnceLock::new();
+    *ABI.get_or_init(linux_landlock_abi_version_uncached)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_abi_version_uncached() -> i32 {
     let version = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -1477,12 +1582,17 @@ fn linux_landlock_restrict(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> s
     }
     let restrict_result =
         unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) };
-    let close_result = unsafe { libc::close(ruleset_fd) };
-    if restrict_result < 0 {
-        return Err(std::io::Error::last_os_error());
+    // Save errno immediately before any other syscall can clobber it.
+    let restrict_err = if restrict_result < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        libc::close(ruleset_fd);
     }
-    if close_result != 0 {
-        return Err(std::io::Error::last_os_error());
+    if let Some(err) = restrict_err {
+        return Err(err);
     }
     Ok(())
 }
@@ -1502,7 +1612,11 @@ fn linux_landlock_add_path_rule(
         .map_err(|_| std::io::Error::other("sandbox root contains NUL byte"))?;
     let parent_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if parent_fd < 0 {
-        return Err(std::io::Error::last_os_error());
+        // Silently skip paths that cannot be opened in the current namespace
+        // context (e.g., proc symlinks after CLONE_NEWNS / CLONE_NEWNET).
+        // A missing rule means the path is simply not in the allowlist,
+        // which is the stricter default — the sandbox remains active.
+        return Ok(());
     }
     let path_beneath = LandlockPathBeneathAttr {
         allowed_access,
@@ -1517,12 +1631,15 @@ fn linux_landlock_add_path_rule(
             0u32,
         )
     };
-    let close_result = unsafe { libc::close(parent_fd) };
-    if result < 0 {
-        return Err(std::io::Error::last_os_error());
+    unsafe {
+        libc::close(parent_fd);
     }
-    if close_result != 0 {
-        return Err(std::io::Error::last_os_error());
+    if result < 0 {
+        // Silently skip paths whose type is not compatible with Landlock's
+        // RULE_PATH_BENEATH (e.g., special device files or virtual-fs paths
+        // on some kernel configurations). A failed rule means the path is
+        // denied by default, which is the stricter behavior.
+        return Ok(());
     }
     Ok(())
 }
