@@ -573,13 +573,33 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
 /// when the model already wrote a real prefix; gating on `/` removes that
 /// noise without regressing the bareword UX.
 fn path_matches_filter(path: &str, filter: &str) -> bool {
+    // Normalize backslashes and leading `./` once before all comparisons so
+    // Windows-style input like `.\src\app.cs` resolves against `src/app.cs`.
+    let filter_owned = normalize_path_filter(filter);
+    let filter = filter_owned.as_ref();
     if filter.contains('/') {
         let filter = filter.trim_end_matches('/');
         if filter.is_empty() {
             return true;
         }
-        return path == filter
-            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'));
+        if path == filter
+            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'))
+        {
+            return true;
+        }
+        // Case-insensitive prefix match on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            let path_lower = path.to_ascii_lowercase();
+            let filter_lower = filter.to_ascii_lowercase();
+            if path_lower == filter_lower
+                || (path_lower.starts_with(filter_lower.as_str())
+                    && path_lower.as_bytes().get(filter_lower.len()) == Some(&b'/'))
+            {
+                return true;
+            }
+        }
+        return false;
     }
     if path_matches_exact_or_suffix(path, filter) {
         return true;
@@ -1376,10 +1396,14 @@ fn graph_zero_hit_fallback(
     }
     let (path_value, language_value, reason) = match path {
         Some(path) => {
+            // Try exact/suffix match first, then case-insensitive fallback so
+            // Windows-style input (`SRC\app.cs`) resolves to the indexed record
+            // and the response path shows the canonical repository spelling.
             let file = graph
                 .files
                 .values()
-                .find(|file| path_matches_exact_or_suffix(&file.relative_path, path));
+                .find(|file| path_matches_exact_or_suffix(&file.relative_path, path))
+                .or_else(|| graph.find_file_case_insensitive(path));
             match file {
                 Some(file) => {
                     let reason = match file.language {
@@ -1593,11 +1617,53 @@ fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     path_matches_filter(hit.reference.file_id.0.as_str(), filter)
 }
 
+/// Normalize a user-supplied path filter: replace backslashes with forward
+/// slashes and strip leading `./` or `.\` so that Windows-style input like
+/// `.\src\lib.rs` matches the indexed `src/lib.rs`.
+fn normalize_path_filter(filter: &str) -> std::borrow::Cow<'_, str> {
+    let s = if filter.contains('\\') {
+        std::borrow::Cow::Owned(filter.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(filter)
+    };
+    // Strip a leading `./` produced by shell tab-completion or model output.
+    if let Some(rest) = s.strip_prefix("./") {
+        std::borrow::Cow::Owned(rest.to_string())
+    } else {
+        s
+    }
+}
+
 fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
-    path == filter
-        || path
-            .strip_suffix(filter)
+    let filter = normalize_path_filter(filter);
+    let filter = filter.as_ref();
+    if path == filter {
+        return true;
+    }
+    // Case-insensitive comparison on Windows where the filesystem ignores case.
+    #[cfg(target_os = "windows")]
+    if path.to_ascii_lowercase() == filter.to_ascii_lowercase() {
+        return true;
+    }
+    if path
+        .strip_suffix(filter)
+        .is_some_and(|prefix| prefix.ends_with('/'))
+    {
+        return true;
+    }
+    // Case-insensitive suffix match on Windows.
+    #[cfg(target_os = "windows")]
+    {
+        let path_lower = path.to_ascii_lowercase();
+        let filter_lower = filter.to_ascii_lowercase();
+        if path_lower
+            .strip_suffix(filter_lower.as_str())
             .is_some_and(|prefix| prefix.ends_with('/'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn call_edge_packet(
@@ -2338,12 +2404,16 @@ fn read_slice_target(
         .path
         .clone()
         .ok_or_else(|| "read_slice requires path or symbol_id".to_string())?;
+    // Find graph status: try exact/suffix first, then case-insensitive fallback
+    // so a Windows user typing `SRC\lib.rs` gets the correct indexed language
+    // rather than "not_indexed".
     let status = graph
         .and_then(|graph| {
             graph
                 .files
                 .values()
                 .find(|file| path_matches_exact_or_suffix(&file.relative_path, &path))
+                .or_else(|| graph.find_file_case_insensitive(&path))
         })
         .map(|file| graph_status_for_language(file.language))
         .unwrap_or("not_indexed");
@@ -4490,5 +4560,66 @@ mod graph_payload_refresh_status_tests {
         assert!(payload.get("refresh_incomplete").is_none());
         assert!(payload.get("stale_pending").is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod windows_path_normalization_tests {
+    use super::{normalize_path_filter, path_matches_exact_or_suffix, path_matches_filter};
+
+    #[test]
+    fn normalize_path_filter_replaces_backslashes() {
+        assert_eq!(normalize_path_filter("src\\lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path_filter("src/lib.rs"), "src/lib.rs");
+        assert_eq!(
+            normalize_path_filter(".\\src\\app.cs"),
+            "src/app.cs",
+            "leading ./ must be stripped after backslash normalization"
+        );
+        assert_eq!(normalize_path_filter("./src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn path_matches_exact_or_suffix_accepts_backslash_filter() {
+        // Windows users may supply backslash paths; they should match the
+        // slash-normalized indexed paths without extra friction.
+        assert!(
+            path_matches_exact_or_suffix("src/lib.rs", "src\\lib.rs"),
+            "backslash filter must match slash-indexed path"
+        );
+        assert!(
+            path_matches_exact_or_suffix("crates/foo/src/lib.rs", "src\\lib.rs"),
+            "backslash suffix filter must match"
+        );
+        assert!(
+            !path_matches_exact_or_suffix("src/other.rs", "src\\lib.rs"),
+            "non-matching backslash filter must not match"
+        );
+    }
+
+    #[test]
+    fn path_matches_filter_accepts_backslash_directory_filter() {
+        // A Windows-style directory filter like `src\utils` should match files
+        // under `src/utils/` in the indexed tree.
+        assert!(
+            path_matches_filter("src/utils/helper.rs", "src\\utils"),
+            "backslash directory filter must match files under that tree"
+        );
+        assert!(
+            !path_matches_filter("src/utils_extra/helper.rs", "src\\utils"),
+            "backslash directory filter must not cross directory boundaries"
+        );
+    }
+
+    #[test]
+    fn path_matches_filter_strips_leading_dotslash() {
+        assert!(
+            path_matches_filter("src/lib.rs", "./src/lib.rs"),
+            "./prefix must be stripped before matching"
+        );
+        assert!(
+            path_matches_filter("src/lib.rs", ".\\src\\lib.rs"),
+            ".\\prefix must be stripped and backslashes normalized"
+        );
     }
 }

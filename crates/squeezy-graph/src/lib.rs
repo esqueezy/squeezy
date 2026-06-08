@@ -441,6 +441,17 @@ pub struct SemanticGraph {
     /// the workspace per resolved call — the dominant cost of the cold build
     /// on large repos, where it turned call resolution quadratic in symbols.
     symbols_by_language_identity: HashMap<String, Vec<SymbolId>>,
+    /// Lowercase slash-normalized relative path → `FileId` for O(1)
+    /// case-insensitive lookups. Populated by `rebuild_indexes` from every
+    /// indexed file. On case-insensitive filesystems (Windows) this index
+    /// lets path-filter helpers skip linear scans and avoids redundant
+    /// `canonicalize` calls during watcher event reconciliation.
+    pub files_by_normalized_id: HashMap<String, FileId>,
+    /// Case-collision log: pairs of `FileId` strings whose lowercase forms
+    /// are equal. Populated during `rebuild_indexes`; empty on well-formed
+    /// repositories, non-empty on Windows when a checkout leaves two
+    /// differently-cased spellings for the same logical path.
+    pub case_collisions: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -516,6 +527,8 @@ impl SemanticGraph {
             importers_by_file: HashMap::new(),
             resolver_slots: cross_file::ResolverSlots::new(),
             symbols_by_language_identity: HashMap::new(),
+            files_by_normalized_id: HashMap::new(),
+            case_collisions: Vec::new(),
         }
     }
 
@@ -572,6 +585,27 @@ impl SemanticGraph {
         self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
+    }
+
+    /// Look up a `FileRecord` by a case-insensitive, backslash-normalized path.
+    ///
+    /// Returns the first indexed record whose lowercase slash-normalized id
+    /// equals `lowercase(normalize_backslashes(query))`. This is used for
+    /// Windows-friendly path resolution without requiring an exact-case match.
+    pub fn find_file_case_insensitive(&self, query: &str) -> Option<&FileRecord> {
+        let normalized = query.replace('\\', "/").to_ascii_lowercase();
+        self.files_by_normalized_id
+            .get(&normalized)
+            .and_then(|id| self.files.get(id))
+    }
+
+    /// When an exact path lookup misses, check if only casing differs and
+    /// return the indexed spelling for a user-facing hint.
+    pub fn case_insensitive_match_hint(&self, query: &str) -> Option<&str> {
+        let normalized = query.replace('\\', "/").to_ascii_lowercase();
+        self.files_by_normalized_id
+            .get(&normalized)
+            .map(|id| id.0.as_str())
     }
 
     fn remove_file_data(&mut self, file_id: &FileId) {
@@ -1499,7 +1533,24 @@ impl SemanticGraph {
         self.edges_by_from.clear();
         self.edges_by_to.clear();
         self.symbols_by_language_identity.clear();
+        self.files_by_normalized_id.clear();
+        self.case_collisions.clear();
         self.rebuild_import_indexes();
+
+        // Build a lowercase path → FileId index for O(1) case-insensitive
+        // lookups and detect case collisions that indicate Windows casing drift.
+        for (file_id, _record) in &self.files {
+            let normalized = file_id.0.to_ascii_lowercase();
+            if let Some(existing) = self.files_by_normalized_id.get(&normalized) {
+                if existing != file_id {
+                    self.case_collisions
+                        .push((existing.0.clone(), file_id.0.clone()));
+                }
+            } else {
+                self.files_by_normalized_id
+                    .insert(normalized, file_id.clone());
+            }
+        }
 
         self.symbols_by_name.reserve(self.symbols.len());
         self.symbol_signature_lower.reserve(self.symbols.len());
@@ -3053,7 +3104,25 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
     }
     let path = Path::new(path);
     let relative = if path.is_absolute() {
-        path.strip_prefix(root).ok()?.to_path_buf()
+        // First try an exact prefix strip. On Windows this can fail when the
+        // diagnostic path and workspace root differ only by drive-letter casing
+        // (e.g. `C:\...` vs `c:\...`) or verbatim-prefix spelling. Fall back
+        // to comparing lowercased string representations in that case.
+        if let Some(rel) = path.strip_prefix(root).ok() {
+            rel.to_path_buf()
+        } else {
+            let path_lower = path.to_string_lossy().to_ascii_lowercase();
+            let root_lower = root.to_string_lossy().to_ascii_lowercase();
+            let path_lower_norm = path_lower.replace('\\', "/");
+            let root_lower_norm = root_lower.replace('\\', "/");
+            let root_prefix = if root_lower_norm.ends_with('/') {
+                root_lower_norm.clone()
+            } else {
+                format!("{root_lower_norm}/")
+            };
+            let remainder = path_lower_norm.strip_prefix(&root_prefix)?;
+            Path::new(remainder).to_path_buf()
+        }
     } else {
         path.to_path_buf()
     };

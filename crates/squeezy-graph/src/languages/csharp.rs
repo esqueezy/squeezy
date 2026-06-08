@@ -163,14 +163,17 @@ pub(crate) fn csharp_import_matches_symbol(import: &ParsedImport, symbol: &Graph
 }
 
 pub(crate) fn dotnet_project_metadata_provider(file: &FileRecord) -> Option<&'static str> {
-    match file
+    let filename = file
         .relative_path
         .rsplit('/')
         .next()
-        .unwrap_or(&file.relative_path)
-    {
-        "Directory.Build.props" => Some("directory-build-props"),
-        "Directory.Build.targets" => Some("directory-build-targets"),
+        .unwrap_or(&file.relative_path);
+    // Match case-insensitively: Windows MSBuild conventions allow any casing
+    // for `.csproj`, `.sln`, `Directory.Build.props`, etc.
+    let lower = filename.to_ascii_lowercase();
+    match lower.as_str() {
+        "directory.build.props" => Some("directory-build-props"),
+        "directory.build.targets" => Some("directory-build-targets"),
         "global.json" => Some("global-json"),
         "packages.lock.json" => Some("packages-lock"),
         name if name.ends_with(".csproj") => Some("csproj"),
@@ -474,3 +477,7 @@ fn find_json_string_field(value: &serde_json::Value, field: &str) -> Option<Stri
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "csharp_tests.rs"]
+mod tests;

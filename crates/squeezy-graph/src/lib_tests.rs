@@ -8841,3 +8841,118 @@ void main() {
         "app.dart must NOT attach to the unrelated c/d/thing.dart that only shares the leaf",
     );
 }
+
+// ── Windows path identity tests ──────────────────────────────────────────────
+
+#[test]
+fn graph_files_by_normalized_id_enables_case_insensitive_lookup() {
+    let source = "pub fn a() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec = record("src/Lib.rs", source);
+    let parsed = parser.parse_source(&rec, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    // Exact lookup works.
+    assert!(graph.files.contains_key(&FileId::new("src/Lib.rs")));
+    // Case-insensitive lookup via normalized index finds the record.
+    assert!(
+        graph.find_file_case_insensitive("src/lib.rs").is_some(),
+        "find_file_case_insensitive must resolve lowercase query to src/Lib.rs"
+    );
+    // Backslash normalization is applied before the lookup.
+    assert!(
+        graph.find_file_case_insensitive("src\\Lib.rs").is_some(),
+        "find_file_case_insensitive must accept backslash path separators"
+    );
+    // A query with no match returns None.
+    assert!(
+        graph.find_file_case_insensitive("src/missing.rs").is_none(),
+        "find_file_case_insensitive must return None for absent paths"
+    );
+}
+
+#[test]
+fn graph_case_insensitive_hint_returns_canonical_spelling() {
+    let source = "fn x() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec = record("src/MyModule.rs", source);
+    let parsed = parser.parse_source(&rec, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    // When the user types the wrong case, the hint returns the indexed spelling.
+    assert_eq!(
+        graph.case_insensitive_match_hint("src/mymodule.rs"),
+        Some("src/MyModule.rs")
+    );
+    assert_eq!(
+        graph.case_insensitive_match_hint("SRC/MYMODULE.RS"),
+        Some("src/MyModule.rs")
+    );
+    // An exact match path also resolves via the normalized index.
+    assert_eq!(
+        graph.case_insensitive_match_hint("src/MyModule.rs"),
+        Some("src/MyModule.rs")
+    );
+    // A truly missing path returns None.
+    assert!(graph.case_insensitive_match_hint("src/other.rs").is_none());
+}
+
+#[test]
+fn graph_case_collision_detected_in_rebuild_indexes() {
+    // Simulate two files whose paths fold to the same lowercase spelling
+    // (Windows checkout artefact). The graph should record the collision.
+    let source_a = "pub fn a() {}\n";
+    let source_b = "pub fn b() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec_a = record("src/lib.rs", source_a);
+    let mut rec_b = record("src/lib.rs", source_b);
+    // Pretend the second file arrived with a different casing identifier
+    // (Windows-style drift).
+    rec_b.id = FileId::new("src/Lib.rs");
+    rec_b.relative_path = "src/Lib.rs".to_string();
+
+    let parsed_a = parser.parse_source(&rec_a, source_a.to_string()).unwrap();
+    let parsed_b = parser.parse_source(&rec_b, source_b.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed_a, parsed_b]);
+
+    assert_eq!(
+        graph.case_collisions.len(),
+        1,
+        "expected exactly one case collision for src/lib.rs vs src/Lib.rs"
+    );
+    let (a, b) = &graph.case_collisions[0];
+    let pair = [a.as_str(), b.as_str()];
+    assert!(
+        pair.contains(&"src/lib.rs") && pair.contains(&"src/Lib.rs"),
+        "collision must name both spellings, got {a:?} and {b:?}"
+    );
+}
+
+#[test]
+fn normalize_cargo_file_id_handles_drive_letter_casing() {
+    // Test that normalize_cargo_file_id falls back to case-insensitive prefix
+    // stripping when path and root differ only by drive-letter casing.
+    // We simulate this with lowercase vs mixed-case path prefixes rather than
+    // real Windows drive letters so the test runs on all platforms.
+    let root = std::path::Path::new("/workspace/project");
+    // Exact case: must resolve normally.
+    assert_eq!(
+        super::normalize_cargo_file_id(root, "/workspace/project/src/lib.rs"),
+        Some("src/lib.rs".to_string()),
+    );
+    // Case differs only in the prefix: must still resolve on all platforms via
+    // the lowercase fallback path.
+    assert_eq!(
+        super::normalize_cargo_file_id(root, "/Workspace/Project/src/lib.rs"),
+        Some("src/lib.rs".to_string()),
+    );
+    // Path outside the root must return None.
+    assert!(super::normalize_cargo_file_id(root, "/other/src/lib.rs").is_none());
+    // Relative paths pass through unchanged.
+    assert_eq!(
+        super::normalize_cargo_file_id(root, "src/lib.rs"),
+        Some("src/lib.rs".to_string()),
+    );
+    // Angle-bracket macros are excluded.
+    assert!(super::normalize_cargo_file_id(root, "<macro:lib>").is_none());
+}
