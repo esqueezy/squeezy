@@ -672,7 +672,7 @@ pub(crate) async fn wait_for_callback_code_with_timeout(
         result = timeout(deadline, wait_for_callback_code_inner(listener, expected_state)) => {
             result.map_err(|_| SqueezyError::ProviderNotConfigured(format!(
                 "OpenAI Codex OAuth callback timed out after {} seconds; \
-                 re-run `squeezy auth codex login` to start a new session",
+                 re-run `squeezy auth openai-codex login` to start a new session",
                 deadline.as_secs()
             )))?
         }

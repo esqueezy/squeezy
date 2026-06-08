@@ -251,6 +251,10 @@ async fn wait_for_callback_code_times_out_when_no_browser_connects() {
         msg.contains("timed out"),
         "error should say 'timed out'; got: {msg}"
     );
+    assert!(
+        msg.contains("squeezy auth openai-codex login"),
+        "timeout recovery hint should use the real CLI subcommand; got: {msg}"
+    );
 }
 
 // ─── refresh + ApiKeySource interactions ───────────────────────────────────
