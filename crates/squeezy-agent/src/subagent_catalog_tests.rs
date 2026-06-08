@@ -318,33 +318,49 @@ fn user_dir_default_uses_home_when_set() {
 }
 
 #[test]
-fn discover_falls_back_to_userprofile_when_home_unset() {
-    // Simulate a Windows-like environment: HOME unset, USERPROFILE set.
-    // We manipulate environment variables only — the test runs on all
-    // platforms so it cannot create Windows-style paths, but it does
-    // verify that discover() does not panic when HOME is absent.
-    let profile_root = temp_root("userprofile_discover");
-    // On non-Windows the function uses $HOME, so we skip the
-    // USERPROFILE branch by not setting it; but we verify the None
-    // branch doesn't crash the catalog.
+fn discover_does_not_panic_when_home_unset() {
+    // Verify that discover() does not panic when $HOME is absent.
+    // On Windows we also clear APPDATA and USERPROFILE so the function
+    // reaches the None path cleanly.
     let previous_home = std::env::var_os("HOME");
-    unsafe { std::env::remove_var("HOME") };
+    #[cfg(target_os = "windows")]
+    let previous_appdata = std::env::var_os("APPDATA");
+    #[cfg(target_os = "windows")]
+    let previous_userprofile = std::env::var_os("USERPROFILE");
 
-    let workspace = temp_root("userprofile_workspace");
-    // Should not panic; may return an empty-or-builtin-only catalog.
+    unsafe {
+        std::env::remove_var("HOME");
+        #[cfg(target_os = "windows")]
+        std::env::remove_var("APPDATA");
+        #[cfg(target_os = "windows")]
+        std::env::remove_var("USERPROFILE");
+    }
+
+    let workspace = temp_root("no_home_workspace");
+    // Should not panic; only builtin and project entries can appear.
     let catalog = SubagentCatalog::discover(&workspace, None);
     assert!(
         catalog
             .entries()
             .iter()
             .all(|e| matches!(e.source, SubagentSource::Builtin | SubagentSource::Project)),
-        "without HOME and USERPROFILE only builtin+project entries expected"
+        "without HOME/APPDATA/USERPROFILE only builtin+project entries expected"
     );
 
-    if let Some(prev) = previous_home {
-        unsafe { std::env::set_var("HOME", prev) };
+    // Restore env.
+    unsafe {
+        if let Some(prev) = previous_home {
+            std::env::set_var("HOME", prev);
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(prev) = previous_appdata {
+            std::env::set_var("APPDATA", prev);
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(prev) = previous_userprofile {
+            std::env::set_var("USERPROFILE", prev);
+        }
     }
-    let _ = fs::remove_dir_all(&profile_root);
     let _ = fs::remove_dir_all(&workspace);
 }
 
