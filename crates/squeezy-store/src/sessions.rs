@@ -135,8 +135,13 @@ impl SessionStore {
     /// suitable home directory can be resolved. Resolution order:
     ///
     /// 1. `$HOME/.squeezy/memory.md` (Unix and Windows Git Bash / WSL)
-    /// 2. `$USERPROFILE\.squeezy\memory.md` (native Windows)
-    /// 3. `dirs::data_dir()/squeezy/memory.md` (platform data dir)
+    /// 2. `$USERPROFILE\.squeezy\memory.md` (native Windows only)
+    /// 3. `dirs::data_dir()/squeezy/memory.md` (Windows only; %APPDATA%\squeezy)
+    ///
+    /// On Unix/macOS only `$HOME` is consulted so behaviour is unchanged.
+    /// On Windows, `$HOME` is not guaranteed even when `%USERPROFILE%` and
+    /// `%APPDATA%` are set, so the two Windows-specific fallbacks allow the
+    /// memory file to be located without requiring Git Bash / Cygwin.
     ///
     /// The file is the single static memory store described in
     /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
@@ -145,12 +150,13 @@ impl SessionStore {
         if let Some(home) = env::var_os("HOME") {
             return Some(PathBuf::from(home).join(".squeezy").join("memory.md"));
         }
-        // Native Windows: USERPROFILE is always set when APPDATA/LOCALAPPDATA are.
+        // Windows-only fallback: HOME is not guaranteed on native Windows even
+        // when USERPROFILE and APPDATA are set (e.g. in some CI environments).
+        #[cfg(target_os = "windows")]
         if let Some(profile) = env::var_os("USERPROFILE") {
             return Some(PathBuf::from(profile).join(".squeezy").join("memory.md"));
         }
-        // Final fallback: platform data directory (e.g. %APPDATA%\squeezy on Windows).
-        dirs::data_dir().map(|d| d.join("squeezy").join("memory.md"))
+        None
     }
 
     /// Append one normalized line to the user-global memory file
