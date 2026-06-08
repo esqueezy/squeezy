@@ -96,7 +96,7 @@ impl ShellProgram {
     /// PATH probing and reuses it for subsequent calls in the same session.
     #[cfg(windows)]
     fn windows_default_cached(command: &str) -> Self {
-        let binary = WINDOWS_SHELL_BINARY.get_or_init(|| Self::resolve_windows_shell_binary());
+        let binary = WINDOWS_SHELL_BINARY.get_or_init(Self::resolve_windows_shell_binary);
         Self::windows_shell_with_binary(binary, command)
     }
 
