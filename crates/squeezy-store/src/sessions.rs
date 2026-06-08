@@ -264,6 +264,7 @@ impl SessionStore {
         let lock_path = path.with_extension("lock");
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&lock_path)
             .ok();
@@ -306,20 +307,17 @@ impl SessionStore {
         let initial_fingerprint = fs::metadata(&path)
             .ok()
             .map(|metadata| global_index_fingerprint(&metadata));
-        if !legacy_differs {
-            if let Some(fingerprint) = &initial_fingerprint
-                && let Some(entries) = cached_global_index(&path, fingerprint)
-            {
-                return entries;
-            }
+        if !legacy_differs
+            && let Some(fingerprint) = &initial_fingerprint
+            && let Some(entries) = cached_global_index(&path, fingerprint)
+        {
+            return entries;
         }
         let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
         let mut raw_lines = 0usize;
         // Read the legacy path first (lower priority) so primary-path entries win.
-        if legacy_differs {
-            if let Some(ref lp) = legacy_path {
-                read_global_index_into(lp, &mut by_id, &mut raw_lines);
-            }
+        if legacy_differs && let Some(ref lp) = legacy_path {
+            read_global_index_into(lp, &mut by_id, &mut raw_lines);
         }
         if primary_exists {
             read_global_index_into(&path, &mut by_id, &mut raw_lines);
@@ -348,6 +346,7 @@ impl SessionStore {
             let lock_path = path.with_extension("lock");
             let lock_file = OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .write(true)
                 .open(&lock_path)
                 .ok();
@@ -3567,10 +3566,10 @@ fn random_nonce_hex() -> String {
 /// of the directory entry, not the file content.
 fn fsync_parent(path: &Path) {
     #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
 }
 
