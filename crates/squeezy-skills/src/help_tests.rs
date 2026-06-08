@@ -403,7 +403,9 @@ fn slash_help_theme_answers_locally() {
     let body = answer.render_markdown();
     assert!(body.contains("## /theme"), "{body}");
     assert!(body.contains("Syntax:"), "{body}");
-    assert!(body.contains("starlight"), "{body}");
+    assert!(body.contains("catppuccin"), "{body}");
+    assert!(body.contains("high-contrast"), "{body}");
+    assert!(body.contains("Requires: [edit]"), "{body}");
 }
 
 #[test]

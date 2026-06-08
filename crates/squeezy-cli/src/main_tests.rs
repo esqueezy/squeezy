@@ -196,6 +196,17 @@ fn cli_prompt_format_rejects_unknown_value() {
 }
 
 #[test]
+fn cli_help_slash_command_topic_uses_tui_help_parser() {
+    let help = squeezy_skills::SqueezyHelp::new("");
+    let answer = cli_help_answer(&help, Some("/theme"));
+
+    assert_eq!(answer.topic, "/theme");
+    let rendered = answer.render_markdown();
+    assert!(rendered.contains("## /theme"), "{rendered}");
+    assert!(rendered.contains("Syntax:"), "{rendered}");
+}
+
+#[test]
 fn repo_profile_error_does_not_block_startup() {
     let mut config = AppConfig::default();
     let prepared = prepare_repo_profile_from_load(

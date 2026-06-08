@@ -906,11 +906,11 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
             "/theme          — list available themes",
             "/theme default  — switch to the default theme",
             "/theme bright   — switch to the bright theme",
-            "/theme fun      — switch to the fun theme",
-            "/theme starlight — switch to the starlight theme",
+            "/theme catppuccin — switch to the catppuccin theme",
+            "/theme high-contrast — switch to the high-contrast theme",
         ],
         available_during_turn: true,
-        capability_note: None,
+        capability_note: Some("Requires: [edit]"),
         related: &["tui"],
     },
     SlashCommandHelp {
@@ -1217,7 +1217,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         syntax: "/mcp",
         examples: &["/mcp  — open MCP configuration and status screen"],
         available_during_turn: true,
-        capability_note: None,
+        capability_note: Some("Requires: [edit]"),
         related: &["config", "permissions"],
     },
     SlashCommandHelp {

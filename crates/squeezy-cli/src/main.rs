@@ -3482,13 +3482,22 @@ fn handle_help_command(topic: Option<&str>, cli: &Cli) -> squeezy_core::Result<(
     let config = config_from_cli(cli)?;
     let config_inspect = config.inspect_redacted();
     let help = squeezy_skills::SqueezyHelp::new(config_inspect);
-    let answer = match topic {
-        None | Some("") => help.topic_index(),
-        Some(t) => help.answer_topic(t),
-    };
+    let answer = cli_help_answer(&help, topic);
     let rendered = answer.render_markdown();
     println!("{rendered}");
     Ok(())
+}
+
+fn cli_help_answer(
+    help: &squeezy_skills::SqueezyHelp,
+    topic: Option<&str>,
+) -> squeezy_skills::HelpAnswer {
+    let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) else {
+        return help.topic_index();
+    };
+    let input = format!("/help {topic}");
+    help.answer_for_input(&input)
+        .unwrap_or_else(|| help.answer_topic(topic))
 }
 
 fn telemetry_notice_path() -> PathBuf {
