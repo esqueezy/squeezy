@@ -3168,6 +3168,15 @@ async fn statusline_picker_project_scope_save_writes_project_note() {
         content.contains("Note:"),
         "project-scope save should include user-override note; got: {content}"
     );
+    let saved = std::fs::read_to_string(&project_settings).expect("project settings written");
+    assert!(
+        saved.contains("status_line = ["),
+        "project settings should persist the status line list; got: {saved}"
+    );
+    assert!(
+        saved.contains("status_line_use_colors = true"),
+        "project settings should persist color preference; got: {saved}"
+    );
 }
 
 #[tokio::test]
