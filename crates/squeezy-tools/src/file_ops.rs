@@ -61,6 +61,10 @@ pub(crate) struct GlobArgs {
     diff_only: Option<bool>,
     max_paths: Option<usize>,
     offset: Option<usize>,
+    /// When true, follow symlinks during traversal. Default false (conservative).
+    /// Workspace containment is checked for each resolved target: symlinks that
+    /// escape the workspace root are silently skipped with a warning in metadata.
+    follow_symlinks: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +88,10 @@ pub(crate) struct GrepArgs {
     /// `MAX_GREP_CONTEXT` defensively in case a non-spec caller sends a
     /// larger value.
     context: Option<u32>,
+    /// When true, follow symlinks during traversal. Default false (conservative).
+    /// Workspace containment is checked for each resolved target: symlinks that
+    /// escape the workspace root are silently skipped with a warning in metadata.
+    follow_symlinks: Option<bool>,
 }
 
 /// Hard cap on grep `context` to keep per-match windows bounded even if
@@ -500,10 +508,11 @@ impl ToolRegistry {
         };
         let max_paths = args.max_paths.unwrap_or(DEFAULT_MAX_MATCHES).min(1_000);
         let offset = args.offset.unwrap_or(0);
+        let follow_symlinks = args.follow_symlinks.unwrap_or(false);
 
         let mut builder = WalkBuilder::new(&start);
         builder
-            .follow_links(false)
+            .follow_links(follow_symlinks)
             .hidden(false)
             .ignore(!include_ignored)
             .git_ignore(!include_ignored)
@@ -515,7 +524,10 @@ impl ToolRegistry {
         let mut paths = Vec::new();
         let mut skipped_paths = 0usize;
         let mut skipped_secret_files = 0u64;
+        let mut dirs_visited = 0u64;
+        let mut symlink_skipped_count = 0u64;
         let mut cost = ToolCostHint::default();
+        let traverse_start = std::time::Instant::now();
 
         for entry in builder.build() {
             if cancel.is_cancelled() {
@@ -531,8 +543,33 @@ impl ToolRegistry {
                 Err(_) => continue,
             };
             let path = entry.path();
+            if path.is_dir() {
+                dirs_visited += 1;
+                continue;
+            }
+            // When not following symlinks, count symlinked entries that are not
+            // regular files (e.g. symlinks to directories that were not expanded).
+            if !follow_symlinks && entry.path_is_symlink() && !path.is_file() {
+                symlink_skipped_count += 1;
+                continue;
+            }
             if !path.is_file() || contains_skipped_dir(path) {
                 continue;
+            }
+            // When following symlinks, enforce workspace containment to prevent
+            // traversal escaping through symlinks that point outside the root.
+            if follow_symlinks && entry.path_is_symlink() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&self.root) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             let rel = self.relative(path);
             if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
@@ -558,6 +595,8 @@ impl ToolRegistry {
             cost.matches_returned += 1;
         }
 
+        let elapsed_ms = traverse_start.elapsed().as_millis() as u64;
+
         make_result(
             call,
             ToolStatus::Success,
@@ -570,6 +609,10 @@ impl ToolRegistry {
                     "diff_only": diff_only,
                     "offset": offset,
                     "skipped_secret_files": skipped_secret_files,
+                    "symlinks_not_followed": !follow_symlinks,
+                    "symlink_skipped_count": symlink_skipped_count,
+                    "dirs_visited": dirs_visited,
+                    "elapsed_ms": elapsed_ms,
                 },
             }),
             cost,
@@ -638,6 +681,7 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_OUTPUT_BYTE_CAP)
             .min(128_000);
         let context = args.context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize;
+        let follow_symlinks = args.follow_symlinks.unwrap_or(false);
 
         // Cross-tool "already-resident" dedup: when the grep target is a
         // single file the model already read in full this session (a
@@ -673,7 +717,7 @@ impl ToolRegistry {
 
         let mut builder = WalkBuilder::new(&start);
         builder
-            .follow_links(false)
+            .follow_links(follow_symlinks)
             .hidden(false)
             .ignore(!include_ignored)
             .git_ignore(!include_ignored)
@@ -690,6 +734,9 @@ impl ToolRegistry {
         let mut skipped_secret_files = 0u64;
         let mut scanned_files = 0usize;
         let mut stop_search = false;
+        let mut dirs_visited = 0u64;
+        let mut symlink_skipped_count = 0u64;
+        let traverse_start = std::time::Instant::now();
 
         for entry in builder.build() {
             if cancel.is_cancelled() {
@@ -708,6 +755,30 @@ impl ToolRegistry {
                 Err(_) => continue,
             };
             let path = entry.path();
+            if path.is_dir() {
+                dirs_visited += 1;
+                continue;
+            }
+            // When not following symlinks, count symlinked non-file entries
+            // (e.g. symlinks to directories that were not expanded).
+            if !follow_symlinks && entry.path_is_symlink() && !path.is_file() {
+                symlink_skipped_count += 1;
+                continue;
+            }
+            // When following symlinks, enforce workspace containment.
+            if follow_symlinks && entry.path_is_symlink() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&self.root) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if !path.is_file() || contains_skipped_dir(path) {
                 continue;
             }
@@ -891,6 +962,8 @@ impl ToolRegistry {
             }
         }
 
+        let elapsed_ms = traverse_start.elapsed().as_millis() as u64;
+
         let mut metadata = BTreeMap::new();
         metadata.insert("pattern".to_string(), json!(args.pattern));
         metadata.insert(
@@ -912,6 +985,13 @@ impl ToolRegistry {
             "skipped_secret_files".to_string(),
             json!(skipped_secret_files),
         );
+        metadata.insert("symlinks_not_followed".to_string(), json!(!follow_symlinks));
+        metadata.insert(
+            "symlink_skipped_count".to_string(),
+            json!(symlink_skipped_count),
+        );
+        metadata.insert("dirs_visited".to_string(), json!(dirs_visited));
+        metadata.insert("elapsed_ms".to_string(), json!(elapsed_ms));
         if !include_ignored {
             metadata.insert(
                 "hint".to_string(),

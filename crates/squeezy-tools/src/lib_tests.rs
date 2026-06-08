@@ -13181,3 +13181,66 @@ fn detect_inheritance_grep_extraction() {
     assert_eq!(colon.base_names, vec!["Bar"]);
     assert_eq!(colon.decl_kw, "struct");
 }
+
+#[test]
+fn detect_newline_style_lf() {
+    assert_eq!(detect_newline_style(b"hello\nworld\n"), "lf");
+}
+
+#[test]
+fn detect_newline_style_crlf() {
+    assert_eq!(detect_newline_style(b"hello\r\nworld\r\n"), "crlf");
+}
+
+#[test]
+fn detect_newline_style_none() {
+    assert_eq!(detect_newline_style(b"no newlines here"), "none");
+}
+
+#[test]
+fn detect_newline_style_empty() {
+    assert_eq!(detect_newline_style(b""), "none");
+}
+
+#[test]
+fn detect_newline_style_lf_before_crlf() {
+    // A bare \n before any \r\n → reported as lf.
+    assert_eq!(detect_newline_style(b"a\nb\r\nc"), "lf");
+}
+
+#[tokio::test]
+async fn write_file_includes_newline_style() {
+    let root = temp_workspace("write_file_newline_style");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    // Write a new file with LF content.
+    let call = ToolCall {
+        call_id: "newline-write-1".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "newline_test.txt",
+            "content": "line1\nline2\n",
+        }),
+    };
+    let result = registry.execute(call, CancellationToken::new()).await;
+    let v: Value = serde_json::from_str(&result.model_output()).expect("json");
+    // Before: no file existed → "none"
+    assert_eq!(v["newline_style_before"], json!("none"));
+    assert_eq!(v["newline_style_after"], json!("lf"));
+
+    // Overwrite with CRLF content.
+    let before_sha = v["after_sha256"].as_str().unwrap().to_string();
+    let call2 = ToolCall {
+        call_id: "newline-write-2".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "newline_test.txt",
+            "content": "line1\r\nline2\r\n",
+            "expected_sha256": before_sha,
+        }),
+    };
+    let result2 = registry.execute(call2, CancellationToken::new()).await;
+    let v2: Value = serde_json::from_str(&result2.model_output()).expect("json");
+    assert_eq!(v2["newline_style_before"], json!("lf"));
+    assert_eq!(v2["newline_style_after"], json!("crlf"));
+}

@@ -18,7 +18,7 @@ use std::fs;
 use std::os::fd::FromRawFd;
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use squeezy_core::{
     PermissionCapability, PermissionRisk, Redactor, ShellSandboxConfig, ShellSandboxMode,
     StreamRedactor, sensitive_pattern_base,
@@ -480,9 +480,29 @@ impl ToolRegistry {
         );
         self.invalidate_diff_cache();
 
+        // The `command_wrapper` shows the actual process spawned (e.g.
+        // `sh -lc` on Linux/macOS, `sandbox-exec -p ... sh -lc` on macOS
+        // sandbox, etc.) so POSIX-shell vs Bash behavior is explicit.
+        let command_wrapper = if sandbox_plan.args.is_empty() {
+            sandbox_plan.program.clone()
+        } else {
+            // Show program + args up to (but not including) the user's command
+            // literal which is always the last arg on Unix shell plans.
+            let display_args: Vec<&str> = sandbox_plan.args
+                [..sandbox_plan.args.len().saturating_sub(1)]
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            if display_args.is_empty() {
+                sandbox_plan.program.clone()
+            } else {
+                format!("{} {}", sandbox_plan.program, display_args.join(" "))
+            }
+        };
         let mut raw_content = json!({
             "command": args.command,
             "workdir": self.relative(&workdir).to_string_lossy(),
+            "command_wrapper": command_wrapper,
             "exit_code": exit_code,
             "signal": exit_signal,
             "termination": termination,
@@ -491,12 +511,27 @@ impl ToolRegistry {
             "error": error,
             "truncated": truncated,
         });
-        if let Some(fallback) = sandbox_plan.metadata().get("best_effort_fallback").cloned() {
-            insert_content_field(
-                &mut raw_content,
-                "sandbox",
-                json!({ "best_effort_fallback": fallback }),
+        let sandbox_meta = sandbox_plan.metadata();
+        // Always surface sandbox status fields so the model can detect
+        // Linux-specific constraints (ask socket suppressed, Landlock active)
+        // without parsing the backend string.
+        {
+            let mut sandbox_info = serde_json::Map::new();
+            sandbox_info.insert("backend".to_string(), sandbox_meta["backend"].clone());
+            sandbox_info.insert("network".to_string(), sandbox_meta["network"].clone());
+            sandbox_info.insert("filesystem".to_string(), sandbox_meta["filesystem"].clone());
+            sandbox_info.insert(
+                "ask_socket_suppressed".to_string(),
+                sandbox_meta["ask_socket_suppressed"].clone(),
             );
+            sandbox_info.insert(
+                "landlock_active".to_string(),
+                sandbox_meta["landlock_active"].clone(),
+            );
+            if let Some(fallback) = sandbox_meta.get("best_effort_fallback").cloned() {
+                sandbox_info.insert("best_effort_fallback".to_string(), fallback);
+            }
+            insert_content_field(&mut raw_content, "sandbox", Value::Object(sandbox_info));
         }
         if let Some(summary) = implicit_skill {
             insert_content_field(

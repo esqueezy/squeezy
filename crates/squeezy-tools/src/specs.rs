@@ -230,7 +230,8 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."},
-                "context": {"type": "integer", "minimum": 0, "maximum": 50, "description": "Number of leading + trailing context lines to emit around each match (like rg -C N). Default 0. Only affects output_mode=content."}
+                "context": {"type": "integer", "minimum": 0, "maximum": 50, "description": "Number of leading + trailing context lines to emit around each match (like rg -C N). Default 0. Only affects output_mode=content."},
+                "follow_symlinks": {"type": "boolean", "description": "When true, follow symlinks during traversal. Default false. Symlinks whose resolved targets fall outside the workspace root are skipped. Use with care on Linux monorepos with vendored symlink trees."}
             },
             "required": ["pattern"]
         })),
@@ -256,7 +257,8 @@ pub(crate) fn glob_spec() -> ToolSpec {
                 "include_ignored": {"type": "boolean", "description": "When true, include files ignored by .gitignore and other ignore files. Default false."},
                 "diff_only": {"type": "boolean", "description": "When true, list only files changed in the current Git worktree diff. Default false."},
                 "max_paths": {"type": "integer", "minimum": 1, "maximum": 1000},
-                "offset": {"type": "integer", "minimum": 0, "description": "Number of matched paths to skip for pagination."}
+                "offset": {"type": "integer", "minimum": 0, "description": "Number of matched paths to skip for pagination."},
+                "follow_symlinks": {"type": "boolean", "description": "When true, follow symlinks during traversal. Default false. Symlinks whose resolved targets fall outside the workspace root are skipped. Use with care on Linux monorepos with vendored symlink trees."}
             },
             "required": ["pattern"]
         })),

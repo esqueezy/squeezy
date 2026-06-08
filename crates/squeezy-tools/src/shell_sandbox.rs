@@ -220,6 +220,14 @@ impl ShellSandboxPlan {
     }
 
     pub(crate) fn metadata(&self) -> Value {
+        // Whether the `squeezy ask` AF_UNIX callback socket is suppressed for
+        // this backend. True for linux-direct-syscalls (seccomp denies AF_UNIX)
+        // and the Windows sandbox tiers (no Unix socket transport).
+        let ask_socket_suppressed = !self.exports_ask_socket();
+        // Whether Landlock filesystem enforcement is active. On linux-direct-syscalls
+        // this maps to filesystem == "enforced"; other backends do not use Landlock.
+        let landlock_active =
+            self.backend == "linux-direct-syscalls" && self.filesystem == "enforced";
         let mut payload = json!({
             "backend": self.backend,
             "mode": self.mode,
@@ -229,6 +237,8 @@ impl ShellSandboxPlan {
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
+            "ask_socket_suppressed": ask_socket_suppressed,
+            "landlock_active": landlock_active,
         });
         if let Some(record) = self.best_effort_fallback
             && let Some(object) = payload.as_object_mut()
