@@ -151,6 +151,8 @@ use specs::{
 };
 pub use squeezy_graph::LanguageReport;
 
+#[cfg(target_os = "macos")]
+use shell_sandbox::macos_sandbox_exec_supported;
 #[cfg(all(test, target_os = "macos"))]
 use shell_sandbox::macos_shell_sandbox_profile;
 #[cfg(test)]
@@ -161,7 +163,7 @@ use shell_sandbox::{
 pub use shell_sandbox::{ShellSandboxDoctor, shell_sandbox_doctor};
 use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
-    macos_sandbox_exec_supported, prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
+    prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
 #[cfg(target_os = "linux")]
 use shell_sandbox::{linux_landlock_supported, linux_unshare_supported};
