@@ -6787,6 +6787,21 @@ async fn shell_timeout_returns_structured_error_and_kills_process() {
             .contains("timed out")
     );
     assert_eq!(result.content["truncated"], true);
+    #[cfg(unix)]
+    {
+        let kill_meta = result.content["kill_meta"]
+            .as_object()
+            .expect("timeout result must include Unix kill metadata");
+        assert!(
+            kill_meta["pgid"].as_u64().is_some_and(|pgid| pgid > 0),
+            "kill metadata must report the signaled process group: {kill_meta:?}"
+        );
+        assert_eq!(kill_meta["sigterm_ok"], true);
+        assert_eq!(kill_meta["sigkill_sent"], false);
+        assert_eq!(kill_meta["direct_child_fallback"], false);
+    }
+    #[cfg(not(unix))]
+    assert!(result.content.get("kill_meta").is_none());
 
     let _ = fs::remove_dir_all(root);
 }

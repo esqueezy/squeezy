@@ -1609,13 +1609,11 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
         ShellChild::Tokio(child) => {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
-                // Record the actual runtime PGID before sending any signal.
-                // Normally equals `pid` (because configure_shell_process_group
-                // called process_group(0)), but if the child or a wrapper
-                // called setsid/setpgid before we reach here the PGID may
-                // differ.  actual_pgid falls back to pid on ESRCH.
-                let pgid = actual_pgid(pid);
-                let sigterm_ok = kill_process_group(pid, libc::SIGTERM);
+                // `configure_shell_process_group` creates a dedicated process
+                // group whose pgid is the child pid. Keep reporting the same
+                // pgid we signal so metadata reflects the actual target.
+                let pgid = pid;
+                let sigterm_ok = kill_process_group(pgid, libc::SIGTERM);
                 // Treat the grace-period wait as "not expired" only when the
                 // outer timeout returned Ok(Ok(_)) — meaning the child actually
                 // exited.  Ok(Err(_)) means child.wait() returned an IO error
@@ -1637,7 +1635,7 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
                         direct_child_fallback: false,
                     });
                 }
-                let sigkill_ok = kill_process_group(pid, libc::SIGKILL);
+                let sigkill_ok = kill_process_group(pgid, libc::SIGKILL);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 return Some(ShellKillMeta {
@@ -1664,26 +1662,15 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
     None
 }
 
-/// Send `signal` to the process group whose pgid equals `pid`.
+/// Send `signal` to the process group identified by `pgid`.
 /// Returns `true` when the `kill(2)` syscall succeeded (return value ≥ 0).
 /// A `false` return means the pgid was not reachable — the process may have
 /// already exited, changed its process group via `setsid`, or the caller
 /// lacked permission. The caller should treat `false` as a best-effort
 /// signal attempt, not a hard error; `child.kill()` follows as a fallback.
 #[cfg(unix)]
-fn kill_process_group(pid: u32, signal: libc::c_int) -> bool {
-    unsafe { libc::kill(-(pid as libc::pid_t), signal) >= 0 }
-}
-
-/// Return the current process group id for `pid` via `getpgid(2)`.
-/// Falls back to `pid` when `getpgid` fails (e.g. the process already
-/// exited), since the caller uses the result only for diagnostic reporting
-/// in `ShellKillMeta.pgid`; the actual signal target is always `-(pid as
-/// pid_t)` regardless of what `getpgid` returns.
-#[cfg(unix)]
-fn actual_pgid(pid: u32) -> u32 {
-    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
-    if pgid > 0 { pgid as u32 } else { pid }
+fn kill_process_group(pgid: u32, signal: libc::c_int) -> bool {
+    unsafe { libc::kill(-(pgid as libc::pid_t), signal) >= 0 }
 }
 
 /// Compute the env-allowlist-filtered environment that a sandboxed shell child
