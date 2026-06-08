@@ -88,6 +88,32 @@ impl Action {
         Action::ALL.iter().copied().find(|a| a.slug() == slug)
     }
 
+    /// Short note surfaced by `/keymap` when the default binding is
+    /// known to be unreliable across Linux terminals, tmux, or SSH.
+    /// Returns `None` for bindings that are broadly portable.
+    pub(crate) fn terminal_compat_note(self) -> Option<&'static str> {
+        match self {
+            // F11 is often consumed by the desktop window manager or
+            // remapped by terminal emulators (fullscreen toggle).
+            Self::ToggleConfigScreen => Some("terminal-dependent"),
+            // Ctrl+T is tmux's default prefix; Ctrl+P is common in some
+            // editors. Both are Ctrl chords that Linux terminals and tmux
+            // may intercept before Squeezy sees them.
+            Self::ToggleTranscriptOverlay => Some("terminal-dependent"),
+            Self::ToggleTaskPanel => Some("terminal-dependent"),
+            // PageUp/PageDown are intercepted by some terminal emulators
+            // for their own scrollback; also unreliable over SSH.
+            Self::ScrollTranscriptPageUp => Some("terminal-dependent"),
+            Self::ScrollTranscriptPageDown => Some("terminal-dependent"),
+            // Home/End are broadly supported but may behave differently
+            // under screen or certain VTE configurations.
+            Self::TranscriptHome => Some("terminal-dependent"),
+            Self::TranscriptEnd => Some("terminal-dependent"),
+            // Ctrl+Y and Ctrl+R are broadly portable across Linux terminals.
+            Self::CopyLastAssistant | Self::RestoreCancelledPrompt => None,
+        }
+    }
+
     /// Compiled-in default keybinding for the action. Mirrors what
     /// `handle_key` previously hardcoded, so a fresh install behaves
     /// exactly like the pre-`/keymap` build.
@@ -407,7 +433,7 @@ pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
     lines.push("Key bindings".to_string());
     lines.push("(override in settings.toml under [tui.keymap])".to_string());
     lines.push(String::new());
-    let mut rows: Vec<(String, String, bool)> = Vec::new();
+    let mut rows: Vec<(String, String, bool, Option<&'static str>)> = Vec::new();
     for action in Action::ALL.iter().copied() {
         let binding = resolver.binding(action);
         let default = action.default_binding();
@@ -415,19 +441,28 @@ pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
             action.slug().to_string(),
             binding.display(),
             binding != default,
+            action.terminal_compat_note(),
         ));
     }
-    let max_slug = rows.iter().map(|(s, _, _)| s.len()).max().unwrap_or(0);
-    for (slug, display, is_override) in &rows {
+    let max_slug = rows.iter().map(|(s, _, _, _)| s.len()).max().unwrap_or(0);
+    for (slug, display, is_override, note) in &rows {
         let marker = if *is_override { " (override)" } else { "" };
+        let note_str = note.map(|n| format!("  [{n}]")).unwrap_or_default();
         lines.push(format!(
-            "{:<width$}  {}{}",
+            "{:<width$}  {}{}{}",
             slug,
             display,
             marker,
+            note_str,
             width = max_slug
         ));
     }
+    lines.push(String::new());
+    lines.push(
+        "Bindings marked [terminal-dependent] may be intercepted by tmux, SSH, or the terminal"
+            .to_string(),
+    );
+    lines.push("emulator. Use [tui.keymap] in settings.toml to remap to alternatives.".to_string());
     let collisions = resolver.collisions();
     if !collisions.is_empty() {
         lines.push(String::new());

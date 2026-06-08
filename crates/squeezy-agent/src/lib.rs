@@ -3944,7 +3944,8 @@ impl Agent {
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
-            | DispatchCommand::Router { .. }) => DispatchOutcome::TuiOnly {
+            | DispatchCommand::Router { .. }
+            | DispatchCommand::Terminal) => DispatchOutcome::TuiOnly {
                 command: cmd.slash_name().trim_start_matches('/').to_string(),
             },
         }
@@ -5669,13 +5670,26 @@ fn local_tool_completion_message(result: Option<&ToolResult>) -> String {
         ToolStatus::Cancelled => format!("`{command}` was cancelled."),
         _ => {
             let detail = tool_failure_detail(result);
-            if !stderr.is_empty() {
+            let shell_hint = effective_shell_hint();
+            let base = if !stderr.is_empty() {
                 format!("`{command}` failed: {detail}\n\n{stderr}")
             } else {
                 format!("`{command}` failed: {detail}")
-            }
+            };
+            format!("{base}\n{shell_hint}")
         }
     }
+}
+
+/// Short hint about the effective shell used for `!cmd` / `!!cmd`
+/// commands. Shown on failure so users know which shell to target and
+/// that `SQUEEZY_SHELL` can override it.
+fn effective_shell_hint() -> String {
+    let shell = std::env::var("SQUEEZY_SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "sh -lc (default)".to_string());
+    format!("[shell: {shell} — set SQUEEZY_SHELL to change, e.g. SQUEEZY_SHELL=/bin/bash]")
 }
 
 struct TurnRuntime {
@@ -14438,7 +14452,8 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         | DispatchCommand::Statusline
         | DispatchCommand::Keymap
         | DispatchCommand::Cheap
-        | DispatchCommand::Parent => SlashArgShape::None,
+        | DispatchCommand::Parent
+        | DispatchCommand::Terminal => SlashArgShape::None,
         DispatchCommand::Attach { .. } => SlashArgShape::Path,
         DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
             if option_has_text(prompt.as_ref()) {

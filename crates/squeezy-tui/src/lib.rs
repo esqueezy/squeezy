@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
     hash::{Hash, Hasher},
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -353,6 +353,20 @@ where
             || term.contains("contour")
         {
             return true;
+        }
+    }
+    // Tmux passthrough profile: when running inside tmux with a capable outer
+    // terminal, DEC mode 2026 can be passed through via tmux's DCS passthrough
+    // (`allow-passthrough on`). Tmux overwrites $TERM to `tmux-256color`,
+    // masking the outer terminal's $TERM, but tmux 3.3+ sets TERM_PROGRAM=tmux
+    // and some outer terminals set COLORTERM. When inside tmux check for
+    // COLORTERM=truecolor as a signal of a capable outer emulator.
+    if env_get("TMUX").is_some() {
+        if let Some(colorterm) = env_get("COLORTERM") {
+            let ct = colorterm.to_string_lossy().to_ascii_lowercase();
+            if ct == "truecolor" || ct == "24bit" {
+                return true;
+            }
         }
     }
     false
@@ -3683,7 +3697,8 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         | DispatchCommand::Statusline
         | DispatchCommand::Keymap
         | DispatchCommand::Cheap
-        | DispatchCommand::Parent => SlashArgShape::None,
+        | DispatchCommand::Parent
+        | DispatchCommand::Terminal => SlashArgShape::None,
         DispatchCommand::Attach { .. } => SlashArgShape::Path,
         DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
             slash_option_shape(prompt.as_ref(), SlashArgShape::FreeText)
@@ -4286,6 +4301,11 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             } else {
                 format!("keymap ({overrides} override(s))")
             };
+            app.push_transcript_item(TranscriptItem::system(body));
+        }
+        DispatchCommand::Terminal => {
+            let body = build_terminal_diagnostic(app);
+            app.status = "terminal diagnostics".to_string();
             app.push_transcript_item(TranscriptItem::system(body));
         }
         DispatchCommand::Tasks => {
@@ -5226,7 +5246,13 @@ fn copy_last_assistant_to_clipboard(app: &mut TuiApp) {
     };
     match app.clipboard.copy_text(&text) {
         Ok(()) => {
-            app.status = format!("copied assistant message ({} chars)", text.chars().count());
+            // Report what was actually done: the OSC52 sequence was written
+            // to stdout. Whether the terminal (or tmux/SSH relay) accepted
+            // it cannot be verified from this side.
+            app.status = format!(
+                "OSC52 clipboard sequence written ({} chars)",
+                text.chars().count()
+            );
         }
         Err(error) => {
             app.status = format!("copy failed: {error}");
@@ -5242,6 +5268,102 @@ fn last_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
         .iter()
         .rev()
         .find_map(TranscriptEntry::assistant_content)
+}
+
+/// Build a compact terminal diagnostic string for the `/terminal` command.
+/// Reports the key capabilities and environment settings that affect TUI
+/// behaviour, especially on Linux where terminal variety is high.
+fn build_terminal_diagnostic(app: &TuiApp) -> String {
+    let mut rows: Vec<(&'static str, String)> = Vec::new();
+
+    // TTY status
+    let stdout_tty = if io::stdout().is_terminal() {
+        "yes"
+    } else {
+        "no (redirected)"
+    };
+    let stdin_tty = if io::stdin().is_terminal() {
+        "yes"
+    } else {
+        "no (piped)"
+    };
+    rows.push(("stdout tty", stdout_tty.to_string()));
+    rows.push(("stdin tty", stdin_tty.to_string()));
+
+    // Terminal identity
+    let term = env::var("TERM").unwrap_or_else(|_| "(unset)".to_string());
+    let colorterm = env::var("COLORTERM").unwrap_or_else(|_| "(unset)".to_string());
+    rows.push(("$TERM", term));
+    rows.push(("$COLORTERM", colorterm));
+
+    // Multiplexer
+    let in_tmux = env::var_os("TMUX").is_some();
+    let in_screen = env::var_os("STY").is_some();
+    let mux = match (in_tmux, in_screen) {
+        (true, _) => "tmux".to_string(),
+        (_, true) => "screen".to_string(),
+        _ => "none".to_string(),
+    };
+    rows.push(("multiplexer", mux));
+
+    // Synchronized output — report the Auto heuristic result and note if a
+    // passthrough session is detected (tmux + truecolor outer terminal).
+    let sync_detected = detect_synchronized_output_support_from_env(|k| env::var_os(k));
+    rows.push((
+        "synchronized output",
+        format!(
+            "Auto ({})",
+            if sync_detected { "enabled" } else { "disabled" }
+        ),
+    ));
+
+    // Mouse capture
+    let mouse = if env::var_os("SQUEEZY_MOUSE_CAPTURE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+    {
+        "enabled (SQUEEZY_MOUSE_CAPTURE=1)"
+    } else {
+        "disabled (set SQUEEZY_MOUSE_CAPTURE=1 to enable)"
+    };
+    rows.push(("mouse capture", mouse.to_string()));
+
+    // Clipboard method
+    rows.push((
+        "clipboard",
+        format!(
+            "OSC52 (cap {} bytes; terminal acceptance not verifiable)",
+            OSC52_MAX_PAYLOAD_BYTES
+        ),
+    ));
+
+    // Notifications — use the resolved backend from the live notifier.
+    let notif = match app.desktop_notifier.resolved() {
+        None => "off".to_string(),
+        Some(squeezy_core::NotificationMethod::Bel) => "BEL".to_string(),
+        Some(squeezy_core::NotificationMethod::Osc9) => "OSC9".to_string(),
+        Some(squeezy_core::NotificationMethod::Auto) => "auto".to_string(),
+        Some(squeezy_core::NotificationMethod::Off) => "off".to_string(),
+    };
+    rows.push(("notifications", notif));
+
+    // Effective shell
+    let shell = env::var("SQUEEZY_SHELL").unwrap_or_else(|_| "sh -lc (default)".to_string());
+    rows.push(("effective shell", shell));
+
+    // Format as a two-column table
+    let label_width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut lines = vec!["Terminal diagnostics".to_string(), String::new()];
+    for (key, val) in &rows {
+        lines.push(format!("  {:<width$}  {}", key, val, width = label_width));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Remedies: tmux OSC52 → `set-option allow-passthrough on`; \
+         mouse → SQUEEZY_MOUSE_CAPTURE=1; shell → SQUEEZY_SHELL=/bin/bash"
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
@@ -15538,6 +15660,15 @@ pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 
 impl Clipboard for Osc52Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
+        // Guard: OSC52 is a terminal-only escape sequence. When stdout is
+        // not a terminal the bytes would corrupt piped output or be silently
+        // discarded. This is an extra safety net — the TUI startup already
+        // refuses to run if stdout is not a terminal.
+        if !io::stdout().is_terminal() {
+            return Err(
+                "stdout is not a terminal; OSC52 clipboard sequence not emitted".to_string(),
+            );
+        }
         if text.len() > OSC52_MAX_PAYLOAD_BYTES {
             return Err(format!(
                 "payload {} bytes exceeds terminal clipboard cap of {} bytes",
@@ -17994,6 +18125,30 @@ impl TerminalGuard {
 
 impl TerminalGuard {
     fn enter(synchronized_output: TuiSynchronizedOutput) -> Result<Self> {
+        // Refuse interactive TUI startup when stdout is not a real terminal.
+        // Redirected stdout (e.g. `squeezy > out.txt` with interactive stdin)
+        // would pollute the redirected output with raw ANSI sequences.
+        if !io::stdout().is_terminal() {
+            return Err(SqueezyError::Terminal(
+                "stdout is not a terminal; use --prompt for non-interactive output \
+                 or run in a real terminal"
+                    .to_string(),
+            ));
+        }
+        // TERM=dumb signals a minimal terminal incapable of handling ANSI
+        // sequences: CI consoles, serial shells, simple buffers. Refuse TUI
+        // startup instead of polluting the session with unintelligible bytes.
+        if env::var_os("TERM")
+            .as_deref()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case("dumb"))
+        {
+            return Err(SqueezyError::Terminal(
+                "TERM=dumb: interactive TUI requires a capable terminal; \
+                 use --prompt for non-interactive output"
+                    .to_string(),
+            ));
+        }
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         // Wrap stdout in the env-gated debug-tap writer so every
@@ -18002,11 +18157,19 @@ impl TerminalGuard {
         // `SQUEEZY_TUI_WRITE_LOG` is set. When unset the wrapper is a
         // thin pass-through.
         let mut writer = TerminalWriter::from_env(io::stdout());
-        let _ = execute!(
+        if let Err(err) = execute!(
             writer,
             DisableModifyOtherKeys,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
-        );
+        ) {
+            // Keyboard enhancement is unavailable on this terminal (older
+            // xterm, tmux without passthrough, SSH, VTE). Log at debug so
+            // `RUST_LOG=debug` can surface it; the TUI still works but
+            // Ctrl/Alt chords may not distinguish all key combinations.
+            tracing::debug!(
+                "keyboard enhancement setup unavailable (terminal may not support it): {err}"
+            );
+        }
         // Mouse capture is opt-in: it hijacks native text selection
         // and terminal scrollback (Shift+drag / Shift+wheel become the
         // escape hatch, which is friction users shouldn't pay by

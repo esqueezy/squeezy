@@ -164,6 +164,11 @@ pub enum DispatchCommand {
     Router {
         value: Option<String>,
     },
+    /// `/terminal` — show a compact terminal diagnostic table:
+    /// TTY status, $TERM, $COLORTERM, tmux/screen presence,
+    /// synchronized-output policy, mouse capture, clipboard method,
+    /// notification method, and effective shell.
+    Terminal,
 }
 
 impl DispatchCommand {
@@ -217,6 +222,7 @@ impl DispatchCommand {
             Self::Cheap => "/cheap",
             Self::Parent => "/parent",
             Self::Router { .. } => "/router",
+            Self::Terminal => "/terminal",
         }
     }
 
@@ -382,6 +388,7 @@ impl DispatchCommand {
             "/router" => Self::Router {
                 value: first_token(rest),
             },
+            "/terminal" => Self::Terminal,
             unknown => {
                 return Err(DispatchCommandParseError::Unknown {
                     command: unknown.to_string(),

@@ -341,6 +341,10 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         &[PermissionCapability::Edit],
     ),
     slash("/keymap", "list current key bindings"),
+    slash(
+        "/terminal",
+        "show terminal diagnostic info (TTY, TERM, clipboard, notifications, shell)",
+    ),
 ];
 
 impl SlashCommand {

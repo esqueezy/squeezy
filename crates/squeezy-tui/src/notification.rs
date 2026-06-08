@@ -97,11 +97,33 @@ fn sanitized_message(message: &str) -> String {
 }
 
 fn terminal_supports_osc9() -> bool {
-    let program = env::var("TERM_PROGRAM").unwrap_or_default();
-    matches!(
-        program.as_str(),
-        "iTerm.app" | "Ghostty" | "WezTerm" | "kitty" | "WarpTerminal"
-    )
+    // TERM_PROGRAM match — macOS/cross-platform emulators that report
+    // themselves via this var and are known to honour OSC 9.
+    if let Ok(program) = env::var("TERM_PROGRAM") {
+        if matches!(
+            program.as_str(),
+            "iTerm.app" | "Ghostty" | "WezTerm" | "kitty" | "WarpTerminal"
+        ) {
+            return true;
+        }
+    }
+    // Linux-specific environment signals present in capable emulators
+    // even when running inside tmux (which overwrites $TERM_PROGRAM).
+    if env::var_os("KITTY_WINDOW_ID").is_some()
+        || env::var_os("WEZTERM_PANE").is_some()
+        || env::var_os("WEZTERM_EXECUTABLE").is_some()
+        || env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+    {
+        return true;
+    }
+    // TERM values that identify OSC-9-capable emulators on Linux.
+    if let Ok(term) = env::var("TERM") {
+        let term = term.to_ascii_lowercase();
+        if term.contains("kitty") || term.contains("ghostty") || term.contains("wezterm") {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
