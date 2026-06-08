@@ -1094,6 +1094,27 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                     }
                     _ => {}
                 }
+                // Reject HTTP-only fields when the transport is stdio; the runtime
+                // silently ignores them, which would mislead the user.
+                if matches!(transport, McpTransport::Stdio) {
+                    if args.bearer_token_env_var.is_some() {
+                        return Err(SqueezyError::Config(
+                            "--bearer-token-env-var is only valid for http and sse transports"
+                                .to_string(),
+                        ));
+                    }
+                    if !args.http_headers.is_empty() {
+                        return Err(SqueezyError::Config(
+                            "--http-header is only valid for http and sse transports".to_string(),
+                        ));
+                    }
+                    if !args.env_http_headers.is_empty() {
+                        return Err(SqueezyError::Config(
+                            "--env-http-header is only valid for http and sse transports"
+                                .to_string(),
+                        ));
+                    }
+                }
                 let mut server = Table::new();
                 server.insert("enabled", Item::Value(TomlValue::from(true)));
                 server.insert(

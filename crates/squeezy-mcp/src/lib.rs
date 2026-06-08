@@ -313,6 +313,10 @@ pub struct McpClientRegistry {
     /// The inner `Arc<TokioMutex<()>>` is held for the entire startup duration;
     /// subsequent callers find the session already populated after the gate.
     startup_gates: Arc<Mutex<BTreeMap<String, Arc<TokioMutex<()>>>>>,
+    /// Last-seen stderr lines for each stdio server, preserved after session
+    /// invalidation so `stderr_tail` returns useful output for failed/crashed
+    /// servers whose session has already been removed from `sessions`.
+    stderr_excerpts: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     store: Option<Arc<SqueezyStore>>,
     status_tx: watch::Sender<McpStatusSnapshot>,
     elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
@@ -349,6 +353,7 @@ impl McpClientRegistry {
             cache: Arc::new(Mutex::new(BTreeMap::new())),
             sessions: Arc::new(TokioMutex::new(BTreeMap::new())),
             startup_gates: Arc::new(Mutex::new(BTreeMap::new())),
+            stderr_excerpts: Arc::new(Mutex::new(BTreeMap::new())),
             store,
             status_tx,
             elicitation_handler: Arc::new(Mutex::new(None)),
@@ -833,10 +838,20 @@ impl McpClientRegistry {
         }
 
         let server = self.server_config(server_name)?;
-        if !self
+        let is_declared = match self
             .resource_uri_is_declared(server_name, &server, uri, cancel.clone())
-            .await?
+            .await
         {
+            Ok(v) => v,
+            Err(error) => {
+                // A transport error from the declaration check means the
+                // session is broken; invalidate it so the next call triggers
+                // a fresh startup.
+                self.invalidate_session(server_name).await;
+                return Err(error);
+            }
+        };
+        if !is_declared {
             return Err(McpError::UndeclaredResource {
                 server: server_name.to_string(),
                 uri: uri.to_string(),
@@ -1051,34 +1066,62 @@ impl McpClientRegistry {
     }
 
     async fn invalidate_session(&self, server_name: &str) {
-        let mut sessions = self.sessions.lock().await;
-        sessions.remove(server_name);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(server_name)
+        };
+        // Preserve the last stderr lines so they survive session teardown and
+        // remain available to `stderr_tail` for diagnostics (e.g. doctor --probe).
+        if let Some(entry) = removed {
+            if let Some(ring) = &entry.stderr_ring {
+                if let (Ok(r), Ok(mut excerpts)) = (ring.lock(), self.stderr_excerpts.lock()) {
+                    let lines: Vec<String> = r.iter().cloned().collect();
+                    if !lines.is_empty() {
+                        excerpts.insert(server_name.to_string(), lines);
+                    }
+                }
+            }
+        }
         if let Ok(mut cache) = self.resource_declarations.lock() {
             cache.remove(server_name);
         }
     }
 
     pub async fn shutdown(&self) {
+        if let Ok(mut gates) = self.startup_gates.lock() {
+            gates.clear();
+        }
         let mut sessions = self.sessions.lock().await;
         sessions.clear();
         if let Ok(mut cache) = self.resource_declarations.lock() {
             cache.clear();
         }
+        if let Ok(mut excerpts) = self.stderr_excerpts.lock() {
+            excerpts.clear();
+        }
     }
 
     /// Return a snapshot of the recent stderr lines for the named stdio MCP
-    /// server. Returns an empty vec if the server has no active session, is not
-    /// a stdio transport, or no lines have been captured yet.
+    /// server. If the server has an active session, the live ring buffer is
+    /// returned. If the session was already invalidated (e.g., after a failed
+    /// discovery), the last preserved excerpt is returned instead so
+    /// diagnostics (e.g., `doctor --probe`) still see the output.
     pub async fn stderr_tail(&self, server_name: &str) -> Vec<String> {
-        let sessions = self.sessions.lock().await;
-        let Some(entry) = sessions.get(server_name) else {
-            return Vec::new();
-        };
-        let Some(ring) = &entry.stderr_ring else {
-            return Vec::new();
-        };
-        ring.lock()
-            .map(|r| r.iter().cloned().collect())
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(entry) = sessions.get(server_name) {
+                return entry
+                    .stderr_ring
+                    .as_ref()
+                    .and_then(|ring| ring.lock().ok())
+                    .map(|r| r.iter().cloned().collect())
+                    .unwrap_or_default();
+            }
+        }
+        // Session gone (invalidated); return any preserved excerpt.
+        self.stderr_excerpts
+            .lock()
+            .map(|ex| ex.get(server_name).cloned().unwrap_or_default())
             .unwrap_or_default()
     }
 
@@ -1387,25 +1430,43 @@ impl McpClientRegistry {
             return Ok(cached);
         }
 
-        let resources_result = self
+        // Propagate transport-level errors so a broken session is surfaced to
+        // the caller (which then calls `invalidate_session`) rather than being
+        // silently swallowed and leaving the stale session cached indefinitely.
+        let resources = match self
             .all_resources(server_name, server, cancel.clone())
-            .await;
-        let resources = resources_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
-        if let Ok(resources) = &resources_result {
-            self.store_resource_declarations_partial(server_name, Some(resources), None);
-            if resources.iter().any(|resource| resource.raw.uri == uri) {
-                return Ok(true);
+            .await
+        {
+            Ok(r) => {
+                self.store_resource_declarations_partial(server_name, Some(&r), None);
+                if r.iter().any(|resource| resource.raw.uri == uri) {
+                    return Ok(true);
+                }
+                r
             }
-        }
+            Err(
+                e @ (McpError::Transport { .. }
+                | McpError::Timeout { .. }
+                | McpError::Cancelled { .. }),
+            ) => return Err(e),
+            Err(_) => Vec::new(),
+        };
 
-        let templates_result = self
+        let templates = match self
             .all_resource_templates(server_name, server, cancel)
-            .await;
-        let templates = templates_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
-
-        if let Ok(templates) = &templates_result {
-            self.store_resource_declarations_partial(server_name, None, Some(templates));
-        }
+            .await
+        {
+            Ok(t) => {
+                self.store_resource_declarations_partial(server_name, None, Some(&t));
+                t
+            }
+            Err(
+                e @ (McpError::Transport { .. }
+                | McpError::Timeout { .. }
+                | McpError::Cancelled { .. }),
+            ) => return Err(e),
+            Err(_) => Vec::new(),
+        };
 
         Ok(resources.iter().any(|resource| resource.raw.uri == uri)
             || templates
@@ -1938,8 +1999,14 @@ async fn start_stdio_service(
                     Ok(Some(raw_line)) => {
                         // Truncate untrusted child output before logging or
                         // storing to avoid log injection and memory growth.
+                        // Find the largest UTF-8 char boundary ≤ the byte
+                        // cap so we never slice mid-codepoint and panic.
                         let line = if raw_line.len() > STDERR_LINE_MAX_BYTES {
-                            let mut s = raw_line[..STDERR_LINE_MAX_BYTES].to_string();
+                            let end = (0..=STDERR_LINE_MAX_BYTES)
+                                .rev()
+                                .find(|&i| raw_line.is_char_boundary(i))
+                                .unwrap_or(0);
+                            let mut s = raw_line[..end].to_string();
                             s.push_str(" [truncated]");
                             s
                         } else {

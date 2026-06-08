@@ -805,15 +805,40 @@ fn stdio_probe_detail(name: &str, server: &McpServerConfig) -> String {
 
 /// Walk `$PATH` to find the first executable named `name`. Returns the absolute
 /// path as a `String`, or `None` if no match is found.
+///
+/// On Unix the candidate must have at least one execute bit set; a file that
+/// is readable but not executable would fail at startup with "Permission denied"
+/// and is more useful to surface as "not found" in the doctor detail string.
 fn which_in_path(name: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return candidate.into_os_string().into_string().ok();
         }
     }
     None
+}
+
+/// Return `true` if `path` is a regular file that the current process can
+/// attempt to execute. On Unix this checks `is_file()` *and* at least one
+/// execute bit in the mode bits; on other platforms it falls back to
+/// `is_file()` only (no permission API available).
+fn is_executable_file(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {

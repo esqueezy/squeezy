@@ -18,7 +18,11 @@
 //! the POST URL up front vs. learns it from `event: endpoint`), so an SSE
 //! server cannot be driven by the streamable-HTTP client and vice versa.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use http::{HeaderName, HeaderValue};
@@ -211,6 +215,11 @@ impl Worker for SseClientWorker {
     }
 }
 
+/// Global call counter mixed into each reconnect delay. Ensures concurrent
+/// workers that reconnect at the same instant produce different delays even
+/// when the system clock resolution is coarser than their spacing.
+static SSE_JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Compute the reconnect backoff delay in milliseconds for the given attempt
 /// number (0-indexed). Uses full-jitter exponential backoff:
 ///
@@ -221,21 +230,36 @@ impl Worker for SseClientWorker {
 /// Full jitter spreads concurrent clients across the reconnect window and
 /// prevents the thundering-herd that a fixed or additive backoff produces
 /// when a local daemon crashes and many reconnects pile up simultaneously.
+///
+/// The jitter source mixes a process-global monotonic counter with the current
+/// nanosecond timestamp. The counter ensures callers in the same nanosecond —
+/// the failure mode of a pure time-based approach — still produce distinct
+/// delays.
 fn sse_reconnect_delay_ms(attempt: u32) -> u64 {
     let shift = attempt.min(10); // cap the shift to avoid overflow
     let cap = SSE_RECONNECT_BASE_MS
         .saturating_mul(1u64 << shift)
         .min(SSE_RECONNECT_MAX_MS);
-    // Cheap deterministic jitter from the current time's sub-millisecond bits.
-    let jitter_source = std::time::SystemTime::now()
+    if cap == 0 {
+        return 0;
+    }
+    // Mix a global counter (unique per call) with the current nanosecond
+    // timestamp (unique across restarts) for a low-cost, non-repeating seed.
+    let counter = SSE_JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let time_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(12345);
-    // Map nanos to [0, cap)
-    (jitter_source as u64)
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1)
-        % cap.max(1)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(counter.wrapping_mul(6364136223846793005));
+    // Splitmix64 finalizer to spread the bits.
+    let mut seed = counter
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(time_ns);
+    seed ^= seed >> 30;
+    seed = seed.wrapping_mul(0xbf58476d1ce4e5b9);
+    seed ^= seed >> 27;
+    seed = seed.wrapping_mul(0x94d049bb133111eb);
+    seed ^= seed >> 31;
+    seed % cap
 }
 
 impl SseClientWorker {
