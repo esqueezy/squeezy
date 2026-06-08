@@ -1240,20 +1240,9 @@ struct StatusRow {
 impl StatusRow {
     fn effective_source(&self) -> &'static str {
         if self.inline_tier.is_some() {
-            // On Windows, distinguish file-backed from a hypothetical
-            // Credential Manager source. Currently all inline keys are
-            // file-backed (TOML or credentials.json).
-            if cfg!(windows) {
-                "inline (file-backed)"
-            } else {
-                "inline"
-            }
+            "inline"
         } else if self.credentials_file_set {
-            if cfg!(windows) {
-                "credentials.json (file-backed)"
-            } else {
-                "credentials.json"
-            }
+            "credentials.json"
         } else if self.env_set {
             "env"
         } else if self.fallback_env_set {
@@ -1261,6 +1250,14 @@ impl StatusRow {
         } else {
             "missing"
         }
+    }
+
+    /// Whether the active key is file-backed rather than sourced from an
+    /// environment variable or a credential manager. On Windows this
+    /// distinction matters because file-backed keys are not protected by
+    /// DPAPI or Windows Credential Manager.
+    fn is_file_backed(&self) -> bool {
+        self.inline_tier.is_some() || self.credentials_file_set
     }
 
     fn to_json(&self) -> serde_json::Value {
@@ -1275,6 +1272,7 @@ impl StatusRow {
             "fallback_env_set": self.fallback_env_set,
             "credentials_file_set": self.credentials_file_set,
             "effective_source": self.effective_source(),
+            "file_backed": self.is_file_backed(),
         })
     }
 }
@@ -1355,12 +1353,14 @@ fn print_status_table(rows: &[StatusRow]) {
             (Some(tier), Some(path)) => format!("{} ({})", tier.as_str(), path.display()),
             _ => "-".to_string(),
         };
-        grid.push([
-            row.provider.to_string(),
-            row.effective_source().to_string(),
-            env_cell,
-            inline_cell,
-        ]);
+        // On Windows, annotate file-backed sources so users know the key
+        // is not protected by Windows Credential Manager or DPAPI.
+        let source_cell = if cfg!(windows) && row.is_file_backed() {
+            format!("{} [file-backed]", row.effective_source())
+        } else {
+            row.effective_source().to_string()
+        };
+        grid.push([row.provider.to_string(), source_cell, env_cell, inline_cell]);
     }
     print_table_rows(&grid);
 }
