@@ -11897,6 +11897,29 @@ async fn slash_keymap_surfaces_overrides_and_diagnostics() {
     assert!(body.contains("PageUp"), "default binding lost: {body}");
 }
 
+#[tokio::test]
+async fn slash_terminal_reports_diagnostics() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/terminal").await;
+    assert!(ran);
+    assert_eq!(app.status, "terminal diagnostics");
+
+    let body = last_message_content(&app)
+        .expect("terminal diagnostics transcript entry")
+        .to_string();
+    for expected in [
+        "Terminal diagnostics",
+        "stdout tty",
+        "$TERM",
+        "clipboard",
+        "effective shell",
+    ] {
+        assert!(body.contains(expected), "missing {expected:?}: {body}");
+    }
+}
+
 /// Serializes `/theme` tests so the process-global palette override and the
 /// `SQUEEZY_SETTINGS_PATH` env var don't race between concurrent tests.
 static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

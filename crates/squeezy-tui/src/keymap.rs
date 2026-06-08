@@ -141,7 +141,8 @@ impl Action {
 /// A normalised `(KeyCode, KeyModifiers)` pair. Modifiers are stored
 /// with `SHIFT` stripped from `KeyCode::Char` because the shift bit
 /// usually shows up on uppercase letters but not on punctuation
-/// (terminal-dependent). The eq compares on the canonical form.
+/// (terminal-dependent). Ctrl/Alt letters are lowercased to match
+/// `handle_key`'s event normalisation before lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct KeyBinding {
     pub(crate) code: KeyCode,
@@ -149,11 +150,16 @@ pub(crate) struct KeyBinding {
 }
 
 impl KeyBinding {
-    pub(crate) fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        Self {
-            code,
-            modifiers: normalise_modifiers(code, modifiers),
+    pub(crate) fn new(mut code: KeyCode, modifiers: KeyModifiers) -> Self {
+        let mut modifiers = normalise_modifiers(code, modifiers);
+        if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let KeyCode::Char(ch) = code
+            && ch.is_ascii_alphabetic()
+        {
+            code = KeyCode::Char(ch.to_ascii_lowercase());
+            modifiers.remove(KeyModifiers::SHIFT);
         }
+        Self { code, modifiers }
     }
 
     /// Human-facing description: `"Ctrl+T"`, `"PageUp"`, `"Alt+k"`.
