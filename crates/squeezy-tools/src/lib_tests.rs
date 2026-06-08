@@ -973,6 +973,34 @@ async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn required_glob_normalizes_windows_separators() {
+    let glob = build_required_glob(r"src\**\*.rs").expect("glob");
+
+    assert!(glob.is_match("src/bin/main.rs"));
+    assert!(!glob.is_match("tests/bin/main.rs"));
+}
+
+#[test]
+fn include_set_normalizes_windows_separators() {
+    let patterns = vec![r"src\**\*.rs".to_string(), "README.md".to_string()];
+    let include = build_include_set(Some(&patterns))
+        .expect("include set")
+        .expect("include set present");
+
+    assert!(include.is_match("src/bin/main.rs"));
+    assert!(include.is_match("docs/README.md"));
+    assert!(!include.is_match("tests/bin/main.rs"));
+}
+
+#[test]
+fn detect_line_endings_classifies_common_shapes() {
+    assert_eq!(detect_line_endings(b"one\r\ntwo\r\n"), "crlf");
+    assert_eq!(detect_line_endings(b"one\ntwo\n"), "lf");
+    assert_eq!(detect_line_endings(b"one\r\ntwo\n"), "mixed");
+    assert_eq!(detect_line_endings(b"one two"), "none");
+}
+
 #[tokio::test]
 async fn grep_and_glob_apply_squeezy_indexing_policy_by_default() {
     let root = temp_workspace("tool_indexing_policy");

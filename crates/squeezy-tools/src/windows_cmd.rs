@@ -16,15 +16,26 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let tokens: Vec<&str> = lower.split_whitespace().collect();
     let first = tokens.first().copied().unwrap_or("");
 
-    // ── Remove-Item / ri (PowerShell) ────────────────────────────────────
+    let powershell_command = tokens
+        .iter()
+        .copied()
+        .find(|token| *token != "&")
+        .unwrap_or("");
+    let command_name = powershell_command
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .rsplit(|ch| ch == '\\' || ch == '/')
+        .next()
+        .unwrap_or(powershell_command);
+
+    // Remove-Item / ri (PowerShell).
     // Destructive when any of:
-    //   • -Recurse or its short alias -r is present (any parameter position)
-    //   • -Confirm:$false suppresses the safety prompt
+    //   - -Recurse or its short alias -r is present (any parameter position)
+    //   - -Confirm:$false suppresses the safety prompt
     //
     // The `ri` check matches the built-in PowerShell alias; `rm` / `rmdir`
     // are already flagged by the POSIX destructive-verb list in
     // `destructive_shell_segment_reason`.
-    let is_remove_item = lower.contains("remove-item") || first == "ri";
+    let is_remove_item = command_name == "remove-item" || command_name == "ri";
     if is_remove_item {
         let has_recurse = tokens.iter().any(|t| *t == "-recurse" || *t == "-r");
         if has_recurse || lower.contains("-confirm:$false") {
@@ -32,19 +43,19 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         }
     }
 
-    // ── Other unambiguously destructive PowerShell cmdlets ───────────────
-    for needle in [
+    // Other unambiguously destructive PowerShell cmdlets.
+    if [
         "set-executionpolicy",
         "new-localuser",
         "clear-recyclebin",
         "format-volume",
-    ] {
-        if lower.contains(needle) {
-            return true;
-        }
+    ]
+    .contains(&command_name)
+    {
+        return true;
     }
 
-    // ── cmd.exe destructive commands ─────────────────────────────────────
+    // cmd.exe destructive commands.
     // Tokenise to avoid matching substrings inside paths.
     let flag_matches = |flag: &str| tokens.contains(&flag);
 

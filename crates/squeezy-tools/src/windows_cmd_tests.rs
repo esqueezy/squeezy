@@ -52,6 +52,16 @@ fn flags_remove_item_short_recurse_alias() {
 }
 
 #[test]
+fn flags_invoked_and_module_qualified_remove_item() {
+    assert!(is_destructive_windows_segment(
+        "& Remove-Item -Recurse C:\\tmp"
+    ));
+    assert!(is_destructive_windows_segment(
+        "Microsoft.PowerShell.Management\\Remove-Item -r C:\\tmp"
+    ));
+}
+
+#[test]
 fn flags_set_executionpolicy() {
     assert!(is_destructive_windows_segment(
         "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process"
@@ -110,5 +120,13 @@ fn ignores_benign_commands() {
     // Remove-Item without -Recurse/-r or -Confirm:$false is not flagged.
     assert!(!is_destructive_windows_segment(
         "Remove-Item C:\\logs\\app.log"
+    ));
+    // Cmdlet names mentioned as ordinary arguments must not trigger the
+    // destructive classifier.
+    assert!(!is_destructive_windows_segment(
+        "Write-Output remove-item -Confirm:$false"
+    ));
+    assert!(!is_destructive_windows_segment(
+        "Write-Output set-executionpolicy"
     ));
 }
