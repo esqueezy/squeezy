@@ -240,8 +240,16 @@ The agent-facing graph tool surface is:
   enclosing symbol span (function, method, impl, test) is a follow-up rather
   than something this surface already implements.
 
-Graph navigation tools return uniform evidence packets with `claim`, `spans`,
-`confidence`, `freshness`, `provenance`, `cost_hint`, and `next_action`.
+Graph navigation tools return compact evidence packets. The wire payload has been
+deliberately trimmed: `claim`, `freshness`, `provenance`, `cost_hint`, and
+`next_action` are dropped to reduce per-result token cost — these signals flow to
+telemetry via typed graph events rather than the tool result JSON. The `symbol`
+body carries `id`, `name`, `kind`, `path`, `signature`, `span`, `confidence`,
+and optionally `rank` (present when a query was provided; values: `exact`,
+`case_insensitive`, `signature_substring`, `token_bag`, `fuzzy`) plus
+`visibility` and `dirty` when set. Zero-hit results include a structured
+`fallback` object with `status`, `reason`, and a one-line `hint` that
+distinguishes unsupported-language paths from indexed-language misses.
 Unsupported or unknown-language paths return structured fallback suggestions for
 bounded grep/read navigation rather than graph confidence. Raw file reads should
 be targeted by graph spans or `read_slice` ranges.
