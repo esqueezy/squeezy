@@ -2355,6 +2355,41 @@ impl AppConfig {
                     .join(", ");
                 output.push_str(&format!("env = {{ {entries} }}\n"));
             }
+            if let Some(cwd) = &server.cwd {
+                output.push_str(&format!("cwd = {}\n", toml_string(cwd)));
+            }
+            if let Some(env_var) = &server.bearer_token_env_var {
+                output.push_str(&format!(
+                    "bearer_token_env_var = {}\n",
+                    toml_string(env_var)
+                ));
+            }
+            if !server.http_headers.is_empty() {
+                let entries = server
+                    .http_headers
+                    .keys()
+                    .map(|key| {
+                        format!(
+                            "{} = {}",
+                            toml_bare_or_quoted_key(key),
+                            toml_string("<redacted>")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("http_headers = {{ {entries} }}\n"));
+            }
+            if !server.env_http_headers.is_empty() {
+                let entries = server
+                    .env_http_headers
+                    .iter()
+                    .map(|(key, value)| {
+                        format!("{} = {}", toml_bare_or_quoted_key(key), toml_string(value))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("env_http_headers = {{ {entries} }}\n"));
+            }
             if let Some(default) = server.permissions.default {
                 output.push('\n');
                 output.push_str(&format!(
