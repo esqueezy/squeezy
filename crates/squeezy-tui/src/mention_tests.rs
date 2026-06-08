@@ -283,3 +283,24 @@ fn detect_mention_mismatched_quote_falls_back_to_unquoted() {
     assert_eq!(q.end, 6);
     assert_eq!(q.query, "\"docs");
 }
+
+#[test]
+fn path_display_normalized_converts_backslashes() {
+    // Backslash-separated components (Windows paths) are normalized to `/`.
+    let path = Path::new("src\\lib.rs");
+    assert_eq!(path_display_normalized(path), "src/lib.rs");
+
+    // Forward-slash paths are unchanged (no-op on Unix and on normalized Windows paths).
+    let unix_path = Path::new("crates/squeezy-tui/src/lib.rs");
+    assert_eq!(
+        path_display_normalized(unix_path),
+        "crates/squeezy-tui/src/lib.rs"
+    );
+
+    // Deeply nested Windows path.
+    let deep = Path::new("crates\\squeezy-tui\\src\\lib.rs");
+    assert_eq!(
+        path_display_normalized(deep),
+        "crates/squeezy-tui/src/lib.rs"
+    );
+}

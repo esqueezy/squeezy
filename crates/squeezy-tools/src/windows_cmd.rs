@@ -42,8 +42,9 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         // Drive / volume operations
         "clear-recyclebin",
         "format-volume",
-        // Arbitrary code execution via expression string
+        // Arbitrary code execution via expression string (full name and alias)
         "invoke-expression",
+        "iex ",
         // WMIC destructive operations
         "wmic process delete",
         "wmic product delete",
@@ -62,7 +63,10 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
 
     match first.as_str() {
-        "del" | "erase" => return flag_matches("/s") || flag_matches("/q") && flag_matches("/f"),
+        // `/s` recurses into subdirectories — the unambiguously destructive
+        // case. `/q /f` alone only affects individual files and is too narrow
+        // to classify reliably, so we keep the rule precise.
+        "del" | "erase" => return flag_matches("/s"),
         "rd" | "rmdir" => return flag_matches("/s"),
         "format" | "diskpart" => return true,
         "vssadmin" => return flag_matches("delete"),

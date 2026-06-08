@@ -15761,10 +15761,14 @@ fn compact_path(path: &std::path::Path) -> String {
         return display;
     };
     if let Ok(stripped) = path.strip_prefix(&home) {
-        if stripped.as_os_str().is_empty() {
+        // Normalize to forward slashes for consistent display across
+        // platforms. On Windows, `stripped.display()` would produce
+        // backslashes, yielding a mixed `~/projects\foo` form.
+        let normalized = stripped.to_string_lossy().replace('\\', "/");
+        if normalized.is_empty() {
             "~".to_string()
         } else {
-            format!("~/{}", stripped.display())
+            format!("~/{normalized}")
         }
     } else {
         display
