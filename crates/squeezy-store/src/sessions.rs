@@ -23,6 +23,12 @@ use squeezy_core::{
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Monotonic counter that makes sibling temp file names unique within a
+/// process even when multiple session handles concurrently write the same
+/// target path. Combined with `std::process::id()` this eliminates temp-file
+/// collisions on Windows where `rename` fails when a temp is held open by
+/// another writer in the same process.
+static WRITE_UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 /// Schema version stamped onto every `RolloutEvent` emitted by
 /// [`SessionStore::bundle_rollout_trace`]. The reducer is additive over
@@ -123,12 +129,24 @@ impl SessionStore {
     /// Atomically persist the cross-session `TokenCalibration`. Errors are
     /// returned to the caller but expected to be logged-and-ignored — a
     /// failed write only costs us the next session's warm-start.
+    ///
+    /// Skips the write when the serialized content is byte-for-byte identical
+    /// to the current file. This avoids unnecessary rename operations on
+    /// Windows (common when calibration ratios are stable across consecutive
+    /// turns) and reduces contention on the shared calibration file.
     pub fn save_global_calibration(
         &self,
         calibration: &squeezy_llm::TokenCalibration,
     ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
-        write_json(&self.calibration_path(), calibration)
+        let path = self.calibration_path();
+        let new_bytes = serde_json::to_vec_pretty(calibration).map_err(json_error)?;
+        if let Ok(existing) = fs::read(&path) {
+            if existing == new_bytes {
+                return Ok(());
+            }
+        }
+        write_json(&path, calibration)
     }
 
     /// Path to the user-global memory file. Returns `None` when `HOME` is
@@ -2824,10 +2842,13 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    // Per-pid temp name so concurrent writers to the same path don't
-    // clobber each other's in-flight temp file before the rename.
+    // Unique temp name: pid + monotonic counter so concurrent writers in
+    // the same process (multiple session handles writing metadata or
+    // calibration) never share a temp path. This is especially important
+    // on Windows where rename fails if another handle holds the temp file.
+    let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
+        Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),
         None => path.with_extension("tmp"),
     };
     {
@@ -2839,11 +2860,48 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
-    if let Err(error) = fs::rename(&tmp, path) {
+    if let Err(error) = rename_with_retry(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(error.into());
     }
     Ok(())
+}
+
+/// `fs::rename` wrapper that retries on Windows sharing-violation errors
+/// (OS error 32 / `ERROR_SHARING_VIOLATION`). Antivirus scanners, indexers,
+/// and shell preview panes briefly lock files without delete-sharing, causing
+/// transient failures that a short bounded retry reliably clears.
+/// On non-Windows platforms this is a thin wrapper with zero overhead.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut delay_ms = 10u64;
+        for attempt in 0..MAX_ATTEMPTS {
+            match fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(ref e) if attempt + 1 < MAX_ATTEMPTS && is_windows_sharing_violation(e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms = (delay_ms * 2).min(100);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        fs::rename(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
+}
+
+/// Returns `true` when `e` is a Windows sharing violation (OS error 32).
+/// Defined unconditionally to avoid `#[cfg]` noise at call sites; on
+/// non-Windows it is never reached.
+#[allow(unused)]
+fn is_windows_sharing_violation(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(32) // ERROR_SHARING_VIOLATION
+        || e.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 /// Heuristic guard for [`SessionStore::record_global_index`].
@@ -2926,7 +2984,16 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
+    // Unique temp name: pid + monotonic counter. A fixed `.jsonl.tmp`
+    // name caused races on Windows when multiple sessions finished
+    // concurrently — one writer could rename the other's partially
+    // prepared temp, losing session cost summaries from cross-project
+    // resume views.
+    let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),
+        None => path.with_extension("tmp"),
+    };
     {
         let mut file = OpenOptions::new()
             .create(true)
@@ -2943,7 +3010,11 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         }
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    if let Err(e) = rename_with_retry(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
