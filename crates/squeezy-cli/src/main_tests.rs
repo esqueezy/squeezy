@@ -1364,10 +1364,15 @@ fn normalize_cwd_strips_verbatim_prefix() {
 
 #[test]
 fn normalize_cwd_folds_drive_letter_case() {
+    // Only the drive letter (`C` vs `c`) differs; directory names are identical.
     assert_eq!(
         normalize_cwd_for_compare(r"C:\Repo"),
-        normalize_cwd_for_compare(r"c:\repo"),
+        normalize_cwd_for_compare(r"c:\Repo"),
         "drive-letter case difference must not trigger cross-project prompt"
+    );
+    assert_eq!(
+        normalize_cwd_for_compare(r"C:/Repo/sub"),
+        normalize_cwd_for_compare(r"c:/Repo/sub"),
     );
 }
 
@@ -1381,9 +1386,9 @@ fn normalize_cwd_normalizes_backslash_to_slash() {
 
 #[test]
 fn cross_project_resume_prompt_skips_for_windows_drive_case() {
-    // `C:\Repo` and `c:\repo` are the same directory on Windows.
-    assert!(cross_project_resume_prompt(r"C:\Repo", r"c:\repo").is_none());
-    assert!(cross_project_resume_prompt(r"C:/Repo", r"c:/repo").is_none());
+    // `C:\Repo` and `c:\Repo` are the same directory on Windows (drive letter is case-insensitive).
+    assert!(cross_project_resume_prompt(r"C:\Repo", r"c:\Repo").is_none());
+    assert!(cross_project_resume_prompt(r"C:/Repo", r"c:/Repo").is_none());
 }
 
 #[test]
@@ -1411,8 +1416,8 @@ fn resolve_resume_session_continue_matches_with_drive_case() {
     meta.session_id = "abc123".to_string();
     meta.cwd = r"C:\Repo".to_string();
     meta.resume_available = true;
-    // Querying with lower-case drive letter should still match.
-    let result = resolve_resume_session(ResumeFlag::Continue, &[meta], r"c:\repo");
+    // Querying with lower-case drive letter (but same directory name case) should still match.
+    let result = resolve_resume_session(ResumeFlag::Continue, &[meta], r"c:\Repo");
     assert_eq!(
         result.session_id.as_deref(),
         Some("abc123"),
