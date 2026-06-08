@@ -3664,7 +3664,9 @@ impl Agent {
         match cmd {
             DispatchCommand::Compact { undo, history } => {
                 if history {
-                    DispatchOutcome::TuiOnly
+                    DispatchOutcome::TuiOnly {
+                        command: "/compact history".into(),
+                    }
                 } else if undo {
                     match self.compact_context_undo().await {
                         Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
