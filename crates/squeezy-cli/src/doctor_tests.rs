@@ -423,3 +423,50 @@ fn state_store_check_fails_when_path_unwritable() {
     let check = state_store_check(&config);
     assert_eq!(check.status, Status::Fail, "detail: {}", check.detail);
 }
+
+#[test]
+fn skills_roots_check_shows_resolved_paths() {
+    // Skip when HOME is absent; the warn path is covered by the next test.
+    if std::env::var_os("HOME").is_none() {
+        return;
+    }
+    let root = skills_doctor_workspace("skills_roots_paths");
+    let config = skills_doctor_config(&root);
+    let check = skills_roots_check(&config);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("user="),
+        "expected resolved user path in detail: {check:?}"
+    );
+    assert!(
+        check.detail.contains("project="),
+        "expected resolved project path in detail: {check:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skills_roots_check_warns_when_roots_are_relative() {
+    // Simulate the condition that arises when HOME is unset and skill roots
+    // default to relative paths: construct a config with relative user_dir /
+    // compat_user_dir and verify the check emits a warning.
+    let root = skills_doctor_workspace("skills_roots_relative_warn");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        skills: squeezy_core::SkillsConfig {
+            // Relative paths — as would result from HOME being absent at
+            // config-load time.
+            user_dir: std::path::PathBuf::from(".squeezy/skills"),
+            compat_user_dir: std::path::PathBuf::from(".agents/skills"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let check = skills_roots_check(&config);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("relative"),
+        "expected 'relative' in detail: {check:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -236,6 +236,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         if let Some(hooks) = hooks_check(config, &skill_catalog) {
             checks.push(hooks);
         }
+        checks.push(skills_roots_check(config));
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
         checks.push(cache_check(config, args.prune_cache));
@@ -1004,6 +1005,73 @@ fn which_sh_missing() -> bool {
         }
     }
     true
+}
+
+/// Report resolved skill discovery roots with their configuration sources so
+/// Linux users can understand which directories will be scanned.  Warns per
+/// root when `HOME` is absent and that specific root resolved to a relative
+/// path (rather than blanket-warning whenever `HOME` is missing, which can be
+/// misleading when `XDG_DATA_HOME` provides absolute roots).
+fn skills_roots_check(config: &AppConfig) -> Check {
+    let s = &config.skills;
+    let mut parts: Vec<String> = Vec::new();
+    let mut any_relative = false;
+
+    let push_root =
+        |label: &str, path: &std::path::Path, parts: &mut Vec<String>, rel: &mut bool| {
+            if path.is_relative() {
+                *rel = true;
+                parts.push(format!("{label}={} (relative!)", path.display()));
+            } else {
+                parts.push(format!("{label}={}", path.display()));
+            }
+        };
+
+    push_root(
+        "compat_user",
+        &s.compat_user_dir,
+        &mut parts,
+        &mut any_relative,
+    );
+    push_root("user", &s.user_dir, &mut parts, &mut any_relative);
+
+    if let Some(xdg) = &s.xdg_user_dir {
+        push_root("xdg_user", xdg, &mut parts, &mut any_relative);
+    }
+
+    for extra in &s.extra_roots {
+        push_root("extra_root", extra, &mut parts, &mut any_relative);
+    }
+
+    // Project-local roots (workspace-relative, always shown).
+    parts.push(format!(
+        "project_compat={}",
+        config.workspace_root.join(".agents/skills").display()
+    ));
+    parts.push(format!(
+        "project={}",
+        config.workspace_root.join(".squeezy/skills").display()
+    ));
+
+    let detail = parts.join(" | ");
+
+    if any_relative {
+        return Check {
+            name: "skills_roots".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "One or more skill roots resolved to relative paths (HOME likely unset). \
+                 Set HOME or override with SQUEEZY_SKILLS_USER_DIR / \
+                 SQUEEZY_SKILLS_COMPAT_USER_DIR. Roots: {detail}"
+            ),
+        };
+    }
+
+    Check {
+        name: "skills_roots".to_string(),
+        status: Status::Ok,
+        detail,
+    }
 }
 
 /// Pull the result of `update::check_for_update()` into a doctor row. Newer

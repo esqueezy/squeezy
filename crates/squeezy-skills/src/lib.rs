@@ -545,6 +545,17 @@ impl SkillCatalog {
             .push(workspace_root.join(PROJECT_SKILLS_DIR));
         catalog.discover_dir(&config.compat_user_dir, SkillSource::CompatUser);
         catalog.discover_dir(&config.user_dir, SkillSource::User);
+        // XDG-aware user directory scanned right after the legacy user dir so
+        // that skills placed in `$XDG_DATA_HOME/squeezy/skills` are
+        // discoverable on Linux without requiring the user to set
+        // `SQUEEZY_SKILLS_USER_DIR`.  All skills already present at this point
+        // (from both `compat_user_dir` and `user_dir`) shadow same-name
+        // entries from the XDG path so higher-priority legacy directories
+        // always take precedence on a name collision.
+        if let Some(xdg_dir) = &config.xdg_user_dir {
+            let shadow_set: BTreeSet<String> = catalog.skills.keys().cloned().collect();
+            catalog.discover_dir_filtered(xdg_dir, SkillSource::User, Some(&shadow_set));
+        }
         catalog.discover_extra_roots(&config.extra_roots);
         catalog.discover_dir(
             &workspace_root.join(COMPAT_PROJECT_SKILLS_DIR),
@@ -2085,7 +2096,7 @@ pub struct SkillValidationResult {
 /// scan for a given `(workspace_root, config)` pair, in the same order
 /// `discover` uses. This includes:
 ///
-/// - User-level roots (`compat_user_dir`, `user_dir`).
+/// - User-level roots (`compat_user_dir`, `user_dir`, optional XDG user dir).
 /// - `extra_roots` from config.
 /// - The current workspace's project roots (`.agents/skills`,
 ///   `.squeezy/skills`).
@@ -2098,6 +2109,9 @@ pub fn skill_scan_dirs(workspace_root: &Path, config: &squeezy_core::SkillsConfi
     let mut dirs = Vec::new();
     dirs.push(config.compat_user_dir.clone());
     dirs.push(config.user_dir.clone());
+    if let Some(xdg_dir) = &config.xdg_user_dir {
+        dirs.push(xdg_dir.clone());
+    }
     dirs.extend(config.extra_roots.iter().cloned());
     dirs.push(workspace_root.join(COMPAT_PROJECT_SKILLS_DIR));
     dirs.push(workspace_root.join(PROJECT_SKILLS_DIR));
