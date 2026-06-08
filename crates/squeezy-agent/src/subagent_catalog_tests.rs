@@ -367,6 +367,10 @@ fn discover_does_not_panic_when_home_unset() {
 #[cfg(target_os = "windows")]
 #[test]
 fn discover_uses_appdata_on_windows() {
+    // HOME takes precedence when set; clear it so we reach the APPDATA branch.
+    let previous_home = std::env::var_os("HOME");
+    let previous_appdata = std::env::var_os("APPDATA");
+
     let appdata_root = temp_root("appdata_discover");
     let agents_dir = appdata_root.join("squeezy").join("agents");
     fs::create_dir_all(&agents_dir).expect("mkdir appdata agents");
@@ -376,16 +380,24 @@ fn discover_uses_appdata_on_windows() {
     )
     .expect("write winagent");
 
-    let previous_appdata = std::env::var_os("APPDATA");
-    unsafe { std::env::set_var("APPDATA", &appdata_root) };
+    unsafe {
+        std::env::remove_var("HOME");
+        std::env::set_var("APPDATA", &appdata_root);
+    }
 
     let workspace = temp_root("appdata_workspace");
     let catalog = SubagentCatalog::discover(&workspace, None);
 
-    if let Some(prev) = previous_appdata {
-        unsafe { std::env::set_var("APPDATA", prev) };
-    } else {
-        unsafe { std::env::remove_var("APPDATA") };
+    // Restore env.
+    unsafe {
+        if let Some(prev) = previous_home {
+            std::env::set_var("HOME", prev);
+        }
+        if let Some(prev) = previous_appdata {
+            std::env::set_var("APPDATA", prev);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
     }
 
     let winagent = catalog
