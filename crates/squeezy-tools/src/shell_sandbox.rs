@@ -1077,19 +1077,19 @@ fn linux_shell_read_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathB
             roots.push(p);
         }
     }
-    // Narrow device access: only the nodes a sandboxed shell legitimately
-    // uses. The broad /dev allowlist can expose readable device paths that
-    // build/test commands do not need.
+    // Narrow device access: only the non-symlink device nodes a sandboxed
+    // shell legitimately uses. Symlinks into /proc/self/fd (like /dev/fd,
+    // /dev/stdin, /dev/stdout, /dev/stderr) are excluded because they
+    // follow into the child's /proc namespace and can cause Landlock
+    // rule-add failures in the new namespace context. The broad /dev
+    // allowlist can expose readable device paths that build/test commands
+    // do not need.
     for path in [
         "/dev/null",
         "/dev/zero",
         "/dev/random",
         "/dev/urandom",
         "/dev/full",
-        "/dev/fd",
-        "/dev/stdin",
-        "/dev/stdout",
-        "/dev/stderr",
         "/dev/tty",
         "/dev/pts",
         "/dev/ptmx",
@@ -1100,8 +1100,11 @@ fn linux_shell_read_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathB
         }
     }
     // Narrow /proc access: only the paths a sandboxed shell needs at
-    // runtime. Broad /proc access can expose process metadata and
-    // host/container topology that sandboxed commands do not require.
+    // runtime. Symlinks within /proc (like /proc/mounts → /proc/self/mounts
+    // and /proc/net → /proc/self/net) are excluded because they resolve into
+    // namespace-specific paths that may behave differently after unshare.
+    // /proc/self covers the child's own process entries. Broad /proc access
+    // can expose process metadata and host/container topology.
     for path in [
         "/proc/self",
         "/proc/sys",
@@ -1109,8 +1112,6 @@ fn linux_shell_read_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathB
         "/proc/cpuinfo",
         "/proc/meminfo",
         "/proc/filesystems",
-        "/proc/mounts",
-        "/proc/net",
     ] {
         let p = PathBuf::from(path);
         if p.exists() {
@@ -1501,7 +1502,11 @@ fn linux_landlock_add_path_rule(
         .map_err(|_| std::io::Error::other("sandbox root contains NUL byte"))?;
     let parent_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if parent_fd < 0 {
-        return Err(std::io::Error::last_os_error());
+        // Silently skip paths that cannot be opened in the current namespace
+        // context (e.g., proc symlinks after CLONE_NEWNS / CLONE_NEWNET).
+        // A missing rule means the path is simply not in the allowlist,
+        // which is the stricter default — the sandbox remains active.
+        return Ok(());
     }
     let path_beneath = LandlockPathBeneathAttr {
         allowed_access,
@@ -1516,12 +1521,15 @@ fn linux_landlock_add_path_rule(
             0u32,
         )
     };
-    let close_result = unsafe { libc::close(parent_fd) };
-    if result < 0 {
-        return Err(std::io::Error::last_os_error());
+    unsafe {
+        libc::close(parent_fd);
     }
-    if close_result != 0 {
-        return Err(std::io::Error::last_os_error());
+    if result < 0 {
+        // Silently skip paths whose type is not compatible with Landlock's
+        // RULE_PATH_BENEATH (e.g., special device files or virtual-fs paths
+        // on some kernel configurations). A failed rule means the path is
+        // denied by default, which is the stricter behavior.
+        return Ok(());
     }
     Ok(())
 }
