@@ -425,8 +425,8 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     let notice = format_cap_unenforceable_notice(&provider, &model);
                     app.push_transcript_item(TranscriptItem::system(notice));
                     // Persist flag so the status-line cost segment shows a
-                    // reminder for the remainder of the session or until the
-                    // model switches to one with known pricing.
+                    // reminder until a priced cost update proves the cap is
+                    // enforceable again.
                     app.cap_unenforceable = true;
                 }
                 AgentEvent::ShellSandboxBestEffortFallback {

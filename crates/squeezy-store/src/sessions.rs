@@ -142,9 +142,9 @@ impl SessionStore {
                 (squeezy_llm::TokenCalibration::default(), None)
             }
             Err(e) => {
+                let error_kind = calibration_load_error_kind(&e);
                 eprintln!(
-                    "squeezy: warning: {:?}: {}; falling back to default token calibration",
-                    path, e
+                    "squeezy: warning: calibration.json could not be loaded ({error_kind}); falling back to default token calibration"
                 );
                 (squeezy_llm::TokenCalibration::default(), Some(false))
             }
@@ -2989,6 +2989,17 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(json_error)
+}
+
+fn calibration_load_error_kind(error: &SqueezyError) -> &'static str {
+    match error {
+        SqueezyError::Io(error) => match error.kind() {
+            std::io::ErrorKind::PermissionDenied => "permission denied",
+            _ => "I/O error",
+        },
+        SqueezyError::Tool(_) => "malformed JSON",
+        _ => "unexpected error",
+    }
 }
 
 /// Serde default for [`SessionMetadata::schema_version`]. Returns 0 — the

@@ -14875,6 +14875,26 @@ fn status_line_item_round_trips_through_slug() {
 }
 
 #[test]
+fn status_line_narrow_linux_preset_expands_to_compact_items() {
+    use crate::status::{NARROW_LINUX_STATUS_LINE_ITEMS, StatusLineItem};
+
+    let raw = ["narrow-linux".to_string()];
+    let parsed = parse_status_line_items(Some(&raw)).expect("preset should parse");
+
+    assert_eq!(parsed.as_slice(), NARROW_LINUX_STATUS_LINE_ITEMS);
+    assert_eq!(
+        parsed,
+        vec![
+            StatusLineItem::ProviderAndModel,
+            StatusLineItem::Cost,
+            StatusLineItem::ContextRemaining,
+            StatusLineItem::Tools,
+            StatusLineItem::Budget,
+        ]
+    );
+}
+
+#[test]
 fn status_line_codex_aliases_parse() {
     use crate::status::StatusLineItem;
     assert_eq!(

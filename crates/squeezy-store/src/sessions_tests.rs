@@ -1214,6 +1214,13 @@ fn load_global_calibration_with_source_hint_corrupt_file_returns_some_false() {
 }
 
 #[test]
+fn calibration_load_error_kind_does_not_echo_error_payload() {
+    let error =
+        SqueezyError::Tool("session store JSON error: OPENROUTER_API_KEY=secret".to_string());
+    assert_eq!(calibration_load_error_kind(&error), "malformed JSON");
+}
+
+#[test]
 fn session_metadata_v0_file_reads_as_v1() {
     // Pre-versioning `metadata.json` files are missing the
     // `schema_version` field. The reader migration framework must treat

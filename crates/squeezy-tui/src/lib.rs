@@ -16178,8 +16178,8 @@ pub(crate) struct TuiApp {
     pub(crate) cost_cap_usd_micros: Option<u64>,
     /// Set when the active (provider, model) has no pricing data and a session
     /// cap is configured, so the cap cannot be enforced. Surfaces a persistent
-    /// `unpriced` marker in the cost status-line segment for the duration of
-    /// the session or until a model switch (TurnRouted) resets it.
+    /// `unpriced` marker in the cost status-line segment until a priced cost
+    /// update proves the cap is enforceable again.
     pub(crate) cap_unenforceable: bool,
     pub(crate) metrics: squeezy_core::TurnMetrics,
     pub(crate) turn_rx: Option<mpsc::Receiver<AgentEvent>>,
