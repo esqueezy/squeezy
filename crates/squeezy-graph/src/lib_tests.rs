@@ -8929,30 +8929,61 @@ fn graph_case_collision_detected_in_rebuild_indexes() {
 }
 
 #[test]
-fn normalize_cargo_file_id_handles_drive_letter_casing() {
-    // Test that normalize_cargo_file_id falls back to case-insensitive prefix
-    // stripping when path and root differ only by drive-letter casing.
-    // We simulate this with lowercase vs mixed-case path prefixes rather than
-    // real Windows drive letters so the test runs on all platforms.
-    let root = std::path::Path::new("/workspace/project");
-    // Exact case: must resolve normally.
-    assert_eq!(
-        super::normalize_cargo_file_id(root, "/workspace/project/src/lib.rs"),
-        Some("src/lib.rs".to_string()),
-    );
-    // Case differs only in the prefix: must still resolve on all platforms via
-    // the lowercase fallback path.
-    assert_eq!(
-        super::normalize_cargo_file_id(root, "/Workspace/Project/src/lib.rs"),
-        Some("src/lib.rs".to_string()),
-    );
-    // Path outside the root must return None.
-    assert!(super::normalize_cargo_file_id(root, "/other/src/lib.rs").is_none());
-    // Relative paths pass through unchanged.
+fn normalize_cargo_file_id_handles_relative_and_excluded_paths() {
+    // Use a platform-absolute root derived from the temp directory so the
+    // test behaves consistently on Windows (where /foo is not absolute) and
+    // on Unix.
+    let root = temp_root("cargo-norm");
+    let root = root.as_path();
+
+    // Relative paths pass through the normaliser unchanged (no prefix strip).
     assert_eq!(
         super::normalize_cargo_file_id(root, "src/lib.rs"),
         Some("src/lib.rs".to_string()),
     );
-    // Angle-bracket macros are excluded.
+
+    // Angle-bracket macros (rustc virtual files) are excluded.
     assert!(super::normalize_cargo_file_id(root, "<macro:lib>").is_none());
+
+    // A path inside the root resolves to the relative portion.
+    let inside = root.join("src").join("lib.rs");
+    assert_eq!(
+        super::normalize_cargo_file_id(root, &inside.to_string_lossy()),
+        Some("src/lib.rs".to_string()),
+    );
+
+    // A path outside the root returns None (can't strip prefix).
+    let outside = root.parent().unwrap().join("other").join("lib.rs");
+    assert!(super::normalize_cargo_file_id(root, &outside.to_string_lossy()).is_none());
+}
+
+#[test]
+fn normalize_cargo_file_id_case_insensitive_fallback() {
+    // Build a root path from the temp directory and construct a path that
+    // differs from the root only in casing. On Windows, drive-letter case
+    // differences (C:\ vs c:\) produce this; we simulate it by uppercasing
+    // the root's string representation.
+    let root = temp_root("cargo-norm-case");
+    let root = root.as_path();
+
+    let inside = root.join("src").join("lib.rs");
+    let inside_str = inside.to_string_lossy().into_owned();
+
+    // Exact-case: strip_prefix succeeds directly.
+    assert_eq!(
+        super::normalize_cargo_file_id(root, &inside_str),
+        Some("src/lib.rs".to_string()),
+    );
+
+    // Upper-cased variant: strip_prefix fails, fallback must still resolve.
+    let upper_str = inside_str.to_ascii_uppercase();
+    // Only run this sub-check on platforms where the uppercased path actually
+    // differs from the original (i.e. the path has at least one ASCII letter).
+    if upper_str != inside_str {
+        assert_eq!(
+            super::normalize_cargo_file_id(root, &upper_str),
+            Some("src/lib.rs".to_string()),
+            "case-insensitive fallback must resolve when path casing differs from root casing"
+        );
+    }
 }
