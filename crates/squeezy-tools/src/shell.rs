@@ -481,17 +481,34 @@ impl ToolRegistry {
         self.invalidate_diff_cache();
 
         // The `command_wrapper` shows the actual process spawned (e.g.
-        // `sh -lc` on Linux/macOS, `sandbox-exec -p ... sh -lc` on macOS
-        // sandbox, etc.) so POSIX-shell vs Bash behavior is explicit.
-        let command_wrapper = if sandbox_plan.args.is_empty() {
-            sandbox_plan.program.clone()
-        } else {
-            // Show program + args up to (but not including) the user's command
-            // literal which is always the last arg on Unix shell plans.
-            let display_args: Vec<&str> = sandbox_plan.args
+        // `sh -lc` on Linux/macOS) so POSIX-shell vs Bash behavior is explicit.
+        // For the macOS `sandbox-exec` backend the `-p <profile>` argument
+        // contains a multi-KB policy string; we summarize it as `<sandbox-profile>`
+        // so the field stays concise and readable.
+        let command_wrapper = {
+            // Collect args up to (but not including) the user command literal,
+            // which is always the last element on Unix shell plans.
+            let display_args: Vec<String> = sandbox_plan.args
                 [..sandbox_plan.args.len().saturating_sub(1)]
                 .iter()
-                .map(|s| s.as_str())
+                .enumerate()
+                .filter_map(|(i, arg)| {
+                    // Suppress the sandbox-exec profile text that follows `-p`.
+                    let prev = if i > 0 {
+                        sandbox_plan.args.get(i - 1).map(|s| s.as_str())
+                    } else {
+                        None
+                    };
+                    if prev == Some("-p") {
+                        // Replace the large profile blob with a short placeholder.
+                        Some("<sandbox-profile>".to_string())
+                    } else if arg == "-p" || arg.as_str() == "<sandbox-profile>" {
+                        // Keep the `-p` flag itself.
+                        Some(arg.clone())
+                    } else {
+                        Some(arg.clone())
+                    }
+                })
                 .collect();
             if display_args.is_empty() {
                 sandbox_plan.program.clone()

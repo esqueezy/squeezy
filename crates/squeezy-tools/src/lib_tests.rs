@@ -973,6 +973,95 @@ async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Verify that `follow_symlinks=true` with a symlink pointing outside the
+/// workspace does NOT return the out-of-workspace file in glob results.
+/// Also verifies that in-workspace files are still returned.
+#[cfg(unix)]
+#[tokio::test]
+async fn glob_follow_symlinks_respects_workspace_containment() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("glob_symlink_containment");
+    // A real in-workspace file.
+    fs::write(root.join("inside.rs"), "// inside\n").expect("write inside");
+
+    // Create a file outside the workspace.
+    let outside_dir = temp_workspace("glob_symlink_outside");
+    fs::write(outside_dir.join("secret.rs"), "// secret\n").expect("write secret");
+
+    // Symlink inside the workspace pointing to the outside directory.
+    symlink(&outside_dir, root.join("link_to_outside")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-symlink-1".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.rs", "follow_symlinks": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let paths = result.content["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+
+    // in-workspace file must appear
+    assert!(
+        paths.contains(&"inside.rs".to_string()),
+        "inside.rs must be in results; got: {paths:?}"
+    );
+    // out-of-workspace file via symlink must NOT appear
+    assert!(
+        !paths.iter().any(|p| p.contains("secret")),
+        "secret.rs from outside workspace must not appear; got: {paths:?}"
+    );
+    // symlink_skipped_count must be non-zero (the outside dir was rejected)
+    let skipped = result.content["metadata"]["symlink_skipped_count"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        skipped > 0,
+        "symlink_skipped_count must be > 0 when out-of-workspace symlinks were rejected"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+/// Verify that `follow_symlinks=false` (default) reports `symlinks_not_followed: true`.
+#[tokio::test]
+async fn glob_default_reports_symlinks_not_followed() {
+    let root = temp_workspace("glob_symlink_meta");
+    fs::write(root.join("file.rs"), "// file\n").expect("write file");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-meta-1".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["metadata"]["symlinks_not_followed"],
+        json!(true)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_and_glob_apply_squeezy_indexing_policy_by_default() {
     let root = temp_workspace("tool_indexing_policy");
@@ -13211,6 +13300,15 @@ fn detect_newline_style_empty() {
 fn detect_newline_style_lf_before_crlf() {
     // A bare \n before any \r\n → reported as lf.
     assert_eq!(detect_newline_style(b"a\nb\r\nc"), "lf");
+}
+
+#[test]
+fn detect_newline_style_crlf_straddles_probe_boundary() {
+    // \r at byte 8191 and \n at byte 8192: must detect crlf, not "none".
+    let mut buf = vec![b'x'; 8191];
+    buf.push(b'\r');
+    buf.push(b'\n');
+    assert_eq!(detect_newline_style(&buf), "crlf");
 }
 
 #[tokio::test]

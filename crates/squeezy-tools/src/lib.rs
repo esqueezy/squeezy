@@ -6815,10 +6815,13 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 ///
 /// Returns `"crlf"` when the first newline found is `\r\n`, `"lf"` when
 /// the first newline is a bare `\n`, or `"none"` when the content contains
-/// no newline characters at all.  Inspects only the first 8 KB so the
-/// check is O(1) for large files.
+/// no newline characters at all.  Inspects only the first 8 KB + 1 byte so
+/// the check is O(1) for large files.  The extra byte ensures a CRLF pair
+/// straddling the 8 192-byte boundary is not missed.
 pub(crate) fn detect_newline_style(bytes: &[u8]) -> &'static str {
-    let probe = &bytes[..bytes.len().min(8192)];
+    // +1 so a \r\n pair where \r lands at byte 8191 and \n at byte 8192 is
+    // still detected correctly.
+    let probe = &bytes[..bytes.len().min(8193)];
     for (i, &b) in probe.iter().enumerate() {
         if b == b'\n' {
             if i > 0 && probe[i - 1] == b'\r' {
