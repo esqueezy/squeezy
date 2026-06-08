@@ -1072,14 +1072,13 @@ impl McpClientRegistry {
         };
         // Preserve the last stderr lines so they survive session teardown and
         // remain available to `stderr_tail` for diagnostics (e.g. doctor --probe).
-        if let Some(entry) = removed {
-            if let Some(ring) = &entry.stderr_ring {
-                if let (Ok(r), Ok(mut excerpts)) = (ring.lock(), self.stderr_excerpts.lock()) {
-                    let lines: Vec<String> = r.iter().cloned().collect();
-                    if !lines.is_empty() {
-                        excerpts.insert(server_name.to_string(), lines);
-                    }
-                }
+        if let Some(entry) = removed
+            && let Some(ring) = &entry.stderr_ring
+            && let (Ok(r), Ok(mut excerpts)) = (ring.lock(), self.stderr_excerpts.lock())
+        {
+            let lines: Vec<String> = r.iter().cloned().collect();
+            if !lines.is_empty() {
+                excerpts.insert(server_name.to_string(), lines);
             }
         }
         if let Ok(mut cache) = self.resource_declarations.lock() {
