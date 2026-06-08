@@ -448,11 +448,13 @@ impl McpClientRegistry {
         self.status_tx.subscribe()
     }
 
-    /// Returns the `Notify` that is signalled whenever any connected server
-    /// sends a `tools/list_changed` notification.  Callers can `await
-    /// registry.tool_list_changed_notify().notified()` to learn that a server's
-    /// tool palette may have changed and then call
-    /// `refresh_one_server_tools` to update only that server's cache entry.
+    /// Returns the `Notify` that is signalled whenever **any** connected
+    /// server sends a `tools/list_changed` notification.  The notification
+    /// carries no server identity — callers that need to know which server
+    /// changed should diff `status_snapshot()` before and after, or iterate
+    /// all stale entries and call `refresh_one_server_tools` for each.
+    /// `notify_one()` is used so the signal survives a brief gap between
+    /// `notified()` calls; at most one permit is queued at a time.
     pub fn tool_list_changed_notify(&self) -> Arc<Notify> {
         self.tool_list_changed.clone()
     }
@@ -461,6 +463,9 @@ impl McpClientRegistry {
     /// the shared cache and status snapshot.  Intended for handling
     /// `tools/list_changed` notifications: call this instead of the full
     /// `refresh_tools` to avoid unnecessary work on unchanged servers.
+    /// Because `tool_list_changed_notify()` carries no server identity,
+    /// callers that respond to that signal should iterate the stale entries
+    /// in `status_snapshot()` and call this method for each affected server.
     ///
     /// If the server is not configured or is disabled the call is a no-op.
     /// On discovery failure the server entry is moved to `Stale` using the
@@ -1763,9 +1768,10 @@ impl ClientHandler for SqueezyMcpClientHandler {
             server = %self.server_name,
             "MCP server tool list changed; signalling registry for re-discovery"
         );
-        // Notify all waiters so the agent or registry can schedule a targeted
-        // re-discovery via `McpClientRegistry::refresh_one_server_tools`.
-        self.tool_list_changed.notify_waiters();
+        // `notify_one()` stores a permit so the signal survives a brief gap
+        // between poll cycles (unlike `notify_waiters()` which drops the
+        // event if no waiter is currently blocked).
+        self.tool_list_changed.notify_one();
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -2794,10 +2800,15 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
     // Hash secret values before including them in the fingerprint so the key
     // is safe to store in the on-disk DB while still invalidating when a
     // credential rotates.  We include enough signal to detect any auth/header
-    // change without embedding the raw secrets: env key→value-hash pairs,
-    // static header key→value-hash pairs, the bearer_token_env_var name (its
-    // value is dynamic so we fold it into env_value_hashes), and the env-HTTP
-    // header map keys (values come from the environment at session start).
+    // change without embedding the raw secrets:
+    //   - env key → SHA-256-prefix(value) — env values are runtime secrets.
+    //   - static header key → SHA-256-prefix(value) — header values may be
+    //     tokens; hashed so the key is safe to persist.
+    //   - bearer_token_env_var name — static config, safe to store as-is.
+    //   - env_http_headers key → env-var-name pairs — both the HTTP header
+    //     name and the env-var name that backs it are static config. If an
+    //     operator changes `{ "X-Auth" = "OLD_TOKEN_VAR" }` to
+    //     `{ "X-Auth" = "NEW_TOKEN_VAR" }`, the fingerprint must change.
     let env_value_hashes: Vec<(&str, String)> = server
         .env
         .iter()
@@ -2807,6 +2818,15 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         .http_headers
         .iter()
         .map(|(k, v)| (k.as_str(), sha256_hex_prefix(v.as_bytes(), 16)))
+        .collect();
+    // `env_http_headers` maps HTTP-header-name → env-var-name.  Both parts
+    // are static config that affect which credential is loaded at session
+    // start; include both so renaming either the header or the env-var
+    // triggers cache eviction.
+    let env_http_headers_pairs: Vec<(&str, &str)> = server
+        .env_http_headers
+        .iter()
+        .map(|(header, env_var)| (header.as_str(), env_var.as_str()))
         .collect();
     let fingerprint = json!({
         "schema": MCP_TOOL_CACHE_SCHEMA_VERSION,
@@ -2823,7 +2843,7 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         "disabled_tools": &server.disabled_tools,
         "bearer_token_env_var": &server.bearer_token_env_var,
         "header_value_hashes": header_value_hashes,
-        "env_http_header_keys": server.env_http_headers.keys().collect::<Vec<_>>(),
+        "env_http_headers": env_http_headers_pairs,
     });
     format!(
         "{server_name}\0{}",

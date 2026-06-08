@@ -488,6 +488,72 @@ fn tool_cache_key_changes_when_palette_filters_change() {
 }
 
 #[test]
+fn tool_cache_key_changes_when_env_value_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server
+        .env
+        .insert("MY_VAR".to_string(), "value-one".to_string());
+    let base = tool_cache_key("docs", &server);
+    server
+        .env
+        .insert("MY_VAR".to_string(), "value-two".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing an env value must invalidate the cache key"
+    );
+}
+
+#[test]
+fn tool_cache_key_changes_when_bearer_token_env_var_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server.bearer_token_env_var = Some("OLD_TOKEN_VAR".to_string());
+    let base = tool_cache_key("docs", &server);
+    server.bearer_token_env_var = Some("NEW_TOKEN_VAR".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing bearer_token_env_var name must invalidate the cache key"
+    );
+}
+
+#[test]
+fn tool_cache_key_changes_when_http_header_value_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server
+        .http_headers
+        .insert("X-Api-Key".to_string(), "secret-one".to_string());
+    let base = tool_cache_key("docs", &server);
+    server
+        .http_headers
+        .insert("X-Api-Key".to_string(), "secret-two".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing a static HTTP header value must invalidate the cache key"
+    );
+}
+
+#[test]
+fn tool_cache_key_changes_when_env_http_header_env_var_name_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    server
+        .env_http_headers
+        .insert("X-Auth".to_string(), "OLD_TOKEN_ENV".to_string());
+    let base = tool_cache_key("docs", &server);
+    // Renaming the backing env-var changes which credential is loaded at
+    // session start — the cache must be evicted.
+    server
+        .env_http_headers
+        .insert("X-Auth".to_string(), "NEW_TOKEN_ENV".to_string());
+    assert_ne!(
+        base,
+        tool_cache_key("docs", &server),
+        "changing the env-var name in env_http_headers must invalidate the cache key"
+    );
+}
+
+#[test]
 fn registry_loads_cached_tools_from_store_on_startup() {
     let root = temp_root("mcp-tool-cache");
     let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));

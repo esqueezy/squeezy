@@ -49,7 +49,10 @@ fn sse_reconnect_delay(attempt: u32) -> Duration {
     let capped = computed.min(SSE_RECONNECT_MAX_MS as f64);
     // Pseudorandom jitter derived from `attempt` — no dependency on `rand`.
     // Uses a deterministic but irregular sequence so consecutive attempts
-    // don't all hit the same boundary.
+    // don't all hit the same boundary.  Note: the jitter is process-
+    // independent, so multiple Squeezy instances that restart at the same
+    // time and share the same attempt counter will compute the same delay.
+    // Full thundering-herd protection would require per-process entropy.
     let jitter_seed = (attempt.wrapping_mul(2654435761)) as f64 / u32::MAX as f64;
     let jitter = (jitter_seed - 0.5) * 2.0 * SSE_RECONNECT_JITTER_FRACTION * capped;
     let delay_ms = ((capped + jitter).round() as u64).clamp(1, SSE_RECONNECT_MAX_MS);

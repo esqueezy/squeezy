@@ -1056,7 +1056,15 @@ async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Re
                         let probe_str = status_map
                             .get(name)
                             .map(mcp_status_probe_str)
-                            .unwrap_or_else(|| "skipped".to_string());
+                            .unwrap_or_else(|| {
+                                // Disabled servers are not probed; distinguish
+                                // from servers that simply failed to report.
+                                if server.enabled {
+                                    "no result".to_string()
+                                } else {
+                                    "disabled".to_string()
+                                }
+                            });
                         row.push(probe_str);
                     }
                     rows.push(row);
@@ -1181,8 +1189,8 @@ fn mcp_status_probe_str(status: &McpServerStatus) -> String {
             outcome,
         } => {
             let reason = match outcome {
-                McpStaleOutcome::Failed { .. } => "discovery failed",
-                McpStaleOutcome::Cancelled => "discovery cancelled",
+                McpStaleOutcome::Failed { error } => format!("discovery failed: {error}"),
+                McpStaleOutcome::Cancelled => "discovery cancelled".to_string(),
             };
             format!("stale ({tools_count} cached; {reason})")
         }
