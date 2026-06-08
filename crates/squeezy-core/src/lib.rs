@@ -10209,7 +10209,8 @@ pub fn project_settings_template() -> &'static str {
 # external MCP tools that are discovered before each agent turn.
 
 # [graph]
-# languages = ["rust", "python"]  # empty or absent means all supported languages
+# languages = []  # all supported languages (the default); set
+#                 # e.g. ["rust", "python"] to restrict to those
 # max_file_bytes = 1000000
 # include_hidden = false
 # require_indexing_signal = true

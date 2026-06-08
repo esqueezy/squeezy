@@ -17,6 +17,14 @@ use squeezy_core::{
 };
 
 pub const CRATE_NAME: &str = "squeezy-workspace";
+
+/// Directory names whose events should never trigger a graph refresh and
+/// whose contents are always pruned from the workspace crawl: VCS metadata
+/// (`.git`, `.hg`, `.jj`, `.svn`) and Squeezy's own state cache (`.squeezy`).
+/// Centralised so the workspace crawl, the file-watcher event filter, and
+/// any future caller stay in sync.
+pub const VCS_AND_CACHE_DIR_NAMES: &[&str] = &[".git", ".hg", ".jj", ".svn", ".squeezy"];
+
 const SOURCE_SCAN_MAX_DEPTH: usize = 2;
 const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
@@ -363,6 +371,14 @@ pub struct WorkspaceCrawler {
 }
 
 impl WorkspaceCrawler {
+    /// Construct a crawler, panicking on invalid `CrawlOptions`. Prefer
+    /// [`WorkspaceCrawler::try_new`], which surfaces a `SqueezyError::Config`
+    /// for the same inputs (bad policy globs, unknown language allow-list
+    /// entries) so callers can render a friendly error instead of crashing.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use WorkspaceCrawler::try_new to surface invalid CrawlOptions as SqueezyError::Config"
+    )]
     pub fn new(options: CrawlOptions) -> Self {
         // Default policies always compile; user-supplied policies must be
         // validated up front via `IndexingPolicy::compile` to surface glob
@@ -585,6 +601,10 @@ impl WorkspaceCrawler {
             });
         }
 
+        // Order matters: refine first so that ambiguous `.h` files are
+        // reclassified to their sibling's language *before* the allow-list
+        // decides whether to keep them. Otherwise `[graph].languages = ["c"]`
+        // could drop a sibling-less `.h` that should have stayed as C.
         refine_c_family_header_languages(&mut files);
         apply_language_allowlist(&mut files, &self.enabled_languages, &mut unsupported);
 
@@ -703,6 +723,10 @@ fn compile_language_allowlist(languages: &[String]) -> Result<HashSet<LanguageKi
 
 fn parse_language_selector(language: &str) -> Result<Vec<LanguageKind>> {
     let raw = language.trim().to_ascii_lowercase();
+    // Early-match on the literal lowercased form before normalization:
+    // `language_selector_key` strips `#`, `+`, and `/`, so `c#`, `c++`,
+    // and `c/c++` would otherwise collapse to `c`. Keep this in sync with
+    // the strip set in `language_selector_key`.
     match raw.as_str() {
         "c#" => return Ok(LanguageFamily::CSharp.kinds().to_vec()),
         "c++" => return Ok(vec![LanguageKind::Cpp]),
@@ -732,7 +756,10 @@ fn parse_language_selector(language: &str) -> Result<Vec<LanguageKind>> {
         "tsx" => &[LanguageKind::Tsx],
         other => {
             return Err(SqueezyError::Config(format!(
-                "unknown graph language {other:?}; expected a supported language or family id"
+                "unknown graph language {other:?}; expected a supported language or family id \
+                 (see LANGUAGES.md for canonical ids; family ids like `c-family`, `js-ts`, \
+                 `c-sharp` map to every kind in the family, while singletons like `cpp`, \
+                 `jsx`, `tsx` map to one kind only)"
             )));
         }
     };
@@ -752,6 +779,12 @@ fn language_selector_key(language: &str) -> String {
 }
 
 fn language_enabled(language: LanguageKind, enabled: &HashSet<LanguageKind>) -> bool {
+    // The allow-list governs parser-backed kinds. `LanguageKind::Unsupported`
+    // is already diverted to `unsupported` before this runs, so the only
+    // family-less kind that reaches this branch is `LanguageKind::Unknown`
+    // (extensionless inputs like `Makefile`); keep them indexed regardless
+    // of the allow-list — they are not parser-backed and are not what the
+    // user is restricting via `[graph].languages`.
     enabled.is_empty() || language.family().is_none() || enabled.contains(&language)
 }
 
@@ -1534,6 +1567,10 @@ fn update_stable_hash(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+// Tests intentionally exercise the deprecated `WorkspaceCrawler::new` panic
+// path alongside `try_new`; the deprecation steers external callers without
+// forcing a mass rewrite of in-tree fixtures.
 #[cfg(test)]
 #[path = "lib_tests.rs"]
+#[allow(deprecated)]
 mod tests;

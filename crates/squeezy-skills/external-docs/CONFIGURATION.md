@@ -536,7 +536,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   glob would otherwise re-enable it; the exclusion is reported with its normal
   class reason, not `user_exclude`.
   Canonical supported-language families and recognized extensions are listed in
-  [`LANGUAGES.md`](LANGUAGES.md).
+  [`LANGUAGES.md`](LANGUAGES.md). Family ids (e.g. `c-family`, `js-ts`,
+  `c-sharp`) match every kind in the family, while singleton ids like `cpp`,
+  `jsx`, `tsx` match only one kind. `javascript`/`js` matches `JavaScript`
+  plus `Jsx` only — use the `js-ts` family id (or `typescript`/`ts`) when you
+  want to index JS/JSX together with TS/TSX.
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory. Graph warm-start state,
   cross-session receipt metadata, and internal observations are stored in

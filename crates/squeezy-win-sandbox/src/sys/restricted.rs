@@ -25,9 +25,17 @@ pub(crate) fn spawn(
     }
 
     // For writable-roots mode, add per-root write capability SIDs and apply ACLs.
-    // Do not also include the read-only cap: write-restricted tokens require
-    // every restricting SID to pass write access, so a cap without the root's
-    // write ACE would block legitimate workspace writes.
+    // Do not also include the read-only cap: write-restricted tokens AND every
+    // restricting SID against the requested access, so a cap that has no write
+    // ACE on a workspace root (the read-only cap, by definition) would always
+    // fail the AND and block legitimate workspace writes.
+    //
+    // Previously this branch also pushed `cap::readonly_cap_sid(...)` alongside
+    // each per-root write SID; with both present the AND was unsatisfiable
+    // for writes and the sandboxed child could not write to its workspace
+    // root at all. The world-writable audit's `deny_sid` index moves with
+    // this change (now `[0]`, the first writable-root SID) — both halves
+    // are required and must stay in sync.
     if spec.token_mode == WinTokenMode::WritableRootsCapability {
         tracing::debug!(
             "restricted spawn: applying writable-root ACLs for {} root(s)",

@@ -56,14 +56,17 @@ impl Default for WatcherConfig {
 
 impl WatcherConfig {
     /// Build a watcher config that recursively watches the workspace root.
+    /// Convenience wrapper for `WatcherConfig::default().with_default_root(root)`
+    /// so the "fill `src_dirs` if empty" rule has a single source of truth.
     pub fn for_workspace_root(root: impl Into<PathBuf>) -> Self {
-        Self {
-            src_dirs: vec![root.into()],
-            debounce_ms: DEFAULT_DEBOUNCE_MS,
-        }
+        Self::default().with_default_root(root.into())
     }
 
-    pub(crate) fn with_default_root(mut self, root: PathBuf) -> Self {
+    /// Defensive default: if `src_dirs` is empty, fill it with `root` so a
+    /// caller passing `WatcherConfig::default()` does not end up with an
+    /// inert zero-directory watcher. Leaves an explicitly populated
+    /// `src_dirs` untouched.
+    pub fn with_default_root(mut self, root: PathBuf) -> Self {
         if self.src_dirs.is_empty() {
             self.src_dirs.push(root);
         }

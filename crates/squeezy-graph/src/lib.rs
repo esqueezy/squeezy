@@ -25,7 +25,8 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, WorkspaceCrawler,
+    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, VCS_AND_CACHE_DIR_NAMES,
+    WorkspaceCrawler,
 };
 
 use crate::languages::{
@@ -2641,14 +2642,19 @@ impl GraphManager {
 
 fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
+    // Conservative filter: drop only VCS metadata and Squeezy's own cache
+    // (`VCS_AND_CACHE_DIR_NAMES`) so persisting the graph cannot self-trigger
+    // a refresh loop. Heavy-churn build dirs like `target/` and
+    // `node_modules/` stay visible because an `include` glob may re-enable
+    // a subset of them; the crawler does the policy-aware filtering.
     !relative.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
             return false;
         };
-        matches!(
-            name.to_str(),
-            Some(".git" | ".hg" | ".jj" | ".svn" | ".squeezy")
-        )
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        VCS_AND_CACHE_DIR_NAMES.contains(&name)
     })
 }
 
