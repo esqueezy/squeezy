@@ -886,12 +886,12 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/router",
-        what: "Toggle cheap-model turn routing on or off. Omit the argument to open the router config screen.",
+        what: "Toggle cheap-model turn routing on or off for this session (session-only; does not change `[routing].enabled` in your config). Omit the argument to open the router config screen where the setting can be persisted.",
         syntax: "/router [on|off]",
         examples: &[
-            "/router on   — enable cheap-model routing",
-            "/router off  — disable cheap-model routing",
-            "/router      — open router configuration",
+            "/router on   — enable cheap-model routing for this session",
+            "/router off  — disable cheap-model routing for this session",
+            "/router      — open router configuration (persists the setting)",
         ],
         available_during_turn: true,
         capability_note: None,
@@ -1032,9 +1032,9 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/cheap",
-        what: "Force the current turn to use the cheap/judge model tier.",
+        what: "Force the next turn to use the cheap/judge model tier (one-shot; only affects the immediately following prompt).",
         syntax: "/cheap",
-        examples: &["/cheap  — run this turn with the cheapest available model"],
+        examples: &["/cheap  — run the next turn with the cheapest available model"],
         available_during_turn: true,
         capability_note: None,
         related: &["providers", "config"],

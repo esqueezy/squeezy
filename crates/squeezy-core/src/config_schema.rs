@@ -3986,6 +3986,9 @@ fn set_subagent_max_concurrent(cfg: &mut AppConfig, value: FieldValue) -> Result
     if v < 1 {
         return Err("max_concurrent must be at least 1");
     }
+    if v > 256 {
+        return Err("max_concurrent must be at most 256");
+    }
     cfg.subagents.max_concurrent = v as usize;
     Ok(())
 }

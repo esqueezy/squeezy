@@ -2164,7 +2164,7 @@ impl Agent {
     /// snapshot is internally consistent.
     pub fn mode_state_snapshot(&self) -> ModeStateSnapshot {
         let routing = self.routing_state.lock().expect("routing state lock");
-        let session_mode = self.config.session_mode;
+        let session_mode = self.session_mode();
         ModeStateSnapshot {
             session_mode,
             routing_session_disabled: routing.pending_override.session_disabled,

@@ -4226,7 +4226,12 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Cheap => {
             agent.request_routing_force_cheap();
-            let parent_model = agent.config_snapshot().model;
+            let config = agent.config_snapshot();
+            let provider = agent.provider_name();
+            let raw_parent = &config.model;
+            let parent_model = squeezy_core::resolve_model_alias(provider, raw_parent)
+                .unwrap_or(raw_parent)
+                .to_owned();
             let note = match agent.cheap_model() {
                 Some(ref cheap) if cheap == &parent_model => {
                     "\nNote: the cheap model resolves to the same model as the parent; \
