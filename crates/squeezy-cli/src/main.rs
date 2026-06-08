@@ -255,7 +255,7 @@ enum McpCommand {
         json: bool,
     },
     #[command(about = "Add an MCP server to user or project settings")]
-    Add(McpAddArgs),
+    Add(Box<McpAddArgs>),
     #[command(about = "Enable a configured MCP server")]
     Enable(McpNameScope),
     #[command(about = "Disable a configured MCP server")]

@@ -761,12 +761,11 @@ async fn probe_mcp_servers(
             };
             // Append captured stderr for failed/warn stdio servers to give
             // actionable startup diagnostics without requiring a manual re-run.
-            if !matches!(status, Status::Ok) {
-                if let Some(lines) = stderr_tails.get(name) {
-                    let excerpt: String =
-                        lines.iter().map(|l| format!("\n  stderr: {l}")).collect();
-                    detail.push_str(&excerpt);
-                }
+            if !matches!(status, Status::Ok)
+                && let Some(lines) = stderr_tails.get(name)
+            {
+                let excerpt: String = lines.iter().map(|l| format!("\n  stderr: {l}")).collect();
+                detail.push_str(&excerpt);
             }
             Check {
                 name: format!("probe:mcp:{name}"),
