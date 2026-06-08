@@ -266,9 +266,9 @@ fn config_without_env_uses_openai_provider_defaults() {
             user_dir.contains("squeezy") && user_dir.contains("skills"),
             "unexpected user_dir on Windows: {user_dir}"
         );
+        // Both APPDATA and USERPROFILE fallbacks now use the .squeezy namespace.
         assert!(
-            (compat_dir.contains("squeezy") || compat_dir.contains(".agents"))
-                && compat_dir.contains("skills"),
+            compat_dir.contains("squeezy") && compat_dir.contains("skills"),
             "unexpected compat_user_dir on Windows: {compat_dir}"
         );
     }
@@ -6004,9 +6004,10 @@ fn default_agent_compat_skills_dir_uses_appdata_on_windows() {
         assert_eq!(dir, expected);
     } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
         let dir = default_agent_compat_skills_dir();
+        // USERPROFILE fallback uses .squeezy namespace for consistency with APPDATA path.
         let expected = std::path::PathBuf::from(&userprofile)
-            .join(".agents")
-            .join("skills");
+            .join(".squeezy")
+            .join("agent-skills");
         assert_eq!(dir, expected);
     }
 }

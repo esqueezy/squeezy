@@ -83,6 +83,7 @@ fn doc_prefilter_matches_non_skill_doc_by_filename() {
 
 #[test]
 fn powershell_readers_trigger_doc_read_detection() {
+    // get-content and gc are cross-platform (not standard Unix commands).
     assert!(command_reads_file(&[
         "Get-Content".to_string(),
         "SKILL.md".to_string()
@@ -91,40 +92,74 @@ fn powershell_readers_trigger_doc_read_detection() {
         "gc".to_string(),
         "SKILL.md".to_string()
     ]));
-    assert!(command_reads_file(&[
-        "type".to_string(),
-        "SKILL.md".to_string()
-    ]));
-    // Non-reader should not match.
+    // Non-reader should not match on any platform.
     assert!(!command_reads_file(&[
         "Invoke-WebRequest".to_string(),
         "SKILL.md".to_string()
     ]));
 }
 
+#[cfg(windows)]
+#[test]
+fn type_command_triggers_read_on_windows() {
+    // On Windows, `type` is the cmd.exe file-display command and is a reader.
+    assert!(command_reads_file(&[
+        "type".to_string(),
+        "SKILL.md".to_string()
+    ]));
+}
+
 #[cfg(not(windows))]
 #[test]
-fn tokenizer_treats_backslash_as_escape_on_unix() {
-    // On Unix, backslash escapes the next character.
-    let tokens = tokenize_command("cat foo\\ bar.txt");
+fn type_command_does_not_trigger_read_on_unix() {
+    // On Unix, `type` is a shell introspection built-in, not a file reader.
+    assert!(!command_reads_file(&[
+        "type".to_string(),
+        "SKILL.md".to_string()
+    ]));
+}
+
+#[test]
+fn unix_tokenizer_treats_backslash_as_escape() {
+    // tokenize_command_unix is always compiled; verify backslash-as-escape behavior.
+    let tokens = tokenize_command_unix("cat foo\\ bar.txt");
     assert_eq!(tokens, vec!["cat", "foo bar.txt"]);
 }
 
-#[cfg(windows)]
 #[test]
-fn tokenizer_preserves_windows_path_separators() {
-    // On Windows, backslash is a path separator, not an escape character.
-    let tokens = tokenize_command(r"pwsh -File .\.squeezy\skills\nav\scripts\init.ps1");
+fn windows_tokenizer_preserves_windows_path_separators() {
+    // tokenize_command_windows is always compiled; verify Windows path preservation.
+    let tokens = tokenize_command_windows(r"pwsh -File .\.squeezy\skills\nav\scripts\init.ps1");
     assert_eq!(tokens.len(), 3);
     assert_eq!(tokens[0], "pwsh");
     assert_eq!(tokens[1], "-File");
     assert_eq!(tokens[2], r".\.squeezy\skills\nav\scripts\init.ps1");
 }
 
-#[cfg(windows)]
 #[test]
-fn tokenizer_preserves_absolute_windows_path() {
-    let tokens = tokenize_command(r#"pwsh -File "C:\Users\alice\SKILL.md""#);
+fn windows_tokenizer_preserves_absolute_windows_path() {
+    let tokens = tokenize_command_windows(r#"pwsh -File "C:\Users\alice\SKILL.md""#);
     assert_eq!(tokens.len(), 3);
     assert_eq!(tokens[2], r"C:\Users\alice\SKILL.md");
+}
+
+#[test]
+fn dispatch_routes_to_platform_tokenizer() {
+    // On Unix the dispatcher should use the Unix tokenizer (backslash escapes).
+    // On Windows the dispatcher should use the Windows tokenizer (backslash is literal).
+    if cfg!(windows) {
+        let tokens = tokenize_command(r"pwsh -File .\.squeezy\skills\SKILL.md");
+        assert_eq!(
+            tokens.len(),
+            3,
+            "Windows: backslash should not split tokens"
+        );
+    } else {
+        let tokens = tokenize_command("cat foo\\ bar.txt");
+        assert_eq!(
+            tokens,
+            vec!["cat", "foo bar.txt"],
+            "Unix: backslash should escape space"
+        );
+    }
 }

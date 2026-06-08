@@ -9800,7 +9800,12 @@ pub fn default_agent_compat_skills_dir() -> PathBuf {
             return PathBuf::from(appdata).join("squeezy").join("agent-skills");
         }
         if let Some(userprofile) = env::var_os("USERPROFILE") {
-            return PathBuf::from(userprofile).join(".agents").join("skills");
+            // Use the same `.squeezy` namespace as the APPDATA path so that
+            // skills installed under one profile location remain visible if
+            // APPDATA becomes available (roaming profiles, new machine).
+            return PathBuf::from(userprofile)
+                .join(".squeezy")
+                .join("agent-skills");
         }
     }
     env::var_os("HOME")

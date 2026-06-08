@@ -756,7 +756,7 @@ fn skills_check(config: &AppConfig) -> Check {
         // fall back to allow — warn early before the first dispatch.
         #[cfg(windows)]
         if which_sh_missing() {
-            detail.push_str("; hooks_enabled but `sh` not found in PATH — hooks may not fire (install Git for Windows or set SQUEEZY_SHELL)");
+            detail.push_str("; hooks_enabled but `sh` not found in PATH — hook scripts will not fire (add sh to PATH via Git for Windows or MSYS2, or add `failure_policy: deny` to policy hooks)");
             return Check {
                 name: "skills".to_string(),
                 status: Status::Warn,
@@ -771,15 +771,20 @@ fn skills_check(config: &AppConfig) -> Check {
     }
 }
 
-/// Returns `true` when `sh` is not reachable on the current `PATH`.
+/// Returns `true` when `sh.exe` or `sh` is not found in any directory on
+/// the current `PATH`. Uses filesystem `try_exists` probes so no child
+/// process is spawned, keeping `skills_check` stat-only.
 #[cfg(windows)]
 fn which_sh_missing() -> bool {
-    std::process::Command::new("sh")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_err()
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        if dir.join("sh.exe").try_exists().unwrap_or(false)
+            || dir.join("sh").try_exists().unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Pull the result of `update::check_for_update()` into a doctor row. Newer

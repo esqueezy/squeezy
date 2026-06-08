@@ -9,7 +9,7 @@ const RUNNERS: &[&str] = &[
     "python", "python3", "bash", "zsh", "sh", "node", "deno", "ruby", "perl", "pwsh",
 ];
 const SCRIPT_EXTENSIONS: &[&str] = &[".py", ".sh", ".js", ".ts", ".rb", ".pl", ".ps1"];
-const READERS: &[&str] = &[
+const READERS_COMMON: &[&str] = &[
     // Unix readers
     "cat",
     "sed",
@@ -19,11 +19,32 @@ const READERS: &[&str] = &[
     "more",
     "bat",
     "awk",
-    // Windows PowerShell cmdlet and aliases for file reading
+    // PowerShell Get-Content cmdlet and gc alias are safe cross-platform —
+    // neither is a standard Unix command that has a different meaning.
     "get-content",
     "gc",
-    "type",
 ];
+
+// `type` is a Unix shell built-in for command introspection ("type bash" →
+// "bash is /bin/bash"), not a file reader. On Unix, treating it as a reader
+// would cause `type SKILL.md` in a directory containing a SKILL.md to trigger
+// implicit activation. On Windows it is the cmd.exe file-display command and
+// is a legitimate file reader.
+#[cfg(windows)]
+const READERS_WINDOWS_ONLY: &[&str] = &["type"];
+
+fn is_reader_program(program: &str) -> bool {
+    if READERS_COMMON.contains(&program) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if READERS_WINDOWS_ONLY.contains(&program) {
+            return true;
+        }
+    }
+    false
+}
 
 pub(crate) fn detect_for_command(
     command: &str,
@@ -135,7 +156,7 @@ fn command_reads_file(tokens: &[String]) -> bool {
         return false;
     };
     let program = command_basename(program).to_ascii_lowercase();
-    READERS.contains(&program.as_str())
+    is_reader_program(&program)
 }
 
 fn command_basename(command: &str) -> String {
@@ -147,21 +168,21 @@ fn command_basename(command: &str) -> String {
 }
 
 fn tokenize_command(command: &str) -> Vec<String> {
-    // On Windows, backslash is a path separator (PowerShell uses backtick for
-    // escaping), so the tokenizer treats `\` as a literal character. This
-    // preserves native Windows paths like `.\.squeezy\skills\nav\SKILL.md`.
-    // On Unix, `\` outside quotes escapes the next character.
-    #[cfg(not(windows))]
-    {
-        tokenize_command_unix(command)
-    }
-    #[cfg(windows)]
-    {
+    // Dispatch to the correct variant based on the host platform. On Windows,
+    // backslash is a path separator (PowerShell uses backtick for escaping),
+    // so we treat `\` as a literal. On Unix, `\` outside quotes escapes the
+    // next character. Both functions are compiled on all platforms so they can
+    // be exercised by cross-platform unit tests.
+    if cfg!(windows) {
         tokenize_command_windows(command)
+    } else {
+        tokenize_command_unix(command)
     }
 }
 
-#[cfg(not(windows))]
+/// Unix tokenizer: `\` outside quotes escapes the next character.
+/// Compiled on all platforms so Windows-path tests can verify the Unix
+/// variant's behavior and vice versa, reducing the risk of silent divergence.
 fn tokenize_command_unix(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -197,7 +218,9 @@ fn tokenize_command_unix(command: &str) -> Vec<String> {
     tokens
 }
 
-#[cfg(windows)]
+/// Windows tokenizer: `\` is a path separator, not an escape character.
+/// PowerShell uses backtick (`) for escaping. Compiled on all platforms so
+/// the logic can be unit-tested on Linux and macOS CI runners.
 fn tokenize_command_windows(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();

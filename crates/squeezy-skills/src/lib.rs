@@ -436,6 +436,10 @@ pub struct SkillCatalog {
     /// every reader token — especially helpful on Windows with large or
     /// slow-mount catalogs.
     implicit_doc_filenames: BTreeSet<String>,
+    /// All root directories that were probed during the last [`Self::discover`]
+    /// call, in discovery order. Stored so callers (e.g. `squeezy skills list`)
+    /// can display the scanned roots without triggering a second ancestor walk.
+    scanned_roots: Vec<PathBuf>,
     active_budget_chars: usize,
     active_body_cap_chars: usize,
     preamble_enabled: bool,
@@ -458,6 +462,7 @@ impl Default for SkillCatalog {
             implicit_by_scripts_dir: BTreeMap::new(),
             implicit_by_doc_path: BTreeMap::new(),
             implicit_doc_filenames: BTreeSet::new(),
+            scanned_roots: Vec::new(),
             active_budget_chars: defaults.active_budget_effective_chars(),
             active_body_cap_chars: defaults.active_body_cap_chars,
             preamble_enabled: defaults.preamble_enabled,
@@ -485,6 +490,19 @@ impl SkillCatalog {
             inline: config.inline,
             ..Self::default()
         };
+        // Populate scanned_roots eagerly so callers (e.g. `squeezy skills list`)
+        // can display the probed roots without a second ancestor walk.
+        catalog.scanned_roots.push(config.compat_user_dir.clone());
+        catalog.scanned_roots.push(config.user_dir.clone());
+        catalog
+            .scanned_roots
+            .extend(config.extra_roots.iter().cloned());
+        catalog
+            .scanned_roots
+            .push(workspace_root.join(COMPAT_PROJECT_SKILLS_DIR));
+        catalog
+            .scanned_roots
+            .push(workspace_root.join(PROJECT_SKILLS_DIR));
         catalog.discover_dir(&config.compat_user_dir, SkillSource::CompatUser);
         catalog.discover_dir(&config.user_dir, SkillSource::User);
         catalog.discover_extra_roots(&config.extra_roots);
@@ -506,6 +524,14 @@ impl SkillCatalog {
         // new skills so closer ancestors always win over farther ones.
         let mut shadow_set: BTreeSet<String> = catalog.skills.keys().cloned().collect();
         for ancestor in ancestor_project_roots(workspace_root) {
+            // Track ancestor roots for `scanned_roots()` so callers see the
+            // full set without a second ancestor walk.
+            catalog
+                .scanned_roots
+                .push(ancestor.join(COMPAT_PROJECT_SKILLS_DIR));
+            catalog
+                .scanned_roots
+                .push(ancestor.join(PROJECT_SKILLS_DIR));
             let before: BTreeSet<String> = catalog.skills.keys().cloned().collect();
             catalog.discover_dir_filtered(
                 &ancestor.join(COMPAT_PROJECT_SKILLS_DIR),
@@ -527,6 +553,14 @@ impl SkillCatalog {
         catalog.collect_trigger_collisions();
         catalog.rebuild_implicit_indexes();
         catalog
+    }
+
+    /// Returns all root directories that were probed during the last
+    /// [`Self::discover`] call, in discovery order. Callers can display
+    /// this list (e.g. `squeezy skills list`) without performing a
+    /// second ancestor walk.
+    pub fn scanned_roots(&self) -> &[PathBuf] {
+        &self.scanned_roots
     }
 
     pub fn summaries(&self) -> Vec<SkillSummary> {
@@ -1169,6 +1203,7 @@ impl Clone for SkillCatalog {
             implicit_by_scripts_dir: self.implicit_by_scripts_dir.clone(),
             implicit_by_doc_path: self.implicit_by_doc_path.clone(),
             implicit_doc_filenames: self.implicit_doc_filenames.clone(),
+            scanned_roots: self.scanned_roots.clone(),
             active_budget_chars: self.active_budget_chars,
             active_body_cap_chars: self.active_body_cap_chars,
             preamble_enabled: self.preamble_enabled,
@@ -1524,7 +1559,15 @@ fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
         "failure_policy" => {
             spec.failure_policy = match value {
                 "deny" => HookFailurePolicy::Deny,
-                _ => HookFailurePolicy::Allow,
+                "allow" => HookFailurePolicy::Allow,
+                other => {
+                    warn!(
+                        target: "squeezy_skills",
+                        value = %other,
+                        "unrecognized failure_policy value; expected \"allow\" or \"deny\", defaulting to allow"
+                    );
+                    HookFailurePolicy::Allow
+                }
             };
         }
         "type" if value != "command" => {
