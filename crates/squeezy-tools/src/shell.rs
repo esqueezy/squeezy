@@ -641,8 +641,11 @@ impl ToolRegistry {
         let pty_master: Option<std::fs::File>;
         let ask_server: Option<ShellAskServer>;
         let mut child: ShellChild;
-        // Mutable tracking vars initialized here so both branches can set them.
+        // Tracking vars set by platform-gated cfg blocks below; `mut` is
+        // needed only on the relevant platform but must compile on all targets.
+        #[allow(unused_mut)]
         let mut tty_degraded = false;
+        #[allow(unused_mut)]
         let mut windows_job_status_out: Option<&'static str> = None;
 
         if win_sandbox_backend {

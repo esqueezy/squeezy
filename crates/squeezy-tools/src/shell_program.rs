@@ -4,6 +4,7 @@
 //! their own `cfg(target_os = ...)` blocks; this module covers everything
 //! else.
 
+#[cfg(windows)]
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
@@ -12,6 +13,10 @@ pub(crate) struct ShellProgram {
     pub args: Vec<String>,
     /// Short display name for diagnostics (e.g. `"pwsh"`, `"powershell"`,
     /// `"cmd.exe"`, `"gitbash"`, `"sh"`, or the custom path basename).
+    /// Populated on all platforms; consumed by Windows sandbox plan metadata
+    /// and cached shell resolution. Dead-code lint is suppressed because the
+    /// field is read only inside `#[cfg(windows)]` blocks.
+    #[allow(dead_code)]
     pub display_name: String,
 }
 
