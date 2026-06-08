@@ -279,7 +279,7 @@ fn is_active_plan_path_returns_true_for_same_file() {
     fs::write(&plan, "body").expect("write");
     assert!(
         canonicalize_active_plan_path(&plan)
-            .map_or(false, |canon| is_active_plan_path_with_canon(&plan, &canon)),
+            .is_some_and(|canon| is_active_plan_path_with_canon(&plan, &canon)),
         "same path should match"
     );
     let _ = fs::remove_dir_all(&root);
@@ -294,9 +294,8 @@ fn is_active_plan_path_returns_false_for_different_file() {
     fs::write(&plan_a, "body").expect("write a");
     fs::write(&plan_b, "body").expect("write b");
     assert!(
-        !canonicalize_active_plan_path(&plan_b).map_or(false, |canon| {
-            is_active_plan_path_with_canon(&plan_a, &canon)
-        }),
+        !canonicalize_active_plan_path(&plan_b)
+            .is_some_and(|canon| { is_active_plan_path_with_canon(&plan_a, &canon) }),
         "different files should not match"
     );
     let _ = fs::remove_dir_all(&root);
@@ -311,9 +310,7 @@ fn is_active_plan_path_returns_false_when_target_nonexistent() {
     let ghost = plans_dir.join("ghost.md");
     assert!(
         !canonicalize_active_plan_path(&plan)
-            .map_or(false, |canon| is_active_plan_path_with_canon(
-                &ghost, &canon
-            )),
+            .is_some_and(|canon| is_active_plan_path_with_canon(&ghost, &canon)),
         "nonexistent target should return false"
     );
     let _ = fs::remove_dir_all(&root);
@@ -332,9 +329,8 @@ fn is_active_plan_path_resolves_dotdot_traversal() {
         .join(TEST_SESSION_ID)
         .join("plan-a.md");
     assert!(
-        canonicalize_active_plan_path(&plan).map_or(false, |canon| is_active_plan_path_with_canon(
-            &traversal, &canon
-        )),
+        canonicalize_active_plan_path(&plan)
+            .is_some_and(|canon| is_active_plan_path_with_canon(&traversal, &canon)),
         "dotdot-resolved path should match"
     );
     let _ = fs::remove_dir_all(&root);
@@ -351,9 +347,8 @@ fn is_active_plan_path_case_insensitive_on_windows() {
     let lower = plans_dir.join("plan-a.md");
     // Both spellings should canonicalize to the same path on NTFS.
     assert!(
-        canonicalize_active_plan_path(&plan).map_or(false, |canon| is_active_plan_path_with_canon(
-            &lower, &canon
-        )),
+        canonicalize_active_plan_path(&plan)
+            .is_some_and(|canon| is_active_plan_path_with_canon(&lower, &canon)),
         "case-only difference should match on Windows"
     );
     let _ = fs::remove_dir_all(&root);
