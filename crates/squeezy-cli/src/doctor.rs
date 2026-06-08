@@ -768,16 +768,6 @@ fn hook_shell_check(config: &AppConfig) -> Check {
         }
     }
 
-    // Verify the shell isn't on the standard fixed path before warning.
-    #[cfg(not(windows))]
-    if std::path::Path::new("/bin/sh").exists() || std::path::Path::new("/usr/bin/sh").exists() {
-        return Check {
-            name: "hooks:shell".to_string(),
-            status: Status::Ok,
-            detail: "hook shell available: sh (fixed path)".to_string(),
-        };
-    }
-
     let tried = candidates.join(", ");
     Check {
         name: "hooks:shell".to_string(),

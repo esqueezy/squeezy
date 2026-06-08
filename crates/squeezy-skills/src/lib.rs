@@ -3,7 +3,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -2022,14 +2025,19 @@ pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillMa
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// JSON payload byte length above which the payload is written to a
-/// temporary file instead of (or in addition to) the environment variable.
+/// temporary file instead of the environment variable.
 ///
 /// Windows process environment blocks have practical size limits; large
 /// payloads (e.g. prompts or full tool metadata) can push past them.
 /// When the threshold is exceeded the handler writes the payload to a
-/// temp file, sets `SQUEEZY_HOOK_PAYLOAD_FILE` to that path, and still
-/// sets `SQUEEZY_HOOK_PAYLOAD` for scripts that read only the env var.
+/// temp file and sets `SQUEEZY_HOOK_PAYLOAD_FILE`; `SQUEEZY_HOOK_PAYLOAD`
+/// is left unset so that the large JSON is never placed in the env block.
 const PAYLOAD_INLINE_THRESHOLD: usize = 8 * 1024;
+
+/// Per-process dispatch sequence number used to generate unique temp-file
+/// names. A plain counter is enough: file names only need to be unique
+/// within a single process, not globally.
+static HOOK_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Resolve the shell program and arguments used to run a hook command
 /// string on the current platform.
@@ -2171,13 +2179,15 @@ impl HookHandler for SkillHookHandler {
         let payload = payload_json.to_string();
 
         // For payloads that exceed the inline threshold, write to a temp
-        // file and set SQUEEZY_HOOK_PAYLOAD_FILE so scripts can read from
-        // either source. The env var is still set for scripts that only
-        // read it; the file copy avoids exhausting the Windows environment
-        // block for large payloads.
+        // file and pass only SQUEEZY_HOOK_PAYLOAD_FILE. Setting the full
+        // payload in SQUEEZY_HOOK_PAYLOAD when the file is also present
+        // would still exhaust the Windows environment block, defeating the
+        // purpose. Each dispatch gets a unique sequence number appended to
+        // the PID so concurrent dispatches cannot clobber each other's file.
+        let seq = HOOK_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let payload_file_path = if payload.len() > PAYLOAD_INLINE_THRESHOLD {
-            let path =
-                std::env::temp_dir().join(format!("squeezy_hook_{}.json", std::process::id()));
+            let path = std::env::temp_dir()
+                .join(format!("squeezy_hook_{}_{seq}.json", std::process::id()));
             match fs::write(&path, &payload) {
                 Ok(()) => Some(path),
                 Err(error) => {
@@ -2202,10 +2212,14 @@ impl HookHandler for SkillHookHandler {
             .arg(trimmed)
             .current_dir(&self.base_dir)
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
-            .env("SQUEEZY_SKILL_NAME", &self.skill_name)
-            .env("SQUEEZY_HOOK_PAYLOAD", &payload);
+            .env("SQUEEZY_SKILL_NAME", &self.skill_name);
+        // Deliver payload: via file for large payloads (avoids the Windows
+        // environment-block ceiling), via env var for small ones. Never set
+        // both so that the large JSON is never placed in the env block.
         if let Some(ref path) = payload_file_path {
             command.env("SQUEEZY_HOOK_PAYLOAD_FILE", path);
+        } else {
+            command.env("SQUEEZY_HOOK_PAYLOAD", &payload);
         }
 
         let cleanup = |path: Option<&Path>| {
@@ -2238,7 +2252,7 @@ impl HookHandler for SkillHookHandler {
                             ));
                         }
                         Ok(None) => {
-                            std::thread::sleep(Duration::from_millis(50));
+                            std::thread::sleep(Duration::from_millis(5));
                         }
                         Err(error) => {
                             warn!(

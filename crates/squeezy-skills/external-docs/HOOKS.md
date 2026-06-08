@@ -63,7 +63,10 @@ printf '%s\n' "$SQUEEZY_HOOK_PAYLOAD" >> "$SQUEEZY_SKILL_DIR/hooks.log"
 exit 0
 ```
 
-**Windows — PowerShell 7 (`pwsh`):**
+**Windows — PowerShell 7 (`pwsh`) or Windows PowerShell 5 (`powershell`):**
+
+Squeezy resolves the shell and invokes it with `-NoProfile -Command <your command>`.
+Write the `command` field as a PowerShell expression, not as a `pwsh` invocation:
 
 ```powershell
 # scripts/pre-turn.ps1
@@ -72,18 +75,19 @@ $payload | ConvertTo-Json | Add-Content "$env:SQUEEZY_SKILL_DIR\hooks.log"
 exit 0
 ```
 
-Declare in the skill's `SKILL.md` frontmatter using `pwsh`:
-
 ```yaml
 hooks:
   PreTurn:
     - matcher: "*"
       hooks:
         - type: command
-          command: pwsh -NoProfile -File scripts/pre-turn.ps1
+          command: "& .\\scripts\\pre-turn.ps1"
 ```
 
-**Windows — Windows PowerShell 5 fallback:**
+The `& .\scripts\...` call-operator syntax works with both `pwsh` and
+`powershell`; Squeezy picks whichever shell it finds first on `PATH`.
+
+**Windows — cmd.exe:**
 
 ```yaml
 hooks:
@@ -91,7 +95,7 @@ hooks:
     - matcher: shell
       hooks:
         - type: command
-          command: powershell.exe -NoProfile -File scripts\audit-shell.ps1
+          command: scripts\audit-shell.cmd
 ```
 
 **Windows — cmd.exe:**
