@@ -331,6 +331,8 @@ where
         || env_get("ALACRITTY_LOG").is_some()
         || env_get("ALACRITTY_WINDOW_ID").is_some()
         || env_get("ITERM_SESSION_ID").is_some()
+        // Windows Terminal sets WT_SESSION per-tab; it supports DEC 2026.
+        || env_get("WT_SESSION").is_some()
     {
         return true;
     }
@@ -14631,7 +14633,7 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .map(|(index, path)| {
             let selected = index == popup.selected;
             let marker = if selected { "› " } else { "  " };
-            let display = path.display().to_string();
+            let display = mention::path_display_normalized(path);
             let style = if selected {
                 Style::default()
                     .fg(crate::render::theme::secondary())
@@ -15751,7 +15753,11 @@ fn parse_shortstat(text: &str) -> Option<(u32, u32)> {
 
 fn compact_path(path: &std::path::Path) -> String {
     let display = path.display().to_string();
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+    // On Windows, HOME is often unset; fall back to USERPROFILE.
+    let Some(home) = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
         return display;
     };
     if let Ok(stripped) = path.strip_prefix(&home) {

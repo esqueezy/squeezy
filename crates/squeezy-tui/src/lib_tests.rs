@@ -15129,6 +15129,7 @@ fn synchronized_output_auto_detects_known_capable_terminals() {
         &[("ALACRITTY_LOG", "/tmp/alacritty.log")],
         &[("ALACRITTY_WINDOW_ID", "1")],
         &[("ITERM_SESSION_ID", "w0t0p0")],
+        &[("WT_SESSION", "{11111111-2222-3333-4444-555555555555}")],
         &[("TERM_PROGRAM", "iTerm.app")],
         &[("TERM_PROGRAM", "WezTerm")],
         &[("TERM_PROGRAM", "ghostty")],

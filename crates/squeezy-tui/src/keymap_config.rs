@@ -231,11 +231,14 @@ impl KeybindingsFile {
 }
 
 /// Default location of the user-editable file:
-/// `~/.squeezy/keybindings.toml`. Returns `None` when `$HOME` is
-/// unset (CI sandboxes, some test harnesses), in which case the
-/// loader degrades to "no user overrides".
+/// `~/.squeezy/keybindings.toml`. Returns `None` when neither `$HOME`
+/// nor (on Windows) `$USERPROFILE` is set (CI sandboxes, some test
+/// harnesses), in which case the loader degrades to "no user overrides".
 pub(crate) fn default_keybindings_path() -> Option<PathBuf> {
-    let home = env::var_os("HOME").map(PathBuf::from)?;
+    // On Windows, HOME is often unset; USERPROFILE is the canonical home.
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
     Some(home.join(".squeezy").join("keybindings.toml"))
 }
 

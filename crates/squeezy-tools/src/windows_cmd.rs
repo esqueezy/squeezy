@@ -17,14 +17,38 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     // raw text. Each needle is a contiguous substring that does not appear
     // inside benign commands.
     for needle in [
+        // Remove-Item recursive/force forms (full name and common aliases ri/rm)
         "remove-item -recurse -force",
         "remove-item -r -force",
         "remove-item -force -recurse",
         "remove-item -force -r",
+        "remove-item -literalpath",
+        // PowerShell aliases for Remove-Item with recurse+force
+        "ri -recurse -force",
+        "ri -r -force",
+        "ri -force -recurse",
+        "ri -force -r",
+        "rm -recurse -force",
+        "rm -r -force",
+        "rm -force -recurse",
+        "rm -force -r",
+        // Privilege / policy escalation
         "set-executionpolicy",
+        // User/group management
         "new-localuser",
+        // System shutdown / reboot
+        "stop-computer",
+        "restart-computer",
+        // Drive / volume operations
         "clear-recyclebin",
         "format-volume",
+        // Arbitrary code execution via expression string
+        "invoke-expression",
+        // WMIC destructive operations
+        "wmic process delete",
+        "wmic product delete",
+        // Destructive content operations
+        "clear-content",
     ] {
         if lower.contains(needle) {
             return true;

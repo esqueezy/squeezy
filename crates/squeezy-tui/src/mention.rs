@@ -13,6 +13,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+/// Returns the path as a forward-slash string suitable for display in the
+/// mention popup and for fuzzy scoring. On Windows, `path.to_string_lossy()`
+/// produces backslashes that users cannot type in the `@` query; normalising
+/// to `/` lets both match naturally. Insertion always uses the native
+/// separator via `path.display()`.
+pub(crate) fn path_display_normalized(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
 const MAX_MATCHES: usize = 10;
 const MAX_WORKSPACE_FILES: usize = 5000;
 
@@ -243,7 +257,7 @@ pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> (Vec<PathBuf>, usize
     let mut total = 0;
     for (index, path) in files.iter().enumerate() {
         if let Some(score) = {
-            let display = path.to_string_lossy();
+            let display = path_display_normalized(path);
             crate::fuzzy::score_prepared(&display, &query)
         } {
             total += 1;

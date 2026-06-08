@@ -11,9 +11,67 @@ fn flags_powershell_recursive_force_remove() {
 }
 
 #[test]
+fn flags_remove_item_literalpath() {
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -LiteralPath C:\\Temp\\file.txt -Force"
+    ));
+    assert!(is_destructive_windows_segment(
+        "remove-item -literalpath 'C:\\Foo' -Recurse"
+    ));
+}
+
+#[test]
+fn flags_ri_alias_recurse_force() {
+    assert!(is_destructive_windows_segment("ri -Recurse -Force C:\\Tmp"));
+    assert!(is_destructive_windows_segment("ri -Force -Recurse C:\\Tmp"));
+    assert!(is_destructive_windows_segment("ri -r -Force C:\\x"));
+    assert!(is_destructive_windows_segment("ri -Force -r C:\\x"));
+}
+
+#[test]
+fn flags_rm_alias_recurse_force() {
+    assert!(is_destructive_windows_segment("rm -Recurse -Force .git"));
+    assert!(is_destructive_windows_segment("rm -Force -Recurse C:\\Log"));
+    assert!(is_destructive_windows_segment("rm -r -Force src/"));
+    assert!(is_destructive_windows_segment("rm -Force -r src/"));
+}
+
+#[test]
 fn flags_set_executionpolicy() {
     assert!(is_destructive_windows_segment(
         "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process"
+    ));
+}
+
+#[test]
+fn flags_stop_and_restart_computer() {
+    assert!(is_destructive_windows_segment("Stop-Computer"));
+    assert!(is_destructive_windows_segment(
+        "Restart-Computer -Force -Wait"
+    ));
+}
+
+#[test]
+fn flags_invoke_expression() {
+    assert!(is_destructive_windows_segment("Invoke-Expression $payload"));
+    assert!(is_destructive_windows_segment(
+        "invoke-expression 'Remove-Item C:\\Tmp'"
+    ));
+}
+
+#[test]
+fn flags_wmic_delete() {
+    assert!(is_destructive_windows_segment(
+        "wmic process delete where name='notepad.exe'"
+    ));
+    assert!(is_destructive_windows_segment("wmic product delete"));
+}
+
+#[test]
+fn flags_clear_content() {
+    assert!(is_destructive_windows_segment("Clear-Content C:\\log.txt"));
+    assert!(is_destructive_windows_segment(
+        "clear-content -path C:\\data\\file.txt"
     ));
 }
 
@@ -49,4 +107,9 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("Get-ChildItem -Recurse"));
     assert!(!is_destructive_windows_segment("echo hello"));
     assert!(!is_destructive_windows_segment("cargo build"));
+    // ri / rm without recurse+force are benign
+    assert!(!is_destructive_windows_segment("ri item.txt"));
+    assert!(!is_destructive_windows_segment("rm file.log"));
+    // Remove-Item without -Force or -Recurse is not flagged
+    assert!(!is_destructive_windows_segment("Remove-Item C:\\Tmp\\file"));
 }
