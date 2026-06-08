@@ -409,9 +409,9 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             linux_user_namespaces: Some(userns),
             linux_landlock_abi: Some(landlock_abi),
             linux_seccomp_available: Some(seccomp_ok),
-            // The seccomp filter always denies AF_UNIX socket(2) so squeezy ask
-            // is always unavailable inside a sandboxed linux child.
-            linux_ask_socket_blocked: Some(true),
+            // AF_UNIX is blocked by the seccomp filter only when the sandbox
+            // actually runs: unshare must succeed AND the filter must compile.
+            linux_ask_socket_blocked: Some(userns && seccomp_ok),
         }
     }
     #[cfg(target_os = "windows")]
@@ -740,11 +740,16 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                 best_effort_fallback: None,
             });
         }
-        let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
         if required {
-            return Err(reason.to_string());
+            return Err(
+                "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles"
+                    .to_string(),
+            );
         }
-        fallback_reason = Some(reason.to_string());
+        fallback_reason = Some(
+            "macos sandbox-exec unavailable; running without OS sandbox because mode is best_effort"
+                .to_string(),
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1369,13 +1374,13 @@ const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
 #[cfg(target_os = "linux")]
-fn linux_landlock_supported() -> bool {
+pub(crate) fn linux_landlock_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| linux_landlock_abi_version() > 0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn linux_landlock_supported() -> bool {
+pub(crate) fn linux_landlock_supported() -> bool {
     false
 }
 

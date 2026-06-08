@@ -161,8 +161,10 @@ use shell_sandbox::{
 pub use shell_sandbox::{ShellSandboxDoctor, shell_sandbox_doctor};
 use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
-    prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
+    macos_sandbox_exec_supported, prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
+#[cfg(target_os = "linux")]
+use shell_sandbox::{linux_landlock_supported, linux_unshare_supported};
 
 /// Provision the Windows elevated sandbox tier (one-time, prompts for UAC):
 /// creates the hidden local sandbox users and installs the persistent WFP
@@ -2407,35 +2409,57 @@ impl ToolRegistry {
                     "sandbox_network".to_string(),
                     self.shell_sandbox.network.as_str().to_string(),
                 );
-                // Surface the active OS sandbox backend name at approval time so
-                // the TUI can show posture without waiting until after spawn. On
-                // linux-direct-syscalls the seccomp filter blocks AF_UNIX, so
-                // `squeezy ask` is also unavailable inside the shell child.
-                let sandbox_backend = {
-                    #[cfg(target_os = "linux")]
-                    {
-                        "linux-direct-syscalls"
-                    }
-                    #[cfg(target_os = "macos")]
-                    {
-                        "macos-sandbox-exec"
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        "windows-restricted-token"
-                    }
-                    #[cfg(not(any(
-                        target_os = "linux",
-                        target_os = "macos",
-                        target_os = "windows"
-                    )))]
-                    {
-                        "none"
+                // Surface the active OS sandbox backend and filesystem posture at
+                // approval time so the TUI can show isolation level before spawn.
+                // Uses the same probe functions the planner calls so the displayed
+                // backend matches the one the planner will actually select.
+                #[cfg(target_os = "linux")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    let will_use_direct_syscalls = linux_unshare_supported()
+                        && !matches!(
+                            self.shell_sandbox.mode,
+                            ShellSandboxMode::Off | ShellSandboxMode::External
+                        );
+                    if will_use_direct_syscalls {
+                        let fs = if linux_landlock_supported() {
+                            "enforced"
+                        } else {
+                            "best_effort_unavailable"
+                        };
+                        ("linux-direct-syscalls", fs)
+                    } else {
+                        ("none", "not_enforced")
                     }
                 };
+                #[cfg(target_os = "macos")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    if macos_sandbox_exec_supported()
+                        && !matches!(
+                            self.shell_sandbox.mode,
+                            ShellSandboxMode::Off | ShellSandboxMode::External
+                        )
+                    {
+                        ("macos-sandbox-exec", "enforced")
+                    } else {
+                        ("none", "not_enforced")
+                    }
+                };
+                #[cfg(target_os = "windows")]
+                let (sandbox_backend, sandbox_filesystem) =
+                    ("windows-restricted-token", "enforced_writes_only");
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                let (sandbox_backend, sandbox_filesystem) = ("none", "not_enforced");
                 metadata.insert("sandbox_backend".to_string(), sandbox_backend.to_string());
+                metadata.insert(
+                    "sandbox_filesystem".to_string(),
+                    sandbox_filesystem.to_string(),
+                );
+                // On linux-direct-syscalls the seccomp filter denies AF_UNIX
+                // socket(2), so squeezy ask cannot connect from inside the child.
+                // Only emit this hint when the direct-syscalls backend will
+                // actually be used (i.e. unshare is available and sandbox is on).
                 #[cfg(target_os = "linux")]
-                if self.shell_sandbox.mode != ShellSandboxMode::Off {
+                if sandbox_backend == "linux-direct-syscalls" {
                     metadata.insert(
                         "ask_socket_unavailable".to_string(),
                         "squeezy ask is unavailable inside this shell child because the seccomp profile blocks AF_UNIX socket(2)".to_string(),

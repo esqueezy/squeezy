@@ -553,6 +553,7 @@ fn shell_preview_shows_sandbox_posture_when_backend_known() {
             ("sandbox", "required"),
             ("sandbox_network", "deny_by_default"),
             ("sandbox_backend", "linux-direct-syscalls"),
+            ("sandbox_filesystem", "enforced"),
         ],
     );
     let out = flatten(&render_preview(&req));
@@ -563,6 +564,10 @@ fn shell_preview_shows_sandbox_posture_when_backend_known() {
     assert!(
         out.contains("required"),
         "sandbox mode should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("enforced"),
+        "sandbox filesystem posture should appear in preview: {out}"
     );
     assert!(
         out.contains("deny_by_default"),

@@ -177,12 +177,20 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
         .metadata
         .get("sandbox_network")
         .map(String::as_str);
-    match (backend, mode, network) {
-        (Some(b), Some(m), Some(n)) if b != "none" => {
-            lines.push(dim(format!("sandbox {b}  mode {m}  network-policy {n}")));
-        }
-        (Some(b), Some(m), None) if b != "none" => {
-            lines.push(dim(format!("sandbox {b}  mode {m}")));
+    let filesystem = permission
+        .metadata
+        .get("sandbox_filesystem")
+        .map(String::as_str);
+    match (backend, mode) {
+        (Some(b), Some(m)) if b != "none" => {
+            let mut posture = format!("sandbox {b}  mode {m}");
+            if let Some(fs) = filesystem {
+                posture.push_str(&format!("  filesystem {fs}"));
+            }
+            if let Some(net) = network {
+                posture.push_str(&format!("  network-policy {net}"));
+            }
+            lines.push(dim(posture));
         }
         _ => {}
     }

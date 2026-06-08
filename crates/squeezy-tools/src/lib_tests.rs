@@ -11573,9 +11573,38 @@ fn shell_sandbox_plan_best_effort_when_sandbox_exec_absent() {
     assert!(
         plan.fallback_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("sandbox unavailable")),
+            .is_some_and(|reason| reason.contains("sandbox-exec unavailable")),
         "{:?}",
         plan.fallback_reason
+    );
+}
+
+/// Regression: macOS best_effort fallback reason must not say "required". The
+/// same confusion fix as the Linux path — both now use mode-neutral wording.
+#[test]
+#[cfg(target_os = "macos")]
+fn shell_sandbox_macos_best_effort_fallback_reason_does_not_say_required() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        false,
+        true,
+    )
+    .expect("best effort falls back gracefully");
+
+    let reason = plan
+        .fallback_reason
+        .expect("best_effort fallback must carry a reason");
+    assert!(
+        !reason.contains("required"),
+        "macOS best_effort fallback reason must not say 'required'; got: {reason:?}"
+    );
+    assert!(
+        reason.contains("best_effort"),
+        "macOS best_effort fallback reason should mention the mode; got: {reason:?}"
     );
 }
 
@@ -11652,26 +11681,20 @@ fn shell_sandbox_best_effort_fallback_reason_does_not_say_required() {
     );
 }
 
-/// Regression: required mode must fail closed even when the static preflight
-/// probe says unshare is available but the actual unshare/Landlock step
-/// would fail at runtime. The plan planner must produce `Err` so the
-/// permission gate surfaces a user-visible denial before any spawn occurs.
+/// Regression: required mode must fail closed when the unshare probe says no.
+/// This covers the "preflight false negative" case where the sysctl / ns file
+/// reports unavailable (or a container policy blocks it). The planner must
+/// return `Err` so the permission gate surfaces a user-visible denial before
+/// any spawn attempt.
 #[test]
 #[cfg(target_os = "linux")]
-fn shell_sandbox_required_mode_fails_closed_on_preflight_false_positive() {
-    // Simulate a host where the sysctl / ns file say "yes" (probes = true,
-    // true) but we invert to probes = false to represent the state where
-    // unshare is blocked by a container security policy. Required mode must
-    // still produce a clean Err rather than a plan that would fail inside
-    // the child.
+fn shell_sandbox_required_mode_fails_closed_when_unshare_probe_says_no() {
     let err = prepare_sandbox_plan_with_probes(
         "printf ok",
         &sandbox_config(
             ShellSandboxMode::Required,
             ShellSandboxNetworkPolicy::DenyByDefault,
         ),
-        // linux_unshare_available = false → simulate host that blocks unshare
-        // even though sysctl may say yes.
         false,
         false,
     )
@@ -11684,6 +11707,33 @@ fn shell_sandbox_required_mode_fails_closed_on_preflight_false_positive() {
     assert!(
         !err.contains("best_effort"),
         "required-mode error must not mention best_effort; got: {err:?}"
+    );
+}
+
+/// Regression: when static probes pass but `pre_exec` unshare/Landlock fails
+/// at runtime (preflight false-positive), `shell_sandbox_runtime_unavailable`
+/// must detect the failure so the agent can surface a sandbox-unavailable
+/// denial rather than silently accepting an unsandboxed exit-1.
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_runtime_unavailable_detects_preflight_false_positive() {
+    // Static probes said yes (plan was created), but after spawn the
+    // kernel denied unshare: child exits 1 with empty stderr. Re-probing
+    // the parent at that point returns false → runtime-unavailable.
+    let plan = fake_sandbox_plan("linux-direct-syscalls", true);
+    assert!(
+        shell_sandbox_runtime_unavailable_with_probe(&plan, Some(1), "", false),
+        "exit-1 + empty stderr + userns-gone must be detected as runtime unavailable"
+    );
+    // If stderr is non-empty the failure is the user's command, not the sandbox.
+    assert!(
+        !shell_sandbox_runtime_unavailable_with_probe(&plan, Some(1), "error text", false),
+        "non-empty stderr must not be treated as sandbox unavailability"
+    );
+    // If the re-probe still says userns is available, this exit-1 is ambiguous.
+    assert!(
+        !shell_sandbox_runtime_unavailable_with_probe(&plan, Some(1), "", true),
+        "exit-1 with userns still available must not be treated as sandbox unavailability"
     );
 }
 
