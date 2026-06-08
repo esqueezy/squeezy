@@ -88,6 +88,30 @@ fn probe_writable_round_trips_in_tempdir() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn settings_path_is_repo_local_detects_workspace_child() {
+    assert!(settings_path_is_repo_local(
+        Path::new("/tmp/repo/.squeezy/settings.toml"),
+        Path::new("/tmp/repo"),
+    ));
+}
+
+#[test]
+fn settings_path_is_repo_local_rejects_sibling_prefix() {
+    assert!(!settings_path_is_repo_local(
+        Path::new("/tmp/repo-other/.squeezy/settings.toml"),
+        Path::new("/tmp/repo"),
+    ));
+}
+
+#[test]
+fn settings_path_is_repo_local_detects_relative_fallback() {
+    assert!(settings_path_is_repo_local(
+        Path::new("./.squeezy/settings.toml"),
+        Path::new("/tmp/repo"),
+    ));
+}
+
 fn mcp_fixture(enabled: bool, transport: McpTransport) -> McpServerConfig {
     McpServerConfig {
         enabled,

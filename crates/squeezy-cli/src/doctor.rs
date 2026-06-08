@@ -1,4 +1,10 @@
-use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
+use std::{
+    env,
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::Args;
 use serde_json::json;
@@ -831,18 +837,7 @@ fn update_check(status: UpdateStatus) -> Check {
 fn settings_location_check(config: &AppConfig) -> Check {
     let settings = default_settings_path();
     let workspace = &config.workspace_root;
-    // Treat the path as suspicious only when it is clearly inside the
-    // workspace root (`.squeezy/...` relative form or an absolute sub-path).
-    // On Windows, path components are compared case-insensitively so that
-    // `C:\Repo` and `c:\repo` are treated as the same root.
-    let settings_str = settings.to_string_lossy().to_lowercase();
-    let workspace_str = workspace.to_string_lossy().to_lowercase();
-    let is_repo_local = settings_str.starts_with(&*workspace_str)
-        || settings
-            .components()
-            .next()
-            .map(|c| c.as_os_str() == ".squeezy")
-            .unwrap_or(false);
+    let is_repo_local = settings_path_is_repo_local(&settings, workspace);
     if is_repo_local {
         return Check {
             name: "settings_location".to_string(),
@@ -864,6 +859,38 @@ fn settings_location_check(config: &AppConfig) -> Check {
         name: "settings_location".to_string(),
         status: Status::Ok,
         detail: settings.display().to_string(),
+    }
+}
+
+fn settings_path_is_repo_local(settings: &Path, workspace: &Path) -> bool {
+    let first_meaningful_component = settings
+        .components()
+        .find(|component| !matches!(component, std::path::Component::CurDir));
+    if first_meaningful_component
+        .map(|component| component.as_os_str() == ".squeezy")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let settings_norm = normalize_path_for_boundary_compare(settings);
+    let workspace_norm = normalize_path_for_boundary_compare(workspace);
+
+    settings_norm == workspace_norm
+        || settings_norm
+            .strip_prefix(&workspace_norm)
+            .is_some_and(|rest| workspace_norm == "/" || rest.starts_with('/'))
+}
+
+fn normalize_path_for_boundary_compare(path: &Path) -> String {
+    let mut value = path.to_string_lossy().replace('\\', "/");
+    while value.ends_with('/') && value.len() > 1 {
+        value.pop();
+    }
+    if cfg!(target_os = "windows") {
+        value.to_ascii_lowercase()
+    } else {
+        value
     }
 }
 
