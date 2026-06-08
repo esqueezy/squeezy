@@ -1001,10 +1001,10 @@ async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Re
                             "permission_default": server.permissions.default.map(|value| value.as_str()),
                             "permission_rules": server.permissions.rules.len(),
                         });
-                        if let Some(status_map) = &live_status {
-                            if let Some(status) = status_map.get(name) {
-                                entry["probe"] = mcp_status_probe_json(status);
-                            }
+                        if let Some(status_map) = &live_status
+                            && let Some(status) = status_map.get(name)
+                        {
+                            entry["probe"] = mcp_status_probe_json(status);
                         }
                         entry
                     })
