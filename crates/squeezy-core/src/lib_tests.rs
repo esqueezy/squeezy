@@ -5950,3 +5950,148 @@ fn session_metrics_merge_turn_folds_model_ledger() {
         .expect("gpt-5.5 bucket");
     assert_eq!(bucket.main.estimated_usd_micros, Some(84));
 }
+
+// ── Linux/Unix path and settings tests ────────────────────────────────────────
+
+#[test]
+fn expand_home_path_expands_tilde_slash() {
+    // Verify that expand_home_path handles the ~/rest pattern used by
+    // SQUEEZY_SESSION_DIR and TOML path values.
+    let result = expand_home_path(PathBuf::from("~/sessions"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = home {
+        assert_eq!(result, home.join("sessions"));
+    } else {
+        // No HOME — path is returned unchanged (no panic).
+        assert_eq!(result, PathBuf::from("~/sessions"));
+    }
+}
+
+#[test]
+fn expand_home_path_leaves_absolute_path_unchanged() {
+    let abs = PathBuf::from("/tmp/sessions");
+    assert_eq!(expand_home_path(abs.clone()), abs);
+}
+
+#[test]
+fn expand_home_path_bare_tilde() {
+    let result = expand_home_path(PathBuf::from("~"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = home {
+        assert_eq!(result, home);
+    } else {
+        assert_eq!(result, PathBuf::from("~"));
+    }
+}
+
+#[test]
+fn resolved_config_paths_returns_absolute_user_settings_when_home_set() {
+    // Smoke-test: when HOME is present the returned user settings path
+    // should be absolute (begins with the HOME prefix or another absolute).
+    if std::env::var_os("HOME").is_some() {
+        let paths = resolved_config_paths();
+        assert!(
+            paths.user_settings.is_absolute(),
+            "user_settings should be absolute, got {:?}",
+            paths.user_settings
+        );
+        assert!(paths.home_set);
+        assert!(paths.home.is_some());
+    }
+}
+
+#[test]
+fn resolved_config_paths_home_field_matches_env() {
+    let paths = resolved_config_paths();
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    assert_eq!(paths.home, env_home);
+    assert_eq!(paths.home_set, env_home.is_some());
+}
+
+#[test]
+fn session_log_dir_env_tilde_is_expanded() {
+    // The env-var closure path (used by tests and the real CLI) should
+    // expand a leading '~' in SQUEEZY_SESSION_DIR.
+    let config =
+        AppConfig::from_settings_and_env_vars(SettingsFile::default(), |name| match name {
+            "SQUEEZY_SESSION_DIR" => Some("~/sessions".to_string()),
+            _ => None,
+        });
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = home {
+        assert_eq!(
+            config.session_logs.log_dir,
+            Some(home.join("sessions")),
+            "SQUEEZY_SESSION_DIR with '~' should be expanded"
+        );
+    }
+}
+
+#[test]
+fn check_settings_file_permissions_does_not_panic() {
+    // A path that doesn't exist should not produce any issues and must
+    // not panic. We can't assert the result is empty (the real user
+    // settings may exist with loose perms) but we confirm no panics.
+    let _ = check_settings_file_permissions();
+}
+
+#[cfg(unix)]
+#[test]
+fn check_settings_file_permissions_detects_world_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = std::env::temp_dir().join(format!("squeezy-perm-test-{}.toml", std::process::id()));
+    std::fs::write(&tmp, b"[model]\n").unwrap();
+    let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+    // Set world-readable (0o644).
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&tmp, perms).unwrap();
+
+    // Temporarily redirect user settings path via env so the checker
+    // picks up our test file. SAFETY: test binary is single-threaded by
+    // default; this env mutation is restored before returning.
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", tmp.to_str().unwrap()) };
+    let issues = check_settings_file_permissions();
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    let _ = std::fs::remove_file(&tmp);
+
+    assert!(
+        !issues.is_empty(),
+        "expected a permission issue for 0o644 settings file"
+    );
+    assert!(
+        issues[0].message.contains("0o644") || issues[0].message.contains("644"),
+        "issue message should mention the mode, got: {}",
+        issues[0].message
+    );
+}
+
+#[test]
+fn config_warning_emitted_for_squeezy_session_dir_with_tilde() {
+    // The load_default_settings_sources path adds a ConfigWarning when
+    // SQUEEZY_SESSION_DIR starts with '~'. We verify this via the
+    // from_settings_and_env_vars closure path which mirrors the same
+    // warning-emitting logic.
+    //
+    // Note: the closure-based path does not exercise load_default_settings_sources
+    // directly, but the underlying expand_home_path fix and the tilde
+    // expansion are both tested by session_log_dir_env_tilde_is_expanded.
+    // This test exercises the warning via from_env_and_settings when
+    // SQUEEZY_SESSION_DIR is in the real env.
+    // SAFETY: test binary is single-threaded by default.
+    unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "~/sessions") };
+    let result = AppConfig::from_env_and_settings();
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    // from_env_and_settings may fail if no settings file exists in CI;
+    // that's fine — we just verify no panic and the warning structure.
+    if let Ok(config) = result {
+        let has_warning = config
+            .config_warnings
+            .iter()
+            .any(|w| w.source == "SQUEEZY_SESSION_DIR" && w.field.contains("starts with '~'"));
+        assert!(
+            has_warning,
+            "expected a ConfigWarning for SQUEEZY_SESSION_DIR with tilde, got: {:?}",
+            config.config_warnings
+        );
+    }
+}
