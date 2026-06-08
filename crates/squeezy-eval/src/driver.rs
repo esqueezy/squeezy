@@ -2673,6 +2673,7 @@ impl Driver {
                 AgentEvent::TurnRouted { .. } => {}
                 AgentEvent::ContextUsageUpdate { .. } => {}
                 AgentEvent::CostCapUnenforceable { .. } => {}
+                AgentEvent::WindowsSandboxActive { .. } => {}
             }
             if should_break_on_text {
                 cancel.cancel();
