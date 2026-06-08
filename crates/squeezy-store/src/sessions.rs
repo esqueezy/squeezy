@@ -3556,27 +3556,32 @@ pub fn paths_same(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
-    #[cfg(target_os = "windows")]
-    {
-        let a_canon = Path::new(a).canonicalize().ok();
-        let b_canon = Path::new(b).canonicalize().ok();
-        if let (Some(ac), Some(bc)) = (a_canon, b_canon) {
-            return ac == bc;
-        }
-        // Canonicalization failed (path may not exist yet). Normalise
-        // separators (Windows accepts both `/` and `\`) and compare
-        // case-insensitively after trimming trailing separators.
-        let norm = |s: &str| -> String {
-            s.trim_end_matches(['/', '\\'])
-                .replace('/', "\\")
-                .to_ascii_lowercase()
-        };
-        return norm(a) == norm(b);
+    paths_same_platform(a, b)
+}
+
+#[cfg(target_os = "windows")]
+fn paths_same_platform(a: &str, b: &str) -> bool {
+    // Try canonical form first: resolves drive-letter case, UNC, junctions,
+    // short/long path spellings.
+    let a_canon = Path::new(a).canonicalize().ok();
+    let b_canon = Path::new(b).canonicalize().ok();
+    if let (Some(ac), Some(bc)) = (a_canon, b_canon) {
+        return ac == bc;
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        a.trim_end_matches('/') == b.trim_end_matches('/')
-    }
+    // Canonicalization failed (path may not exist yet). Normalise
+    // separators (Windows accepts both `/` and `\`) and compare
+    // case-insensitively after trimming trailing separators.
+    let norm = |s: &str| -> String {
+        s.trim_end_matches(['/', '\\'])
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn paths_same_platform(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 #[cfg(test)]
