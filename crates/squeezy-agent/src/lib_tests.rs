@@ -7444,6 +7444,50 @@ fn compaction_persists_checkpoint_and_stamps_replacement_id() {
 }
 
 #[test]
+fn compaction_checkpoint_stores_session_id() {
+    use squeezy_store::SqueezyStore;
+
+    let root = temp_workspace("compact_checkpoint_sid");
+    let store = SqueezyStore::open(&root, None).expect("open store");
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            recent_items: 2,
+            min_items: 4,
+            fallback_window_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let report = super::compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        Some(&store),
+        Some("test-session-abc"),
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+        0,
+    )
+    .expect("compaction");
+    let replacement_id = report
+        .record
+        .replacement_id
+        .clone()
+        .expect("replacement_id stamped");
+    let checkpoint = store
+        .get_compaction_checkpoint(&replacement_id)
+        .expect("get checkpoint")
+        .expect("checkpoint present");
+    assert_eq!(
+        checkpoint.session_id, "test-session-abc",
+        "checkpoint session_id must match the passed session id"
+    );
+}
+
+#[test]
 fn compaction_without_store_leaves_replacement_id_none() {
     let config = AppConfig {
         context_compaction: ContextCompactionConfig {

@@ -41,6 +41,20 @@ use squeezy_vcs::{DiffSnapshot as VcsDiffSnapshot, RollbackResult as VcsRollback
 /// `/task`, `/task-cancel`).
 ///
 /// String-only payloads are intentional: UI-specific types like
+/// Subcommand for `/compact`. Exactly one of these variants is active at a
+/// time, eliminating the invalid two-bool state (`undo: true, history: true`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactSubcommand {
+    /// Trigger a new compaction pass (default).
+    #[default]
+    Run,
+    /// Restore the most recent compaction checkpoint.
+    Undo,
+    /// Display the per-session compaction timeline.
+    History,
+}
+
 /// `ConfigSectionId` live in higher crates and are only meaningful to the
 /// TUI renderer. Keeping the payloads as `String` lets the dispatch layer
 /// stay in `squeezy-agent` without pulling in TUI types.
@@ -77,10 +91,7 @@ pub enum DispatchCommand {
     },
     Attachments,
     Compact {
-        undo: bool,
-        /// `true` when the user ran `/compact history` — show the per-session
-        /// compaction timeline rather than triggering a new compaction pass.
-        history: bool,
+        subcommand: CompactSubcommand,
     },
     /// `/clear` — drop the live conversation and start a clean slate.
     /// The outgoing session stays resumable on disk; the next turn
@@ -278,11 +289,14 @@ impl DispatchCommand {
             }
             "/attachments" => Self::Attachments,
             "/compact" => {
-                let subcommand = rest.split_whitespace().next();
-                let undo = matches!(subcommand, Some(token) if token.eq_ignore_ascii_case("undo"));
-                let history =
-                    matches!(subcommand, Some(token) if token.eq_ignore_ascii_case("history"));
-                Self::Compact { undo, history }
+                let subcommand = match rest.split_whitespace().next() {
+                    Some(token) if token.eq_ignore_ascii_case("undo") => CompactSubcommand::Undo,
+                    Some(token) if token.eq_ignore_ascii_case("history") => {
+                        CompactSubcommand::History
+                    }
+                    _ => CompactSubcommand::Run,
+                };
+                Self::Compact { subcommand }
             }
             "/clear" => Self::Clear,
             "/diff" => Self::Diff,

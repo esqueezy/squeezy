@@ -1,4 +1,4 @@
-use super::{DispatchCommand, DispatchCommandParseError};
+use super::{CompactSubcommand, DispatchCommand, DispatchCommandParseError};
 
 fn parse(input: &str) -> Result<DispatchCommand, DispatchCommandParseError> {
     DispatchCommand::parse(input)
@@ -126,40 +126,35 @@ fn parse_copy_is_not_a_builtin_slash_command() {
 }
 
 #[test]
-fn parse_compact_undo_flag() {
+fn parse_compact_subcommand() {
     assert_eq!(
         parse("/compact").unwrap(),
         DispatchCommand::Compact {
-            undo: false,
-            history: false
+            subcommand: CompactSubcommand::Run,
         }
     );
     assert_eq!(
         parse("/compact undo").unwrap(),
         DispatchCommand::Compact {
-            undo: true,
-            history: false
+            subcommand: CompactSubcommand::Undo,
         }
     );
     assert_eq!(
         parse("/compact UNDO").unwrap(),
         DispatchCommand::Compact {
-            undo: true,
-            history: false
+            subcommand: CompactSubcommand::Undo,
         }
     );
     assert_eq!(
         parse("/compact history").unwrap(),
         DispatchCommand::Compact {
-            undo: false,
-            history: true
+            subcommand: CompactSubcommand::History,
         }
     );
     assert_eq!(
         parse("/compact HISTORY").unwrap(),
         DispatchCommand::Compact {
-            undo: false,
-            history: true
+            subcommand: CompactSubcommand::History,
         }
     );
 }
@@ -436,8 +431,7 @@ fn slash_name_matches_input_command() {
         (
             "/compact",
             DispatchCommand::Compact {
-                undo: false,
-                history: false,
+                subcommand: CompactSubcommand::Run,
             },
         ),
         (

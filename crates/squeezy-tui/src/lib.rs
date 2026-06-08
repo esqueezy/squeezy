@@ -36,8 +36,8 @@ use serde::Deserialize;
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
-    Agent, AgentEvent, DispatchCommand, DispatchCommandParseError, JobEvent, JobId,
-    JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
+    Agent, AgentEvent, CompactSubcommand, DispatchCommand, DispatchCommandParseError, JobEvent,
+    JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
     RequestUserInputRequest, RequestUserInputResponse, SessionAccountingSnapshot, SubagentId,
     ToolApprovalDecision, ToolApprovalRequest,
 };
@@ -3706,13 +3706,10 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Config { section } => {
             slash_option_shape(section.as_ref(), SlashArgShape::FixedSubcommand)
         }
-        DispatchCommand::Compact { undo, history } => {
-            if *undo || *history {
-                SlashArgShape::FixedSubcommand
-            } else {
-                SlashArgShape::None
-            }
-        }
+        DispatchCommand::Compact { subcommand } => match subcommand {
+            CompactSubcommand::Undo | CompactSubcommand::History => SlashArgShape::FixedSubcommand,
+            CompactSubcommand::Run => SlashArgShape::None,
+        },
         DispatchCommand::Plans { args }
         | DispatchCommand::Feedback { args }
         | DispatchCommand::Report { args } => {
@@ -4100,8 +4097,8 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 );
             }
         },
-        DispatchCommand::Compact { undo, history } => {
-            if history {
+        DispatchCommand::Compact { subcommand } => {
+            if matches!(subcommand, CompactSubcommand::History) {
                 app.context_compaction = agent.context_compaction_snapshot().await;
                 let compaction = &app.context_compaction;
                 if compaction.history.is_empty() {
@@ -4125,9 +4122,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                                 ""
                             };
                             format!(
-                                "gen={} trigger={:?} {before}→{after} tok dropped={dropped}{undo_mark}",
+                                "gen={} trigger={} {before}→{after} tok dropped={dropped}{undo_mark}",
                                 record.generation,
-                                record.trigger,
+                                record.trigger.as_str(),
                                 before = record.before.estimated_tokens,
                                 after = record.after.estimated_tokens,
                                 dropped = record.dropped_items,
@@ -4140,7 +4137,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         lines.join("\n"),
                     )));
                 }
-            } else if undo {
+            } else if matches!(subcommand, CompactSubcommand::Undo) {
                 match agent.compact_context_undo().await {
                     Ok(Some(record)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;

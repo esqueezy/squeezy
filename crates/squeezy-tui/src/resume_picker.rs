@@ -825,9 +825,10 @@ fn render_candidate_row(
     } else {
         Style::default().fg(crate::render::theme::quiet())
     };
-    // Branched rows replace the default session label with the branch's
-    // first user message (if any) so the user can disambiguate two paths
-    // that came out of the same fork point.
+    // `expand_entries` currently produces only linear entries, so
+    // `branch_tip` is always `None` here. The branch rendering path is
+    // preserved so it activates automatically when branch-aware resume
+    // populates `branch_tip` in the future.
     let (label, branch_marker) = match entry.branch_tip.as_ref() {
         Some(tip) => {
             let branch_label = tip
