@@ -69,6 +69,60 @@ printf '%s\n' "$SQUEEZY_HOOK_PAYLOAD" >> "$SQUEEZY_SKILL_DIR/hooks.log"
 exit 0
 ```
 
+**Windows — PowerShell 7 (`pwsh`) or Windows PowerShell 5 (`powershell`):**
+
+Squeezy resolves the shell and invokes it with `-NoProfile -Command <your command>`.
+Write the `command` field as a PowerShell expression, not as a `pwsh` invocation:
+
+```powershell
+# scripts/pre-turn.ps1
+$payload = $env:SQUEEZY_HOOK_PAYLOAD | ConvertFrom-Json
+$payload | ConvertTo-Json | Add-Content "$env:SQUEEZY_SKILL_DIR\hooks.log"
+exit 0
+```
+
+```yaml
+hooks:
+  PreTurn:
+    - matcher: "*"
+      hooks:
+        - type: command
+          command: "& .\\scripts\\pre-turn.ps1"
+```
+
+The `& .\scripts\...` call-operator syntax works with both `pwsh` and
+`powershell`; Squeezy picks whichever shell it finds first on `PATH`.
+
+**Windows — cmd.exe:**
+
+```yaml
+hooks:
+  PreToolUse:
+    - matcher: shell
+      hooks:
+        - type: command
+          command: scripts\audit-shell.cmd
+```
+
+**Windows — cmd.exe:**
+
+```yaml
+hooks:
+  PreTurn:
+    - matcher: "*"
+      hooks:
+        - type: command
+          command: scripts\pre-turn.cmd
+```
+
+Inside a `.cmd` script, use `%SQUEEZY_HOOK_PAYLOAD%`:
+
+```cmd
+@echo off
+echo %SQUEEZY_HOOK_PAYLOAD% >> %SQUEEZY_SKILL_DIR%\hooks.log
+exit /b 0
+```
+
 Declare hooks in the skill's `SKILL.md` frontmatter:
 
 ```yaml
@@ -101,13 +155,23 @@ The skill frontmatter parser accepts all event keys listed in the table above
 Hooks are disabled by default. When `[skills].hooks_enabled = true`, all
 non-disabled discovered skills that declare `hooks:` frontmatter have their
 handlers registered against the session's `HookRegistry` at agent startup.
-Hook commands run through `/bin/sh -c` (absolute path on POSIX; `sh` on
-Windows) with the privileges of the Squeezy process, so only enable this for
-trusted skill catalogs.
+Hook commands run with the privileges of the Squeezy process, so only enable
+this for trusted skill catalogs.
 
 > **Warning**: setting `hooks_enabled = true` is a high-trust operation.
 > `squeezy doctor` will flag this configuration as a warning so it is visible
 > in CI smoke runs. Use it only with skill catalogs you fully control.
+
+**Shell selection**: on POSIX platforms, hooks run through `/bin/sh -c`. On
+Windows, Squeezy tries `pwsh` (PowerShell 7), then `powershell` (Windows
+PowerShell 5), then `cmd /C`, using the first one found on `PATH`. Run
+`squeezy doctor` to confirm which shell will be used — the `hooks:shell` row
+reports the resolved shell or warns when none is available.
+
+Spawn failures (including "shell not found" on Windows) are fail-open: the
+action is allowed and a warning is emitted. A hook that should deny an action
+must actually execute and exit non-zero; if the hook shell is missing it cannot
+block.
 
 The `[skills]` section controls skill discovery:
 
@@ -133,14 +197,13 @@ In addition to `command` and `once`, each hook spec accepts:
 
 ### Windows note
 
-Skill hook scripts run through **`sh -c`** on all platforms, including Windows.
-This means `.ps1` scripts cannot be used as hooks directly, even though implicit
-activation recognises PowerShell scripts. On Windows, `sh` must be available in
-`PATH` (provided by Git for Windows, MSYS2, or similar) for hooks to fire.
+On Windows, `.ps1` scripts can be used when `pwsh` or `powershell` is available
+in `PATH`; otherwise Squeezy falls back to `cmd /C`. PowerShell-native syntax
+will not run under the `cmd` fallback.
 
-If `sh` is absent and `hooks_enabled = true`, Squeezy will warn in `squeezy doctor`
-and hook dispatch will fail to spawn. To make a policy hook deny the action on
-spawn failure, add `failure_policy: deny` to the hook spec:
+If no hook shell is available and `hooks_enabled = true`, Squeezy will warn in
+`squeezy doctor` and hook dispatch will fail to spawn. To make a policy hook
+deny the action on spawn failure, add `failure_policy: deny` to the hook spec:
 
 ```yaml
 hooks:
@@ -163,6 +226,8 @@ is on the roadmap.
 Scripts receive the following environment:
 
 - `SQUEEZY_HOOK_PAYLOAD` — the full JSON event payload (see event table above).
+- `SQUEEZY_HOOK_PAYLOAD_FILE` — path to a temp file containing the same JSON,
+  set when the payload exceeds ~8 KiB. Scripts can read from either source.
 - `SQUEEZY_SKILL_DIR` — absolute path to the skill's base directory.
 - `SQUEEZY_SKILL_NAME` — the skill's registered name.
 
@@ -276,6 +341,14 @@ case "$cmd" in
 esac
 exit 0
 ```
+
+**Windows environment variable syntax:**
+
+| Shell | Payload access |
+|-------|---------------|
+| PowerShell (`pwsh` / `powershell`) | `$env:SQUEEZY_HOOK_PAYLOAD` |
+| cmd.exe | `%SQUEEZY_HOOK_PAYLOAD%` |
+| sh / bash | `$SQUEEZY_HOOK_PAYLOAD` |
 
 ## Use Cases
 

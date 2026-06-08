@@ -5,8 +5,8 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -23,12 +23,6 @@ use tracing::warn;
 /// killing it and returning a deny result. Avoids blocking the agent
 /// turn on a hook that hangs (e.g. `sleep infinity`, blocked I/O).
 pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
-
-/// Maximum bytes allowed in `SQUEEZY_HOOK_PAYLOAD`. Payloads that
-/// exceed this threshold are truncated before the env var is set,
-/// so Linux `execve` env-size limits do not cause spawn failures on
-/// hooks with large prompt or error payloads.
-const MAX_HOOK_PAYLOAD_ENV_BYTES: usize = 32 * 1024;
 
 pub mod help;
 pub mod implicit;
@@ -2180,6 +2174,56 @@ pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillMa
     toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
 }
 
+/// JSON payload byte length above which the payload is written to a
+/// temporary file instead of the environment variable.
+///
+/// Windows process environment blocks have practical size limits; large
+/// payloads (e.g. prompts or full tool metadata) can push past them.
+/// When the threshold is exceeded the handler writes the payload to a
+/// temp file and sets `SQUEEZY_HOOK_PAYLOAD_FILE`; `SQUEEZY_HOOK_PAYLOAD`
+/// is left unset so that the large JSON is never placed in the env block.
+const PAYLOAD_INLINE_THRESHOLD: usize = 8 * 1024;
+
+/// Per-process dispatch sequence number used to generate unique temp-file
+/// names. A plain counter is enough: file names only need to be unique
+/// within a single process, not globally.
+static HOOK_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve the shell program and arguments used to run a hook command
+/// string on the current platform.
+///
+/// On Unix, returns `("/bin/sh", ["-c"])`. On Windows, walks the candidates
+/// `pwsh`, `powershell`, and `cmd` in that order, returning the first
+/// one found on `PATH`. Returns `None` only when every candidate is
+/// absent — callers treat that as a spawn error and allow the action
+/// (fail-open) with a clear diagnostic.
+fn resolve_hook_shell_program() -> Option<(String, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        let candidates: &[(&str, &[&str])] = &[
+            ("pwsh", &["-NoProfile", "-Command"]),
+            ("powershell", &["-NoProfile", "-Command"]),
+            ("cmd", &["/C"]),
+        ];
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        for &(shell, args) in candidates {
+            let found = std::env::split_paths(&path_var)
+                .any(|dir| dir.join(format!("{shell}.exe")).exists() || dir.join(shell).exists());
+            if found {
+                return Some((
+                    shell.to_string(),
+                    args.iter().map(|s| s.to_string()).collect(),
+                ));
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        Some(("/bin/sh".to_string(), vec!["-c".to_string()]))
+    }
+}
+
 /// [`HookHandler`] implementation that fires a skill's declared shell
 /// command when its event matches.
 ///
@@ -2205,6 +2249,11 @@ pub struct SkillHookHandler {
     /// dispatches could both read `false` before either writes `true`, and to
     /// avoid the silent-pass risk of a poisoned mutex.
     fired: AtomicBool,
+    /// Cached shell program and arguments for this handler, populated on
+    /// the first dispatch. Avoids re-walking PATH on every hook invocation
+    /// and makes the resolution cost visible (one OnceLock init per handler
+    /// rather than one per dispatch).
+    resolved_shell: OnceLock<Option<(String, Vec<String>)>>,
 }
 
 impl SkillHookHandler {
@@ -2222,6 +2271,7 @@ impl SkillHookHandler {
             spec,
             base_dir,
             fired: AtomicBool::new(false),
+            resolved_shell: OnceLock::new(),
         }
     }
 }
@@ -2257,9 +2307,6 @@ impl HookHandler for SkillHookHandler {
                 skill = %self.skill_name,
                 "skipping skill hook with empty command"
             );
-            if self.spec.once {
-                self.fired.store(false, Ordering::Release);
-            }
             return HookResult::allow();
         }
 
@@ -2276,40 +2323,61 @@ impl HookHandler for SkillHookHandler {
             false
         };
 
-        // Serialize the payload only after all cheap checks have passed.
-        // Truncate oversized payloads to avoid Linux execve env-size limits
-        // rather than letting spawn fail silently.
-        let payload_full = ctx.payload_json().to_string();
-        let payload: &str = if payload_full.len() > MAX_HOOK_PAYLOAD_ENV_BYTES {
-            warn!(
-                target: "squeezy_skills",
-                skill = %self.skill_name,
-                payload_bytes = payload_full.len(),
-                max_bytes = MAX_HOOK_PAYLOAD_ENV_BYTES,
-                "hook payload truncated to avoid env size limits"
-            );
-            // Truncate at a valid UTF-8 boundary at or below the limit.
-            let mut end = MAX_HOOK_PAYLOAD_ENV_BYTES;
-            while !payload_full.is_char_boundary(end) {
-                end -= 1;
+        let shell_info = self.resolved_shell.get_or_init(resolve_hook_shell_program);
+        let (shell, shell_args) = match shell_info {
+            Some(pair) => (&pair.0, &pair.1),
+            None => {
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    "skill hook failed to spawn: no suitable hook shell found on PATH"
+                );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
+                return if self.spec.fail_open
+                    && self.spec.failure_policy == HookFailurePolicy::Allow
+                {
+                    HookResult::allow()
+                } else {
+                    HookResult::deny(format!("skill `{}` hook shell not found", self.skill_name))
+                };
             }
-            &payload_full[..end]
-        } else {
-            &payload_full
         };
 
-        // Use an absolute shell path on Unix to avoid PATH hijacking and
-        // to behave consistently across distros (dash on Debian/Ubuntu,
-        // bash in POSIX mode on others). Fall back to the PATH-resolved
-        // `sh` on non-Unix platforms where /bin/sh is not guaranteed.
-        #[cfg(unix)]
-        let mut command = Command::new("/bin/sh");
-        #[cfg(not(unix))]
-        let mut command = Command::new("sh");
+        let payload = ctx.payload_json().to_string();
+        let seq = HOOK_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let payload_file_path = if payload.len() > PAYLOAD_INLINE_THRESHOLD {
+            let path = std::env::temp_dir()
+                .join(format!("squeezy_hook_{}_{seq}.json", std::process::id()));
+            match fs::write(&path, &payload) {
+                Ok(()) => Some(path),
+                Err(error) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        skill = %self.skill_name,
+                        error = %error,
+                        "failed to write hook payload temp file; falling back to env-only delivery"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cleanup = |path: Option<&Path>| {
+            if let Some(path) = path {
+                let _ = fs::remove_file(path);
+            }
+        };
 
-        // Put the child in its own process group so a timeout signal
-        // reaches all grandchildren spawned by the hook shell script,
-        // not just the immediate sh process.
+        let mut command = Command::new(shell);
+        for arg in shell_args {
+            command.arg(arg);
+        }
+
+        // Put the child in its own process group so a timeout signal reaches
+        // grandchildren spawned by the hook shell script, not just the shell.
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -2317,17 +2385,28 @@ impl HookHandler for SkillHookHandler {
         }
 
         command
-            .arg("-c")
             .arg(trimmed)
             .current_dir(&self.base_dir)
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
-            .env("SQUEEZY_HOOK_PAYLOAD", payload)
-            // Redirect subprocess stdio to /dev/null so hook scripts
-            // cannot corrupt the TUI or write to the agent's streams.
+            // Redirect subprocess stdio to /dev/null so hook scripts cannot
+            // corrupt the TUI or write to the agent's streams.
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+
+        // Deliver payload via file for large payloads and via env var for
+        // small ones. Explicitly clear the alternate variable so stale
+        // inherited values cannot confuse hook scripts.
+        if let Some(ref path) = payload_file_path {
+            command
+                .env("SQUEEZY_HOOK_PAYLOAD_FILE", path)
+                .env_remove("SQUEEZY_HOOK_PAYLOAD");
+        } else {
+            command
+                .env("SQUEEZY_HOOK_PAYLOAD", &payload)
+                .env_remove("SQUEEZY_HOOK_PAYLOAD_FILE");
+        }
 
         let child = match command.spawn() {
             Ok(child) => child,
@@ -2335,9 +2414,11 @@ impl HookHandler for SkillHookHandler {
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
+                    shell = %shell,
                     error = %error,
                     "skill hook failed to spawn"
                 );
+                cleanup(payload_file_path.as_deref());
                 if once_claimed {
                     self.fired.store(false, Ordering::Release);
                 }
@@ -2360,12 +2441,9 @@ impl HookHandler for SkillHookHandler {
         #[cfg(unix)]
         let child_pid = child.id();
 
-        // Wrap child in Arc<Mutex<Option<…>>> so the main thread can call
+        // Wrap child in Arc<Mutex<Option<...>>> so the main thread can call
         // `kill()` on timeout without a blocking wait-for-lock: the wait
-        // thread takes the child out of the Option (releasing the lock) before
-        // calling `wait()`, so the main thread's lock attempt never blocks on
-        // a syscall. On non-Unix this is the primary kill path; on Unix the
-        // process-group SIGKILL below handles grandchildren independently.
+        // thread takes the child out of the Option before calling `wait()`.
         let child_arc = Arc::new(Mutex::new(Some(child)));
         let child_for_thread = Arc::clone(&child_arc);
 
@@ -2373,25 +2451,23 @@ impl HookHandler for SkillHookHandler {
             Duration::from_secs(self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            // Take the child out before calling wait() to release the lock so
-            // the main thread can acquire it to kill on timeout.
             let result = child_for_thread
                 .lock()
                 .ok()
-                .and_then(|mut g| g.take())
-                .map(|mut c| c.wait());
-            if let Some(r) = result {
-                let _ = tx.send(r);
+                .and_then(|mut guard| guard.take())
+                .map(|mut child| child.wait());
+            if let Some(result) = result {
+                let _ = tx.send(result);
             }
         });
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(status)) if status.success() => {
-                // A claimed `once: true` hook stays marked after success; all
-                // unsuccessful outcomes below release the claim for retry.
+                cleanup(payload_file_path.as_deref());
                 HookResult::allow()
             }
             Ok(Ok(status)) => {
+                cleanup(payload_file_path.as_deref());
                 let code = status.code();
                 let detail = match code {
                     Some(126) => format!(
@@ -2416,6 +2492,7 @@ impl HookHandler for SkillHookHandler {
                 HookResult::deny(detail)
             }
             Ok(Err(error)) => {
+                cleanup(payload_file_path.as_deref());
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
@@ -2425,7 +2502,7 @@ impl HookHandler for SkillHookHandler {
                 if once_claimed {
                     self.fired.store(false, Ordering::Release);
                 }
-                if self.spec.fail_open {
+                if self.spec.fail_open && self.spec.failure_policy == HookFailurePolicy::Allow {
                     HookResult::allow()
                 } else {
                     HookResult::deny(format!(
@@ -2435,21 +2512,12 @@ impl HookHandler for SkillHookHandler {
                 }
             }
             Err(_timeout_expired) => {
-                // Attempt to kill via Arc in case the wait thread has not yet
-                // taken child ownership. On Windows this is the only kill path.
-                if let Ok(mut g) = child_arc.lock()
-                    && let Some(c) = g.as_mut()
+                cleanup(payload_file_path.as_deref());
+                if let Ok(mut guard) = child_arc.lock()
+                    && let Some(child) = guard.as_mut()
                 {
-                    let _ = c.kill();
+                    let _ = child.kill();
                 }
-                // On Unix: also send SIGKILL to the entire process group so
-                // grandchildren spawned by the hook shell cannot outlive the
-                // timeout. This is the reliable kill path on Unix regardless of
-                // whether the Arc still holds the child.
-                //
-                // SAFETY: child_pid was obtained from `child.id()` before the
-                // Arc wrapper was created. The process group equals child_pid
-                // because we called `process_group(0)` above.
                 #[cfg(unix)]
                 unsafe {
                     libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
