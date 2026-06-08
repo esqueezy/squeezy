@@ -1565,7 +1565,33 @@ pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
     // Squeezy runs on Windows or analyses commands submitted via the shell
     // tool. Including them avoids unnecessary AI-reviewer round-trips for
     // safe exploration commands.
+    //
+    // IMPORTANT: Only classify as read-only when the segment contains no
+    // output-redirect flags (-OutFile, -FilePath, -Encoding with -OutFile,
+    // etc.). Many PowerShell exploration cmdlets accept -OutFile which turns
+    // them into file-writing operations.
+    if windows_segment_has_output_flag(segment) {
+        return false;
+    }
     is_read_only_windows_segment(&prefix)
+}
+
+/// True when the PowerShell segment contains a flag that redirects output
+/// to a file, making the command a writer rather than a pure reader.
+fn windows_segment_has_output_flag(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    tokens.iter().any(|tok| {
+        matches!(
+            tok.as_ref(),
+            "-outfile"
+                | "-filepath"
+                | "-literalpath"
+                | "-destination"
+                | "-destinationpath"
+                | "-append"
+        )
+    })
 }
 
 /// True when `prefix` is a PowerShell or cmd.exe command whose default

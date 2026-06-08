@@ -66,7 +66,10 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
 
     match first.as_str() {
-        "del" | "erase" => return flag_matches("/s") || flag_matches("/q") && flag_matches("/f"),
+        // /S makes deletion recursive (dangerous). /Q /F together suppresses
+        // confirmation and forces deletion of read-only files, which is also
+        // classified as destructive. Parentheses make precedence explicit.
+        "del" | "erase" => return flag_matches("/s") || (flag_matches("/q") && flag_matches("/f")),
         "rd" | "rmdir" => return flag_matches("/s"),
         "format" | "diskpart" => return true,
         "vssadmin" => return flag_matches("delete"),
@@ -101,14 +104,17 @@ fn powershell_has_recurse_flag(tokens: &[&str]) -> bool {
 }
 
 /// True when the token list contains a `-Force` flag or an unambiguous
-/// PowerShell abbreviation of it.
+/// PowerShell abbreviation of it. `-f` alone is intentionally excluded: in
+/// Remove-Item's parameter set, `-f` is ambiguous between `-Force` and
+/// `-Filter` and PowerShell itself would reject it with an ambiguity error.
+/// `-fo` is the first unambiguous prefix that resolves only to `-Force`.
 fn powershell_has_force_flag(tokens: &[&str]) -> bool {
     tokens.iter().skip(1).any(|tok| {
         let t = tok.to_ascii_lowercase();
         if t.starts_with("-force") {
             return true;
         }
-        matches!(t.as_str(), "-f" | "-fo" | "-for" | "-forc")
+        matches!(t.as_str(), "-fo" | "-for" | "-forc")
     })
 }
 

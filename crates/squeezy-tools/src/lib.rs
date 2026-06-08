@@ -2421,14 +2421,16 @@ impl ToolRegistry {
                 // understand that their approval is the primary enforcement
                 // boundary. The flag is compile-time so there is no runtime
                 // cost on other platforms.
+                // NOTE: ShellSandboxMode::Off is intentionally NOT in the
+                // "isolated" set — Off means zero OS containment, which is
+                // exactly the case where the warning matters most. External
+                // mode may have real containment (user-configured wrapper).
                 #[cfg(target_os = "windows")]
                 {
                     use squeezy_core::WindowsSandboxLevel;
-                    let windows_fs_isolated = matches!(
-                        self.shell_sandbox.mode,
-                        ShellSandboxMode::Off | ShellSandboxMode::External
-                    ) || self.shell_sandbox.windows_sandbox_level
-                        == WindowsSandboxLevel::Elevated;
+                    let windows_fs_isolated = self.shell_sandbox.mode == ShellSandboxMode::External
+                        || self.shell_sandbox.windows_sandbox_level
+                            == WindowsSandboxLevel::Elevated;
                     if !windows_fs_isolated {
                         metadata.insert("windows_no_fs_sandbox".to_string(), "true".to_string());
                     }

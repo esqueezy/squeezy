@@ -6317,13 +6317,14 @@ fn capability_project_label(
 
 /// True when a shell prefix target covers a broad class of Windows shell
 /// commands (pwsh, powershell, cmd, gitbash with no further narrowing).
+/// Handles both bare names and `.exe` suffixes since the cached binary path
+/// from `which::which` always stores the full name (e.g. `pwsh.exe`).
 fn is_broad_windows_shell_prefix(prefix: &str) -> bool {
     let lower = prefix.to_ascii_lowercase();
-    let bare = lower.trim_end_matches(":*").trim();
-    matches!(
-        bare,
-        "pwsh" | "powershell" | "cmd" | "cmd.exe" | "gitbash" | "shell"
-    )
+    // Strip rule-target suffix (`:*`) and any `.exe` extension so the match
+    // covers both `pwsh:*` and `pwsh.exe:*` rule forms.
+    let bare = lower.trim_end_matches(":*").trim().trim_end_matches(".exe");
+    matches!(bare, "pwsh" | "powershell" | "cmd" | "gitbash" | "shell")
 }
 
 /// Single-line status banner shown in the 1-line status bar. Compact by

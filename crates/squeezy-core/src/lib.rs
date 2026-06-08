@@ -7426,7 +7426,9 @@ fn default_sensitive_path_patterns() -> Vec<String> {
         ".azure/**",
         "AppData/Roaming/gcloud/**",
         "AppData/Roaming/Microsoft/UserSecrets/**",
-        "AppData/Local/Microsoft/Windows/PowerShell/**",
+        // PSReadLine stores history at %APPDATA%\Microsoft\Windows\PowerShell\
+        // PSReadLine\ConsoleHost_history.txt; %APPDATA% resolves to Roaming.
+        "AppData/Roaming/Microsoft/Windows/PowerShell/**",
         ".nuget/credentials",
     ]
     .into_iter()

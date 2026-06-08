@@ -31,8 +31,10 @@ fn flags_powershell_abbreviated_params() {
     assert!(is_destructive_windows_segment("Remove-Item . -R -Force"));
     assert!(is_destructive_windows_segment("Remove-Item . -Recurse -Fo"));
     assert!(is_destructive_windows_segment("Remove-Item . -Re -Fo"));
-    // ri alias with abbreviations
-    assert!(is_destructive_windows_segment("ri . -R -F"));
+    // `-F` is not a valid abbreviation (ambiguous with -Filter); ri . -R -F
+    // would fail at the PowerShell runtime but we do not classify it as
+    // destructive since the conservative policy is: only flag *valid* forms.
+    assert!(!is_destructive_windows_segment("ri . -R -F"));
 }
 
 #[test]
