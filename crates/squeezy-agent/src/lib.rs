@@ -13489,30 +13489,6 @@ async fn flush_parallel_batch(
         return;
     }
 
-    // Pre-budget check: if the per-turn budget is already exhausted before we
-    // dispatch, deny every call in this batch immediately without paying for
-    // any I/O. This avoids reads that would be thrown away by
-    // `fold_parallel_read_completions` anyway.
-    if broker.enforces_result_budgets()
-        && let Some(reason) = broker.deny_reason()
-    {
-        for (index, call, tool_sequence) in calls {
-            let result = budget_denied_result(&call, reason.clone());
-            emit_tool_telemetry(
-                context.config,
-                &context.telemetry,
-                context.turn_id,
-                tool_sequence,
-                &call,
-                &result,
-                Duration::ZERO,
-            );
-            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
-            results[index] = Some(result);
-        }
-        return;
-    }
-
     // Run the reads *concurrently* (independent reads must not serialize
     // behind one another — that one-at-a-time `.await` per read dominated
     // turn latency), then fold them back with incremental per-turn budget
