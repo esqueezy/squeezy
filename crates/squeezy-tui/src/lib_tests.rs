@@ -8733,6 +8733,210 @@ fn resolve_render_metrics_is_opt_in() {
     assert!(resolve_render_metrics(|_| Some(OsString::from("yes"))));
 }
 
+// ---- UX latency budgets (§12.10.1) ----
+
+#[test]
+fn resolve_latency_overlay_is_opt_in() {
+    use std::ffi::OsString;
+    // Same opt-in contract as the render-metrics HUD: unset / empty / "0" off.
+    assert!(!resolve_latency_overlay(|_| None));
+    assert!(!resolve_latency_overlay(|_| Some(OsString::from(""))));
+    assert!(!resolve_latency_overlay(|_| Some(OsString::from("0"))));
+    assert!(resolve_latency_overlay(|_| Some(OsString::from("1"))));
+    assert!(resolve_latency_overlay(|_| Some(OsString::from("on"))));
+}
+
+#[test]
+fn latency_overlay_off_by_default_and_toggle_forces_hud_visible() {
+    let mut app = test_app(SessionMode::Build);
+    app.needs_redraw = false;
+    assert!(!app.show_latency_overlay, "overlay is off by default");
+    app.toggle_latency_overlay();
+    assert!(app.show_latency_overlay, "toggle turns the overlay on");
+    assert!(
+        app.show_render_metrics,
+        "turning on the latency panel forces the host HUD visible"
+    );
+    assert!(app.needs_redraw, "toggling requests a repaint");
+    app.toggle_latency_overlay();
+    assert!(!app.show_latency_overlay, "toggle turns it back off");
+}
+
+#[tokio::test]
+async fn latency_overlay_keymap_chord_toggles_through_dispatch() {
+    // Keyboard path: the Ctrl+Alt+L keymap action drives the toggle through the
+    // real dispatch, the same routing a rebound key would take.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(!app.show_latency_overlay);
+    let chord = KeyEvent::new(
+        KeyCode::Char('l'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, chord);
+    assert!(consumed, "the chord is consumed by the keymap dispatch");
+    assert!(
+        app.show_latency_overlay,
+        "Ctrl+Alt+L toggles the latency overlay on"
+    );
+}
+
+#[tokio::test]
+async fn keypress_through_event_loop_records_a_latency_sample() {
+    // End to end: a key event flows through the real `dispatch_input_events`
+    // tagging path, and the subsequent painted `draw_app` records a sample for
+    // the tagged interaction. A plain composer key classifies as keypress echo.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert_eq!(app.latency.observed_kinds(), 0, "nothing sampled yet");
+
+    let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    dispatch_input_events(&mut app, &mut agent, vec![key])
+        .await
+        .expect("dispatch typed key");
+    assert_eq!(
+        app.pending_interaction,
+        Some(latency::InteractionKind::KeypressEcho),
+        "typing tags the next paint as a keypress echo"
+    );
+
+    let (mut guard, _sink) = TerminalGuard::for_capture_test(120, 40);
+    guard.draw_app(&mut app).expect("paint after keypress");
+    assert!(
+        app.pending_interaction.is_none(),
+        "draw_app consumes the interaction tag"
+    );
+    assert!(
+        app.latency
+            .percentiles(latency::InteractionKind::KeypressEcho)
+            .is_some(),
+        "the painted frame recorded a keypress-echo latency sample"
+    );
+}
+
+#[tokio::test]
+async fn resize_event_tags_resize_redraw_interaction() {
+    // The mouse-free / non-key path: a resize event must classify as the resize
+    // redraw budget so the loosest budget covers the full reflow.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_input_events(&mut app, &mut agent, vec![Event::Resize(100, 30)])
+        .await
+        .expect("dispatch resize");
+    assert_eq!(
+        app.pending_interaction,
+        Some(latency::InteractionKind::ResizeRedraw)
+    );
+    let (mut guard, _sink) = TerminalGuard::for_capture_test(100, 30);
+    guard.draw_app(&mut app).expect("paint after resize");
+    assert!(
+        app.latency
+            .percentiles(latency::InteractionKind::ResizeRedraw)
+            .is_some(),
+        "the resize repaint recorded a sample under the resize-redraw budget"
+    );
+}
+
+#[tokio::test]
+async fn idle_paint_records_no_latency_sample() {
+    // The zero-idle-cost contract: a paint with no tagged interaction (an
+    // animation / timer tick) must not touch the tracker.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello"));
+    assert!(app.pending_interaction.is_none(), "no interaction tagged");
+
+    let (mut guard, _sink) = TerminalGuard::for_capture_test(120, 40);
+    guard.draw_app(&mut app).expect("idle paint");
+    guard.draw_app(&mut app).expect("second idle paint");
+    assert_eq!(
+        app.latency.observed_kinds(),
+        0,
+        "an untagged (idle) paint records nothing"
+    );
+}
+
+#[tokio::test]
+async fn latency_overlay_paints_only_when_toggled_on() {
+    // The overlay's header only paints once toggled on AND at least one
+    // interaction has been sampled — asserted on the captured glyph stream.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Sample one interaction so there is something to show.
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        ))],
+    )
+    .await
+    .expect("dispatch key");
+
+    // Off by default: no latency header even though a sample now exists.
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
+    guard.draw_app(&mut app).expect("draw with overlay off");
+    let plain_off = strip_ansi(&sink_to_string(&sink));
+    assert!(
+        !plain_off.contains("latency p95/p99"),
+        "the latency panel is hidden by default: {plain_off:?}"
+    );
+
+    // Toggle on, sample again so the next paint has data, then assert it shows.
+    app.toggle_latency_overlay();
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        ))],
+    )
+    .await
+    .expect("dispatch second key");
+    let (mut guard2, sink2) = TerminalGuard::for_capture_test(120, 40);
+    guard2.draw_app(&mut app).expect("draw with overlay on");
+    let plain_on = strip_ansi(&sink_to_string(&sink2));
+    assert!(
+        plain_on.contains("latency p95/p99"),
+        "the latency panel paints once toggled on with data: {plain_on:?}"
+    );
+}
+
+#[tokio::test]
+async fn latency_overlay_renders_on_a_tiny_terminal_without_panicking() {
+    // Resize / edge coverage where the panel paints: a terminal too small for
+    // the box must clip cleanly (the HUD early-returns under 3 rows / 12 cols)
+    // rather than panic, exactly like the frame-budget HUD.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    app.toggle_latency_overlay();
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::NONE,
+        ))],
+    )
+    .await
+    .expect("dispatch key");
+    // Record a sample through the real paint chokepoint so the panel has data.
+    let (mut guard, _sink) = TerminalGuard::for_capture_test(60, 24);
+    guard.draw_app(&mut app).expect("paint to record a sample");
+    assert!(app.latency.observed_kinds() > 0, "a sample was recorded");
+
+    // A 10x2 terminal is below the HUD's minimums; rendering must not panic.
+    let _ = render_to_string(&app, 10, 2);
+    // And a normal small-but-valid size paints the panel header.
+    let out = render_to_string(&app, 60, 24);
+    assert!(
+        out.contains("latency"),
+        "panel header present at 60x24:\n{out}"
+    );
+}
+
 #[test]
 fn emergency_teardown_leaves_alt_screen_and_restores_modes_without_mirror() {
     let mut bytes = Vec::new();

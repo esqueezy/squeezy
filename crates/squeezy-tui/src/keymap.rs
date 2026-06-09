@@ -118,6 +118,12 @@ pub(crate) enum Action {
     /// before-the-global-keymap consumption pattern; undo is the one genuinely
     /// new verb, so it earns a rebindable action.
     QueueUndo,
+    /// Toggle the hidden per-interaction UX latency-budget overlay
+    /// (`Ctrl+Alt+L` default; §12.10.1). A deliberately obscure debug chord —
+    /// it forces the render-metrics HUD visible and adds a p95/p99-vs-budget
+    /// panel for keypress echo, scroll, page jumps, queue drag, paste preview,
+    /// copy ack, search jump, and resize redraw. Off in a normal session.
+    ToggleLatencyOverlay,
 }
 
 impl Action {
@@ -152,6 +158,7 @@ impl Action {
             Self::ToggleFocusedFold => "toggle_focused_fold",
             Self::OpenFocusedInDetail => "open_focused_in_detail",
             Self::QueueUndo => "queue_undo",
+            Self::ToggleLatencyOverlay => "toggle_latency_overlay",
         }
     }
 
@@ -185,6 +192,7 @@ impl Action {
         Action::ToggleFocusedFold,
         Action::OpenFocusedInDetail,
         Action::QueueUndo,
+        Action::ToggleLatencyOverlay,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -237,6 +245,9 @@ impl Action {
             | Self::JumpNextError
             | Self::FocusPrevEntry
             | Self::FocusNextEntry
+            // Ctrl+Alt+L is a Ctrl+Alt (Meta) chord — Alt encoding is the
+            // classically unreliable case across Linux terminals, tmux, and SSH.
+            | Self::ToggleLatencyOverlay
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords.
             Self::OpenSearch
@@ -305,6 +316,15 @@ impl Action {
             // being open, so outside the overlay `u` keeps its composer meaning.
             // Bare `u` is safe to bind here precisely because of that gate.
             Self::QueueUndo => KeyBinding::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            // Hidden latency-budget overlay toggle. `Ctrl+Alt+L` is a
+            // deliberately obscure debug chord — never a normal composer
+            // keystroke — so the overlay stays out of the way while remaining
+            // reachable at runtime (alongside the `SQUEEZY_LATENCY_OVERLAY`
+            // env opt-in).
+            Self::ToggleLatencyOverlay => KeyBinding::new(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
         }
     }
 }

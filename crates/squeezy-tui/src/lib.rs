@@ -82,6 +82,7 @@ mod input;
 mod interaction;
 mod keymap;
 mod keymap_config;
+mod latency;
 mod main_render_cache;
 mod mcp_settings_edit;
 mod mention;
@@ -1986,6 +1987,71 @@ fn transcript_overlay_drag_mode_active(app: &TuiApp) -> bool {
         .is_some_and(|state| state.mode.mouse_capture())
 }
 
+/// Stamp the interaction kind that should be attributed to the *next* painted
+/// frame for the §12.10.1 latency budgets. The tag is consumed (taken) by
+/// `draw_app` once it has the frame's render time; a `None` here leaves any tag
+/// a prior event in the same poll window already set, so the most specific
+/// interaction in a coalesced batch still wins.
+fn tag_interaction(app: &mut TuiApp, kind: Option<latency::InteractionKind>) {
+    if let Some(kind) = kind {
+        app.pending_interaction = Some(kind);
+    }
+}
+
+/// Classify a key event into the latency-budget interaction it drives. Derived
+/// from the resolved keymap action and the active surface so a rebound key still
+/// classifies correctly:
+///   - page/home/end scroll actions → [`PageJump`](latency::InteractionKind::PageJump),
+///   - any copy action → [`CopyAck`](latency::InteractionKind::CopyAck),
+///   - a key pressed while search input is live → [`SearchJump`](latency::InteractionKind::SearchJump),
+///   - everything else (composer typing, jumps, folds) → keypress echo.
+fn classify_key_interaction(app: &TuiApp, key: KeyEvent) -> Option<latency::InteractionKind> {
+    use latency::InteractionKind;
+    // A live search owns the keystroke: typing the query and the nav keys both
+    // re-anchor a match into view, which is the "search jump" the spec budgets.
+    if app.search.is_some() {
+        return Some(InteractionKind::SearchJump);
+    }
+    if let Some(action) = app.keymap.lookup(key.code, key.modifiers) {
+        return Some(match action {
+            keymap::Action::ScrollTranscriptPageUp
+            | keymap::Action::ScrollTranscriptPageDown
+            | keymap::Action::TranscriptHome
+            | keymap::Action::TranscriptEnd => InteractionKind::PageJump,
+            keymap::Action::CopyLastAssistant
+            | keymap::Action::CopyFocusedEntry
+            | keymap::Action::CopyCurrentToolOutput
+            | keymap::Action::CopyCodeBlock
+            | keymap::Action::CopyViewport
+            | keymap::Action::CopyFullTranscript
+            | keymap::Action::CopySelection => InteractionKind::CopyAck,
+            _ => InteractionKind::KeypressEcho,
+        });
+    }
+    Some(InteractionKind::KeypressEcho)
+}
+
+/// Classify a mouse event into the latency-budget interaction it drives: wheel
+/// scroll is [`Scroll`](latency::InteractionKind::Scroll), and a drag while a
+/// prompt-queue reorder is in flight is
+/// [`QueueDrag`](latency::InteractionKind::QueueDrag). Clicks / hover are left
+/// untagged (the surrounding default applies only when they paint).
+fn classify_mouse_interaction(
+    app: &TuiApp,
+    mouse: &crossterm::event::MouseEvent,
+) -> Option<latency::InteractionKind> {
+    use latency::InteractionKind;
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => Some(InteractionKind::Scroll),
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            if app.prompt_queue_drag.is_some() =>
+        {
+            Some(InteractionKind::QueueDrag)
+        }
+        _ => None,
+    }
+}
+
 async fn handle_input_event(
     app: &mut TuiApp,
     agent: &mut Agent,
@@ -2001,6 +2067,11 @@ async fn handle_input_event(
             let before_overlay = app.transcript_overlay;
             let overlay_scroll_key = before_overlay.is_some()
                 && is_transcript_overlay_scroll_key(key.code, key.modifiers);
+            // UX latency budgets (§12.10.1): tag this paint with the kind of
+            // interaction the key drives, classified from the resolved keymap
+            // action (scroll / page-jump / search / copy) and falling back to
+            // keypress-echo for plain composer input.
+            tag_interaction(app, classify_key_interaction(app, key));
             let quit = handle_key(app, agent, key).await?;
             let unchanged_overlay_scroll =
                 overlay_scroll_key && app.transcript_overlay == before_overlay;
@@ -2008,6 +2079,10 @@ async fn handle_input_event(
             Ok(quit)
         }
         Event::Mouse(mouse) => {
+            // Tag wheel scroll and an in-flight queue drag; other mouse work
+            // (clicks, hover) rides the default keypress-class budget only when
+            // it actually paints, so leave it untagged otherwise.
+            tag_interaction(app, classify_mouse_interaction(app, &mouse));
             if handle_mouse(app, mouse) {
                 app.needs_redraw = true;
             } else {
@@ -2016,11 +2091,13 @@ async fn handle_input_event(
             Ok(false)
         }
         Event::Paste(text) => {
+            tag_interaction(app, Some(latency::InteractionKind::PastePreview));
             handle_paste(app, agent, text).await?;
             app.needs_redraw = true;
             Ok(false)
         }
         Event::Resize(_, _) => {
+            tag_interaction(app, Some(latency::InteractionKind::ResizeRedraw));
             app.pending_resize = true;
             app.needs_redraw = true;
             // A live (following) view re-pins to the tail; a scrolled-up view
@@ -3998,6 +4075,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
     if app.transcript_overlay.is_some()
         && action != keymap::Action::ToggleTranscriptOverlay
         && action != keymap::Action::OpenSearch
+        && action != keymap::Action::ToggleLatencyOverlay
     {
         return false;
     }
@@ -4261,6 +4339,12 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             queue_undo(app);
+            true
+        }
+        keymap::Action::ToggleLatencyOverlay => {
+            // Hidden debug surface (§12.10.1): reachable from every surface,
+            // including the Ctrl+T overlay (allowed past the guard above).
+            app.toggle_latency_overlay();
             true
         }
     }
@@ -9734,7 +9818,18 @@ fn render_metrics_hud(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         widgets::{Block, Borders, Clear, Paragraph},
     };
     let snapshot = app.render_metrics.get();
-    let lines = snapshot.hud_lines();
+    let mut lines = snapshot.hud_lines();
+    // UX latency budgets (§12.10.1): when the latency overlay is toggled on,
+    // append the per-interaction p95/p99-vs-budget panel below the frame budget.
+    // `overlay_lines` is empty until at least one interaction has been sampled,
+    // so the box stays compact on a fresh session.
+    if app.show_latency_overlay {
+        let latency_lines = app.latency.overlay_lines();
+        if !latency_lines.is_empty() {
+            lines.push(String::new());
+            lines.extend(latency_lines);
+        }
+    }
     if lines.is_empty() || area.height < 3 || area.width < 12 {
         return;
     }
@@ -20354,6 +20449,23 @@ pub(crate) struct TuiApp {
     /// from `SQUEEZY_RENDER_METRICS` at startup and flipped at runtime by
     /// [`Self::toggle_render_metrics`]. A normal session never shows it.
     pub(crate) show_render_metrics: bool,
+    /// Per-interaction UX latency budgets (§12.10.1). The event loop stamps
+    /// [`Self::pending_interaction`] with the kind of interaction that woke this
+    /// frame; `draw_app` feeds the frame's render time into this tracker, which
+    /// keeps p95/p99 windows per interaction and remembers the last budget
+    /// violation. Surfaced in the hidden latency overlay and the trace line.
+    /// Idle frames carry no tag, so the tracker churns nothing while idle.
+    pub(crate) latency: latency::LatencyTracker,
+    /// The interaction kind that drove the *next* paint, set by the event-loop
+    /// dispatch and consumed (taken) by `draw_app` after it records the frame's
+    /// render time. `None` on timer/animation ticks so idle paints record no
+    /// latency sample.
+    pub(crate) pending_interaction: Option<latency::InteractionKind>,
+    /// When set, the hidden render-metrics overlay also paints the per-
+    /// interaction latency-budget panel. Off by default; seeded from
+    /// `SQUEEZY_LATENCY_OVERLAY` at startup and flipped at runtime by the
+    /// `toggle_latency_overlay` keymap action. A normal session never shows it.
+    pub(crate) show_latency_overlay: bool,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
     /// Elapsed time on the currently-running tool, sourced from the
@@ -20858,6 +20970,12 @@ impl TuiApp {
             // Hidden render-budget HUD: off unless `SQUEEZY_RENDER_METRICS` is
             // set to a non-empty, non-`0` value. Runtime-toggleable thereafter.
             show_render_metrics: resolve_render_metrics(|key| std::env::var_os(key)),
+            latency: latency::LatencyTracker::default(),
+            pending_interaction: None,
+            // Hidden latency-budget overlay: off unless `SQUEEZY_LATENCY_OVERLAY`
+            // is set to a non-empty, non-`0` value. Runtime-toggleable via the
+            // `toggle_latency_overlay` keymap action.
+            show_latency_overlay: resolve_latency_overlay(|key| std::env::var_os(key)),
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             active_tool_elapsed_ms: None,
@@ -21134,6 +21252,21 @@ impl TuiApp {
     /// the per-frame trace line while on.
     pub(crate) fn toggle_render_metrics(&mut self) {
         self.show_render_metrics = !self.show_render_metrics;
+        self.needs_redraw = true;
+    }
+
+    /// Flip the hidden per-interaction latency-budget overlay on/off and request
+    /// a repaint so the change shows immediately. The panel rides inside the
+    /// render-metrics HUD (which it forces visible when toggled on) so a single
+    /// top-right box holds both the frame budget and the interaction budgets.
+    pub(crate) fn toggle_latency_overlay(&mut self) {
+        self.show_latency_overlay = !self.show_latency_overlay;
+        if self.show_latency_overlay {
+            // The latency panel only paints inside the render-metrics HUD, so
+            // turning it on implies turning the HUD on; otherwise the toggle
+            // would silently do nothing visible.
+            self.show_render_metrics = true;
+        }
         self.needs_redraw = true;
     }
 
@@ -22334,6 +22467,20 @@ where
         .unwrap_or(false)
 }
 
+/// Resolve the initial state of the hidden latency-budget overlay (§12.10.1)
+/// from the environment. `SQUEEZY_LATENCY_OVERLAY=1` (or any non-empty, non-`0`
+/// value) shows the per-interaction latency panel from the first frame; default
+/// OFF. Runtime-toggleable thereafter via the `toggle_latency_overlay` keymap
+/// action. Injected `env_get` keeps it testable without process-env mutation.
+fn resolve_latency_overlay<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    env_get("SQUEEZY_LATENCY_OVERLAY")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Emit the terminal startup setup sequence into `writer`: the keyboard
 /// enhancement flags, the fullscreen alt-screen entry, and finally mouse capture
 /// when enabled. This is the byte-emitting half of [`TerminalGuard::enter`],
@@ -22886,6 +23033,29 @@ impl TerminalGuard {
             // At most one line per painted frame, gated on the HUD flag so a
             // normal session logs nothing.
             tracing::debug!(target: "squeezy_tui::render", "{}", snapshot.trace_summary());
+        }
+
+        // ---- UX latency budgets (§12.10.1) ----
+        // Feed THIS painted frame's render time into the per-interaction budget
+        // tracker, tagged with whatever interaction woke it. `take` clears the
+        // tag so the next (possibly idle / animation) frame records nothing —
+        // keeping the zero-idle-work contract. A detected violation is logged
+        // once, gated on the overlay flag so a normal session stays silent.
+        if let Some(kind) = app.pending_interaction.take()
+            && let Some(violation) = app
+                .latency
+                .record(kind, snapshot.render_time, snapshot.frame)
+            && app.show_latency_overlay
+        {
+            tracing::debug!(
+                target: "squeezy_tui::latency",
+                "budget violation: {} p{} {:?} > {:?} @frame {}",
+                violation.kind.label().trim_end(),
+                violation.percentile,
+                violation.observed,
+                violation.budget,
+                violation.frame,
+            );
         }
 
         paint

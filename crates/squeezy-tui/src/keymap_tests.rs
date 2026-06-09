@@ -144,6 +144,38 @@ fn queue_undo_action_round_trips_and_defaults_to_u() {
 }
 
 #[test]
+fn toggle_latency_overlay_round_trips_and_defaults_to_ctrl_alt_l() {
+    // §12.10.1 latency overlay toggle: slug round-trips, is registered in `ALL`
+    // (so `/keymap` lists it and overrides can target it), and defaults to the
+    // obscure debug chord Ctrl+Alt+L.
+    assert_eq!(
+        Action::from_slug("toggle_latency_overlay"),
+        Some(Action::ToggleLatencyOverlay)
+    );
+    assert!(Action::ALL.contains(&Action::ToggleLatencyOverlay));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::ToggleLatencyOverlay),
+        KeyBinding::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+    );
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        Some(Action::ToggleLatencyOverlay),
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent.
+    assert_eq!(
+        Action::ToggleLatencyOverlay.terminal_compat_note(),
+        Some("terminal-dependent")
+    );
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.
