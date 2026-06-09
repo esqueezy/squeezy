@@ -1,8 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
@@ -11,9 +12,19 @@ use std::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, SqueezyError};
+use squeezy_core::{
+    ContentHash, FileId, Freshness, LanguageFamily, LanguageKind, Result, SqueezyError,
+};
 
 pub const CRATE_NAME: &str = "squeezy-workspace";
+
+/// Directory names whose events should never trigger a graph refresh and
+/// whose contents are always pruned from the workspace crawl: VCS metadata
+/// (`.git`, `.hg`, `.jj`, `.svn`) and Squeezy's own state cache (`.squeezy`).
+/// Centralised so the workspace crawl, the file-watcher event filter, and
+/// any future caller stay in sync.
+pub const VCS_AND_CACHE_DIR_NAMES: &[&str] = &[".git", ".hg", ".jj", ".svn", ".squeezy"];
+
 const SOURCE_SCAN_MAX_DEPTH: usize = 2;
 const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
@@ -70,6 +81,10 @@ pub struct CrawlOptions {
     pub include_hidden: bool,
     pub max_file_bytes: u64,
     pub require_indexing_signal: bool,
+    /// Supported graph languages to index. Empty means all supported
+    /// languages; configured callers pass the user's allow-list through so
+    /// disabled languages remain visible as fallback records.
+    pub languages: Vec<String>,
     pub policy: IndexingPolicy,
 }
 
@@ -79,6 +94,7 @@ impl Default for CrawlOptions {
             include_hidden: false,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             require_indexing_signal: true,
+            languages: Vec::new(),
             policy: IndexingPolicy::default(),
         }
     }
@@ -245,6 +261,7 @@ pub struct UnsupportedFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedReason {
     UnsupportedExtension,
+    LanguageDisabled,
     TooLarge,
     BinaryLike,
 }
@@ -359,9 +376,18 @@ impl IndexingDecisionContext {
 pub struct WorkspaceCrawler {
     options: CrawlOptions,
     compiled_policy: Arc<CompiledIndexingPolicy>,
+    enabled_languages: Arc<HashSet<LanguageKind>>,
 }
 
 impl WorkspaceCrawler {
+    /// Construct a crawler, panicking on invalid `CrawlOptions`. Prefer
+    /// [`WorkspaceCrawler::try_new`], which surfaces a `SqueezyError::Config`
+    /// for the same inputs (bad policy globs, unknown language allow-list
+    /// entries) so callers can render a friendly error instead of crashing.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use WorkspaceCrawler::try_new to surface invalid CrawlOptions as SqueezyError::Config"
+    )]
     pub fn new(options: CrawlOptions) -> Self {
         // Default policies always compile; user-supplied policies must be
         // validated up front via `IndexingPolicy::compile` to surface glob
@@ -370,17 +396,23 @@ impl WorkspaceCrawler {
             .policy
             .compile()
             .expect("policy globs must be valid; validate via IndexingPolicy::compile() first");
+        let enabled_languages = compile_language_allowlist(&options.languages).expect(
+            "graph languages must be valid; validate via WorkspaceCrawler::try_new() first",
+        );
         Self {
             options,
             compiled_policy: Arc::new(compiled_policy),
+            enabled_languages: Arc::new(enabled_languages),
         }
     }
 
     pub fn try_new(options: CrawlOptions) -> Result<Self> {
         let compiled_policy = Arc::new(options.policy.compile()?);
+        let enabled_languages = Arc::new(compile_language_allowlist(&options.languages)?);
         Ok(Self {
             options,
             compiled_policy,
+            enabled_languages,
         })
     }
 
@@ -498,11 +530,11 @@ impl WorkspaceCrawler {
                     continue;
                 }
             }
-            let language = classify_language(&path);
+            let detected_language = classify_language(&path);
             // Java source files frequently contain many nested declarations
             // in a single file, so we lift the default cap when the user has
             // not configured an explicit one.
-            let max_file_bytes = if language == LanguageKind::Java
+            let max_file_bytes = if detected_language == LanguageKind::Java
                 && self.options.max_file_bytes == DEFAULT_MAX_FILE_BYTES
             {
                 DEFAULT_JAVA_MAX_FILE_BYTES
@@ -541,14 +573,14 @@ impl WorkspaceCrawler {
                 continue;
             }
 
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
+            let (hash, prefix) = match read_hash_and_prefix(&path) {
+                Ok(result) => result,
                 Err(err) => {
                     record_walk_error(&mut walk_errors, &path, err);
                     continue;
                 }
             };
-            if looks_binary(&bytes) {
+            if looks_binary(&prefix) {
                 if self.compiled_policy.includes_class(ExclusionReason::Binary) {
                     unsupported.push(unsupported_file(
                         &path,
@@ -569,7 +601,7 @@ impl WorkspaceCrawler {
                 }
                 continue;
             }
-            if looks_generated(&bytes)
+            if looks_generated(&prefix)
                 && !self
                     .compiled_policy
                     .includes_class(ExclusionReason::Generated)
@@ -585,7 +617,7 @@ impl WorkspaceCrawler {
                 continue;
             }
 
-            if language == LanguageKind::Unsupported {
+            if detected_language == LanguageKind::Unsupported {
                 unsupported.push(unsupported_file(
                     &path,
                     relative_path.clone(),
@@ -606,15 +638,20 @@ impl WorkspaceCrawler {
                 id: FileId::new(relative_path.clone()),
                 path,
                 relative_path,
-                hash: ContentHash::new(stable_content_hash(&bytes)),
+                hash: ContentHash::new(hash),
                 size_bytes,
                 modified_unix_millis,
-                language,
+                language: detected_language,
                 freshness: Freshness::Fresh,
             });
         }
 
+        // Order matters: refine first so that ambiguous `.h` files are
+        // reclassified to their sibling's language *before* the allow-list
+        // decides whether to keep them. Otherwise `[graph].languages = ["c"]`
+        // could drop a sibling-less `.h` that should have stayed as C.
         refine_c_family_header_languages(&mut files);
+        apply_language_allowlist(&mut files, &self.enabled_languages, &mut unsupported);
 
         // Pull pruned directories collected by `filter_entry` into the
         // snapshot. We do this once so each excluded directory shows up
@@ -726,6 +763,104 @@ pub fn classify_language(path: &Path) -> LanguageKind {
     }
 }
 
+fn compile_language_allowlist(languages: &[String]) -> Result<HashSet<LanguageKind>> {
+    let mut enabled = HashSet::new();
+    for language in languages {
+        let kinds = parse_language_selector(language)?;
+        enabled.extend(kinds);
+    }
+    Ok(enabled)
+}
+
+fn parse_language_selector(language: &str) -> Result<Vec<LanguageKind>> {
+    let raw = language.trim().to_ascii_lowercase();
+    // Early-match on the literal lowercased form before normalization:
+    // `language_selector_key` strips `#`, `+`, and `/`, so `c#`, `c++`,
+    // and `c/c++` would otherwise collapse to `c`. Keep this in sync with
+    // the strip set in `language_selector_key`.
+    match raw.as_str() {
+        "c#" => return Ok(LanguageFamily::CSharp.kinds().to_vec()),
+        "c++" => return Ok(vec![LanguageKind::Cpp]),
+        "c/c++" | "c-c++" => return Ok(LanguageFamily::CFamily.kinds().to_vec()),
+        _ => {}
+    }
+    let normalized = language_selector_key(language);
+    let kinds: &[LanguageKind] = match normalized.as_str() {
+        "" => &[],
+        "c" => &[LanguageKind::C],
+        "cpp" | "cxx" => &[LanguageKind::Cpp],
+        "cfamily" | "c-family" | "ccpp" => LanguageFamily::CFamily.kinds(),
+        "cs" | "csharp" | "c-sharp" => LanguageFamily::CSharp.kinds(),
+        "dart" => LanguageFamily::Dart.kinds(),
+        "go" => LanguageFamily::Go.kinds(),
+        "java" => LanguageFamily::Java.kinds(),
+        "javascript" | "js" => &[LanguageKind::JavaScript, LanguageKind::Jsx],
+        "jsts" | "js-ts" | "typescript" | "ts" => LanguageFamily::JsTs.kinds(),
+        "jsx" => &[LanguageKind::Jsx],
+        "kotlin" => LanguageFamily::Kotlin.kinds(),
+        "php" => LanguageFamily::Php.kinds(),
+        "python" | "py" => LanguageFamily::Python.kinds(),
+        "ruby" | "rb" => LanguageFamily::Ruby.kinds(),
+        "rust" | "rs" => LanguageFamily::Rust.kinds(),
+        "scala" => LanguageFamily::Scala.kinds(),
+        "swift" => LanguageFamily::Swift.kinds(),
+        "tsx" => &[LanguageKind::Tsx],
+        other => {
+            return Err(SqueezyError::Config(format!(
+                "unknown graph language {other:?}; expected a supported language or family id \
+                 (see LANGUAGES.md for canonical ids; family ids like `c-family`, `js-ts`, \
+                 `c-sharp` map to every kind in the family, while singletons like `cpp`, \
+                 `jsx`, `tsx` map to one kind only)"
+            )));
+        }
+    };
+    Ok(kinds.to_vec())
+}
+
+fn language_selector_key(language: &str) -> String {
+    language
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter_map(|ch| match ch {
+            '#' | '+' | '/' | ' ' | '_' => None,
+            ch => Some(ch),
+        })
+        .collect()
+}
+
+fn language_enabled(language: LanguageKind, enabled: &HashSet<LanguageKind>) -> bool {
+    // The allow-list governs parser-backed kinds. `LanguageKind::Unsupported`
+    // is already diverted to `unsupported` before this runs, so the only
+    // family-less kind that reaches this branch is `LanguageKind::Unknown`
+    // (extensionless inputs like `Makefile`); keep them indexed regardless
+    // of the allow-list — they are not parser-backed and are not what the
+    // user is restricting via `[graph].languages`.
+    enabled.is_empty() || language.family().is_none() || enabled.contains(&language)
+}
+
+fn apply_language_allowlist(
+    files: &mut Vec<FileRecord>,
+    enabled: &HashSet<LanguageKind>,
+    unsupported: &mut Vec<UnsupportedFile>,
+) {
+    let mut kept = Vec::with_capacity(files.len());
+    for file in files.drain(..) {
+        if language_enabled(file.language, enabled) {
+            kept.push(file);
+        } else {
+            unsupported.push(unsupported_file(
+                &file.path,
+                file.relative_path.clone(),
+                extension_string(&file.path),
+                file.size_bytes,
+                UnsupportedReason::LanguageDisabled,
+            ));
+        }
+    }
+    *files = kept;
+}
+
 fn extension_string(path: &Path) -> Option<String> {
     path.extension()
         .map(|extension| extension.to_string_lossy().into_owned())
@@ -760,6 +895,11 @@ fn refine_c_family_header_languages(files: &mut [FileRecord]) {
         if !is_plain_c_header(&file.relative_path) {
             continue;
         }
+        debug_assert_eq!(
+            file.language,
+            LanguageKind::Cpp,
+            "classify_language always assigns Cpp to .h files before refinement"
+        );
         let Some(stem) = path_without_extension(&file.relative_path) else {
             file.language = project_default;
             continue;
@@ -1882,18 +2022,46 @@ fn record_excluded_dir_entry(coverage: &mut IndexCoverage, entry: &ExcludedPath)
     }
 }
 
-pub fn stable_content_hash(bytes: &[u8]) -> String {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001b3;
-
+fn read_hash_and_prefix(path: &Path) -> Result<(String, Vec<u8>)> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0u8; CHUNK_BYTES];
+    let mut prefix = Vec::with_capacity(BINARY_GENERATED_PREFIX_BYTES);
     let mut hash = FNV_OFFSET;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        if prefix.len() < BINARY_GENERATED_PREFIX_BYTES {
+            let remaining = BINARY_GENERATED_PREFIX_BYTES - prefix.len();
+            prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        hash = update_stable_hash(hash, chunk);
+    }
+    Ok((format!("{hash:016x}"), prefix))
+}
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+pub fn stable_content_hash(bytes: &[u8]) -> String {
+    format!("{:016x}", update_stable_hash(FNV_OFFSET, bytes))
+}
+
+fn update_stable_hash(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    format!("{hash:016x}")
+    hash
 }
 
+// Tests intentionally exercise the deprecated `WorkspaceCrawler::new` panic
+// path alongside `try_new`; the deprecation steers external callers without
+// forcing a mass rewrite of in-tree fixtures.
 #[cfg(test)]
 #[path = "lib_tests.rs"]
+#[allow(deprecated)]
 mod tests;

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use squeezy_core::{GraphConfig, LanguageKind, Result, SqueezyError, repo_settings_id};
 use squeezy_workspace::{
-    CrawlOptions, ExclusionReason, IndexingPolicy, WorkspaceCrawler, WorkspaceSnapshot,
+    CrawlOptions, ExclusionReason, IndexingPolicy, UnsupportedReason, WorkspaceCrawler,
+    WorkspaceSnapshot, classify_language,
 };
 
 use crate::fs_util;
@@ -704,6 +705,7 @@ fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
         include_hidden: config.include_hidden,
         max_file_bytes: config.max_file_bytes,
         require_indexing_signal: config.require_indexing_signal,
+        languages: config.languages.clone(),
         policy: IndexingPolicy {
             include: config.include.clone(),
             exclude: config.exclude.clone(),
@@ -771,6 +773,11 @@ fn detect_languages(snapshot: &WorkspaceSnapshot) -> Vec<DetectedLanguage> {
     let mut counts = HashMap::<LanguageKind, usize>::new();
     for file in &snapshot.files {
         *counts.entry(file.language).or_default() += 1;
+    }
+    for file in &snapshot.unsupported {
+        if file.reason == UnsupportedReason::LanguageDisabled {
+            *counts.entry(classify_language(&file.path)).or_default() += 1;
+        }
     }
     let mut languages = counts
         .into_iter()

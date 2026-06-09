@@ -25,7 +25,8 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CrawlOptions, FileRecord, IndexCoverage, PathConflict, WorkspaceCrawler, filesystem_paths_match,
+    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, VCS_AND_CACHE_DIR_NAMES,
+    PathConflict, WorkspaceCrawler, filesystem_paths_match,
 };
 use tracing::{error, warn};
 
@@ -2234,6 +2235,9 @@ pub struct GraphBuildReport {
     pub bytes_seen: u64,
     pub language: LanguageReport,
     pub stats: GraphStats,
+    pub indexing_decision: IndexingDecision,
+    pub freshness_mode: GraphFreshnessMode,
+    pub freshness_fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2258,6 +2262,23 @@ pub struct RefreshReport {
     pub stats: GraphStats,
     pub skipped_due_to_interval: bool,
     pub budget_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphFreshnessMode {
+    Watcher,
+    #[default]
+    Polling,
+}
+
+impl GraphFreshnessMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Watcher => "watcher",
+            Self::Polling => "polling",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2482,20 +2503,27 @@ impl GraphManager {
         watcher_config: watcher::WatcherConfig,
     ) -> Result<Self> {
         let mut manager = Self::open_with_optional_store(root, config, crawl_options, store)?;
+        let watcher_config = watcher_config.with_default_root(manager.root.clone());
         let handle = Arc::clone(&manager.pending_changed_paths);
+        let watched_root = manager.root.clone();
         let native_result = watcher::FileWatcher::start(watcher_config.clone(), move |batch| {
             if let Ok(mut paths) = handle.lock() {
                 for path in batch.modified.into_iter().chain(batch.removed) {
-                    paths.insert(path);
+                    if watcher_path_should_enqueue(&watched_root, &path) {
+                        paths.insert(path);
+                    }
                 }
             }
         });
         let polling_start = || {
             let handle = Arc::clone(&manager.pending_changed_paths);
+            let watched_root = manager.root.clone();
             watcher::FileWatcher::start_polling(watcher_config, move |batch| {
                 if let Ok(mut paths) = handle.lock() {
                     for path in batch.modified.into_iter().chain(batch.removed) {
-                        paths.insert(path);
+                        if watcher_path_should_enqueue(&watched_root, &path) {
+                            paths.insert(path);
+                        }
                     }
                 }
             })
@@ -2503,8 +2531,18 @@ impl GraphManager {
         let (file_watcher, watcher_status) =
             resolve_watcher_attachment(native_result, polling_start);
         manager.watcher = file_watcher;
+        manager.build_report.freshness_mode = match watcher_status.mode {
+            WatcherMode::Native => GraphFreshnessMode::Watcher,
+            WatcherMode::PollingFallback | WatcherMode::Disabled => GraphFreshnessMode::Polling,
+        };
+        manager.build_report.freshness_fallback_reason = watcher_status.fallback_reason.clone();
         manager.watcher_status = watcher_status;
         Ok(manager)
+    }
+
+    pub fn mark_polling_fallback(&mut self, reason: impl Into<String>) {
+        self.build_report.freshness_mode = GraphFreshnessMode::Polling;
+        self.build_report.freshness_fallback_reason = Some(reason.into());
     }
 
     fn open_with_optional_store(
@@ -2518,7 +2556,7 @@ impl GraphManager {
         let store_metadata = store
             .as_ref()
             .map(|_| graph_store_metadata(&root, &crawl_options));
-        let crawler = WorkspaceCrawler::new(crawl_options);
+        let crawler = WorkspaceCrawler::try_new(crawl_options)?;
         let snapshot = crawler.crawl(&root)?;
         warn_case_collisions(&snapshot.files);
         let mut parser = LanguageParser::new()?;
@@ -2576,6 +2614,9 @@ impl GraphManager {
             bytes_seen,
             language,
             stats: graph.stats(),
+            indexing_decision: snapshot.indexing_decision.clone(),
+            freshness_mode: GraphFreshnessMode::Polling,
+            freshness_fallback_reason: None,
         };
         Ok(Self {
             root,
@@ -2607,6 +2648,14 @@ impl GraphManager {
 
     pub fn build_report(&self) -> &GraphBuildReport {
         &self.build_report
+    }
+
+    pub fn freshness_mode(&self) -> GraphFreshnessMode {
+        self.build_report.freshness_mode
+    }
+
+    pub fn freshness_fallback_reason(&self) -> Option<&str> {
+        self.build_report.freshness_fallback_reason.as_deref()
     }
 
     /// Per-language file counts derived from the current graph state.
@@ -3034,6 +3083,24 @@ impl GraphManager {
     }
 }
 
+fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    // Conservative filter: drop only VCS metadata and Squeezy's own cache
+    // (`VCS_AND_CACHE_DIR_NAMES`) so persisting the graph cannot self-trigger
+    // a refresh loop. Heavy-churn build dirs like `target/` and
+    // `node_modules/` stay visible because an `include` glob may re-enable
+    // a subset of them; the crawler does the policy-aware filtering.
+    !relative.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        VCS_AND_CACHE_DIR_NAMES.contains(&name)
+    })
+}
+
 struct LoadedPartitions {
     parsed: Vec<ParsedFile>,
     missed_records: Vec<FileRecord>,
@@ -3140,6 +3207,7 @@ fn graph_store_metadata(root: &Path, crawl_options: &CrawlOptions) -> GraphStore
         "include_hidden": crawl_options.include_hidden,
         "max_file_bytes": crawl_options.max_file_bytes,
         "require_indexing_signal": crawl_options.require_indexing_signal,
+        "languages": crawl_options.languages,
         "include": crawl_options.policy.include,
         "exclude": crawl_options.policy.exclude,
         "include_classes": crawl_options.policy.include_classes,

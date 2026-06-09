@@ -60,7 +60,10 @@ that forwards raw LSP responses to the model.
 
 Unsupported files are retained as structured unsupported results so callers can
 fall back to bounded read/grep/list navigation without pretending the graph knows
-more than it does.
+more than it does. Files in a supported language that is disabled by
+`[graph].languages` use the same fallback record shape with a distinct disabled
+language reason, so the allow-list affects parser scheduling without hiding
+files from coverage and repo-profile diagnostics.
 
 Generated, vendored, dependency cache, build output, binary, lockfile, and large
 files are excluded from graph indexing by default with compact reason-tagged
@@ -166,12 +169,23 @@ immediately after debounce. Long-lived tool registries open the graph with
 ReadDirectoryChangesW) to queue debounced changed paths into the same pending
 set. If native watcher registration fails, for example because Linux inotify
 watch limits are exhausted or a mount cannot be watched recursively, Squeezy
-falls back to a polling watcher and records the fallback reason. Graph tool
-payloads expose the active `watcher_mode`, `watcher_backend`, and pending event
-count so users and agents can distinguish native event refresh from fallback or
-one-shot crawl-only graph managers. Refresh recrawls tracked files, compares
-stable hashes, reparses changed files only, removes deleted files, and preserves
-unchanged graph partitions.
+falls back to a polling watcher and records the fallback reason; if both native
+and polling backends fail, live event refresh is disabled but the graph remains
+usable through polling recrawls.
+
+Graph tool payloads include a compact `freshness_mode` value (`watcher` or
+`polling`) and include a `freshness_fallback_reason` only when watcher startup
+degrades. Degraded watcher sessions also expose `watcher_mode`,
+`watcher_backend`, and pending event count inside the `indexing` block so users
+and agents can distinguish native event refresh from fallback or one-shot
+crawl-only graph managers. Watcher-backed graph managers hard-ignore Squeezy's
+own `.squeezy/` cache and VCS metadata events via the shared
+`VCS_AND_CACHE_DIR_NAMES` list, so graph persistence writes do not self-trigger
+refresh loops; other default-pruned directories are left visible to the watcher
+so user policy such as `include = ["vendor/allowed/**"]` can still refresh
+re-included files. Refresh recrawls tracked files, compares stable hashes,
+reparses changed files only, removes deleted files, and preserves unchanged
+graph partitions.
 
 Watcher event paths and refresh records are compared through the workspace path
 identity helper before falling back to canonicalization. This strips Windows

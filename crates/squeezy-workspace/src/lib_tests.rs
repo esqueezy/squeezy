@@ -62,6 +62,7 @@ fn crawler_marks_large_and_binary_files_as_excluded() {
         include_hidden: false,
         max_file_bytes: 8,
         require_indexing_signal: true,
+        languages: Vec::new(),
         policy: IndexingPolicy::default(),
     })
     .crawl(&root)
@@ -110,6 +111,117 @@ fn crawler_does_not_read_large_files_into_memory() {
             .iter()
             .any(|file| file.relative_path == "small.rs")
     );
+}
+
+#[test]
+fn language_allowlist_moves_disabled_languages_to_unsupported() {
+    let root = temp_root("language_allowlist_moves_disabled_languages_to_unsupported");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "fn rust() {}\n").unwrap();
+    fs::write(root.join("src/app.py"), "def python():\n    pass\n").unwrap();
+    fs::write(root.join("src/native.h"), "void native(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["rust".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    // Allowed language stays in files.
+    let rust = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/lib.rs")
+        .expect("rust file indexed");
+    assert_eq!(rust.language, LanguageKind::Rust);
+
+    // Disabled files must NOT appear in snapshot.files at all.
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .all(|file| file.relative_path != "src/app.py"),
+        "disabled python file must not be in snapshot.files"
+    );
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .all(|file| file.relative_path != "src/native.h"),
+        "disabled C header must not be in snapshot.files"
+    );
+
+    // Disabled files must appear exactly once in snapshot.unsupported.
+    assert!(snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/app.py" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+    assert!(snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/native.h" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
+fn language_allowlist_refines_c_headers_before_disabling_languages() {
+    let root = temp_root("language_allowlist_refines_c_headers_before_disabling_languages");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/native.c"), "#include \"native.h\"\n").unwrap();
+    fs::write(root.join("src/native.h"), "void native(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["c".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    let header = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/native.h")
+        .expect("C header indexed");
+    assert_eq!(header.language, LanguageKind::C);
+    assert!(!snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/native.h" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
+fn language_allowlist_accepts_csharp_family_alias() {
+    let root = temp_root("language_allowlist_accepts_csharp_family_alias");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/Program.cs"), "class Program {}\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "fn rust() {}\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["c-sharp".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    let csharp = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/Program.cs")
+        .expect("C# file indexed");
+    assert_eq!(csharp.language, LanguageKind::CSharp);
+    assert!(snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/lib.rs" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
+fn invalid_language_allowlist_is_a_config_error() {
+    let err = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["brainfuck".to_string()],
+        ..CrawlOptions::default()
+    })
+    .expect_err("unknown language should fail");
+    assert!(matches!(err, SqueezyError::Config(_)), "{err:?}");
 }
 
 #[test]
