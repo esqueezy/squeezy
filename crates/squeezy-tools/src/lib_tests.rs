@@ -11325,6 +11325,76 @@ fn sensitive_path_matcher_catches_quoted_and_expanded_bypasses() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn sensitive_path_matcher_blocks_credentials_even_when_tool_roots_are_readable() {
+    let home = PathBuf::from("/tmp/squeezy-sensitive-home-test");
+    let config = squeezy_core::ShellSandboxConfig {
+        read_roots: vec![
+            home.join(".cargo"),
+            home.join(".rustup"),
+            home.join(".config/gcloud"),
+            home.join(".azure"),
+            home.join(".password-store"),
+        ],
+        ..squeezy_core::ShellSandboxConfig::default()
+    };
+
+    // These env names are intentionally preserved for toolchains and TLS, but
+    // their presence must not weaken credential path denial under readable
+    // cache/config roots.
+    for allowed_env in [
+        "HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NIX_SSL_CERT_FILE",
+    ] {
+        assert!(
+            config.env_allowlist.iter().any(|name| name == allowed_env),
+            "{allowed_env} should remain in the sandbox env allowlist"
+        );
+    }
+
+    for (command, expected_pattern) in [
+        (
+            format!("cat {}", home.join(".cargo/credentials.toml").display()),
+            ".cargo/credentials*",
+        ),
+        (
+            format!(
+                "cat {}",
+                home.join(".config/gcloud/application_default_credentials.json")
+                    .display()
+            ),
+            ".config/gcloud/**",
+        ),
+        (
+            format!("cat {}", home.join(".azure/accessTokens.json").display()),
+            ".azure/**",
+        ),
+        (
+            format!(
+                "cat {}",
+                home.join(".password-store/github.gpg").display()
+            ),
+            ".password-store/**",
+        ),
+        (
+            format!("cat {}", home.join(".local/share/gnupg/private-keys-v1.d/key").display()),
+            ".local/share/gnupg/**",
+        ),
+    ] {
+        assert_eq!(
+            shell_command_references_sensitive_path(&command, &config.sensitive_path_patterns)
+                .as_deref(),
+            Some(expected_pattern),
+            "command should remain sensitive despite readable roots: {command}"
+        );
+    }
+}
+
+#[test]
 fn shell_audit_store_is_safe_under_concurrent_appends() {
     let root = temp_workspace("shell_audit_concurrent");
     let store = Arc::new(ShellAuditStore::new(&root));
