@@ -48,8 +48,10 @@ pub struct DoctorArgs {
     /// exits without running other checks.
     #[arg(long)]
     pub sandbox_teardown: bool,
-    /// Include Linux-focused cache/session storage paths, mount types, and
-    /// backup age details in the cache diagnostic row.
+    /// Include cache/session storage paths, mount types, and backup age
+    /// details in the cache diagnostic row. Output is richest on Linux
+    /// (mount classification via `/proc/self/mountinfo`); macOS and
+    /// Windows show paths and probe state with `class=unknown`.
     #[arg(long)]
     pub storage: bool,
 }
@@ -526,7 +528,20 @@ fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        detail.push_str("; move [cache].root to a local SSD path");
+        // Use the per-label relocation hint so a warning on `sessions`
+        // points at `[session].log_dir` instead of misleading the user
+        // to move `[cache].root` (which only governs cache/state/graph
+        // paths). Dedupe across warnings so two cache-flavoured labels
+        // collapse to one suggestion.
+        let mut hints: Vec<&'static str> = storage_warnings
+            .iter()
+            .map(|report| squeezy_store::storage_relocation_hint(&report.label))
+            .collect();
+        hints.sort_unstable();
+        hints.dedup();
+        detail.push_str("; move ");
+        detail.push_str(&hints.join(" and "));
+        detail.push_str(" to a local SSD path");
     }
     if storage {
         detail.push_str("; storage: ");
@@ -585,8 +600,12 @@ fn format_storage_reports(reports: &[StoragePathReport]) -> String {
     reports
         .iter()
         .map(|report| {
-            let fs_type = report.filesystem_type.as_deref().unwrap_or("unknown");
-            let source = report.mount_source.as_deref().unwrap_or("unknown");
+            // Substitute "n/a" rather than "unknown" so a row that simply
+            // didn't match a mountinfo entry (macOS/Windows, or a path
+            // outside `/proc/self/mountinfo`) reads as missing detail
+            // rather than as a defect-classified mount.
+            let fs_type = report.filesystem_type.as_deref().unwrap_or("n/a");
+            let source = report.mount_source.as_deref().unwrap_or("n/a");
             format!(
                 "{}={} fs={} source={} class={}",
                 report.label,

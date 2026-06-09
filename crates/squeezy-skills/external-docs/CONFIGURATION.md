@@ -332,7 +332,8 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   if `[cache].root` is set, otherwise `.squeezy/sessions`. With
   `[cache].root = "xdg"` on Linux, cache and session files resolve under
   `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`.
-  In the TUI,
+  When neither `$XDG_CACHE_HOME` nor `$HOME` is set, the resolver falls back
+  to `<workspace>/.squeezy/cache/squeezy/<repo-id>`. In the TUI,
   `Shift+Tab` toggles modes; `/plan` and `/build` force a specific mode.
 - `[context]`: deterministic context compaction controls. Squeezy estimates
   model-visible prompt tokens locally and, when enabled, replaces stale raw
@@ -543,7 +544,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[cache]`: `root`, `tool_outputs`, and `durability`. Relative paths resolve
   against the workspace root, not the process working directory. On Linux,
   `root = "xdg"` stores large cache files under
-  `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`.
+  `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`,
+  falling back to `<workspace>/.squeezy/cache/squeezy/<repo-id>` when neither
+  environment variable is set (typically only in sandboxed runs).
   Cross-session receipt metadata, read snapshots, observations, and small
   session-side cache state are stored in `state.redb`; semantic graph
   partitions and resolver-cache snapshots are stored in `graph.redb`.

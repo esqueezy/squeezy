@@ -248,13 +248,15 @@ impl SessionStore {
             return;
         };
         payload.push(b'\n');
-        let _ = with_global_index_lock(&path, || {
+        if let Err(error) = with_global_index_lock(&path, || {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
             let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
             file.write_all(&payload)
-        });
+        }) {
+            log_global_index_lock_failure(&path, "append", &error);
+        }
     }
 
     /// Read the cross-project session index, deduping by `session_id` and
@@ -327,7 +329,11 @@ impl SessionStore {
             // Compact in oldest-first order so future appends keep the newest
             // entries at the tail — matches how readers see time.
             ordered.sort_by_key(|entry| entry.started_at_ms);
-            let _ = with_global_index_lock(&path, || rewrite_global_index(&path, &ordered));
+            if let Err(error) =
+                with_global_index_lock(&path, || rewrite_global_index(&path, &ordered))
+            {
+                log_global_index_lock_failure(&path, "compact", &error);
+            }
         }
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
         cache_global_index(&path, &entries);
@@ -2963,6 +2969,11 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     atomic_replace(path, &bytes)
 }
 
+/// Run `action` while holding an exclusive advisory `flock(2)` on a sibling
+/// lock file. The lock file is named `.{name}.compact.lock` and lives next
+/// to the data file; it is created on first use and intentionally left in
+/// place across runs (size 0) so concurrent processes can re-acquire the
+/// same OS-visible advisory lock without racing on the file's creation.
 fn with_global_index_lock<T>(
     path: &Path,
     action: impl FnOnce() -> std::io::Result<T>,
@@ -2979,6 +2990,16 @@ fn with_global_index_lock<T>(
         (Ok(_), Err(error)) => Err(error),
         (Err(error), _) => Err(error),
     }
+}
+
+fn log_global_index_lock_failure(path: &Path, operation: &str, error: &std::io::Error) {
+    tracing::debug!(
+        target: "squeezy::store",
+        path = %path.display(),
+        operation,
+        error = %error,
+        "global index lock unavailable after retry",
+    );
 }
 
 fn global_index_lock_path(path: &Path) -> PathBuf {

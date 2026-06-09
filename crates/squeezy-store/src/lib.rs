@@ -1215,9 +1215,20 @@ fn backup_path_with_label(path: &Path, label: &str) -> PathBuf {
 }
 
 pub(crate) fn is_xdg_cache_root(path: &Path) -> bool {
+    // Case-sensitive sentinel: only literal "xdg" opts into XDG resolution.
+    // `"XDG"`, `"Xdg"`, and `"xdg/"` are treated as ordinary relative paths,
+    // matching the lowercase-only convention used by `CacheDurability::parse`.
     path == Path::new("xdg")
 }
 
+/// Resolve the on-disk location backing `[cache].root = "xdg"`.
+///
+/// Walks the standard XDG chain: `$XDG_CACHE_HOME` first, then
+/// `$HOME/.cache`, and finally `<workspace_root>/.squeezy/cache` when
+/// neither environment variable is set (typically only happens in sandboxes
+/// or test runs that strip both env vars). The repo-stable
+/// `squeezy/<repo-id>` suffix is appended in every branch so the resolved
+/// path survives workspace re-canonicalizations.
 fn xdg_cache_dir_path(workspace_root: &Path) -> PathBuf {
     let base = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -1241,9 +1252,23 @@ fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
 /// directory so the directory entry survives a crash; on other platforms the
 /// parent fsync is a no-op (APFS provides equivalent rename durability without
 /// it).
+///
+/// Temp file naming pattern: `.{name}.{pid}.{stamp}.{counter}.tmp` (hidden,
+/// per-process). The sibling advisory lock used by the global session index
+/// follows the matching `.{name}.compact.lock` pattern. Both names are
+/// dot-prefixed so they stay out of `ls` listings; grep on either suffix when
+/// debugging a half-written state.
 pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
+        // Newly-created session directories must themselves survive a crash:
+        // a grandparent fsync after the freshly created directory ensures the
+        // directory entry is durable before the file inside is renamed into
+        // place, closing the gap between `create_dir_all` and `fs::rename`.
+        let parent_existed = parent.exists();
         fs::create_dir_all(parent)?;
+        if !parent_existed {
+            sync_parent_dir(parent)?;
+        }
     }
     let tmp = unique_tmp_path(path);
     let result = (|| -> io::Result<()> {
@@ -1328,7 +1353,7 @@ fn storage_report(label: &str, path: &Path) -> StoragePathReport {
         .as_deref()
         .map(classify_filesystem)
         .unwrap_or(StorageMountClassification::Unknown);
-    let warning = storage_warning(classification, filesystem_type.as_deref());
+    let warning = storage_warning(label, classification, filesystem_type.as_deref());
     StoragePathReport {
         label: label.to_string(),
         path: path.to_path_buf(),
@@ -1339,17 +1364,29 @@ fn storage_report(label: &str, path: &Path) -> StoragePathReport {
     }
 }
 
+/// Suggested config key to relocate when `label` lands on a remote/volatile mount.
+/// `sessions` paths come from `[session].log_dir`; every other label
+/// (`cache`, `state.redb`, `graph.redb`) is governed by `[cache].root`.
+pub fn storage_relocation_hint(label: &str) -> &'static str {
+    match label {
+        "sessions" => "[session].log_dir",
+        _ => "[cache].root",
+    }
+}
+
 fn storage_warning(
+    label: &str,
     classification: StorageMountClassification,
     filesystem_type: Option<&str>,
 ) -> Option<String> {
+    let hint = storage_relocation_hint(label);
     match classification {
         StorageMountClassification::Network => Some(format!(
-            "{} filesystems can surprise redb locking, mmap, rename, or fsync; move [cache].root to a local SSD path",
+            "{} filesystems can surprise redb locking, mmap, rename, or fsync; move {hint} to a local SSD path",
             filesystem_type.unwrap_or("network")
         )),
         StorageMountClassification::Virtual => Some(format!(
-            "{} filesystems can make cache locking or fsync slower or less durable; prefer a local SSD cache path",
+            "{} filesystems can make cache locking or fsync slower or less durable; move {hint} to a local SSD path",
             filesystem_type.unwrap_or("virtual")
         )),
         StorageMountClassification::Local | StorageMountClassification::Unknown => None,
@@ -1415,6 +1452,10 @@ fn parse_linux_mountinfo(contents: &str) -> Vec<MountEntry> {
 
 #[cfg(target_os = "linux")]
 fn parse_linux_mountinfo_line(line: &str) -> Option<MountEntry> {
+    // Per `proc(5)`, the variable-length optional-fields tail between
+    // `mount_point` and the `" - "` separator is consumed by `split_once`
+    // (we never count those fields directly); the post-separator side begins
+    // unconditionally with `fs_type` then `mount_source`.
     let (pre, post) = line.split_once(" - ")?;
     let mut pre_fields = pre.split_whitespace();
     let _mount_id = pre_fields.next()?;
@@ -1424,7 +1465,10 @@ fn parse_linux_mountinfo_line(line: &str) -> Option<MountEntry> {
     let mount_point = unescape_mountinfo_path(pre_fields.next()?);
     let mut post_fields = post.split_whitespace();
     let fs_type = post_fields.next()?.to_string();
-    let source = post_fields.next().unwrap_or("").to_string();
+    let source = post_fields
+        .next()
+        .map(unescape_mountinfo_path)
+        .unwrap_or_default();
     Some(MountEntry {
         mount_point: PathBuf::from(mount_point),
         fs_type,
