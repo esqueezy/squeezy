@@ -31,6 +31,11 @@ ansi-to-tui.workspace = true
 crossterm.workspace = true
 ignore.workspace = true
 lru.workspace = true
+# Unix-only: re-raising SIGTSTP with the default disposition so Ctrl+Z (job
+# control) actually suspends squeezy after we restore the terminal. Pulled in on
+# all targets for a single `[dependencies]` entry; every `libc` use site is
+# `#[cfg(unix)]`, so it is dead weight (no calls) on Windows.
+libc.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true

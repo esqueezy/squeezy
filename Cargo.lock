@@ -3403,6 +3403,7 @@ dependencies = [
  "futures-util",
  "ignore",
  "insta",
+ "libc",
  "lru",
  "pulldown-cmark",
  "ratatui",

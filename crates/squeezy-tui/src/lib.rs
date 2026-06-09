@@ -97,6 +97,7 @@ mod scroll;
 mod search;
 mod selection;
 mod settings_watcher;
+mod signal_teardown;
 mod size_source;
 mod startup_model_picker;
 mod status;
@@ -906,7 +907,28 @@ async fn run_inner_with_terminal(
     let mut frame_limiter = FrameRateLimiter::default();
     let mut interactive_marked = false;
 
+    // Crash safety (Phase 9): on Unix, register SIGTERM/SIGHUP handlers that run
+    // the emergency teardown and exit, so a killed process (where `Drop` never
+    // runs) does not leave the terminal in raw mode / the alternate screen. The
+    // panic hook is installed earlier in `TerminalGuard::enter`. Best-effort and
+    // additive — a failed registration just falls back to the panic hook + Drop;
+    // a no-op on non-Unix. Installed here, inside the tokio runtime, because the
+    // Unix handlers spawn listener tasks.
+    signal_teardown::install_signal_handlers();
+
     loop {
+        // Cooperative SIGTSTP (Ctrl+Z) suspend, handled at the top of the loop
+        // so the clean terminal restore + re-raise + redraw never races the
+        // renderer or runs on a half-mutated model. The SIGTSTP handler only
+        // flips a flag (`take_suspend_request`); the guard owns the byte work.
+        // `take_suspend_request` is always `false` on non-Unix, so this whole
+        // block compiles to nothing there. Suspend during a running turn is
+        // safe: only the terminal is parked; the async turn keeps its state.
+        #[cfg(unix)]
+        if signal_teardown::take_suspend_request() {
+            terminal.suspend_and_resume(&mut app);
+        }
+
         // Drain producers first so the next draw reflects everything that
         // has landed since the previous iteration. A flurry of events
         // therefore coalesces into a single frame.
@@ -22265,6 +22287,24 @@ fn emit_finish_fullscreen<W: Write>(
     )
 }
 
+/// Mark the app so the very next loop frame repaints EVERYTHING from model state
+/// after a SIGTSTP/SIGCONT resume. The freshly re-entered alternate screen is
+/// blank, so we cannot trust ratatui's incremental diff: `needs_redraw` forces a
+/// draw past the idle-skip gate, and `pending_resize` forces it past the frame
+/// limiter's wants-draw gate and re-anchors scroll geometry as if the size may
+/// have changed while suspended (the user may have resized the window in the
+/// shell). Factored out of [`TerminalGuard::suspend_and_resume`] so the
+/// forced-redraw contract is unit-testable on every platform without the
+/// Unix-only blocking re-raise.
+///
+/// Compiled on Unix (the only suspend/resume target) and in any test build (so
+/// the contract test runs on Windows CI too); elsewhere it would be dead code.
+#[cfg(any(unix, test))]
+fn mark_full_redraw_after_resume(app: &mut TuiApp) {
+    app.needs_redraw = true;
+    app.pending_resize = true;
+}
+
 impl TerminalGuard {
     fn enter(synchronized_output: TuiSynchronizedOutput) -> Result<Self> {
         let synchronized_output = resolve_synchronized_output(synchronized_output);
@@ -22297,6 +22337,15 @@ impl TerminalGuard {
         // `paint_main_inner` / the term-matrix capture harness.
         emit_terminal_enter_setup(&mut writer, inline_repro, mouse_capture)
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        // Crash safety (Phase 9): install the panic hook now that the terminal is
+        // in raw mode / the alternate screen, and publish the alt-screen state so
+        // the hook (and the Unix signal handlers) leave it exactly once. Both are
+        // idempotent across the process and additive — the clean lifecycle is
+        // unchanged; these only cover the paths where `Drop` cannot run (a panic
+        // message printing pre-unwind, or a SIGTERM/SIGHUP killing the process).
+        // The panic hook is restored on the clean exit in `finish_fullscreen`.
+        signal_teardown::set_alt_screen_active(!inline_repro);
+        signal_teardown::install_panic_hook();
         let backend = CrosstermBackend::new(writer);
         let viewport = if inline_repro {
             Viewport::Inline(INLINE_VIEWPORT_HEIGHT)
@@ -22421,8 +22470,15 @@ impl TerminalGuard {
         emit_finish_fullscreen(backend, &mirror, width, exit_hint.as_deref())?;
         // The alternate screen has been left; record it so `Drop` won't leave it
         // again. Set BEFORE the trailing fallible calls so an error here still
-        // prevents a double-leave.
+        // prevents a double-leave. Mirror the same fact into the crash-path flag
+        // so a panic hook / signal handler that fires after this clean exit does
+        // not re-leave an alternate screen we already left.
         self.alt_screen_active = false;
+        signal_teardown::set_alt_screen_active(false);
+        // Clean exit: put back the panic hook that was in place before `enter`
+        // installed the emergency-teardown one, so a subsequent TUI (or non-TUI
+        // code) in this process is unaffected by our hook.
+        signal_teardown::restore_previous_panic_hook();
         // Raw mode is the very last thing disabled — after every CRLF write above
         // — so bare-`\n` stair-stepping can't occur mid-mirror. Then show the
         // hardware cursor `enter` hid, and flush so everything is emitted before
@@ -22430,6 +22486,90 @@ impl TerminalGuard {
         let _ = disable_raw_mode();
         let _ = self.term().show_cursor();
         self.term().backend_mut().flush()
+    }
+
+    /// Cooperative SIGTSTP (Ctrl+Z) suspend/resume, driven from the main loop
+    /// when [`signal_teardown::take_suspend_request`] returns `true`.
+    ///
+    /// A signal handler cannot do this work safely: leaving the alternate screen
+    /// cleanly and redrawing from model state both need the guard's writer and
+    /// the live `TuiApp`, and they must not race the renderer's own writes or run
+    /// on a half-mutated model. So the SIGTSTP handler only flips a flag and the
+    /// loop calls this at a safe point. Suspend during a running turn is safe:
+    /// the turn's async work and `app.cancel` token are untouched — we only park
+    /// the process and restore the terminal around the stop. On resume the turn
+    /// keeps streaming and the forced full redraw repaints whatever it produced.
+    ///
+    /// Order (this is the load-bearing contract the tests pin):
+    ///   1. RESTORE the terminal to a sane shell state BEFORE the process stops:
+    ///      leave the alternate screen, disable mouse / bracketed-paste / focus /
+    ///      alternate-scroll, reset keyboard-enhancement flags + title, show the
+    ///      hardware cursor, and disable raw mode LAST. This reuses the exact
+    ///      single-sourced [`emit_terminal_emergency_teardown`] bytes the panic /
+    ///      signal / Drop paths emit (no transcript mirror — that is the heavy
+    ///      clean-exit), so the shell that takes over sees a normal terminal.
+    ///   2. Re-raise `SIGTSTP` with the default disposition so job control
+    ///      actually stops squeezy (the shell reclaims the terminal). Execution
+    ///      blocks here until `SIGCONT` (e.g. `fg`).
+    ///   3. On resume, RE-ENTER: re-enable raw mode, replay
+    ///      [`emit_terminal_enter_setup`] (alt-screen, clear, home, bracketed
+    ///      paste, focus, mouse capture, hidden cursor), re-publish the crash-path
+    ///      alt-screen flag, and mark the app dirty so the very next loop frame
+    ///      repaints everything from model state.
+    ///
+    /// Best-effort throughout: every emit is `let _ =` so a flaky terminal cannot
+    /// abort the suspend mid-restore (which would leave a corrupted screen). A
+    /// no-op when not in the alternate screen (inline-repro), where Ctrl+Z needs
+    /// no special handling — the inline path lives in the normal buffer already.
+    #[cfg(unix)]
+    fn suspend_and_resume(&mut self, app: &mut TuiApp) {
+        // Inline-repro never enters the alternate screen and renders into the
+        // normal buffer, so the shell already sees a sane terminal on Ctrl+Z.
+        // Let the default SIGTSTP-equivalent path (a plain stop) handle it; we
+        // only manage the alt-screen lifecycle here.
+        if !self.alt_screen_active {
+            return;
+        }
+
+        // 1. Restore the terminal BEFORE stopping. Reuse the emergency-teardown
+        //    bytes (leave alt-screen + restore modes, NO transcript mirror), then
+        //    show the cursor and disable raw mode last — exactly the clean
+        //    crash-path restore, so the shell inherits a normal terminal.
+        {
+            let backend = self.term().backend_mut();
+            let _ = emit_terminal_emergency_teardown(backend, /* alt_screen_active = */ true);
+            let _ = backend.flush();
+        }
+        let _ = self.term().show_cursor();
+        let _ = disable_raw_mode();
+        // The alternate screen is left; keep both the guard flag and the shared
+        // crash-path flag in sync so a panic/signal firing WHILE we are stopped
+        // does not try to leave it again.
+        self.alt_screen_active = false;
+        signal_teardown::set_alt_screen_active(false);
+
+        // 2. Actually stop (job control). Blocks until SIGCONT (`fg`). The async
+        //    turn, if any, is untouched — only this thread parks.
+        signal_teardown::reraise_sigtstp_default();
+
+        // 3. Resumed (SIGCONT). Re-enter the alternate screen and clear, then
+        //    force a full repaint from model state on the next frame.
+        let _ = enable_raw_mode();
+        {
+            let inline_repro = self.inline_repro;
+            let mouse_capture = self.mouse_capture;
+            let backend = self.term().backend_mut();
+            let _ = emit_terminal_enter_setup(backend, inline_repro, mouse_capture);
+            let _ = backend.flush();
+        }
+        self.alt_screen_active = true;
+        signal_teardown::set_alt_screen_active(true);
+        // Force a full redraw from model state: clear ratatui's diff baseline so
+        // the next `draw` repaints every cell (the alternate screen we just
+        // re-entered is blank), then mark the app so the loop draws on its very
+        // next turn regardless of the idle-skip gate.
+        let _ = self.term().clear();
+        mark_full_redraw_after_resume(app);
     }
 
     /// Paint a single centered status line, flushed before the first real
@@ -23147,6 +23287,10 @@ impl Drop for TerminalGuard {
             // already ran.
             let _ = emit_terminal_emergency_teardown(backend, self.alt_screen_active);
             self.alt_screen_active = false;
+            // Keep the crash-path flag in sync: the alternate screen (if any) has
+            // now been left, so a panic hook / signal handler firing during or
+            // after this Drop must not leave it a second time.
+            signal_teardown::set_alt_screen_active(false);
         }
         let _ = terminal.show_cursor();
     }

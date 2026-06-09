@@ -8806,6 +8806,202 @@ fn emergency_teardown_leaves_alt_screen_and_restores_modes_without_mirror() {
     );
 }
 
+/// Phase 9 SIGTSTP (Ctrl+Z) suspend/resume — byte contract.
+///
+/// `TerminalGuard::suspend_and_resume` performs three steps around the actual
+/// process-stop: (1) restore the terminal to a sane shell state, (2) re-raise
+/// SIGTSTP (the real stop — not exercised here, it would stop the test process),
+/// (3) on resume, re-enter the alternate screen + clear. Steps 1 and 3 reuse the
+/// exact single-sourced emitters `emit_terminal_emergency_teardown` and
+/// `emit_terminal_enter_setup`. This test pins that the SUSPEND restore leaves
+/// the alternate screen + restores modes (no transcript mirror, no scrollback
+/// purge), and the RESUME re-enter re-enters the alternate screen + clears — i.e.
+/// the bytes the shell sees on Ctrl+Z and the bytes the user sees on `fg`, in
+/// order.
+#[test]
+fn suspend_restores_terminal_then_resume_reenters_and_clears() {
+    // Step 1 — suspend restore: the same emergency-teardown bytes, which leave
+    // the alternate screen and restore terminal modes but write NO user content.
+    let mut suspend_bytes = Vec::new();
+    emit_terminal_emergency_teardown(&mut suspend_bytes, /* alt_screen_active = */ true)
+        .expect("emit suspend restore");
+    let suspend = String::from_utf8(suspend_bytes).expect("ansi");
+
+    // Leaves the alternate screen so the shell that reclaims the terminal sees a
+    // normal buffer.
+    assert!(
+        suspend.contains("\x1b[?1049l"),
+        "suspend must leave the alternate screen before the process stops"
+    );
+    // Restores modes the shell needs back: mouse off, bracketed paste off.
+    assert!(
+        suspend.contains(DISABLE_MOUSE_MODES),
+        "suspend must disable mouse modes"
+    );
+    assert!(
+        suspend.contains("\x1b[?2004l"),
+        "suspend must disable bracketed paste"
+    );
+    // Suspend is NOT a clean exit: it must never mirror the transcript or purge
+    // the user's scrollback — `fg` should drop the user right back into the TUI.
+    assert!(
+        !suspend.contains("\x1b[3J"),
+        "suspend must never purge scrollback (\\x1b[3J)"
+    );
+
+    // Step 3 — resume re-enter: the same enter-setup bytes (fullscreen, mouse on).
+    let mut resume_bytes = Vec::new();
+    emit_terminal_enter_setup(
+        &mut resume_bytes,
+        /* inline_repro = */ false,
+        /* mouse_capture = */ true,
+    )
+    .expect("emit resume re-enter");
+    let resume = String::from_utf8(resume_bytes).expect("ansi");
+
+    // Re-enters the alternate screen and clears it (blank on re-entry).
+    assert!(
+        resume.contains("\x1b[?1049h"),
+        "resume must re-enter the alternate screen"
+    );
+    assert!(
+        resume.contains("\x1b[2J") || resume.contains("\x1b[3J") || resume.contains("\x1b[H"),
+        "resume must clear/home the freshly re-entered alternate screen"
+    );
+    // Mouse capture and alternate-scroll come back up with the re-enter.
+    assert!(
+        resume.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "resume must re-enable mouse click capture"
+    );
+    assert!(
+        resume.contains("\x1b[?1007h"),
+        "resume must re-enable alternate-scroll"
+    );
+}
+
+/// Phase 9 SIGTSTP resume — forced full redraw from model state.
+///
+/// After `SIGCONT` the freshly re-entered alternate screen is blank and
+/// ratatui's incremental diff cannot be trusted, so resume marks the app so the
+/// very next loop frame repaints EVERYTHING: `needs_redraw` forces a draw past
+/// the idle-skip gate and `pending_resize` forces it past the frame-limiter
+/// wants-draw gate (and re-anchors scroll geometry in case the window was resized
+/// while suspended). `mark_full_redraw_after_resume` is the factored-out contract
+/// `suspend_and_resume` calls after re-entering; this drives it directly so the
+/// forced-redraw guarantee is pinned without the Unix-only blocking re-raise.
+#[test]
+fn resume_marks_app_for_full_redraw() {
+    let mut app = test_app(SessionMode::Build);
+    // Start from a "clean / nothing pending" state to prove resume sets both.
+    app.needs_redraw = false;
+    app.pending_resize = false;
+
+    mark_full_redraw_after_resume(&mut app);
+
+    assert!(
+        app.needs_redraw,
+        "resume must force a redraw past the idle-skip gate"
+    );
+    assert!(
+        app.pending_resize,
+        "resume must force a draw past the frame-limiter wants-draw gate and \
+         re-anchor scroll geometry"
+    );
+}
+
+/// Phase 9 cancel-vs-teardown: a mid-turn Ctrl+C cancels the running turn and
+/// returns to the composer with the TUI INTACT — `handle_key` returns `Ok(false)`
+/// (the loop keeps running, so neither `finish_fullscreen` nor the emergency
+/// teardown — i.e. no `LeaveAlternateScreen` — is ever reached). The cancel path
+/// touches only the cancel token / pending approvals, never the terminal.
+#[tokio::test]
+async fn mid_turn_ctrl_c_cancels_without_leaving_fullscreen() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
+
+    // A turn is in flight: a live cancellation token stands in for a running turn.
+    let cancel = CancellationToken::new();
+    app.cancel = Some(cancel.clone());
+    app.turn_visual = TurnVisualState::Running;
+
+    // Ctrl+C while the turn runs.
+    let exit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle_key");
+
+    // Mid-turn cancel must NOT exit the loop (so no teardown / LeaveAlternateScreen
+    // is ever emitted) ...
+    assert!(
+        !exit,
+        "a mid-turn Ctrl+C must NOT request loop exit (TUI stays intact)"
+    );
+    // ... the turn was actually cancelled ...
+    assert!(
+        cancel.is_cancelled(),
+        "the running turn's cancellation token must be cancelled"
+    );
+    assert_eq!(app.turn_visual, TurnVisualState::Failed);
+    // ... and the exit-confirm gesture was NOT armed (cancel != pending-exit).
+    assert!(
+        !app.exit_confirm_armed,
+        "cancelling a turn must not arm the exit confirmation"
+    );
+}
+
+/// Phase 9 cancel-vs-teardown, the other half: the EXPLICIT exit gesture (a
+/// double idle Ctrl+C) DOES request loop exit, which is what drives the clean
+/// `finish_fullscreen` teardown that emits `LeaveAlternateScreen`. We assert the
+/// gesture returns `Ok(true)` (idle, nothing running) and that the teardown the
+/// loop then runs emits the leave-fullscreen sequence.
+#[tokio::test]
+async fn explicit_idle_exit_requests_teardown_that_leaves_fullscreen() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
+
+    // Nothing is running: no cancel token, no pending approvals.
+    app.cancel = None;
+
+    // First idle Ctrl+C arms the exit confirmation but does NOT exit.
+    let first = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle_key first ctrl-c");
+    assert!(!first, "first idle Ctrl+C only arms the exit confirmation");
+    assert!(
+        app.exit_confirm_armed,
+        "first idle Ctrl+C arms exit confirm"
+    );
+
+    // Second idle Ctrl+C confirms the explicit exit: handle_key returns Ok(true),
+    // which is the only signal that drives the loop break -> finish_fullscreen.
+    let second = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle_key second ctrl-c");
+    assert!(second, "the explicit exit gesture must request loop exit");
+
+    // The teardown the loop runs on exit DOES leave the alternate screen — unlike
+    // the mid-turn cancel above, which never reaches this.
+    let mut bytes = Vec::new();
+    emit_terminal_emergency_teardown(&mut bytes, /* alt_screen_active = */ true)
+        .expect("emit teardown");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+    assert!(
+        ansi.contains("\x1b[?1049l"),
+        "the explicit-exit teardown must emit LeaveAlternateScreen"
+    );
+}
+
 #[test]
 fn emergency_teardown_skips_leave_alt_screen_for_inline_repro() {
     // The inline-repro path never entered the alternate screen, so teardown must

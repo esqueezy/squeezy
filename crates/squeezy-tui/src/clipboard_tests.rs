@@ -215,6 +215,69 @@ fn osc52_over_limit_without_chunking_falls_through_to_platform() {
     }
 }
 
+/// Phase 9 platform-hardening (tmux/SSH): at the PRODUCTION default cap
+/// (`DEFAULT_OSC52_MAX_BYTES` = 8 KiB, chunking OFF — the config
+/// `build_clipboard_chain` ships), an oversized selection must NOT emit a
+/// truncated or oversized OSC 52 escape. It degrades gracefully to the next
+/// provider in the chain (here `pbcopy`), so a payload past what the outer
+/// terminal/tmux `set-clipboard` buffer accepts never silently corrupts the
+/// clipboard or the screen. A payload just UNDER the cap still goes via OSC 52.
+#[test]
+fn osc52_default_cap_falls_through_when_oversized_otherwise_uses_terminal() {
+    // 1. Just under the cap: OSC 52 is used. base64 inflates by 4/3, so a raw
+    //    payload of ~half the cap is comfortably under the 8 KiB base64 limit.
+    let under = "u".repeat(DEFAULT_OSC52_MAX_BYTES / 2);
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    // Default cap, chunking off — exactly the production `with_providers` config.
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    let outcome = chain.copy(&CopyRequest::new(&under, "x"));
+    assert!(
+        matches!(
+            outcome,
+            CopyOutcome::Copied {
+                provider: ClipboardProviderKind::Osc52,
+                ..
+            }
+        ),
+        "a payload under the 8 KiB cap must go via OSC 52, got {outcome:?}"
+    );
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, SinkCall::Terminal { .. })),
+        "under-cap OSC 52 must write the escape to the terminal"
+    );
+
+    // 2. Over the cap: must fall through to the platform command and emit NO
+    //    terminal escape (no truncation, no oversized sequence on the wire).
+    let over = "o".repeat(DEFAULT_OSC52_MAX_BYTES * 2);
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    let outcome = chain.copy(&CopyRequest::new(&over, "x"));
+    assert!(
+        matches!(
+            outcome,
+            CopyOutcome::Copied {
+                provider: ClipboardProviderKind::Platform("pbcopy"),
+                ..
+            }
+        ),
+        "an over-cap payload must degrade to the platform provider, got {outcome:?}"
+    );
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, SinkCall::Terminal { .. })),
+        "over-cap OSC 52 must never write a (truncated/oversized) escape to the terminal"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Platform fallback when OSC 52 is unsupported
 // ---------------------------------------------------------------------------
