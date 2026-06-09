@@ -212,6 +212,12 @@ pub(crate) fn install_signal_handlers() {
 /// suspend/resume cycle (clean terminal restore, re-raise SIGTSTP with the
 /// default disposition, then re-enter + force a full redraw). Always `false` on
 /// non-Unix (no job-control suspend), so the loop's call site stays `cfg`-free.
+//
+// On non-Unix the only lib call site (`lib.rs`, behind `#[cfg(unix)]`) compiles
+// out, so the lib never references this. It is still exercised by the
+// `#[cfg(not(unix))]` test, hence we keep the function (not a `cfg`-split) and
+// silence the lib-target dead-code lint off Unix instead of deleting it.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn take_suspend_request() -> bool {
     #[cfg(unix)]
     {
