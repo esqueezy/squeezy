@@ -12620,3 +12620,90 @@ fn subagent_refusal_does_not_fire_when_tool_calls_pending() {
         );
     });
 }
+
+fn local_shell_failure_result(
+    command: &str,
+    exit_code: i64,
+    stderr: &str,
+) -> squeezy_tools::ToolResult {
+    squeezy_tools::ToolResult {
+        call_id: "shell-call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Error,
+        content: json!({
+            "command": command,
+            "stdout": "",
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "error": format!("exit {exit_code}"),
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+        web_call_stats: None,
+    }
+}
+
+#[test]
+fn local_tool_completion_message_appends_shell_hint_on_nonempty_stderr() {
+    // stderr came back populated (the shell printed a syntax-error message,
+    // a `permission denied`, etc.). Surface the effective-shell hint so the
+    // user knows which shell to retarget via `SQUEEZY_SHELL`.
+    let result = local_shell_failure_result("echo $(", 1, "sh: 1: syntax error");
+    let message = super::local_tool_completion_message(Some(&result));
+    assert!(message.contains("sh: 1: syntax error"), "{message}");
+    assert!(
+        message.contains("set SQUEEZY_SHELL to change"),
+        "stderr-populated failure must include the shell hint: {message}",
+    );
+}
+
+#[test]
+fn local_tool_completion_message_appends_shell_hint_on_shellish_exit_codes() {
+    // 127 = command not found, 126 = not executable, 2 = bash/sh syntax
+    // error. All three are shell-attributable even when stderr happens to
+    // be empty (some shells emit to stdout, mocks may drop it), so the
+    // hint should still appear.
+    for exit_code in [2, 126, 127] {
+        let result = local_shell_failure_result("nope", exit_code, "");
+        let message = super::local_tool_completion_message(Some(&result));
+        assert!(
+            message.contains("set SQUEEZY_SHELL to change"),
+            "exit_code {exit_code} must surface the shell hint even with empty stderr: {message}",
+        );
+    }
+}
+
+#[test]
+fn local_tool_completion_message_omits_shell_hint_for_benign_failures() {
+    // A `grep` that finds nothing exits 1 with empty stderr — the failure
+    // is informational, not shell-attributable. Suggesting a shell change
+    // here would be noise.
+    let result = local_shell_failure_result("grep needle file", 1, "");
+    let message = super::local_tool_completion_message(Some(&result));
+    assert!(
+        !message.contains("set SQUEEZY_SHELL to change"),
+        "exit-1 with empty stderr must NOT spuriously suggest the shell: {message}",
+    );
+}
+
+#[test]
+fn local_tool_completion_message_omits_shell_hint_on_success() {
+    // Successful completions never carry the failure hint.
+    let mut result = local_shell_failure_result("ls", 0, "");
+    result.status = ToolStatus::Success;
+    result.content = json!({
+        "command": "ls",
+        "stdout": "foo bar",
+        "stderr": "",
+        "exit_code": 0,
+    });
+    let message = super::local_tool_completion_message(Some(&result));
+    assert!(
+        !message.contains("set SQUEEZY_SHELL to change"),
+        "success path must not surface the shell hint: {message}",
+    );
+}

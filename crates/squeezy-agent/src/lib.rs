@@ -4180,7 +4180,8 @@ impl Agent {
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
-            | DispatchCommand::Router { .. }) => DispatchOutcome::TuiOnly {
+            | DispatchCommand::Router { .. }
+            | DispatchCommand::Terminal) => DispatchOutcome::TuiOnly {
                 command: cmd.slash_name().trim_start_matches('/').to_string(),
             },
         }
@@ -6031,13 +6032,40 @@ fn local_tool_completion_message(result: Option<&ToolResult>) -> String {
         ToolStatus::Cancelled => format!("`{command}` was cancelled."),
         _ => {
             let detail = tool_failure_detail(result);
-            if !stderr.is_empty() {
-                format!("`{command}` failed: {detail}\n\n{stderr}")
+            let exit_code = result
+                .content
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1);
+            // Surface the effective-shell hint only when the failure looks
+            // like it may be shell-syntax related: stderr was non-empty
+            // (shell printed a message) or the exit code suggests the shell
+            // itself failed (127 = command not found, 126 = not executable,
+            // 2 = common syntax error exit in bash/sh).
+            let shell_hint = if !stderr.is_empty() || matches!(exit_code, 2 | 126 | 127) {
+                format!("\n{}", effective_shell_hint())
             } else {
-                format!("`{command}` failed: {detail}")
+                String::new()
+            };
+            if !stderr.is_empty() {
+                format!("`{command}` failed: {detail}\n\n{stderr}{shell_hint}")
+            } else {
+                format!("`{command}` failed: {detail}{shell_hint}")
             }
         }
     }
+}
+
+/// Short hint about the effective shell used for `!cmd` / `!!cmd`
+/// commands. Shown on failure so users know which shell to target and
+/// that `SQUEEZY_SHELL` can override it.
+///
+/// The label is sourced from [`squeezy_tools::effective_shell_label`] so the
+/// TUI's `/terminal` row and this hint always agree on what the user will
+/// see — including empty-string and non-UTF-8 `SQUEEZY_SHELL` cases.
+fn effective_shell_hint() -> String {
+    let shell = squeezy_tools::effective_shell_label();
+    format!("[shell: {shell} — set SQUEEZY_SHELL to change, e.g. SQUEEZY_SHELL=/bin/bash]")
 }
 
 struct TurnRuntime {
@@ -15040,7 +15068,8 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         | DispatchCommand::Statusline
         | DispatchCommand::Keymap
         | DispatchCommand::Cheap
-        | DispatchCommand::Parent => SlashArgShape::None,
+        | DispatchCommand::Parent
+        | DispatchCommand::Terminal => SlashArgShape::None,
         DispatchCommand::CheckpointsDoctor => SlashArgShape::FixedSubcommand,
         DispatchCommand::Attach { .. } => SlashArgShape::Path,
         DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {

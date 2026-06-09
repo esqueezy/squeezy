@@ -138,6 +138,7 @@ use shell_parse::{analyze_shell_command, extract_shell_write_targets};
 use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
 use shell_program::ShellProgram;
+pub use shell_program::effective_shell_label;
 use specs::{
     apply_patch_spec, checkpoint_check_spec, checkpoint_doctor_spec, checkpoint_list_spec,
     checkpoint_restore_file_spec, checkpoint_revert_spec, checkpoint_show_spec,
