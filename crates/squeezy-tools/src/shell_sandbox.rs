@@ -439,6 +439,17 @@ pub struct ShellSandboxDoctor {
     /// shell child because the seccomp profile denies AF_UNIX `socket(2)`.
     /// Always `None` on non-Linux platforms.
     pub linux_ask_socket_blocked: Option<bool>,
+    /// Linux only: whether unprivileged user namespaces (`CLONE_NEWUSER`) are
+    /// available. `None` on non-Linux platforms.
+    pub userns: Option<bool>,
+    /// Linux only: whether Landlock filesystem enforcement is available.
+    /// `None` on non-Linux platforms.
+    pub landlock: Option<bool>,
+    /// When `available` is `false`, a short machine-readable string
+    /// explaining why the backend cannot enforce isolation right now. Mirrors
+    /// the prose in `detail` but under a stable key for scripts that should
+    /// not scrape the human-readable string.
+    pub fallback_reason: Option<String>,
 }
 
 /// Probe the active shell-sandbox backend for `doctor`.
@@ -446,6 +457,11 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
     #[cfg(target_os = "macos")]
     {
         let available = macos_sandbox_exec_supported();
+        let fallback_reason = if available {
+            None
+        } else {
+            Some("/usr/bin/sandbox-exec not found".to_string())
+        };
         ShellSandboxDoctor {
             backend: "macos-sandbox-exec",
             available,
@@ -460,6 +476,9 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             linux_landlock_abi: None,
             linux_seccomp_available: None,
             linux_ask_socket_blocked: None,
+            userns: None,
+            landlock: None,
+            fallback_reason,
         }
     }
     #[cfg(target_os = "linux")]
@@ -474,6 +493,20 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
         let userns_ns_present = std::path::Path::new("/proc/self/ns/user").exists();
         let knob_str = userns_knob.as_deref().unwrap_or("absent");
         let seccomp_ok = linux_seccomp::build_shell_filter().is_ok();
+        let fallback_reason: Option<String> = match (userns, landlock) {
+            (true, true) => None,
+            (true, false) => Some(
+                "Landlock filesystem enforcement unavailable (kernel 5.13+ required)".to_string(),
+            ),
+            (false, true) => Some(
+                "unprivileged user namespaces disabled \
+                 (kernel.unprivileged_userns_clone=0 or /proc/self/ns/user absent)"
+                    .to_string(),
+            ),
+            (false, false) => {
+                Some("neither unprivileged user namespaces nor Landlock available".to_string())
+            }
+        };
         let detail = match (userns, landlock) {
             (true, true) => format!(
                 "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock ABI {abi} + seccomp available; \
@@ -482,17 +515,21 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             (true, false) => format!(
                 "user namespaces available but Landlock filesystem enforcement is not \
                  (Landlock ABI {abi}); required mode denies; \
-                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}"
+                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}; \
+                 hint: check kernel version (Landlock requires 5.13+)"
             ),
             (false, true) => format!(
                 "Landlock available (ABI {abi}) but unprivileged user namespaces are disabled; \
                  required mode denies; \
-                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}"
+                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}; \
+                 hint: set sysctl kernel.unprivileged_userns_clone=1 or check container/seccomp policy"
             ),
             (false, false) => format!(
                 "neither unprivileged user namespaces nor Landlock available (ABI {abi}); \
                  required mode denies; \
-                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}"
+                 unprivileged_userns_clone={knob_str}, /proc/self/ns/user present={userns_ns_present}; \
+                 hint: check kernel.unprivileged_userns_clone sysctl, container seccomp policy, \
+                 and kernel version (Landlock requires 5.13+)"
             ),
         };
         ShellSandboxDoctor {
@@ -505,6 +542,9 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             // AF_UNIX is blocked by the seccomp filter only when the sandbox
             // actually runs: unshare must succeed AND the filter must compile.
             linux_ask_socket_blocked: Some(userns && seccomp_ok),
+            userns: Some(userns),
+            landlock: Some(landlock),
+            fallback_reason,
         }
     }
     #[cfg(target_os = "windows")]
@@ -522,6 +562,9 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             linux_landlock_abi: None,
             linux_seccomp_available: None,
             linux_ask_socket_blocked: None,
+            userns: None,
+            landlock: None,
+            fallback_reason: None,
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -534,6 +577,9 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             linux_landlock_abi: None,
             linux_seccomp_available: None,
             linux_ask_socket_blocked: None,
+            userns: None,
+            landlock: None,
+            fallback_reason: Some("unsupported platform".to_string()),
         }
     }
 }

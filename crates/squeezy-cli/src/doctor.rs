@@ -41,6 +41,15 @@ pub struct DoctorArgs {
     /// Remove rotated redb schema backups after reporting cache health.
     #[arg(long)]
     pub prune_cache: bool,
+    /// Skip the repo-profile load. Useful for post-install smoke tests and
+    /// Linux package CI that do not have a full repository to scan, or for
+    /// fast binary-health checks where repo latency is undesirable.
+    #[arg(long)]
+    pub no_repo_profile: bool,
+    /// Skip the update-availability check. Useful in network-isolated CI
+    /// environments or when only local health checks are needed.
+    #[arg(long)]
+    pub no_update_check: bool,
     /// Windows only: provision the elevated shell-sandbox tier (one-time, UAC
     /// prompt). Creates the hidden local sandbox users and installs the WFP
     /// network egress-block filters, enabling `windows_sandbox_level =
@@ -116,6 +125,10 @@ struct Check {
     name: String,
     status: Status,
     detail: String,
+    /// Optional structured metadata included in `--json` output. Used by the
+    /// sandbox row to expose machine-readable platform fields (`backend`,
+    /// `userns`, `landlock`, `required_mode_supported`) without scraping prose.
+    extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -172,11 +185,24 @@ impl DoctorReport {
             "ok": self.failures == 0,
             "warnings": self.warnings,
             "failures": self.failures,
-            "checks": self.checks.iter().map(|c| json!({
-                "name": c.name,
-                "status": c.status.as_str(),
-                "detail": c.detail,
-            })).collect::<Vec<_>>(),
+            "checks": self.checks.iter().map(|c| {
+                let mut obj = json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "detail": c.detail,
+                });
+                if let (Some(extra), Some(map)) = (c.extra.as_ref(), obj.as_object_mut())
+                    && let Some(extra_map) = extra.as_object()
+                {
+                    // Extra metadata can never overwrite the base row fields.
+                    for (k, v) in extra_map {
+                        if !matches!(k.as_str(), "name" | "status" | "detail") {
+                            map.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                obj
+            }).collect::<Vec<_>>(),
         })
     }
 }
@@ -249,6 +275,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                         name: "config".to_string(),
                         status: Status::Ok,
                         detail: format!("sources: {}", labels.join(", ")),
+                        extra: None,
                     });
                 }
                 Some(config)
@@ -258,6 +285,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                     name: "config".to_string(),
                     status: Status::Fail,
                     detail: format!("{error}"),
+                    extra: None,
                 });
                 None
             }
@@ -268,21 +296,32 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
 
     if let Some(config) = config.as_ref() {
         if should_include_check(args, "repo_profile") {
-            match ensure_repo_profile(&config.workspace_root, &config.graph) {
-                Ok(loaded) => checks.push(Check {
+            if args.no_repo_profile {
+                checks.push(Check {
                     name: "repo_profile".to_string(),
                     status: Status::Ok,
-                    detail: format!(
-                        "status={} languages={}",
-                        loaded.status.as_str(),
-                        loaded.profile.languages.len()
-                    ),
-                }),
-                Err(error) => checks.push(Check {
-                    name: "repo_profile".to_string(),
-                    status: Status::Warn,
-                    detail: format!("{error}"),
-                }),
+                    detail: "skipped (--no-repo-profile)".to_string(),
+                    extra: None,
+                });
+            } else {
+                match ensure_repo_profile(&config.workspace_root, &config.graph) {
+                    Ok(loaded) => checks.push(Check {
+                        name: "repo_profile".to_string(),
+                        status: Status::Ok,
+                        detail: format!(
+                            "status={} languages={}",
+                            loaded.status.as_str(),
+                            loaded.profile.languages.len()
+                        ),
+                        extra: None,
+                    }),
+                    Err(error) => checks.push(Check {
+                        name: "repo_profile".to_string(),
+                        status: Status::Warn,
+                        detail: format!("{error}"),
+                        extra: None,
+                    }),
+                }
             }
         }
         if should_include_check(args, "workspace_paths") {
@@ -296,6 +335,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                 name: provider_check_name,
                 status: provider_check.0,
                 detail: provider_check.1,
+                extra: None,
             });
         }
 
@@ -310,6 +350,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                 name: provider_probe_name,
                 status,
                 detail,
+                extra: None,
             });
         }
 
@@ -363,8 +404,17 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     if should_include_check(args, "sandbox") {
         checks.push(sandbox_check(config.as_ref()));
     }
-    if !args.skip_update && should_include_check(args, "update") {
-        checks.push(update_check(update::check_for_update().await));
+    if should_include_check(args, "update") {
+        if args.no_update_check {
+            checks.push(Check {
+                name: "update".to_string(),
+                status: Status::Ok,
+                detail: "skipped (--no-update-check)".to_string(),
+                extra: None,
+            });
+        } else if !args.skip_update {
+            checks.push(update_check(update::check_for_update().await));
+        }
     }
 
     let config_failed = config.is_none() && needs_config(args);
@@ -429,6 +479,7 @@ fn workspace_paths_check(config: &AppConfig) -> Check {
             profile.kind.as_str(),
             case
         ),
+        extra: None,
     }
 }
 
@@ -517,7 +568,7 @@ fn unmatched_selector_checks(
             || checks
                 .iter()
                 .any(|check| check_name_matches(selector, &check.name))
-            || (selector == "update" && args.skip_update)
+            || (selector == "update" && (args.skip_update || args.no_update_check))
         {
             continue;
         }
@@ -533,6 +584,7 @@ fn unmatched_selector_checks(
             name: "selector".to_string(),
             status: Status::Fail,
             detail: format!("unknown doctor --only selector(s): {}", unknown.join(", ")),
+            extra: None,
         });
     }
     if !skipped_due_to_config.is_empty() {
@@ -552,6 +604,7 @@ fn unmatched_selector_checks(
                     "these checks"
                 }
             ),
+            extra: None,
         });
     }
     out
@@ -772,6 +825,7 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
             name: "session_home".to_string(),
             status: Status::Warn,
             detail,
+            extra: None,
         });
     }
 
@@ -784,6 +838,7 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
             name: "session_xdg_state_home".to_string(),
             status: Status::Warn,
             detail: format!("XDG_STATE_HOME={raw} is not absolute; falling back to HOME"),
+            extra: None,
         });
     }
 
@@ -810,6 +865,7 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
             detail: format!(
                 "global index directory {dir} appears read-only; index writes will fail"
             ),
+            extra: None,
         });
     }
 
@@ -844,6 +900,7 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
                 "legacy global index still present at {lp}; \
                  it will continue to be merged on every startup until removed"
             ),
+            extra: None,
         });
     }
 
@@ -873,6 +930,7 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
         name: "session_paths".to_string(),
         status,
         detail,
+        extra: None,
     });
     checks
 }
@@ -923,12 +981,14 @@ fn session_store_check(config: &AppConfig) -> Check {
                     "writable JSON/JSONL logs: {}; {index_detail}",
                     root.display()
                 ),
+                extra: None,
             }
         }
         Err(error) => Check {
             name: "session_store".to_string(),
             status: Status::Fail,
             detail: format!("{}: {error}", root.display()),
+            extra: None,
         },
     }
 }
@@ -952,12 +1012,14 @@ fn state_store_check(config: &AppConfig) -> Check {
                 name: "state_store".to_string(),
                 status: Status::Ok,
                 detail: format!("opened: {path}"),
+                extra: None,
             }
         }
         Err(error) => Check {
             name: "state_store".to_string(),
             status: Status::Fail,
             detail: format!("{} ({})", error, storage_error_hint(&error.to_string())),
+            extra: None,
         },
     }
 }
@@ -969,6 +1031,7 @@ fn graph_store_check(config: &AppConfig) -> Check {
             name: "graph_store".to_string(),
             status: Status::Ok,
             detail: format!("absent: {} (graph cache not created yet)", path.display()),
+            extra: None,
         };
     }
     match GraphStore::probe_path_read_only(&path) {
@@ -976,6 +1039,7 @@ fn graph_store_check(config: &AppConfig) -> Check {
             name: "graph_store".to_string(),
             status: Status::Ok,
             detail: format!("readable: {}", probe.path.display()),
+            extra: None,
         },
         Ok(probe) => Check {
             name: "graph_store".to_string(),
@@ -986,6 +1050,7 @@ fn graph_store_check(config: &AppConfig) -> Check {
                 GRAPH_SCHEMA_VERSION,
                 probe.path.display()
             ),
+            extra: None,
         },
         Err(error) => {
             // On Windows, another agent process holding graph.redb open will
@@ -1018,6 +1083,7 @@ fn graph_store_check(config: &AppConfig) -> Check {
                         "locked by another process (graph persistence is active): {}",
                         path.display()
                     ),
+                    extra: None,
                 }
             } else {
                 Check {
@@ -1027,6 +1093,7 @@ fn graph_store_check(config: &AppConfig) -> Check {
                         "{text}; graph persistence will be disabled until graph.redb can be opened: {}",
                         path.display()
                     ),
+                    extra: None,
                 }
             }
         }
@@ -1048,12 +1115,14 @@ fn user_global_storage_check(config: &AppConfig) -> Check {
             name: "user_global_storage".to_string(),
             status: Status::Warn,
             detail,
+            extra: None,
         };
     }
     Check {
         name: "user_global_storage".to_string(),
         status: Status::Ok,
         detail,
+        extra: None,
     }
 }
 
@@ -1128,6 +1197,7 @@ fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
                 name: "cache".to_string(),
                 status: Status::Fail,
                 detail: format!("{error}"),
+                extra: None,
             };
         }
     };
@@ -1269,6 +1339,7 @@ fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
         name: "cache".to_string(),
         status,
         detail,
+        extra: None,
     }
 }
 
@@ -1390,6 +1461,7 @@ fn providers_check(settings: &SettingsFile) -> Check {
             name: "providers".to_string(),
             status: Status::Ok,
             detail: "no [providers.*] sections in settings.toml".to_string(),
+            extra: None,
         };
     };
     let mut detail = String::new();
@@ -1413,6 +1485,7 @@ fn providers_check(settings: &SettingsFile) -> Check {
         name: "providers".to_string(),
         status,
         detail,
+        extra: None,
     }
 }
 
@@ -1437,15 +1510,18 @@ fn provider_settings_state(name: &str, settings: &ProviderSettings) -> &'static 
 
 /// Summarize configured MCP servers without touching the network: count
 /// enabled/disabled servers and verify that each enabled entry has the field
-/// its transport needs (`command` for stdio, `url` for http/sse). Missing
-/// fields downgrade the row to `warn` — the server will fail to launch at
-/// session start but doctor stays runnable in CI without keys.
+/// its transport needs (`command` for stdio, `url` for http/sse). For stdio
+/// servers the first token of `command` is also resolved against `PATH` to
+/// catch common Linux packaging failures (binary absent from PATH, missing
+/// executable bit) before the user reaches `--probe`. Missing fields or an
+/// unresolvable command downgrade the row to `warn`.
 fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> Check {
     if servers.is_empty() {
         return Check {
             name: "mcp".to_string(),
             status: Status::Ok,
             detail: "no MCP servers configured".to_string(),
+            extra: None,
         };
     }
     let mut enabled = 0usize;
@@ -1481,6 +1557,12 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
                             "{name}: stdio command is a relative path ({cmd:?}); \
                              use an absolute path for reproducible resolution"
                         );
+                    }
+                    if let Some(issue) = mcp_stdio_command_issue(cmd) {
+                        if !issues.is_empty() {
+                            issues.push_str(", ");
+                        }
+                        let _ = write!(issues, "{name}: {issue}");
                     }
                     // Warn about env overrides that can redirect dynamic
                     // linker or interpreter search paths — common vectors for
@@ -1531,12 +1613,83 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
             name: "mcp".to_string(),
             status: Status::Ok,
             detail: summary,
+            extra: None,
         }
     } else {
         Check {
             name: "mcp".to_string(),
             status: Status::Warn,
             detail: format!("{summary}; {issues}"),
+            extra: None,
+        }
+    }
+}
+
+/// Offline check for a stdio MCP server command: resolve the first token
+/// against `PATH` and verify the file exists and has the execute bit set.
+/// Returns `None` when the command looks reachable, or a short warning
+/// string when a common packaging failure is detected.
+fn mcp_stdio_command_issue(command: &str) -> Option<String> {
+    // Extract the binary name/path (first whitespace-delimited token).
+    let binary = command.split_whitespace().next()?;
+    let path = std::path::Path::new(binary);
+
+    // If the user specified an absolute or relative path, check it directly.
+    // Accept both the platform-native separator and forward slash, so a config
+    // written with `/` on Windows (e.g. `bin/server.exe`) still routes through
+    // the direct-path branch instead of being treated as a bare PATH lookup.
+    if path.is_absolute() || binary.contains(std::path::MAIN_SEPARATOR) || binary.contains('/') {
+        return mcp_stdio_path_issue(path);
+    }
+
+    // Otherwise walk PATH looking for the binary. If PATH is unset or
+    // unparseable we cannot resolve the command, so surface that explicitly
+    // rather than silently passing the check.
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Some(format!(
+            "PATH is unset; cannot resolve stdio command '{binary}'"
+        ));
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        if candidate.exists() {
+            return mcp_stdio_path_issue(&candidate);
+        }
+    }
+    Some(format!(
+        "stdio command '{binary}' not found on PATH; \
+         install the package or check PATH"
+    ))
+}
+
+/// Given a resolved path, check whether it names an executable file (Unix) or
+/// an existing file (Windows). Returns a warning string on problems, `None` on ok.
+fn mcp_stdio_path_issue(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(path) {
+            Ok(meta) if !meta.is_file() => Some(format!(
+                "stdio command '{}' exists but is not a file",
+                path.display()
+            )),
+            Ok(meta) if meta.permissions().mode() & 0o111 != 0 => None,
+            Ok(_) => Some(format!(
+                "stdio command '{}' exists but is not executable (missing execute bit)",
+                path.display()
+            )),
+            Err(err) => Some(format!(
+                "stdio command '{}' cannot be stat'd: {err}",
+                path.display()
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if path.is_file() {
+            None
+        } else {
+            Some(format!("stdio command '{}' does not exist", path.display()))
         }
     }
 }
@@ -1641,6 +1794,7 @@ async fn probe_mcp_servers(
                 name: format!("probe:mcp:{name}"),
                 status,
                 detail,
+                extra: None,
             }
         })
         .collect()
@@ -1750,6 +1904,7 @@ fn hook_shell_check(config: &AppConfig) -> Check {
             name: "hooks:shell".to_string(),
             status: Status::Ok,
             detail: "hooks_enabled=false; shell check skipped".to_string(),
+            extra: None,
         };
     }
 
@@ -1761,12 +1916,14 @@ fn hook_shell_check(config: &AppConfig) -> Check {
                 name: "hooks:shell".to_string(),
                 status: Status::Ok,
                 detail: "hook shell available: /bin/sh".to_string(),
+                extra: None,
             }
         } else {
             Check {
                 name: "hooks:shell".to_string(),
                 status: Status::Warn,
                 detail: "hooks_enabled=true but /bin/sh was not found; skill hooks will fail-open when spawning".to_string(),
+                extra: None,
             }
         }
     }
@@ -1780,6 +1937,7 @@ fn hook_shell_check(config: &AppConfig) -> Check {
                     name: "hooks:shell".to_string(),
                     status: Status::Ok,
                     detail: format!("hook shell available: {shell}"),
+                    extra: None,
                 };
             }
         }
@@ -1791,6 +1949,7 @@ fn hook_shell_check(config: &AppConfig) -> Check {
                 "hooks_enabled=true but no hook shell ({tried}) found on PATH; \
                  skill hooks will fail-open when spawning"
             ),
+            extra: None,
         }
     }
 }
@@ -1809,6 +1968,7 @@ fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> C
             name: "skills".to_string(),
             status: Status::Ok,
             detail: "no skills discovered".to_string(),
+            extra: None,
         };
     }
     let disabled = summaries.iter().filter(|s| s.disabled).count();
@@ -1827,6 +1987,7 @@ fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> C
             name: "skills".to_string(),
             status: Status::Warn,
             detail,
+            extra: None,
         };
     }
     if config.skills.hooks_enabled {
@@ -1871,12 +2032,14 @@ fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> C
             name: "skills".to_string(),
             status: Status::Warn,
             detail,
+            extra: None,
         };
     }
     Check {
         name: "skills".to_string(),
         status: Status::Ok,
         detail,
+        extra: None,
     }
 }
 
@@ -1929,6 +2092,7 @@ fn hooks_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> Op
         name: "hooks".to_string(),
         status,
         detail,
+        extra: None,
     })
 }
 
@@ -2005,6 +2169,7 @@ fn skills_roots_check(config: &AppConfig) -> Check {
                  Set HOME or override with SQUEEZY_SKILLS_USER_DIR / \
                  SQUEEZY_SKILLS_COMPAT_USER_DIR. Roots: {detail}"
             ),
+            extra: None,
         };
     }
 
@@ -2012,6 +2177,7 @@ fn skills_roots_check(config: &AppConfig) -> Check {
         name: "skills_roots".to_string(),
         status: Status::Ok,
         detail,
+        extra: None,
     }
 }
 
@@ -2029,6 +2195,7 @@ fn update_check(status: UpdateStatus) -> Check {
         name: "update".to_string(),
         status: row_status,
         detail: status.doctor_detail(),
+        extra: None,
     }
 }
 
@@ -2056,6 +2223,7 @@ fn parser_health_check() -> Check {
             detail: format!(
                 "target={target} backends={backend_count} grammars={ok_count}/{total} ok"
             ),
+            extra: None,
         }
     } else {
         let names: Vec<String> = failures
@@ -2070,19 +2238,28 @@ fn parser_health_check() -> Check {
                  failed: {}",
                 names.join(", ")
             ),
+            extra: None,
         }
     }
 }
 
 /// Report the active shell-sandbox backend and configured mode/network. Delegates
 /// to `squeezy_tools::shell_sandbox_doctor`, the single source of truth shared
-/// with the runtime — so this row reflects the backend the sandbox actually
-/// uses (e.g. Linux `linux-direct-syscalls`, not the long-stale `bwrap` proxy),
-/// plus the configured `mode` and `network` policy from the loaded config when
-/// available, so operators can verify what the session will enforce.
+/// with the runtime, and exposes structured JSON fields for Linux package smoke
+/// tests without scraping prose.
 fn sandbox_check(config: Option<&AppConfig>) -> Check {
     let report = squeezy_tools::shell_sandbox_doctor();
     let mut detail = format!("backend {}: {}", report.backend, report.detail);
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "backend".to_string(),
+        serde_json::Value::String(report.backend.to_string()),
+    );
+    extra.insert(
+        "required_mode_supported".to_string(),
+        serde_json::Value::Bool(report.available),
+    );
+
     if let Some(cfg) = config {
         let sb = &cfg.permissions.shell_sandbox;
         detail.push_str(&format!(
@@ -2090,24 +2267,39 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
             sb.mode.as_str(),
             sb.network.as_str()
         ));
+        extra.insert(
+            "mode".to_string(),
+            serde_json::Value::String(sb.mode.as_str().to_string()),
+        );
+        extra.insert(
+            "network".to_string(),
+            serde_json::Value::String(sb.network.as_str().to_string()),
+        );
         // On Windows, surface the configured sandbox level so operators can
         // see when it differs from the doctor-reported backend. Notably,
         // `windows_sandbox_level=disabled` selects the job-object-only backend
         // at runtime, which is more limited than the restricted-token default.
         #[cfg(target_os = "windows")]
-        detail.push_str(&format!(
-            " windows_sandbox_level={}",
-            sb.windows_sandbox_level.as_str()
-        ));
+        {
+            detail.push_str(&format!(
+                " windows_sandbox_level={}",
+                sb.windows_sandbox_level.as_str()
+            ));
+            extra.insert(
+                "windows_sandbox_level".to_string(),
+                serde_json::Value::String(sb.windows_sandbox_level.as_str().to_string()),
+            );
+        }
         // Explain squeezy ask socket availability under Linux direct-syscalls:
         // the seccomp filter denies AF_UNIX, so in-shell approval escalation
         // is unavailable. Show a note when the backend is active.
         if report.backend == "linux-direct-syscalls" && report.available {
             detail.push_str(
-                "; note: squeezy ask (in-shell approval) is unavailable — seccomp denies AF_UNIX sockets under linux-direct-syscalls",
+                "; note: squeezy ask (in-shell approval) is unavailable - seccomp denies AF_UNIX sockets under linux-direct-syscalls",
             );
         }
     }
+
     // Surface Linux-specific sandbox health fields for diagnostics.
     if let Some(userns) = report.linux_user_namespaces {
         detail.push_str(if userns {
@@ -2115,6 +2307,12 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
         } else {
             "; user-namespaces: unavailable"
         });
+        extra.insert("userns".to_string(), serde_json::Value::Bool(userns));
+    } else if let Some(userns) = report.userns {
+        extra.insert("userns".to_string(), serde_json::Value::Bool(userns));
+    }
+    if let Some(landlock) = report.landlock {
+        extra.insert("landlock".to_string(), serde_json::Value::Bool(landlock));
     }
     if let Some(abi) = report.linux_landlock_abi {
         if abi > 0 {
@@ -2122,6 +2320,10 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
         } else {
             detail.push_str("; landlock-abi: unavailable");
         }
+        extra.insert(
+            "landlock_abi".to_string(),
+            json!(abi),
+        );
     }
     if let Some(seccomp) = report.linux_seccomp_available {
         detail.push_str(if seccomp {
@@ -2129,10 +2331,24 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
         } else {
             "; seccomp: unavailable"
         });
+        extra.insert("seccomp".to_string(), serde_json::Value::Bool(seccomp));
     }
-    if report.linux_ask_socket_blocked == Some(true) {
-        detail.push_str("; squeezy-ask-in-child: blocked (AF_UNIX denied by seccomp)");
+    if let Some(blocked) = report.linux_ask_socket_blocked {
+        if blocked {
+            detail.push_str("; squeezy-ask-in-child: blocked (AF_UNIX denied by seccomp)");
+        }
+        extra.insert(
+            "ask_socket_blocked".to_string(),
+            serde_json::Value::Bool(blocked),
+        );
     }
+    if let Some(reason) = report.fallback_reason {
+        extra.insert(
+            "fallback_reason".to_string(),
+            serde_json::Value::String(reason),
+        );
+    }
+
     Check {
         name: "sandbox".to_string(),
         status: if report.available {
@@ -2141,6 +2357,7 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
             Status::Warn
         },
         detail,
+        extra: Some(serde_json::Value::Object(extra)),
     }
 }
 
@@ -2156,11 +2373,11 @@ fn linux_sandbox_detail_check() -> Check {
 #[cfg(target_os = "linux")]
 fn linux_sandbox_check_from_report(report: squeezy_tools::ShellSandboxDoctor) -> Check {
     let detail = format!(
-        "backend={} available={} — {}",
+        "backend={} available={} - {}",
         report.backend, report.available, report.detail
     );
     // Use Fail (not Warn) so `--linux-sandbox` exits 1 on hosts where required
-    // mode would fail — CI gates written as `squeezy doctor --linux-sandbox`
+    // mode would fail - CI gates written as `squeezy doctor --linux-sandbox`
     // can rely on the exit code.
     Check {
         name: "linux-sandbox".to_string(),
@@ -2170,6 +2387,7 @@ fn linux_sandbox_check_from_report(report: squeezy_tools::ShellSandboxDoctor) ->
             Status::Fail
         },
         detail,
+        extra: None,
     }
 }
 
@@ -2185,6 +2403,7 @@ fn linux_sandbox_check_from_report(report: squeezy_tools::ShellSandboxDoctor) ->
             report.backend,
             report.detail
         ),
+        extra: None,
     }
 }
 
@@ -2195,6 +2414,7 @@ fn sandbox_setup_action(config: Option<&AppConfig>) -> Check {
             name: "sandbox-setup".to_string(),
             status: Status::Fail,
             detail: "could not load configuration; cannot provision the sandbox".to_string(),
+            extra: None,
         };
     };
     match squeezy_tools::windows_sandbox_setup(
@@ -2205,11 +2425,13 @@ fn sandbox_setup_action(config: Option<&AppConfig>) -> Check {
             name: "sandbox-setup".to_string(),
             status: Status::Ok,
             detail,
+            extra: None,
         },
         Err(detail) => Check {
             name: "sandbox-setup".to_string(),
             status: Status::Fail,
             detail,
+            extra: None,
         },
     }
 }
@@ -2221,11 +2443,13 @@ fn sandbox_teardown_action() -> Check {
             name: "sandbox-teardown".to_string(),
             status: Status::Ok,
             detail,
+            extra: None,
         },
         Err(detail) => Check {
             name: "sandbox-teardown".to_string(),
             status: Status::Fail,
             detail,
+            extra: None,
         },
     }
 }

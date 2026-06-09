@@ -78,11 +78,13 @@ fn status_filter_does_not_make_hidden_failures_exit_zero() {
             name: "config".to_string(),
             status: Status::Fail,
             detail: "broken".to_string(),
+            extra: None,
         },
         Check {
             name: "sandbox".to_string(),
             status: Status::Ok,
             detail: "available".to_string(),
+            extra: None,
         },
     ];
 
@@ -102,6 +104,7 @@ fn json_summary_counts_full_result_even_when_rows_are_filtered() {
             name: "sandbox".to_string(),
             status: Status::Ok,
             detail: "available".to_string(),
+            extra: None,
         }],
         version: "test",
         target: "test-target",
@@ -129,6 +132,7 @@ fn unmatched_only_selector_becomes_visible_failure() {
         name: "session_store".to_string(),
         status: Status::Ok,
         detail: "ok".to_string(),
+        extra: None,
     }];
 
     let selector_failures = unmatched_selector_checks(&args, &checks, false);
@@ -176,6 +180,7 @@ fn unmatched_selector_after_config_load_passes_still_fails_on_typo() {
         name: "sandbox".to_string(),
         status: Status::Ok,
         detail: "ok".to_string(),
+        extra: None,
     }];
 
     let selector_failures = unmatched_selector_checks(&args, &checks, false);
@@ -487,13 +492,19 @@ fn skills_check_warns_on_ambiguous_same_precedence_names() {
 fn mcp_check_is_ok_when_fields_match_transport() {
     let mut servers = BTreeMap::new();
     let mut stdio = mcp_fixture(true, McpTransport::Stdio);
-    stdio.command = Some("/usr/bin/example-server".to_string());
+    // Use the running test binary itself — guaranteed to exist and be
+    // executable on every CI platform, so the PATH/exec-bit check passes.
+    let test_exe = std::env::current_exe()
+        .expect("current_exe")
+        .to_string_lossy()
+        .into_owned();
+    stdio.command = Some(test_exe);
     servers.insert("local".to_string(), stdio);
     let mut http = mcp_fixture(true, McpTransport::Sse);
     http.url = Some("https://example.test/mcp".to_string());
     servers.insert("remote".to_string(), http);
     let check = mcp_check(&servers);
-    assert_eq!(check.status, Status::Ok);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("enabled=2"));
 }
 
@@ -508,6 +519,9 @@ fn linux_sandbox_detail_fails_when_required_backend_unavailable() {
         linux_landlock_abi: Some(0),
         linux_seccomp_available: Some(false),
         linux_ask_socket_blocked: Some(false),
+        userns: Some(false),
+        landlock: Some(false),
+        fallback_reason: Some("user namespaces disabled".to_string()),
     });
 
     assert_eq!(check.name, "linux-sandbox");
@@ -527,12 +541,85 @@ fn linux_sandbox_detail_warns_on_non_linux_platforms() {
         linux_landlock_abi: None,
         linux_seccomp_available: None,
         linux_ask_socket_blocked: None,
+        userns: None,
+        landlock: None,
+        fallback_reason: None,
     });
 
     assert_eq!(check.name, "linux-sandbox");
     assert_eq!(check.status, Status::Warn);
     assert!(check.detail.contains("only available on Linux"));
     assert!(check.detail.contains("active backend=test-backend"));
+}
+
+#[test]
+fn mcp_check_warns_when_stdio_command_not_on_path() {
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some("squeezy-doctor-no-such-mcp-binary-xyzzy-abc".to_string());
+    servers.insert("missing".to_string(), server);
+    let check = mcp_check(&servers);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not found on PATH"),
+        "detail: {}",
+        check.detail
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_check_warns_when_stdio_command_not_executable() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-mcp-check-noexec-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).expect("create dir");
+    let noexec = dir.join("noexec-server");
+    fs::write(&noexec, b"#!/bin/sh\nexit 0\n").expect("write script");
+    // Leave execute bit unset.
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some(noexec.to_string_lossy().into_owned());
+    servers.insert("noexec".to_string(), server);
+    let check = mcp_check(&servers);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not executable"),
+        "detail: {}",
+        check.detail
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_check_warns_when_stdio_command_is_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-mcp-check-directory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).expect("create dir");
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some(dir.to_string_lossy().into_owned());
+    servers.insert("directory".to_string(), server);
+    let check = mcp_check(&servers);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not a file"),
+        "detail: {}",
+        check.detail
+    );
 }
 
 #[test]
@@ -930,4 +1017,28 @@ fn skills_roots_check_warns_when_roots_are_relative() {
         "expected 'relative' in detail: {check:?}"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn sandbox_check_includes_structured_extra() {
+    let check = sandbox_check(None);
+    let extra = check.extra.as_ref().expect("sandbox check must have extra");
+    let backend = extra.get("backend").expect("extra must have backend field");
+    assert!(backend.is_string(), "backend must be a string");
+    assert!(
+        extra.get("required_mode_supported").is_some(),
+        "extra must have required_mode_supported"
+    );
+}
+
+#[test]
+fn sandbox_check_extra_backend_matches_detail() {
+    let check = sandbox_check(None);
+    let extra = check.extra.as_ref().expect("sandbox check must have extra");
+    let backend = extra["backend"].as_str().expect("backend is a string");
+    assert!(
+        check.detail.contains(backend),
+        "detail should mention the backend; detail={:?} backend={backend:?}",
+        check.detail
+    );
 }
