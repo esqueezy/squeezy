@@ -4,6 +4,37 @@
 //! their own `cfg(target_os = ...)` blocks; this module covers everything
 //! else.
 
+/// User-facing description of the shell that `!cmd` / `!!cmd` will launch.
+///
+/// Reads `SQUEEZY_SHELL` exactly like [`ShellProgram::for_command`] does — an
+/// unset or empty value falls back to the platform default label. Both the
+/// TUI `/terminal` diagnostic and the agent's `[shell: ...]` failure hint
+/// call this so they agree on what they print, including the empty-string
+/// and non-UTF-8 cases (handled lossily, not silently dropped).
+pub fn effective_shell_label() -> String {
+    if let Some(value) = std::env::var_os("SQUEEZY_SHELL")
+        && !value.is_empty()
+    {
+        return value.to_string_lossy().into_owned();
+    }
+    default_shell_label().to_string()
+}
+
+#[cfg(unix)]
+const fn default_shell_label() -> &'static str {
+    "sh -lc (default)"
+}
+
+#[cfg(windows)]
+const fn default_shell_label() -> &'static str {
+    "pwsh/powershell/cmd auto-select (default)"
+}
+
+#[cfg(not(any(unix, windows)))]
+const fn default_shell_label() -> &'static str {
+    "sh -lc (default)"
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ShellProgram {
     pub program: String,

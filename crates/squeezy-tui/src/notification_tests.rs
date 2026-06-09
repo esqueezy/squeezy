@@ -192,3 +192,27 @@ fn osc9_off_for_unknown_terminals() {
             .map(|(_, v)| OsString::from(*v))
     }));
 }
+
+#[test]
+fn osc9_off_when_tmux_is_outer_term_program_without_capability_signals() {
+    // Under tmux 3.3+ `$TERM_PROGRAM` is sometimes overwritten to "tmux".
+    // If the underlying emulator did not export any of the Linux capability
+    // signals (KITTY_WINDOW_ID / WEZTERM_* / GHOSTTY_RESOURCES_DIR) and
+    // $TERM is a plain screen/tmux value, OSC9 must NOT be auto-enabled —
+    // we can't prove the outer emulator honours it.
+    let fixture: &[(&str, &str)] = &[
+        ("TERM_PROGRAM", "tmux"),
+        ("TERM", "tmux-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+    ];
+    let lookup = |key: &str| {
+        fixture
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(*v))
+    };
+    assert!(
+        !detect_osc9_support_from_env(lookup),
+        "TERM_PROGRAM=tmux without a capability signal must keep OSC9 off",
+    );
+}

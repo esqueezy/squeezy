@@ -91,26 +91,32 @@ impl Action {
     /// Short note surfaced by `/keymap` when the default binding is
     /// known to be unreliable across Linux terminals, tmux, or SSH.
     /// Returns `None` for bindings that are broadly portable.
+    ///
+    /// EXHAUSTIVENESS: enumerating every variant (rather than a `_ => None`
+    /// catch-all) means any new `Action` requires an explicit decision here
+    /// instead of silently inheriting a "portable" label.
     pub(crate) fn terminal_compat_note(self) -> Option<&'static str> {
         match self {
             // F11 is often consumed by the desktop window manager or
             // remapped by terminal emulators (fullscreen toggle).
             Self::ToggleConfigScreen => Some("terminal-dependent"),
-            // Ctrl+T is tmux's default prefix; Ctrl+P is common in some
-            // editors. Both are Ctrl chords that Linux terminals and tmux
-            // may intercept before Squeezy sees them.
+            // Ctrl+T may collide with a custom tmux prefix (the default
+            // prefix is Ctrl+B, but Ctrl+T is a common user rebind);
+            // Ctrl+P is also a common editor binding. Both are Ctrl
+            // chords that the host terminal or tmux may intercept before
+            // Squeezy sees them.
             Self::ToggleTranscriptOverlay => Some("terminal-dependent"),
             Self::ToggleTaskPanel => Some("terminal-dependent"),
             // PageUp/PageDown are intercepted by some terminal emulators
             // for their own scrollback; also unreliable over SSH.
             Self::ScrollTranscriptPageUp => Some("terminal-dependent"),
             Self::ScrollTranscriptPageDown => Some("terminal-dependent"),
-            // Home/End are broadly supported but may behave differently
-            // under screen or certain VTE configurations.
-            Self::TranscriptHome => Some("terminal-dependent"),
-            Self::TranscriptEnd => Some("terminal-dependent"),
-            // Ctrl+Y and Ctrl+R are broadly portable across Linux terminals.
-            Self::CopyLastAssistant | Self::RestoreCancelledPrompt => None,
+            // Home/End, Ctrl+Y, and Ctrl+R are broadly portable across
+            // Linux terminals — no annotation needed.
+            Self::TranscriptHome
+            | Self::TranscriptEnd
+            | Self::CopyLastAssistant
+            | Self::RestoreCancelledPrompt => None,
         }
     }
 

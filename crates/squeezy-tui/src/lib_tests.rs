@@ -11899,8 +11899,12 @@ async fn slash_keymap_surfaces_overrides_and_diagnostics() {
 
 #[tokio::test]
 async fn slash_terminal_reports_diagnostics() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    // Lock the synchronized-output policy so the diagnostic row prints a
+    // deterministic value regardless of the CI runner's env.
+    config.tui.synchronized_output = TuiSynchronizedOutput::Never;
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
 
     let ran = handle_slash_command(&mut app, &mut agent, "/terminal").await;
     assert!(ran);
@@ -11915,9 +11919,108 @@ async fn slash_terminal_reports_diagnostics() {
         "$TERM",
         "clipboard",
         "effective shell",
+        "synchronized output",
+        "Never",
+        "Remedies:",
     ] {
         assert!(body.contains(expected), "missing {expected:?}: {body}");
     }
+}
+
+#[test]
+fn precheck_terminal_environment_refuses_when_stdout_not_tty() {
+    // `TerminalGuard::enter` must short-circuit when stdout is not a TTY so
+    // a `squeezy > out.txt` invocation never pollutes the redirected file
+    // with raw VT bytes. The pure helper carries the contract; the
+    // production caller wires it into `io::stdout().is_terminal()`.
+    let env = |_: &str| -> Option<std::ffi::OsString> { None };
+    let message = super::precheck_terminal_environment(|| false, env)
+        .expect("non-tty stdout must produce a refusal");
+    assert!(
+        message.contains("stdout is not a terminal"),
+        "unexpected refusal: {message}",
+    );
+    assert!(
+        message.contains("--prompt"),
+        "refusal must point to --prompt: {message}",
+    );
+}
+
+#[test]
+fn precheck_terminal_environment_refuses_term_dumb() {
+    // TERM=dumb signals a sink that can't render ANSI. Refuse before
+    // `enable_raw_mode()` ever runs so the session terminator stays clean.
+    let env = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("dumb"))
+    };
+    let message = super::precheck_terminal_environment(|| true, env)
+        .expect("TERM=dumb must produce a refusal");
+    assert!(
+        message.contains("TERM=dumb"),
+        "unexpected refusal: {message}",
+    );
+
+    // Case-insensitive — `DUMB` / `Dumb` must trip the same gate.
+    let env_upper = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("DUMB"))
+    };
+    assert!(
+        super::precheck_terminal_environment(|| true, env_upper).is_some(),
+        "TERM=DUMB must refuse like TERM=dumb",
+    );
+}
+
+#[test]
+fn precheck_terminal_environment_accepts_capable_terminal() {
+    let env = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("xterm-256color"))
+    };
+    assert!(
+        super::precheck_terminal_environment(|| true, env).is_none(),
+        "capable terminal must not refuse startup",
+    );
+
+    // No $TERM at all is fine — only the literal "dumb" value refuses.
+    let env_empty = |_: &str| -> Option<std::ffi::OsString> { None };
+    assert!(
+        super::precheck_terminal_environment(|| true, env_empty).is_none(),
+        "unset TERM must not refuse",
+    );
+}
+
+#[test]
+fn precheck_terminal_environment_tty_check_wins_over_term_dumb() {
+    // The stdout-not-TTY arm runs first; even with TERM=dumb the message
+    // should point at stdout so the user fixes the right thing.
+    let env = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("dumb"))
+    };
+    let message = super::precheck_terminal_environment(|| false, env)
+        .expect("non-tty stdout must short-circuit even when TERM=dumb");
+    assert!(
+        message.contains("stdout is not a terminal"),
+        "tty check should win over TERM=dumb: {message}",
+    );
+}
+
+#[test]
+fn osc52_sequence_is_bare_with_no_tmux_dcs_wrap() {
+    // Today's behaviour is intentional: OSC52 emits a bare
+    // `ESC ] 52 ; c ; <base64> BEL`, with no DCS wrapping for tmux/screen.
+    // Inside tmux without `allow-passthrough on` the sequence is consumed
+    // by the multiplexer; the `/terminal` Remedies line documents the
+    // workaround. Locking the shape so a future tmux-aware wrap PR is
+    // intentional rather than accidental.
+    let sequence = super::build_osc52_sequence("hello").expect("encode hello");
+    assert_eq!(sequence, "\x1b]52;c;aGVsbG8=\x07");
+    assert!(
+        !sequence.starts_with("\x1bPtmux;"),
+        "OSC52 must not currently DCS-wrap; see /terminal Remedies for the user-side fix",
+    );
+    assert!(
+        !sequence.starts_with("\x1bP"),
+        "no DCS framing of any kind today: {sequence:?}",
+    );
 }
 
 /// Serializes `/theme` tests so the process-global palette override and the

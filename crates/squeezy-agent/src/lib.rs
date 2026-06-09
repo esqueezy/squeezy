@@ -5697,11 +5697,12 @@ fn local_tool_completion_message(result: Option<&ToolResult>) -> String {
 /// Short hint about the effective shell used for `!cmd` / `!!cmd`
 /// commands. Shown on failure so users know which shell to target and
 /// that `SQUEEZY_SHELL` can override it.
+///
+/// The label is sourced from [`squeezy_tools::effective_shell_label`] so the
+/// TUI's `/terminal` row and this hint always agree on what the user will
+/// see — including empty-string and non-UTF-8 `SQUEEZY_SHELL` cases.
 fn effective_shell_hint() -> String {
-    let shell = std::env::var("SQUEEZY_SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "sh -lc (default)".to_string());
+    let shell = squeezy_tools::effective_shell_label();
     format!("[shell: {shell} — set SQUEEZY_SHELL to change, e.g. SQUEEZY_SHELL=/bin/bash]")
 }
 

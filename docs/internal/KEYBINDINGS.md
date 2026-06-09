@@ -67,6 +67,27 @@ key specs, and binding collisions from the `[tui.keymap]` layer; the dedicated
 `keybindings.toml` file remains all-or-nothing and is ignored as a whole if it
 fails validation.
 
+### `[terminal-dependent]` markers
+
+`/keymap` annotates each row whose default is known to be intercepted by the
+host terminal, tmux, or SSH with a `[terminal-dependent]` marker, and prints
+a footer pointing at `[tui.keymap]` so the user knows how to remap. The
+annotation is informational only — the binding still works when the terminal
+allows it through. Today the marked defaults are `toggle_config_screen`
+(`F11`, often eaten by the window manager), `transcript_overlay` (`Ctrl+T`,
+collides with custom tmux prefixes), `toggle_task_panel` (`Ctrl+P`, common
+editor binding), and `page_up` / `page_down` (`PageUp` / `PageDown`,
+intercepted by some emulators for their own scrollback and unreliable over
+SSH). The remaining defaults (`copy_last_assistant`, `restore_cancelled_prompt`,
+`transcript_home`, `transcript_end`) are unmarked because they are broadly
+portable across Linux terminals.
+
+For a deeper view of the runtime — TTY state, `$TERM`, multiplexer detection,
+synchronized-output policy, mouse-capture state, clipboard backend,
+notification backend, and effective shell — run `/terminal` inside the TUI.
+That command also lists the canonical remedies for `tmux` OSC52 passthrough,
+mouse capture, and shell selection.
+
 Transcript-overlay expansion is not currently part of the editable keymap
 namespace. `transcript_overlay` (`Ctrl+T` by default) opens the expanded
 overlay, expands a folded subagent overlay in place, and closes an already

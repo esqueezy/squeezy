@@ -5277,11 +5277,11 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     rows.push(("stdout tty", stdout_tty.to_string()));
     rows.push(("stdin tty", stdin_tty.to_string()));
 
-    // Terminal identity
-    let term = env::var("TERM").unwrap_or_else(|_| "(unset)".to_string());
-    let colorterm = env::var("COLORTERM").unwrap_or_else(|_| "(unset)".to_string());
-    rows.push(("$TERM", term));
-    rows.push(("$COLORTERM", colorterm));
+    // Terminal identity. Use `env::var_os` + `to_string_lossy` so a
+    // set-but-non-UTF-8 $TERM / $COLORTERM is reported (lossily) rather
+    // than silently misclassified as "(unset)".
+    rows.push(("$TERM", env_var_label("TERM")));
+    rows.push(("$COLORTERM", env_var_label("COLORTERM")));
 
     // Multiplexer
     let in_tmux = env::var_os("TMUX").is_some();
@@ -5294,13 +5294,14 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     rows.push(("multiplexer", mux));
 
     // Synchronized output — report the configured policy and, for Auto, the
-    // heuristic result so the user can see what was actually decided.
+    // heuristic result so the user can see what was actually decided. ASCII
+    // arrow stays consistent with the rest of the table.
     let sync_out = match sync_policy {
         TuiSynchronizedOutput::Always => "Always".to_string(),
         TuiSynchronizedOutput::Never => "Never".to_string(),
         TuiSynchronizedOutput::Auto => {
             let detected = detect_synchronized_output_support_from_env(|k| env::var_os(k));
-            format!("Auto → {}", if detected { "enabled" } else { "disabled" })
+            format!("Auto -> {}", if detected { "enabled" } else { "disabled" })
         }
     };
     rows.push(("synchronized output", sync_out));
@@ -5326,19 +5327,25 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     ));
 
     // Notifications — use the resolved backend from the live notifier.
-    // resolved() only returns None, Some(Bel), or Some(Osc9); Auto and Off
-    // are consumed internally before returning.
+    // `resolved()` only returns None, Some(Bel), or Some(Osc9); Auto and
+    // Off are consumed internally before returning. Enumerate the impossible
+    // arms explicitly so a new `NotificationMethod` variant trips this match
+    // at compile time instead of silently surfacing a `Debug`-formatted
+    // value to users.
     let notif = match app.desktop_notifier.resolved() {
         None => "off".to_string(),
         Some(squeezy_core::NotificationMethod::Bel) => "BEL".to_string(),
         Some(squeezy_core::NotificationMethod::Osc9) => "OSC9".to_string(),
-        Some(other) => format!("{other:?}"),
+        Some(squeezy_core::NotificationMethod::Off)
+        | Some(squeezy_core::NotificationMethod::Auto) => {
+            unreachable!("DesktopNotifier::resolved() never returns Off or Auto")
+        }
     };
     rows.push(("notifications", notif));
 
-    // Effective shell
-    let shell = env::var("SQUEEZY_SHELL").unwrap_or_else(|_| "sh -lc (default)".to_string());
-    rows.push(("effective shell", shell));
+    // Effective shell — shared with the agent's `[shell: ...]` failure hint
+    // so the two surfaces always print the same value.
+    rows.push(("effective shell", squeezy_tools::effective_shell_label()));
 
     // Format as a two-column table
     let label_width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -5347,12 +5354,20 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
         lines.push(format!("  {:<width$}  {}", key, val, width = label_width));
     }
     lines.push(String::new());
-    lines.push(
-        "Remedies: tmux OSC52 → `set-option allow-passthrough on`; \
-         mouse → SQUEEZY_MOUSE_CAPTURE=1; shell → SQUEEZY_SHELL=/bin/bash"
-            .to_string(),
-    );
+    lines.push("Remedies:".to_string());
+    lines.push("  - tmux OSC52: `set-option -g allow-passthrough on`".to_string());
+    lines.push("  - mouse: set SQUEEZY_MOUSE_CAPTURE=1".to_string());
+    lines.push("  - shell: set SQUEEZY_SHELL (e.g. SQUEEZY_SHELL=/bin/bash)".to_string());
     lines.join("\n")
+}
+
+/// Read an environment variable as a user-facing label, using `env::var_os`
+/// and lossy decoding so a set-but-non-UTF-8 value still shows up in the
+/// `/terminal` diagnostic rather than being misclassified as `(unset)`.
+fn env_var_label(key: &str) -> String {
+    env::var_os(key)
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unset)".to_string())
 }
 
 fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
@@ -15649,20 +15664,33 @@ pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 
 impl Clipboard for Osc52Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
-        if text.len() > OSC52_MAX_PAYLOAD_BYTES {
-            return Err(format!(
-                "payload {} bytes exceeds terminal clipboard cap of {} bytes",
-                text.len(),
-                OSC52_MAX_PAYLOAD_BYTES,
-            ));
-        }
-        let sequence = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+        let sequence = build_osc52_sequence(text)?;
         let mut stdout = io::stdout();
         stdout
             .write_all(sequence.as_bytes())
             .and_then(|()| stdout.flush())
             .map_err(|err| format!("terminal clipboard write failed: {err}"))
     }
+}
+
+/// Build the OSC52 clipboard escape for `text` (or refuse when the payload
+/// exceeds [`OSC52_MAX_PAYLOAD_BYTES`]).
+///
+/// Today's behaviour is intentionally bare — `ESC ] 52 ; c ; <b64> BEL` with
+/// no DCS wrapping for tmux/screen. Inside tmux without `allow-passthrough
+/// on` the sequence is consumed by tmux and never reaches the outer
+/// emulator; the `/terminal` Remedies line documents the workaround. Adding
+/// a tmux-aware DCS wrap is a separate change and would need to update the
+/// regression test that locks the current bare shape.
+pub(crate) fn build_osc52_sequence(text: &str) -> std::result::Result<String, String> {
+    if text.len() > OSC52_MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "payload {} bytes exceeds terminal clipboard cap of {} bytes",
+            text.len(),
+            OSC52_MAX_PAYLOAD_BYTES,
+        ));
+    }
+    Ok(format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes())))
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -18103,31 +18131,53 @@ impl TerminalGuard {
     }
 }
 
+/// Pre-flight check for the conditions [`TerminalGuard::enter`] refuses on:
+/// stdout not being a TTY, or `TERM=dumb`. Returns the message to surface in
+/// the typed [`SqueezyError::Terminal`] when the environment is not
+/// interactive-capable, `None` when startup may proceed.
+///
+/// Factored out from `TerminalGuard::enter` so the refusal contract is
+/// testable without race-prone process-global env mutation or a real TTY —
+/// tests pass an `is_terminal` closure and an env-reader closure, the same
+/// shape used by `detect_synchronized_output_support_from_env` and
+/// `detect_osc9_support_from_env`.
+pub(crate) fn precheck_terminal_environment<F, G>(is_terminal: F, env_get: G) -> Option<String>
+where
+    F: FnOnce() -> bool,
+    G: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if !is_terminal() {
+        return Some(
+            "stdout is not a terminal; use --prompt for non-interactive output \
+             or run in a real terminal"
+                .to_string(),
+        );
+    }
+    if env_get("TERM")
+        .as_deref()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("dumb"))
+    {
+        return Some(
+            "TERM=dumb: interactive TUI requires a capable terminal; \
+             use --prompt for non-interactive output"
+                .to_string(),
+        );
+    }
+    None
+}
+
 impl TerminalGuard {
     fn enter(synchronized_output: TuiSynchronizedOutput) -> Result<Self> {
-        // Refuse interactive TUI startup when stdout is not a real terminal.
-        // Redirected stdout (e.g. `squeezy > out.txt` with interactive stdin)
-        // would pollute the redirected output with raw ANSI sequences.
-        if !io::stdout().is_terminal() {
-            return Err(SqueezyError::Terminal(
-                "stdout is not a terminal; use --prompt for non-interactive output \
-                 or run in a real terminal"
-                    .to_string(),
-            ));
-        }
-        // TERM=dumb signals a minimal terminal incapable of handling ANSI
-        // sequences: CI consoles, serial shells, simple buffers. Refuse TUI
-        // startup instead of polluting the session with unintelligible bytes.
-        if env::var_os("TERM")
-            .as_deref()
-            .and_then(|v| v.to_str())
-            .is_some_and(|v| v.eq_ignore_ascii_case("dumb"))
-        {
-            return Err(SqueezyError::Terminal(
-                "TERM=dumb: interactive TUI requires a capable terminal; \
-                 use --prompt for non-interactive output"
-                    .to_string(),
-            ));
+        // Refuse interactive TUI startup when stdout is not a real terminal
+        // or when $TERM signals a minimal sink (CI, serial, dumb). Runs
+        // before `enable_raw_mode()` and any ANSI byte so a redirected
+        // stdout never gets raw VT bytes written into it.
+        if let Some(message) = precheck_terminal_environment(
+            || io::stdout().is_terminal(),
+            |key: &str| env::var_os(key),
+        ) {
+            return Err(SqueezyError::Terminal(message));
         }
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
