@@ -85,7 +85,13 @@ pub(crate) struct ShellRunOutcome {
 /// outcomes so that Linux users can see whether pgid-based cleanup
 /// succeeded and whether detached descendants may have survived.
 pub(crate) struct ShellKillMeta {
-    /// Process group id targeted by the signal calls (`-pgid`).
+    /// Process group id we *targeted* with `kill(-pgid, …)`. This is the
+    /// child's pid, since `configure_shell_process_group` arranges a child-side
+    /// `setpgid(0, 0)` at exec time so the freshly-spawned process is its own
+    /// pgid leader. `pgid` may not match `getpgid(child)` if the child later
+    /// re-set its process group via `setpgid(0, X)` with `X != pid`; in that
+    /// case `sigterm_ok` / `sigkill_ok` will surface the kernel's `ESRCH`
+    /// response (the targeted pgid no longer points at the child).
     pub(crate) pgid: u32,
     /// Whether `kill(-pgid, SIGTERM)` returned without error.
     pub(crate) sigterm_ok: bool,
@@ -103,6 +109,14 @@ pub(crate) struct ShellKillMeta {
     /// exited during the SIGTERM grace period, in which case no SIGKILL or
     /// direct-child kill was needed.
     pub(crate) direct_child_fallback: bool,
+    /// Whether the supplemental `child.kill()` direct-child fallback returned
+    /// `Ok(())`. Only meaningful when [`direct_child_fallback`] is `true`. A
+    /// `false` value here usually means the kernel had already reaped the
+    /// direct child via the prior pgid `SIGKILL`, in which case tokio reports
+    /// `InvalidInput`. The companion field exists so a troubleshooter can tell
+    /// whether *any* of the three signal attempts (pgid SIGTERM, pgid SIGKILL,
+    /// direct-child kill) reached a live process.
+    pub(crate) direct_child_kill_ok: bool,
 }
 
 struct ShellRunRequest<'a> {
@@ -538,24 +552,31 @@ impl ToolRegistry {
                 json!({ "best_effort_fallback": fallback }),
             );
         }
-        // Inform the model and user when nested `squeezy ask` approvals are
-        // unavailable. The two cases are:
-        //   (a) sandbox policy forbids AF_UNIX sockets (e.g. linux-direct-syscalls)
-        //   (b) ShellAskServer::start failed at runtime even though the backend
-        //       supports AF_UNIX sockets (e.g. temp directory full)
-        // Without this field the child shell sees a missing SQUEEZY_ASK_SOCKET
-        // env var, which looks like a misconfiguration rather than an
-        // intentional sandbox policy or a transient startup error.
-        if let Some(reason) = sandbox_plan
+        // Always inform the model and user about whether nested `squeezy ask`
+        // approvals are usable for this shell call. Emitting the field
+        // unconditionally with an explicit `available: true|false` removes the
+        // earlier "absence implies available" ambiguity, which masked at least
+        // three real cases: (a) sandbox policy forbids AF_UNIX sockets (e.g.
+        // linux-direct-syscalls), (b) ShellAskServer::start failed at runtime
+        // even though the backend supports AF_UNIX sockets, and (c) the caller
+        // did not pass a `shell_ask_approver`, so no ask socket would have been
+        // exported even if the sandbox allowed it. Without this field the
+        // child shell sees a missing SQUEEZY_ASK_SOCKET env var, which looks
+        // like a misconfiguration rather than an intentional policy.
+        let nested_ask_block = if let Some(reason) = sandbox_plan
             .nested_ask_disabled_reason()
             .or(ask_server_start_error)
         {
-            insert_content_field(
-                &mut raw_content,
-                "nested_ask",
-                json!({ "available": false, "reason": reason }),
-            );
-        }
+            json!({ "available": false, "reason": reason })
+        } else if shell_ask_approver.is_some() {
+            json!({ "available": true })
+        } else {
+            json!({
+                "available": false,
+                "reason": "nested ask disabled: no approver wired to this shell call",
+            })
+        };
+        insert_content_field(&mut raw_content, "nested_ask", nested_ask_block);
         // When the child was killed via Unix signals, surface the kill
         // mechanics so users can see whether pgid-based cleanup succeeded
         // and whether detached descendants (setsid / daemonized) may survive.
@@ -570,7 +591,8 @@ impl ToolRegistry {
                     "sigkill_sent": km.sigkill_sent,
                     "sigkill_ok": km.sigkill_ok,
                     "direct_child_fallback": km.direct_child_fallback,
-                    "caveat": "process-group signals cannot reach setsid/daemonized descendants; detached processes may survive until cgroup-backed cleanup is available",
+                    "direct_child_kill_ok": km.direct_child_kill_ok,
+                    "caveat_text": "process-group signals cannot reach setsid/daemonized descendants; detached processes may survive until cgroup-backed cleanup is available",
                 }),
             );
         }
@@ -1102,7 +1124,10 @@ pub(crate) fn shell_termination_reason(
 /// Build the error message string for a cancelled shell audit row.
 /// When kill metadata is available (Unix only), the message includes the
 /// process group id and key signal outcomes so the audit record captures
-/// whether pgid-based cleanup reached the child group.
+/// whether pgid-based cleanup reached the child group. `grace_expired` is
+/// included for symmetry with the JSON `kill_meta.grace_expired` field so a
+/// reader of the audit row can distinguish "child exited inside the SIGTERM
+/// grace window" from "grace expired and SIGKILL was needed".
 pub(crate) fn shell_cancelled_error_msg(kill_meta: Option<&ShellKillMeta>) -> String {
     match kill_meta {
         None => "shell command cancelled".to_string(),
@@ -1113,8 +1138,8 @@ pub(crate) fn shell_cancelled_error_msg(kill_meta: Option<&ShellKillMeta>) -> St
                 String::new()
             };
             format!(
-                "shell command cancelled: pgid={}, sigterm_ok={}{}",
-                km.pgid, km.sigterm_ok, sigkill,
+                "shell command cancelled: pgid={}, sigterm_ok={}, grace_expired={}{}",
+                km.pgid, km.sigterm_ok, km.grace_expired, sigkill,
             )
         }
     }
@@ -1633,10 +1658,16 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
                         sigkill_sent: false,
                         sigkill_ok: false,
                         direct_child_fallback: false,
+                        direct_child_kill_ok: false,
                     });
                 }
                 let sigkill_ok = kill_process_group(pgid, libc::SIGKILL);
-                let _ = child.kill().await;
+                // Capture the supplemental direct-child kill result so the
+                // metadata can distinguish "we attempted the fallback" from
+                // "the fallback reached a live process". A common `false`
+                // outcome is tokio returning `InvalidInput` because the prior
+                // pgid SIGKILL already reaped the direct child.
+                let direct_child_kill_ok = child.kill().await.is_ok();
                 let _ = child.wait().await;
                 return Some(ShellKillMeta {
                     pgid,
@@ -1645,6 +1676,7 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<
                     sigkill_sent: true,
                     sigkill_ok,
                     direct_child_fallback: true,
+                    direct_child_kill_ok,
                 });
             }
             #[cfg(not(unix))]
