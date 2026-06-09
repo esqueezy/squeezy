@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -22,6 +21,8 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload,
     ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
 };
+
+use crate::fs_util;
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
@@ -176,15 +177,13 @@ impl SessionStore {
         write_json_bytes(&path, &new_bytes)
     }
 
-    /// Path to the user-global memory file. Returns `None` when `HOME` is
-    /// unset — the same condition under which the agent's prompt-side
-    /// ingestion (`ingest_user_memory`) declines to do anything. The file
-    /// itself is the single static memory store described in
+    /// Path to the user-global memory file. Uses `HOME/.squeezy` when
+    /// available and falls back to native Windows profile/app-data roots when
+    /// `HOME` is unset. The file itself is the single static memory store described in
     /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
     /// new directory or partition scheme.
     pub fn memory_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".squeezy").join("memory.md"))
+        Some(fs_util::user_squeezy_dir()?.join("memory.md"))
     }
 
     /// Append one normalized line to the user-global memory file
@@ -204,9 +203,10 @@ impl SessionStore {
             return Ok(0);
         }
         let Some(path) = Self::memory_path() else {
-            return Err(SqueezyError::Agent(
-                "remember requires HOME to be set to locate ~/.squeezy/memory.md".to_string(),
-            ));
+            return Err(SqueezyError::Agent(format!(
+                "remember requires a user profile directory to be set ({})",
+                fs_util::user_squeezy_dir_detail()
+            )));
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -233,8 +233,8 @@ impl SessionStore {
     /// Matches the semantics of the agent's prompt-side
     /// `ingest_user_memory` so call sites can rely on a single source of
     /// truth for the recall shape. Returns `None` when ingestion is
-    /// disabled (`max_bytes == 0`), `HOME` is unset, or the file is
-    /// absent / empty / unreadable. Errors are silent on purpose — recall
+    /// disabled (`max_bytes == 0`), no user-global directory can be resolved,
+    /// or the file is absent / empty / unreadable. Errors are silent on purpose — recall
     /// is best-effort enrichment, never load-bearing.
     pub fn recall(max_bytes: usize) -> Option<String> {
         if max_bytes == 0 {
@@ -261,8 +261,8 @@ impl SessionStore {
     /// Path to the cross-project session index. When `XDG_STATE_HOME` is set
     /// to an absolute path (Linux XDG Base Directory Specification) it resolves to
     /// `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`; otherwise it uses the
-    /// legacy `$HOME/.squeezy/sessions/index.jsonl` path so that existing
-    /// macOS, Windows, and Linux state at that location is undisturbed.
+    /// user-global Squeezy directory (`$HOME/.squeezy` or the Windows native
+    /// profile/app-data fallback) so existing local state remains visible.
     ///
     /// Linux users who want the canonical XDG placement can set `XDG_STATE_HOME`
     /// (typically `$HOME/.local/state`); `list_global_index` will then merge
@@ -270,8 +270,8 @@ impl SessionStore {
     ///
     /// Per-project session roots live under each workspace, so a global index
     /// is the only way the resume picker can show sessions started from sibling
-    /// repos. Returns `None` when neither an absolute `XDG_STATE_HOME` nor
-    /// `HOME` is set.
+    /// repos. Returns `None` when neither an absolute `XDG_STATE_HOME` nor a
+    /// user-global directory can be resolved.
     pub fn global_index_path() -> Option<PathBuf> {
         xdg_global_index_path()
     }
@@ -309,23 +309,8 @@ impl SessionStore {
             return;
         };
         payload.push(b'\n');
-        let lock_path = path.with_extension("lock");
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .ok();
-        if let Some(ref lf) = lock_file {
-            let _ = lf.lock_exclusive();
-        }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
-            return;
-        };
-        let _ = file.write_all(&payload);
-        if let Some(ref lf) = lock_file {
-            let _ = lf.unlock();
-        }
+        let mut ignored_size = 0;
+        let _ = append_payload_with_recovery(&path, &payload, &mut ignored_size);
     }
 
     /// Read the cross-project session index, deduping by `session_id` and
@@ -361,22 +346,27 @@ impl SessionStore {
         {
             return entries;
         }
-        let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
-        let mut raw_lines = 0usize;
+        let mut raw_entries = Vec::new();
         // Read the legacy path first (lower priority) so primary-path entries win.
-        if legacy_differs && let Some(ref lp) = legacy_path {
-            read_global_index_into(lp, &mut by_id, &mut raw_lines);
+        if legacy_differs && let Some(ref lp) = legacy_path
+            && let Ok(entries) = read_global_index_entries(lp)
+        {
+            raw_entries.extend(entries);
         }
         if primary_exists {
-            read_global_index_into(&path, &mut by_id, &mut raw_lines);
+            let Ok(entries) = read_global_index_entries(&path) else {
+                return Vec::new();
+            };
+            raw_entries.extend(entries);
         }
-        let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
-        // Drop all but the most-recent `GLOBAL_INDEX_MAX_ENTRIES` so the index
-        // can never grow unbounded with a user's lifetime session count. The
-        // newest-first return order below is what the picker consumes.
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
-        let trimmed_to_cap = entries.len() > GLOBAL_INDEX_MAX_ENTRIES;
-        entries.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+        let raw_lines = raw_entries.len();
+        // `compact_global_index_entries` is shared with `rewrite_global_index`
+        // so the dedup-by-id + cap policy lives in one place. Both callers
+        // agree on "newest `last_event_at_ms` wins" and the
+        // `GLOBAL_INDEX_MAX_ENTRIES` ceiling; only the post-compaction
+        // ordering differs (this caller surfaces newest-first by
+        // `started_at_ms`; the rewriter persists oldest-first).
+        let mut entries = compact_global_index_entries(raw_entries);
         let oversized = fs::metadata(&path)
             .map(|meta| meta.len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES)
             .unwrap_or(false);
@@ -384,33 +374,12 @@ impl SessionStore {
         // the cap, or dedup collapsed duplicate appends). Rewriting an already
         // minimal, all-distinct index on every read — as the byte-threshold
         // alone did — is pure write+fsync waste that scales with history.
-        // Use an exclusive lock so concurrent `list_global_index` calls from
-        // different processes don't race to rewrite the same file.
-        if primary_exists && oversized && (trimmed_to_cap || raw_lines > entries.len()) {
+        if primary_exists && oversized && raw_lines > entries.len() {
             let mut ordered: Vec<&GlobalSessionIndexEntry> = entries.iter().collect();
             // Compact in oldest-first order so future appends keep the newest
             // entries at the tail — matches how readers see time.
             ordered.sort_by_key(|entry| entry.started_at_ms);
-            let lock_path = path.with_extension("lock");
-            let lock_file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)
-                .ok();
-            // Only rewrite when we actually hold the lock. try_lock_exclusive
-            // returns Err when another process already owns it; in that case
-            // we skip the rewrite — the other process will compact the file,
-            // and the in-memory entries we already built are still valid.
-            let locked = lock_file
-                .as_ref()
-                .is_none_or(|lf| lf.try_lock_exclusive().is_ok());
-            if locked {
-                let _ = rewrite_global_index(&path, &ordered);
-                if let Some(ref lf) = lock_file {
-                    let _ = lf.unlock();
-                }
-            }
+            let _ = rewrite_global_index(&path, &ordered);
         }
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
         if !legacy_differs {
@@ -651,7 +620,7 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        rename_with_retry(&src, &dest).map_err(|e| enrich_lock_error(e, &src))?;
+        fs_util::move_path(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
@@ -684,7 +653,7 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        rename_with_retry(&src, &dest).map_err(|e| enrich_lock_error(e, &src))?;
+        fs_util::move_path(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
@@ -1420,26 +1389,32 @@ fn append_payload_once(
     path: &Path,
     payload: &[u8],
 ) -> std::result::Result<usize, (usize, std::io::Error)> {
+    let lock = lock_append_path(path).map_err(|error| (0, error))?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| (0, error))?;
     let mut written = 0;
-    while written < payload.len() {
-        match file.write(&payload[written..]) {
-            Ok(0) => {
-                return Err((
-                    written,
-                    std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write event"),
-                ));
+    let result = (|| {
+        while written < payload.len() {
+            match file.write(&payload[written..]) {
+                Ok(0) => {
+                    return Err((
+                        written,
+                        std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write event"),
+                    ));
+                }
+                Ok(bytes) => written += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err((written, error)),
             }
-            Ok(bytes) => written += bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err((written, error)),
         }
-    }
-    Ok(written)
+        Ok(written)
+    })();
+    // Unlock best-effort; the OS releases the lock when `lock` drops regardless.
+    let _ = lock.unlock();
+    result
 }
 
 fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
@@ -1447,6 +1422,33 @@ fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -
     let mut metadata = read_session_metadata(&path)?;
     update(&mut metadata);
     write_json(&path, &metadata)
+}
+
+fn lock_append_path(path: &Path) -> std::io::Result<fs::File> {
+    let lock_path = append_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // `truncate(false)` is the `OpenOptions` default, but clippy's
+    // `suspicious_open_options` lint requires an explicit choice when
+    // `create(true).write(true)` is set so a reader of the call site does
+    // not have to remember which side of the default the call falls on.
+    // Lock files are zero-byte sentinels; preserving any contents is fine.
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+fn append_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("append");
+    path.with_file_name(format!(".{name}.lock"))
 }
 
 impl SessionHandle {
@@ -2956,101 +2958,27 @@ fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
 }
 
 /// Serialize `value` to `path` atomically: write to a sibling temp file,
-/// `sync_all`, then `fs::rename` over the target. A reader (and a crash)
+/// `sync_all`, then replace the target. A reader (and a crash)
 /// therefore only ever observes the previous complete file or the new
 /// complete file, never a truncated/torn one. This matters because
 /// `metadata.json` is rewritten on essentially every turn; a non-atomic
 /// in-place write left a torn metadata file that silently hid an
 /// otherwise-recoverable session from `list()`/`resume()`. Mirrors the
-/// tmp + `sync_all` + `rename` pattern in [`rewrite_global_index`].
-///
-/// The temp name includes PID, thread ID, and a random nonce so concurrent
-/// writers from the same process to the same path cannot clobber each other's
-/// in-flight temp before the rename.
+/// tmp + `sync_all` + replace pattern in [`rewrite_global_index`].
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    write_json_bytes(path, &bytes)
+    fs_util::write_json_atomically(path, value)
 }
 
-/// Write `bytes` to `path` atomically via a unique sibling temp file.
-/// Called by [`write_json`] (which serializes first) and by callers that
-/// have already serialized the value and want to avoid double-work.
+/// Write `bytes` to `path` atomically via the shared filesystem helper.
 fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    // Unique temp name: pid + monotonic counter so concurrent writers in
-    // the same process (multiple session handles writing metadata or
-    // calibration) never share a temp path. This is especially important
-    // on Windows where rename fails if another handle holds the temp file.
-    let tmp = unique_tmp_path(path);
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    if let Err(error) = rename_with_retry(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error.into());
-    }
-    fsync_parent(path);
-    Ok(())
-}
-
-/// `fs::rename` wrapper that retries on Windows sharing-violation errors
-/// (OS error 32 / `ERROR_SHARING_VIOLATION`). Antivirus scanners, indexers,
-/// and shell preview panes briefly lock files without delete-sharing, causing
-/// transient failures that a short bounded retry reliably clears.
-/// On non-Windows platforms this is a thin wrapper with zero overhead.
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        // 4 retry attempts with backoff, then one final attempt — 5 total.
-        const RETRY_ATTEMPTS: u32 = 4;
-        let mut delay_ms = 10u64;
-        for _ in 0..RETRY_ATTEMPTS {
-            match fs::rename(from, to) {
-                Ok(()) => return Ok(()),
-                Err(ref e) if is_windows_sharing_violation(e) => {
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    delay_ms = (delay_ms * 2).min(100);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        fs::rename(from, to)
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(from, to)
-    }
-}
-
-/// Returns `true` when `e` is a transient Windows sharing/lock violation that
-/// is worth retrying. Covers `ERROR_SHARING_VIOLATION` (32) and
-/// `ERROR_LOCK_VIOLATION` (33), which are both raised by AV scanners and
-/// indexers that briefly hold files without delete-sharing.
-///
-/// `ERROR_ACCESS_DENIED` (5) / `PermissionDenied` is intentionally excluded:
-/// that error is permanent (ACL denial, read-only target) and will not clear
-/// on retry.
-///
-/// Defined unconditionally to avoid `#[cfg]` noise at call sites; on
-/// non-Windows it is never reached.
-#[allow(unused)]
-fn is_windows_sharing_violation(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(32) | Some(33)) // ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION
+    fs_util::write_bytes_atomically(path, bytes).map_err(SqueezyError::Io)
 }
 
 /// Heuristic guard for [`SessionStore::record_global_index`].
 ///
 /// Returns `true` only when the workspace_root resolves under the system
-/// temp directory AND `HOME` does not. That combination is overwhelmingly
-/// a `cargo test` setup that created its session store via
+/// temp directory AND the user-global Squeezy directory does not. That
+/// combination is overwhelmingly a `cargo test` setup that created its session store via
 /// `temp_root(..)` but never redirected `HOME` to a test sandbox — i.e.
 /// the test is not exercising the global index and a write would pollute
 /// the developer's real `~/.squeezy/sessions/index.jsonl`.
@@ -3071,17 +2999,23 @@ fn skip_global_index_for_test_workspace(workspace_root: &str) -> bool {
     if !workspace_under_temp {
         return false;
     }
-    // Check both HOME and XDG_STATE_HOME: if either resolves under temp, the
-    // global index destination is already sandboxed and the guard must not fire.
-    let home_under_temp = env::var_os("HOME")
+    // Check the active global index destination plus the legacy HOME path:
+    // if either resolves under temp, the destination is already sandboxed and
+    // the guard must not fire.
+    let active_global_under_temp = xdg_global_index_path()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|path| path.canonicalize().ok())
+        .map(|canonical| canonical.starts_with(&temp_dir))
+        .unwrap_or(false);
+    let legacy_under_temp = env::var_os("HOME")
         .and_then(|home| Path::new(&home).canonicalize().ok())
         .map(|canonical| canonical.starts_with(&temp_dir))
         .unwrap_or(false);
-    let xdg_under_temp = env::var_os("XDG_STATE_HOME")
-        .and_then(|xdg| Path::new(&xdg).canonicalize().ok())
+    let user_global_under_temp = fs_util::user_squeezy_dir()
+        .and_then(|path| path.canonicalize().ok())
         .map(|canonical| canonical.starts_with(&temp_dir))
         .unwrap_or(false);
-    !(home_under_temp || xdg_under_temp)
+    !(active_global_under_temp || legacy_under_temp || user_global_under_temp)
 }
 
 fn global_index_cache() -> &'static StdMutex<Option<GlobalIndexCache>> {
@@ -3125,23 +3059,28 @@ fn cache_global_index(path: &Path, entries: &[GlobalSessionIndexEntry]) {
 }
 
 /// Replace the global session index file with the supplied entries via a
-/// tmp + rename so concurrent readers never see a half-written file. The
-/// caller chooses the iteration order; readers re-sort by
-/// `started_at_ms`. The temp name includes PID and a random nonce so two
-/// processes compacting at the same time use distinct temp files and do not
-/// clobber each other's in-flight write.
+/// unique tmp + replace so concurrent readers never see a half-written
+/// file. The caller chooses the iteration order; readers re-sort by
+/// `started_at_ms`. Dedup + cap goes through
+/// [`compact_global_index_entries`] so the policy stays in lock-step with
+/// the reader path in `list_global_index`.
 fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = unique_tmp_path(path);
+    let lock = lock_append_path(path)?;
+    let existing = read_global_index_entries(path)?;
+    let merged = existing
+        .into_iter()
+        .chain(entries.iter().map(|entry| (*entry).clone()));
+    let mut compacted = compact_global_index_entries(merged);
+    // Persist oldest-first so subsequent appends keep the newest entries
+    // at the tail — matches how readers see time.
+    compacted.sort_by_key(|entry| entry.started_at_ms);
+    let tmp = fs_util::unique_temp_path(path);
     {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        for entry in entries {
+        let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        for entry in &compacted {
             let mut payload = match serde_json::to_vec(entry) {
                 Ok(payload) => payload,
                 Err(_) => continue,
@@ -3151,12 +3090,64 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         }
         file.sync_all()?;
     }
-    if let Err(err) = rename_with_retry(&tmp, path) {
+    if let Err(error) = fs_util::replace_file(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(err);
+        return Err(error);
     }
-    fsync_parent(path);
+    // The new index is on disk. Unlock best-effort; the OS releases the lock
+    // when `lock` drops regardless.
+    let _ = lock.unlock();
     Ok(())
+}
+
+/// Apply the dedup-by-`session_id` (keep the entry with the largest
+/// `last_event_at_ms`) and the `GLOBAL_INDEX_MAX_ENTRIES` cap to
+/// `entries`. Returns the compacted set sorted newest-first by
+/// `last_event_at_ms`; callers that need a different iteration order
+/// (e.g. oldest-first for on-disk layout) re-sort the returned vector.
+fn compact_global_index_entries(
+    entries: impl IntoIterator<Item = GlobalSessionIndexEntry>,
+) -> Vec<GlobalSessionIndexEntry> {
+    let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
+    for entry in entries {
+        match by_id.get(&entry.session_id) {
+            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
+            _ => {
+                by_id.insert(entry.session_id.clone(), entry);
+            }
+        }
+    }
+    let mut compacted: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+    compacted.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
+    compacted.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+    compacted
+}
+
+fn read_global_index_entries(path: &Path) -> std::io::Result<Vec<GlobalSessionIndexEntry>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut entries = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -3700,8 +3691,7 @@ fn paths_same_platform(a: &str, b: &str) -> bool {
 
 /// Resolve the XDG-aware path for the global session index. When
 /// `XDG_STATE_HOME` is set to an absolute path it takes precedence (Linux XDG
-/// Base Dir Spec); otherwise falls back to `$HOME/.squeezy/sessions/index.jsonl`
-/// to preserve existing macOS/Windows state.
+/// Base Dir Spec); otherwise falls back to the user-global Squeezy directory.
 fn xdg_global_index_path() -> Option<PathBuf> {
     if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
         let path = PathBuf::from(xdg);
@@ -3709,75 +3699,11 @@ fn xdg_global_index_path() -> Option<PathBuf> {
             return Some(path.join("squeezy").join("sessions").join("index.jsonl"));
         }
     }
-    let home = env::var_os("HOME")?;
     Some(
-        PathBuf::from(home)
-            .join(".squeezy")
+        fs_util::user_squeezy_dir()?
             .join("sessions")
             .join("index.jsonl"),
     )
-}
-
-/// Read one global index file into `by_id`, keeping the entry with the largest
-/// `last_event_at_ms` for each session id. `raw_lines` is incremented for each
-/// valid entry parsed.
-fn read_global_index_into(
-    path: &Path,
-    by_id: &mut HashMap<String, GlobalSessionIndexEntry>,
-    raw_lines: &mut usize,
-) {
-    let Ok(file) = fs::File::open(path) else {
-        return;
-    };
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => return,
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
-            continue;
-        };
-        *raw_lines += 1;
-        match by_id.get(&entry.session_id) {
-            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
-            _ => {
-                by_id.insert(entry.session_id.clone(), entry);
-            }
-        }
-    }
-}
-
-/// Build a unique sibling temp path for `path` using the process id, thread
-/// id, and a random 4-byte nonce. This prevents both same-pid concurrent
-/// threads and same-millisecond different-pid processes from colliding on the
-/// same temp file before the rename.
-fn unique_tmp_path(path: &Path) -> PathBuf {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
-    let pid = std::process::id();
-    let tid = thread_id_u64();
-    let nonce = random_nonce_hex();
-    path.with_file_name(format!(".{name}.{pid}.{tid}.{nonce}.tmp"))
-}
-
-/// Per-process thread counter used as a discriminator inside unique temp
-/// file names. Each thread gets a stable monotonically-increasing id on
-/// first access via `thread_local!`, which is cheap and does not rely on
-/// any unstable `ThreadId` Debug representation.
-static THREAD_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-fn thread_id_u64() -> u64 {
-    thread_local! {
-        static TID: u64 = THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    }
-    TID.with(|id| *id)
 }
 
 /// Generate 4 random bytes and encode them as an 8-character hex string.
@@ -3794,21 +3720,6 @@ fn random_nonce_hex() -> String {
     } else {
         // Degenerate fallback: use the low bits of the current timestamp.
         format!("{:08x}", now_ms() & 0xffff_ffff)
-    }
-}
-
-/// Fsync the parent directory of `path` after a successful rename to ensure
-/// the directory entry update is durable on Linux crash-safety scenarios.
-/// This is a best-effort operation — the session file content is already
-/// durable (synced before rename); a missed dir sync only costs durability
-/// of the directory entry, not the file content.
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn fsync_parent(path: &Path) {
-    #[cfg(unix)]
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
     }
 }
 

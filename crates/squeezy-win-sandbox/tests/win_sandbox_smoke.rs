@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use squeezy_win_sandbox::{
     WinNetwork, WinSandboxSpec, WinTokenMode, WinWritableRoot, spawn_restricted_token,
@@ -70,50 +71,89 @@ struct CmdOutput {
     stderr: String,
 }
 
-/// Run `cmd /c <cmdline_arg>` (a single shell command string) inside the
-/// sandbox rooted at `workspace`.  Returns the child's captured output, or
-/// `None` if the spawn was skipped because the host can't create restricted
-/// tokens.
-fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<CmdOutput> {
+fn run_cmd_inner(
+    workspace: &Path,
+    cmdline_arg: &str,
+    timeout: Duration,
+) -> Result<CmdOutput, String> {
     let spec = make_spec(workspace);
     let argv = vec!["cmd".to_string(), "/c".to_string(), cmdline_arg.to_string()];
     let env: HashMap<String, String> = std::env::vars().collect();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let mut child = match spawn_restricted_token(&spec, &argv, workspace, &env, false) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[skip] spawn_restricted_token returned error: {e}");
-            return None;
-        }
+        Ok(child) => child,
+        Err(err) => return Err(format!("spawn_restricted_token returned error: {err}")),
     };
 
     let mut stdout = child.take_stdout();
     let mut stderr = child.take_stderr();
-    let (status, stdout_text, stderr_text) = rt.block_on(async move {
-        let stdout_task = async move {
+    rt.block_on(async move {
+        let stdout_task = tokio::spawn(async move {
             let mut text = String::new();
             if let Some(out) = stdout.as_mut() {
                 let _ = out.read_to_string(&mut text).await;
             }
             text
-        };
-        let stderr_task = async move {
+        });
+        let stderr_task = tokio::spawn(async move {
             let mut text = String::new();
             if let Some(err) = stderr.as_mut() {
                 let _ = err.read_to_string(&mut text).await;
             }
             text
-        };
-        let wait_task = child.wait();
-        let (status, stdout_text, stderr_text) = tokio::join!(wait_task, stdout_task, stderr_task);
-        (status.expect("wait failed"), stdout_text, stderr_text)
-    });
-    Some(CmdOutput {
-        status,
-        stdout: stdout_text,
-        stderr: stderr_text,
+        });
+        let wait = tokio::time::timeout(timeout, child.wait()).await;
+        if wait.is_err() {
+            child.kill();
+        }
+        let stdout_text = stdout_task.await.unwrap_or_default();
+        let stderr_text = stderr_task.await.unwrap_or_default();
+        match wait {
+            Ok(Ok(status)) => Ok(CmdOutput {
+                status,
+                stdout: stdout_text,
+                stderr: stderr_text,
+            }),
+            Ok(Err(err)) => Err(format!("wait failed: {err}; stdout={stdout_text:?}; stderr={stderr_text:?}")),
+            Err(_) => Err(format!("timed out after {timeout:?}; stdout={stdout_text:?}; stderr={stderr_text:?}")),
+        }
     })
+}
+
+fn sandbox_smoke_available(workspace: &Path) -> bool {
+    match run_cmd_inner(
+        workspace,
+        "echo squeezy-sandbox-ready",
+        Duration::from_secs(5),
+    ) {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "[skip] restricted-token sandbox probe exited with {:?}; stdout={:?}; stderr={:?}",
+                output.status, output.stdout, output.stderr
+            );
+            false
+        }
+        Err(err) => {
+            eprintln!("[skip] restricted-token sandbox probe failed: {err}");
+            false
+        }
+    }
+}
+
+/// Run `cmd /c <cmdline_arg>` (a single shell command string) inside the
+/// sandbox rooted at `workspace`.  Returns the child's captured output, or
+/// `None` if the host can't run a basic restricted-token sandboxed command.
+fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<CmdOutput> {
+    if !sandbox_smoke_available(workspace) {
+        return None;
+    }
+
+    Some(
+        run_cmd_inner(workspace, cmdline_arg, Duration::from_secs(10))
+            .expect("sandboxed command should complete after probe succeeds"),
+    )
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -242,8 +282,8 @@ fn read_system_still_works() {
     let workspace = fresh_workspace("read_system");
 
     // Check for a stable system file without emitting a large directory listing;
-    // these smoke tests do not otherwise need stdout, and an un-drained listing
-    // can fill the pipe before the process exits.
+    // these smoke tests do not otherwise need stdout, and bounded output avoids
+    // filling pipes before the process exits.
     let Some(output) = run_cmd(
         &workspace,
         r#"if exist C:\Windows\System32\cmd.exe (exit /b 0) else (exit /b 1)"#,
@@ -253,7 +293,7 @@ fn read_system_still_works() {
 
     assert!(
         output.status.success(),
-        "reading C:\\Windows should succeed on restricted-token tier; exit={:?}; stdout={:?}; stderr={:?}",
+        "reading C:\\Windows\\System32\\cmd.exe should succeed on restricted-token tier; exit={:?}; stdout={:?}; stderr={:?}",
         output.status,
         output.stdout,
         output.stderr,

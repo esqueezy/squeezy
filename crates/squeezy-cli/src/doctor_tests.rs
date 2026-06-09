@@ -1,7 +1,7 @@
 use super::*;
 use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport, ProviderSettings};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 // env::set_var/remove_var is process-global; serialize these tests so a parallel
@@ -621,6 +621,100 @@ fn state_store_check_opens_redb_in_tempdir() {
     let _ = fs::remove_dir_all(&workspace);
     assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("opened"));
+}
+
+#[test]
+fn graph_store_check_reports_absent_without_creating_redb() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-graph-absent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    let check = graph_store_check(&config);
+    let graph = squeezy_store::graph_path(&workspace, None);
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(check.detail.contains("absent"));
+    assert!(
+        !graph.exists(),
+        "doctor graph probe must not create graph.redb"
+    );
+}
+
+#[test]
+fn graph_store_check_opens_existing_redb_in_tempdir() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-graph-existing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let store = squeezy_store::GraphStore::open(&workspace, None).expect("seed graph store");
+    drop(store);
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    let check = graph_store_check(&config);
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(check.detail.contains("readable"));
+}
+
+#[test]
+fn user_global_storage_warns_for_synced_workspace_with_default_cache() {
+    let mut config = AppConfig::from_env();
+    // Use forward slashes so the path parses into multiple components on
+    // both Windows and Unix; `workspace_looks_synced` is component-based
+    // and the substring `onedrive` matches case-insensitively either way.
+    config.workspace_root = PathBuf::from("/home/dev/OneDrive/repo");
+    config.cache.root = None;
+    let check = user_global_storage_check(&config);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(check.detail.contains("synced folder"));
+    assert!(check.detail.contains("[cache].root"));
+}
+
+#[test]
+fn workspace_looks_synced_matches_known_cloud_clients() {
+    let positive = [
+        "/home/dev/OneDrive/repo",
+        "/home/dev/Dropbox/work/repo",
+        "/Users/dev/Library/CloudStorage/GoogleDrive-me/repo",
+        "/Users/dev/Library/CloudStorage/iCloud Drive/repo",
+        "/home/dev/Nextcloud/code",
+        "/home/dev/Syncthing/repo",
+        "/home/dev/pCloud Drive/repo",
+    ];
+    for path in positive {
+        assert!(
+            workspace_looks_synced(std::path::Path::new(path)),
+            "expected sync detection for {path}",
+        );
+    }
+    let negative = [
+        "/home/dev/code/squeezy",
+        "/Users/dev/Documents/repo",
+        "/tmp/sandbox",
+        "/home/dev/toolbox",
+    ];
+    for path in negative {
+        assert!(
+            !workspace_looks_synced(std::path::Path::new(path)),
+            "did not expect sync detection for {path}",
+        );
+    }
 }
 
 #[test]

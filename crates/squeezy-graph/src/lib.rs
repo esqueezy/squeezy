@@ -2440,13 +2440,15 @@ impl GraphManager {
     ) -> Result<Self> {
         let root_path = root.as_ref().to_path_buf();
         let store = match GraphStore::open(&root_path, cache_root.as_deref()) {
-            Ok(s) => Some(Arc::new(s)),
-            Err(err) => {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                let cache_dir = squeezy_store::cache_dir_path(&root_path, cache_root.as_deref());
                 tracing::warn!(
+                    target: "squeezy::graph",
                     root = %root_path.display(),
-                    %err,
-                    "graph persistence disabled: GraphStore::open failed; \
-                     falling back to in-memory graph"
+                    cache_dir = %cache_dir.display(),
+                    error = %error,
+                    "graph persistence disabled: GraphStore::open failed; falling back to in-memory graph",
                 );
                 None
             }

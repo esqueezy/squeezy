@@ -4,15 +4,17 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
-    Result, SettingsFile, default_settings_path,
+    Result, SettingsFile, SqueezyError, default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
 };
 use squeezy_parse::smoke_all_languages;
 use squeezy_store::{
+    GRAPH_SCHEMA_VERSION, GraphStore,
     STALE_RUNNING_SESSION_THRESHOLD_MS, SessionQuery, SessionStatus, SessionStore, SqueezyStore,
-    cache_diagnostics, ensure_repo_profile, prune_cache_backups,
+    cache_diagnostics, ensure_repo_profile, graph_path, prune_cache_backups,
+    user_squeezy_dir_detail,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use squeezy_workspace::{WorkspaceRootKind, WorkspaceRootProfile};
@@ -335,8 +337,14 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                 .into_iter()
                 .filter(|check| should_include_check(args, &check.name)),
         );
+        if should_include_check(args, "user_global_storage") {
+            checks.push(user_global_storage_check(config));
+        }
         if should_include_check(args, "state_store") {
             checks.push(state_store_check(config));
+        }
+        if should_include_check(args, "graph_store") {
+            checks.push(graph_store_check(config));
         }
         if should_include_check(args, "cache") {
             checks.push(cache_check(config, args.prune_cache));
@@ -929,6 +937,136 @@ fn state_store_check(config: &AppConfig) -> Check {
     }
 }
 
+fn graph_store_check(config: &AppConfig) -> Check {
+    let path = graph_path(&config.workspace_root, config.cache.root.as_deref());
+    if !path.exists() {
+        return Check {
+            name: "graph_store".to_string(),
+            status: Status::Ok,
+            detail: format!("absent: {} (graph cache not created yet)", path.display()),
+        };
+    }
+    match GraphStore::probe_path_read_only(&path) {
+        Ok(probe) if probe.schema_version == Some(GRAPH_SCHEMA_VERSION) => Check {
+            name: "graph_store".to_string(),
+            status: Status::Ok,
+            detail: format!("readable: {}", probe.path.display()),
+        },
+        Ok(probe) => Check {
+            name: "graph_store".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "readable with schema {:?}, expected {}; graph persistence will reinitialize on next write: {}",
+                probe.schema_version,
+                GRAPH_SCHEMA_VERSION,
+                probe.path.display()
+            ),
+        },
+        Err(error) => {
+            // On Windows, another agent process holding graph.redb open will
+            // fail this probe with ERROR_SHARING_VIOLATION (32) or
+            // ERROR_LOCK_VIOLATION (33); occasionally ERROR_ACCESS_DENIED (5).
+            // Distinguish that from a real open failure so the user isn't told
+            // persistence is broken when it's actually just another live
+            // Squeezy session. The literal Win32 messages for codes 32/33 do
+            // *not* contain the phrase "sharing violation", so we match by
+            // `raw_os_error()` first (when we can recover the underlying
+            // `io::Error`), and fall back to substring markers that *do*
+            // appear in those messages ("being used by another process",
+            // "another process has locked").
+            let text = error.to_string();
+            let is_locked = match &error {
+                SqueezyError::Io(io_err) => matches!(io_err.raw_os_error(), Some(5 | 32 | 33)),
+                _ => false,
+            } || {
+                let lower = text.to_ascii_lowercase();
+                lower.contains("being used by another process")
+                    || lower.contains("another process has locked")
+                    || lower.contains("sharing violation")
+                    || lower.contains("access is denied")
+            };
+            if is_locked {
+                Check {
+                    name: "graph_store".to_string(),
+                    status: Status::Ok,
+                    detail: format!(
+                        "locked by another process (graph persistence is active): {}",
+                        path.display()
+                    ),
+                }
+            } else {
+                Check {
+                    name: "graph_store".to_string(),
+                    status: Status::Warn,
+                    detail: format!(
+                        "{text}; graph persistence will be disabled until graph.redb can be opened: {}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn user_global_storage_check(config: &AppConfig) -> Check {
+    let mut detail = user_squeezy_dir_detail();
+    if cfg!(windows) && env::var_os("HOME").is_none() {
+        detail.push_str(
+            "; HOME is unset, using native Windows profile/app-data fallback if available",
+        );
+    }
+    if workspace_looks_synced(&config.workspace_root) && config.cache.root.is_none() {
+        detail.push_str(
+            "; workspace appears to be under a synced folder, consider a short local [cache].root",
+        );
+        return Check {
+            name: "user_global_storage".to_string(),
+            status: Status::Warn,
+            detail,
+        };
+    }
+    Check {
+        name: "user_global_storage".to_string(),
+        status: Status::Ok,
+        detail,
+    }
+}
+
+/// Substrings (lowercased) that mark a path component as belonging to a
+/// known consumer cloud-sync client root. Matches the spellings that
+/// real-world Windows / macOS / Linux installers create; the heuristic is
+/// intentionally over-eager — false positives cost a single doctor warn,
+/// while a missed sync mount can cost the user repeated cache corruption
+/// when the agent races the sync engine.
+const SYNCED_FOLDER_MARKERS: &[&str] = &[
+    "onedrive",
+    "dropbox",
+    "googledrive",
+    "google drive",
+    "drive file stream",
+    "drivefs",
+    "icloud drive",
+    "icloud-drive",
+    "icloud_drive",
+    "icloud~drive",
+    "syncthing",
+    "pcloud",
+    "sync.com",
+    "nextcloud",
+    "owncloud",
+    "yandex.disk",
+    "yandexdisk",
+];
+
+fn workspace_looks_synced(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        SYNCED_FOLDER_MARKERS
+            .iter()
+            .any(|marker| name.contains(marker))
+    })
+}
+
 fn cache_check(config: &AppConfig, prune: bool) -> Check {
     let diagnostics = match cache_diagnostics(&config.workspace_root, config.cache.root.as_deref())
     {
@@ -970,8 +1108,19 @@ fn cache_check(config: &AppConfig, prune: bool) -> Check {
                     report.removed_files.len(),
                     format_bytes(report.removed_bytes)
                 ));
+                if !report.failed_files.is_empty() {
+                    status = Status::Warn;
+                    let failed = report
+                        .failed_files
+                        .iter()
+                        .map(|(path, error)| format!("{} ({error})", path.display()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    detail.push_str(&format!("; failed to prune: {failed}"));
+                }
                 if diagnostics.state.size_bytes <= STATE_CACHE_WARN_BYTES
                     && diagnostics.graph.size_bytes <= GRAPH_CACHE_WARN_BYTES
+                    && report.failed_files.is_empty()
                 {
                     status = Status::Ok;
                 }
