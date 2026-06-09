@@ -499,7 +499,11 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
         ShellSandboxDoctor {
             backend: "windows-restricted-token",
             available: true,
-            detail: "restricted-token tier enforces filesystem writes with no admin; the elevated tier (sensitive-read deny + WFP network egress control) is opt-in via `squeezy doctor --sandbox-setup` (one UAC prompt)"
+            detail: "Windows restricted-token sandbox: filesystem writes are enforced without \
+                     admin; reads and network are not isolated. The elevated tier adds full \
+                     read + write isolation plus WFP network egress control via \
+                     `squeezy doctor --sandbox-setup` plus windows_sandbox_level = \"elevated\"; \
+                     windows_sandbox_level = \"disabled\" uses Job Object cleanup only."
                 .to_string(),
             linux_user_namespaces: None,
             linux_landlock_abi: None,

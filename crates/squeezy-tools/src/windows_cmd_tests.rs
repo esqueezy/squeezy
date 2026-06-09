@@ -308,3 +308,60 @@ fn ignores_benign_commands() {
     // ri alias without both flags
     assert!(!is_destructive_windows_segment("ri foo.txt"));
 }
+
+#[test]
+fn flags_powershell_remove_item_short_alias() {
+    assert!(is_destructive_windows_segment("ri -Recurse -Force C:\\tmp"));
+    assert!(is_destructive_windows_segment(
+        "ri -force -recurse C:\\data"
+    ));
+}
+
+#[test]
+fn flags_remove_local_user() {
+    assert!(is_destructive_windows_segment("Remove-LocalUser -Name foo"));
+}
+
+#[test]
+fn flags_unregister_scheduled_task() {
+    assert!(is_destructive_windows_segment(
+        "Unregister-ScheduledTask -TaskName backup -Confirm:$false"
+    ));
+}
+
+#[test]
+fn flags_takeown_recursive() {
+    assert!(is_destructive_windows_segment("takeown /f C:\\dir /r"));
+}
+
+#[test]
+fn flags_net_user_delete() {
+    assert!(is_destructive_windows_segment("net user bob /delete"));
+}
+
+#[test]
+fn ri_substring_does_not_false_positive_inside_benign_tokens() {
+    // `Invoke-WebRequest -Uri ... -Recurse -Force` lowercases to a stream
+    // that contains the bytes `ri -recurse -force` immediately after `-u`,
+    // which the previous substring matcher tripped on. The token-based
+    // `ri` arm refuses to match unless `ri` is the first whitespace-
+    // separated token.
+    assert!(!is_destructive_windows_segment(
+        "Invoke-WebRequest -Uri https://example.com/api -Recurse -Force"
+    ));
+    // A bare `ri` without recursion/force flags still classifies safe.
+    assert!(!is_destructive_windows_segment("ri foo.txt"));
+}
+
+#[test]
+fn does_not_flag_safe_takeown() {
+    // /r is required for our match; single-file takeown is less dangerous
+    assert!(!is_destructive_windows_segment("takeown /f somefile.txt"));
+}
+
+#[test]
+fn does_not_flag_safe_net_user_add() {
+    assert!(!is_destructive_windows_segment(
+        "net user bob Password1 /add"
+    ));
+}

@@ -1459,9 +1459,14 @@ pub(crate) fn shell_segment_writes_filesystem(segment: &str) -> bool {
 /// Normalises a path-like token for sensitive-path matching:
 ///   - replaces backslashes with `/`,
 ///   - expands a leading `~/` or `~` against `$HOME`,
-///   - expands a leading `$HOME` or `${HOME}` against `$HOME`.
+///   - expands a leading `$HOME` or `${HOME}` against `$HOME`,
+///   - expands Windows `%VAR%` and PowerShell `$env:VAR` forms for
+///     `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, and `HOME`.
 fn normalize_path_token(token: &str, home: Option<&str>) -> String {
+    // Normalise path separators first so all comparisons use `/`.
     let token = token.replace('\\', "/");
+
+    // Expand Unix-style $HOME / ${HOME} / ~/
     if let Some(home) = home {
         if let Some(rest) = token.strip_prefix("$HOME/") {
             return format!("{home}/{rest}");
@@ -1482,6 +1487,42 @@ fn normalize_path_token(token: &str, home: Option<&str>) -> String {
             return home.to_string();
         }
     }
+
+    // Expand Windows cmd-style `%VAR%` and PowerShell `$env:VAR` prefixes.
+    // We only expand the three most security-sensitive Windows path roots so
+    // the pattern list stays specific. The result is normalised to `/`
+    // separators so the subsequent token_contains_sensitive_base check works
+    // identically on all platforms.
+    for (cmd_var, ps_var, env_key) in [
+        ("%USERPROFILE%", "$env:USERPROFILE", "USERPROFILE"),
+        ("%APPDATA%", "$env:APPDATA", "APPDATA"),
+        ("%LOCALAPPDATA%", "$env:LOCALAPPDATA", "LOCALAPPDATA"),
+        ("%HOME%", "$env:HOME", "HOME"),
+    ] {
+        let value = env::var_os(env_key)
+            .map(|v| v.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if value.is_empty() {
+            continue;
+        }
+        for prefix in [cmd_var, ps_var] {
+            // Both cmd.exe (`%USERPROFILE%`) and PowerShell (`$env:USERPROFILE`)
+            // treat env-var names case-insensitively, so match case-insensitively
+            // for both the bare form and the path form (e.g. `%userprofile%\...`).
+            let prefix_lower = prefix.to_ascii_lowercase();
+            let token_lower = token.to_ascii_lowercase();
+            let prefix_slash_lower = format!("{prefix_lower}/");
+            if let Some(rest) = token_lower.strip_prefix(&prefix_slash_lower) {
+                // Preserve original-case suffix from the real token.
+                let rest_start = token.len() - rest.len();
+                return format!("{value}/{}", &token[rest_start..]);
+            }
+            if token_lower == prefix_lower {
+                return value.clone();
+            }
+        }
+    }
+
     token
 }
 

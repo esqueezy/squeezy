@@ -53,6 +53,84 @@ fn request_with(
 }
 
 #[test]
+fn shell_preview_warns_when_filesystem_best_effort_unavailable() {
+    // Job-Object-only Windows tier: no filesystem or network isolation. The
+    // approval prompt must surface that posture or users approve commands
+    // assuming a sandbox that isn't there.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[
+            ("command", "cargo test"),
+            ("filesystem", "best_effort_unavailable"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("Windows: no filesystem/network isolation"),
+        "best-effort-unavailable warn line missing: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_warns_when_filesystem_enforced_writes_only() {
+    // Restricted-token tier: writes are blocked by ACLs, but reads and
+    // network are not isolated. Users need that caveat before approving
+    // commands that may exfiltrate or hit the network.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[
+            ("command", "cargo test"),
+            ("filesystem", "enforced_writes_only"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains(
+            "Windows: filesystem write isolation enforced; reads and network are not isolated"
+        ),
+        "enforced-writes-only warn line missing: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_does_not_warn_when_filesystem_enforced() {
+    // Fully enforced sandbox (macOS / Linux Landlock / Windows elevated):
+    // no Windows-specific posture caveat in the prompt.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test"), ("filesystem", "enforced")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("Windows:"),
+        "enforced filesystem must not render a Windows posture warning: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_omits_warn_line_without_filesystem_metadata() {
+    // Backwards-compat: pre-existing emitters that don't set the
+    // filesystem key keep the legacy preview shape.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("Windows:"),
+        "missing filesystem metadata must not render a Windows posture warning: {out}"
+    );
+}
+
+#[test]
 fn shell_preview_shows_command_and_cwd() {
     let req = request_with(
         "shell",

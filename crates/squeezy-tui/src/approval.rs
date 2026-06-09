@@ -230,6 +230,26 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(hint) = permission.metadata.get("ask_socket_unavailable") {
         lines.push(dim(format!("note: {hint}")));
     }
+    // Warn about Windows sandbox posture when the metadata reveals the active
+    // tier. The two non-full-isolation cases get distinct messages:
+    // - "best_effort_unavailable": Job-Object backend (disabled tier) — no
+    //   filesystem or network isolation at all.
+    // - "enforced_writes_only": restricted-token tier — filesystem *writes*
+    //   are blocked by ACLs, but reads and network are not isolated.
+    match permission.metadata.get("filesystem").map(String::as_str) {
+        Some("best_effort_unavailable") => {
+            lines.push(warn_line(
+                "Windows: no filesystem/network isolation; process tree will be killed on timeout/cancel".to_string(),
+            ));
+        }
+        Some("enforced_writes_only") => {
+            lines.push(warn_line(
+                "Windows: filesystem write isolation enforced; reads and network are not isolated"
+                    .to_string(),
+            ));
+        }
+        _ => {}
+    }
 }
 
 fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
@@ -378,6 +398,18 @@ fn dim(text: String) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
         Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
+    ])
+}
+
+fn warn_line(text: String) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            text,
+            Style::default()
+                .fg(crate::render::theme::cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 

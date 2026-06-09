@@ -60,6 +60,9 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         "restart-computer",
         "remove-service",
         "unregister-scheduledtask",
+        "remove-storedcredential",
+        "clear-content",
+        "remove-netfirewallrule",
     ]
     .contains(&command_name)
     {
@@ -101,6 +104,16 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         "sc" | "sc.exe" => return flag_matches("delete"),
         // Scheduled task deletion
         "schtasks" | "schtasks.exe" => return flag_matches("/delete"),
+        // TAKEOWN and ICACLS can be used to seize ownership of files and
+        // rewrite ACLs wholesale.
+        "takeown" => return flag_matches("/r"),
+        "icacls" => return flag_matches("/reset") || flag_matches("/grant:r"),
+        "attrib" => return flag_matches("/s") && (flag_matches("-r") || flag_matches("+h")),
+        "net" => {
+            if tokens.get(1).copied() == Some("user") {
+                return flag_matches("/delete");
+            }
+        }
         // Shutdown / restart from cmd
         "shutdown" => {
             return flag_matches("/s")

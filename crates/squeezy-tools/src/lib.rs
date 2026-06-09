@@ -2544,6 +2544,19 @@ impl ToolRegistry {
                     "sandbox_write_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.write_roots),
                 );
+                // Surface the active filesystem-isolation posture (e.g.
+                // "enforced", "enforced_writes_only", "best_effort_unavailable")
+                // so the approval prompt can warn when the active backend
+                // does not actually isolate filesystem reads or writes.
+                if let Ok(plan) = prepare_shell_sandbox_plan(
+                    command,
+                    &analysis,
+                    &self.root,
+                    &self.shell_sandbox,
+                    &self.shell_sandbox_health,
+                ) {
+                    metadata.insert("filesystem".to_string(), plan.filesystem.to_string());
+                }
                 // Surface the effective Windows sandbox posture to the
                 // approval UI. The default restricted-token tier enforces
                 // workspace write boundaries, but it does not isolate reads or

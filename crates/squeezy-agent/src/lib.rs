@@ -6567,6 +6567,24 @@ impl TurnRuntime {
         if self.turn_id.get() == 1 {
             self.dispatch_setup();
             self.dispatch_session_start();
+            // Emit a session-level banner when the Windows sandbox is running
+            // at the job-object-only (disabled) tier. At the restricted-token
+            // or elevated tiers, filesystem isolation is partially or fully
+            // enforced, so the "no isolation" caveat does not apply.
+            #[cfg(target_os = "windows")]
+            {
+                use squeezy_core::WindowsSandboxLevel;
+                if self.config.permissions.shell_sandbox.windows_sandbox_level
+                    == WindowsSandboxLevel::Disabled
+                {
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::WindowsSandboxActive {
+                            turn_id: self.turn_id,
+                        })
+                        .await;
+                }
+            }
         }
         let original_input = input.clone();
         let display_tracks_input = self.display_input == original_input;
@@ -15669,11 +15687,29 @@ pub(crate) fn mode_permission_verdict(
     request: &PermissionRequest,
     active_plan_path: Option<&Path>,
 ) -> Option<PermissionVerdict> {
+    // Pre-canonicalize the active plan path once so it can be reused for
+    // both the permission gate (via is_active_plan_path_with_canon) and the
+    // denial-message display, avoiding a redundant fs::canonicalize syscall.
+    // On Windows this also normalises drive-letter case, UNC prefixes, and
+    // junction targets before either comparison or display.
+    //
+    // Gate the canonicalize on the only branches that consume the result:
+    // Plan-mode + Edit (used by `plan_edit_allowed` and the denial display).
+    // Read / Search / Network / Mcp / Shell / Git / Compiler permission
+    // decisions (the high-volume path on every Plan-mode turn) skip the
+    // syscall entirely.
+    let active_plan_canon =
+        if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
+            active_plan_path.and_then(plan_mode::canonicalize_active_plan_path)
+        } else {
+            None
+        };
     let plan_edit_allowed = matches!(
         (mode, request.capability),
         (SessionMode::Plan, PermissionCapability::Edit)
-    ) && active_plan_path
-        .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
+    ) && active_plan_canon.as_deref().is_some_and(|active| {
+        plan_mode::is_active_plan_path_with_canon(Path::new(&request.target), active)
+    });
     if mode == SessionMode::Plan && request.tool_name == "shell" {
         if matches!(
             request.capability,
@@ -15727,12 +15763,25 @@ pub(crate) fn mode_permission_verdict(
         return None;
     }
     let reason = if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
-        match active_plan_path {
-            Some(active) => format!(
-                "Plan mode: only the active plan file is editable ({}); requested target was {}",
-                active.display(),
-                request.target,
-            ),
+        // Prefer the pre-canonicalized path for display so the message
+        // shows the resolved (drive-letter-normalized, UNC-resolved,
+        // junction-followed) form that the permission gate actually compared.
+        match active_plan_canon.as_deref().or(active_plan_path) {
+            Some(active) => {
+                // Normalise both paths to forward-slashes so the message is
+                // readable on Windows (where Display would otherwise print
+                // backslashes) and to help users spot drive-letter or UNC
+                // differences. The guard itself uses canonicalize/PathBuf
+                // equality; this is display-only.
+                let active_display = active.display().to_string().replace('\\', "/");
+                let target_display = request.target.replace('\\', "/");
+                format!(
+                    "Plan mode: only the active plan file is editable \
+                     (active: {active_display}; requested: {target_display}). \
+                     If paths differ only in drive-letter case, UNC prefix, or \
+                     junction resolution, accept the plan-handoff prompt to reload the session.",
+                )
+            }
             None => format!(
                 "{} mode refuses {} (no active plan file to edit)",
                 mode.as_str(),
@@ -15764,7 +15813,9 @@ pub(crate) fn mode_permission_verdict(
 /// capability is a compile-time prompt to decide whether plan mode admits it.
 /// `plan_edit_allowed` is computed by
 /// `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites and by
-/// `plan_mode::is_active_plan_path` at runtime (issue 2).
+/// `mode_permission_verdict`'s pre-canonicalized pair
+/// (`plan_mode::canonicalize_active_plan_path` +
+/// `plan_mode::is_active_plan_path_with_canon`) at runtime (issue 2).
 fn mode_refuses_capability(
     mode: SessionMode,
     capability: PermissionCapability,
@@ -17996,6 +18047,17 @@ pub enum AgentEvent {
         backend: String,
         fallback_count: u64,
         fallback_reason: Option<String>,
+    },
+    /// Emitted exactly once, on the first turn of a Windows session, to
+    /// surface the steady-state sandbox posture. Unlike
+    /// `ShellSandboxBestEffortFallback` (which fires when a previously
+    /// capable backend silently downgrades), this variant fires because
+    /// Windows Job-Object cleanup is the *intentional* Windows design, not a
+    /// runtime fallback. The TUI renders a durable session-level notice so
+    /// users running Build-mode shell work on Windows see the isolation
+    /// caveat without having to execute a shell command first.
+    WindowsSandboxActive {
+        turn_id: TurnId,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

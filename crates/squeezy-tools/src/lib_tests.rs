@@ -18,6 +18,11 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
+/// Process-wide lock for tests that mutate environment variables. Rust's test
+/// harness runs tests concurrently; without serialization, `set_var`/`remove_var`
+/// calls in one test can corrupt `env::var` reads in another. Acquire this guard
+/// for the entire duration of any test that calls `env::set_var` or `env::remove_var`.
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
     registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
@@ -277,6 +282,35 @@ fn plan_parallel_batches_serializes_unsafe_calls_between_safe_runs() {
             );
         }
     }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_permission_metadata_populates_filesystem_posture_for_approval_prompt() {
+    // Regression test: the approval prompt's `filesystem` warn-line arms
+    // (squeezy-tui::approval::append_shell) only render when this key is
+    // populated at permission-request time. Mode = Off → plan is direct,
+    // so `filesystem` is "not_enforced" — deterministic across platforms.
+    let root = temp_workspace("permission_filesystem_posture");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "filesystem-posture".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "echo hello",
+            "description": "trivial echo"
+        }),
+    });
+
+    assert!(
+        request.metadata.contains_key("filesystem"),
+        "permission_request must populate the `filesystem` metadata key so the \
+         approval prompt's posture warn-line can render: keys = {:?}",
+        request.metadata.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(request.metadata["filesystem"], "not_enforced");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -11669,6 +11703,9 @@ fn sensitive_path_matcher_ignores_substring_false_positives() {
 
 #[test]
 fn sensitive_path_matcher_catches_quoted_and_expanded_bypasses() {
+    // Honour the file-wide ENV_MUTEX so this test serialises with the
+    // newer USERPROFILE / APPDATA tests that mutate sibling vars.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
     assert!(shell_command_references_sensitive_path("cat .env", &patterns).is_some());
     assert!(shell_command_references_sensitive_path("cat ./.env.production", &patterns).is_some());
@@ -13988,4 +14025,66 @@ async fn write_file_includes_newline_style() {
     assert_eq!(result2.status, ToolStatus::Success);
     assert_eq!(result2.content["newline_style_before"], json!("lf"));
     assert_eq!(result2.content["newline_style_after"], json!("crlf"));
+}
+
+#[test]
+fn sensitive_path_matcher_expands_windows_userprofile() {
+    // Simulate a Windows-like environment with USERPROFILE set.
+    // The default sensitive-path patterns include `.ssh/**` which covers
+    // %USERPROFILE%\.ssh\id_rsa.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
+    let previous = env::var_os("USERPROFILE");
+    unsafe {
+        env::set_var("USERPROFILE", "C:/Users/testuser");
+    }
+    let result_cmd =
+        shell_command_references_sensitive_path("type %USERPROFILE%/.ssh/id_rsa", &patterns);
+    let result_ps = shell_command_references_sensitive_path(
+        "Get-Content $env:USERPROFILE/.ssh/id_rsa",
+        &patterns,
+    );
+    unsafe {
+        match previous {
+            Some(v) => env::set_var("USERPROFILE", v),
+            None => env::remove_var("USERPROFILE"),
+        }
+    }
+    assert!(
+        result_cmd.is_some(),
+        "%USERPROFILE% prefix should be expanded and .ssh/id_rsa detected"
+    );
+    assert!(
+        result_ps.is_some(),
+        "$env:USERPROFILE prefix should be expanded and .ssh/id_rsa detected"
+    );
+}
+
+#[test]
+fn sensitive_path_matcher_expands_windows_appdata() {
+    // The pattern "sqzapptest" is a single path segment that appears inside
+    // the APPDATA value we configure but NEVER in the literal command token
+    // "%APPDATA%/.aws/credentials". After expansion the token becomes
+    // "C:/Users/sqzapptest/AppData/Roaming/.aws/credentials", and
+    // token_contains_sensitive_base will find the "sqzapptest" segment.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let custom_patterns = vec!["sqzapptest".to_string()];
+    let previous = env::var_os("APPDATA");
+    unsafe {
+        env::set_var("APPDATA", "C:/Users/sqzapptest/AppData/Roaming");
+    }
+    let result = shell_command_references_sensitive_path(
+        "type %APPDATA%/.aws/credentials",
+        &custom_patterns,
+    );
+    unsafe {
+        match previous {
+            Some(v) => env::set_var("APPDATA", v),
+            None => env::remove_var("APPDATA"),
+        }
+    }
+    assert!(
+        result.is_some(),
+        "%APPDATA% expansion should expose the sqzapptest segment"
+    );
 }
