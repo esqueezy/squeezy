@@ -166,22 +166,12 @@ fn session_paths_check_warns_on_relative_xdg_state_home() {
             ..AppConfig::default()
         };
         let checks = session_paths_checks(&config);
-        #[cfg(not(target_os = "windows"))]
-        {
-            let xdg = checks
-                .iter()
-                .find(|check| check.name == "session_xdg_state_home")
-                .expect("XDG warning");
-            assert_eq!(xdg.status, Status::Warn);
-            assert!(xdg.detail.contains("not absolute"), "{xdg:?}");
-        }
-        #[cfg(target_os = "windows")]
-        assert!(
-            checks
-                .iter()
-                .all(|check| check.name != "session_xdg_state_home"),
-            "XDG_STATE_HOME is ignored on Windows: {checks:?}"
-        );
+        let xdg = checks
+            .iter()
+            .find(|check| check.name == "session_xdg_state_home")
+            .expect("XDG warning");
+        assert_eq!(xdg.status, Status::Warn);
+        assert!(xdg.detail.contains("not absolute"), "{xdg:?}");
         let paths = checks
             .iter()
             .find(|check| check.name == "session_paths")
