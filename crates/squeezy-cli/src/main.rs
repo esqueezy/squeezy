@@ -965,10 +965,14 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             println!("wrote {}", path.display());
             // On Windows, print a one-line PowerShell command for opening the
             // settings file so users don't have to navigate to %APPDATA%
-            // manually.
+            // manually. Use a single-quoted PowerShell literal so `$`, `` ` ``,
+            // and `"` in the path are not reinterpreted; doubling embedded
+            // single quotes is the documented PowerShell escape for a
+            // single-quoted literal string.
             #[cfg(target_os = "windows")]
             if scope.user {
-                println!("  Open: Invoke-Item \"{}\"", path.display());
+                let powershell_literal = path.display().to_string().replace('\'', "''");
+                println!("  Open (PowerShell): Invoke-Item '{}'", powershell_literal);
             }
             if *with_bundled_skills {
                 // scope.user is already verified above.
@@ -2163,11 +2167,37 @@ fn cross_project_resume_prompt(session_cwd: &str, current_cwd: &str) -> Option<S
 /// 1. Strip Windows verbatim (`\\?\`) and UNC (`\\server\share` →
 ///    `//server/share`) prefixes.
 /// 2. Fold backslashes to forward slashes.
-/// 3. Lower-case the drive letter on Windows (`C:/` → `c:/`).
-/// 4. Strip a trailing separator.
+/// 3. Fold the drive letter to lowercase (`C:/` → `c:/`).
+/// 4. On Windows targets, fold the entire string to lowercase so that
+///    directory-component case differences (e.g. `C:\Repo\Sub` vs
+///    `C:\repo\sub`) also compare equal — NTFS is case-insensitive by
+///    default. On non-Windows targets the rest of the string is left
+///    alone because POSIX paths are case-sensitive.
+/// 5. Strip a trailing separator.
 ///
-/// The function is intentionally cheap and allocation-based: it runs
-/// at most once per resume check, never on hot paths.
+/// Transformations 1–3 run unconditionally on every platform. The shapes
+/// they normalize away (verbatim/UNC prefixes, backslashes, drive
+/// letters) are essentially never produced by POSIX tools, so applying
+/// them on Linux/macOS is harmless and keeps the cross-platform unit
+/// tests below honest — a regression in Windows behavior surfaces on
+/// the much faster macOS/Linux dev-loop CI rather than only in the
+/// 15-minute Windows job.
+///
+/// Intentionally not covered (silent partial fix):
+///
+/// - DOS device paths such as `\\.\C:\…` and `\\?\GLOBALROOT\…` are
+///   left as-is. These almost never appear in cwd display strings.
+/// - Junction-target resolution, short (8.3) vs long-path
+///   canonicalization, and substituted-drive resolution. These would
+///   require real I/O (`GetFinalPathNameByHandle` and friends); this
+///   helper is intentionally pure so it stays cheap and unit-testable.
+///
+/// The function is cheap and allocation-based. It is called once per
+/// `cross_project_resume_prompt` invocation, and in
+/// `resolve_resume_session`'s `Continue` arm once per candidate session
+/// in the list (plus once for the query cwd). For typical workspaces
+/// (a few dozen resumable sessions) this is comfortably below any hot
+/// path threshold.
 fn normalize_cwd_for_compare(value: &str) -> String {
     let mut s = value.to_string();
 
@@ -2179,17 +2209,30 @@ fn normalize_cwd_for_compare(value: &str) -> String {
     // Normalize backslashes to forward slashes for uniform comparison.
     s = s.replace('\\', "/");
 
-    // After stripping verbatim prefix, \\?\UNC\server\share becomes UNC/server/share.
-    // Re-normalise to the bare UNC form //server/share so it compares equal to
-    // \\server\share (which becomes //server/share directly).
-    if let Some(rest) = s.strip_prefix("UNC/") {
-        s = format!("//{rest}");
+    // After stripping verbatim prefix, \\?\UNC\server\share becomes
+    // UNC/server/share. Re-normalise to the bare UNC form
+    // //server/share so it compares equal to \\server\share (which
+    // becomes //server/share directly). Match the "UNC" segment
+    // case-insensitively because Windows accepts `\\?\unc\…` and
+    // `\\?\UNC\…` as the same prefix.
+    if s.len() >= 4 && s.as_bytes()[..4].eq_ignore_ascii_case(b"UNC/") {
+        s = format!("//{}", &s[4..]);
     }
 
     // Fold drive-letter to lowercase: "C:/" → "c:/"
     if s.len() >= 2 && s.as_bytes()[1] == b':' {
         let drive = s.as_bytes()[0].to_ascii_lowercase() as char;
         s = format!("{drive}{}", &s[1..]);
+    }
+
+    // On Windows, fold the entire path to lowercase so directory case
+    // differences do not falsely trigger the cross-project prompt.
+    // Gated to `cfg!(target_os = "windows")` because POSIX paths are
+    // case-sensitive (`/home/User` and `/home/user` may name different
+    // directories).
+    #[cfg(target_os = "windows")]
+    {
+        s = s.to_ascii_lowercase();
     }
 
     // Strip trailing separator.
@@ -2239,6 +2282,15 @@ where
 /// `current_cwd` through `std::env::current_dir()` (falling back to
 /// `"."` if the process has no working directory — same fallback
 /// `SessionMetadata::new` uses when recording the original cwd).
+///
+/// Note: this surface and `resolve_resume_session` source the "current
+/// cwd" string from different places — `env::current_dir()` here vs
+/// `config.workspace_root.display()` over there. On Windows those can
+/// differ in display form (verbatim prefix, drive-letter case, slash
+/// direction). Both flows funnel the strings through
+/// [`normalize_cwd_for_compare`] before comparison, so the drift is
+/// absorbed; do not "tidy" one of them to match the other without
+/// preserving the normalization.
 fn confirm_cross_project_resume_stdio(
     store: &SessionStore,
     session_id: &str,

@@ -1442,3 +1442,54 @@ fn resolve_resume_session_continue_matches_with_drive_case() {
         "drive-letter case must not prevent --continue from finding the session"
     );
 }
+
+#[test]
+fn normalize_cwd_strips_verbatim_unc_prefix_case_insensitive() {
+    // \\?\unc\… (lowercase `unc`) must normalize the same as
+    // \\?\UNC\… because Windows treats the literal verbatim-UNC marker
+    // case-insensitively.
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\unc\server\share\dir"),
+        normalize_cwd_for_compare(r"\\server\share\dir"),
+    );
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\Unc\server\share\dir"),
+        normalize_cwd_for_compare(r"\\?\UNC\server\share\dir"),
+    );
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_verbatim_unc_lowercase() {
+    assert!(
+        cross_project_resume_prompt(r"\\?\unc\server\share\dir", r"\\server\share\dir").is_none()
+    );
+}
+
+// On Windows the directory-component case fold also runs, so a session
+// recorded against `C:\Projects\Repo\sub` resumes cleanly from a shell
+// whose cwd is `C:\projects\repo\sub`. Gated behind cfg because POSIX
+// targets must not lowercase path components.
+#[cfg(target_os = "windows")]
+#[test]
+fn cross_project_resume_prompt_skips_for_windows_directory_case() {
+    assert!(
+        cross_project_resume_prompt(r"C:\Projects\Repo\sub", r"C:\projects\repo\sub").is_none()
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn resolve_resume_session_continue_matches_with_directory_case() {
+    let meta = SessionMetadata {
+        session_id: "win-dir-case".to_string(),
+        cwd: r"C:\Projects\Repo".to_string(),
+        resume_available: true,
+        ..SessionMetadata::default()
+    };
+    let result = resolve_resume_session(ResumeFlag::Continue, &[meta], r"c:\projects\repo");
+    assert_eq!(
+        result.session_id.as_deref(),
+        Some("win-dir-case"),
+        "directory-component case must not prevent --continue from finding the session"
+    );
+}

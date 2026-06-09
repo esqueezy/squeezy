@@ -243,7 +243,7 @@ pub fn banner_for_startup(status: &UpdateStatus) -> Option<String> {
 /// fastest path for users who installed via winget; the manual zip is listed as
 /// the alternative for direct installs. Non-Windows users get the Cargo and
 /// POSIX one-liner that were shown previously.
-pub(crate) fn upgrade_hint(latest: &str) -> String {
+fn upgrade_hint(latest: &str) -> String {
     if cfg!(target_os = "windows") {
         format!(
             "winget upgrade esqueezy.Squeezy  \
