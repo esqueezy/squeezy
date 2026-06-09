@@ -42,6 +42,20 @@ pub(crate) enum Action {
     /// Copy the last assistant response to the system clipboard
     /// (`Ctrl+Y` default).
     CopyLastAssistant,
+    /// Copy the current/focused transcript entry to the clipboard
+    /// (`Alt+c` default).
+    CopyFocusedEntry,
+    /// Copy the current/nearest tool output to the clipboard
+    /// (`Alt+o` default).
+    CopyCurrentToolOutput,
+    /// Copy the fenced code block under the cursor to the clipboard
+    /// (`Alt+k` default).
+    CopyCodeBlock,
+    /// Copy the rows visible in the main viewport to the clipboard
+    /// (`Alt+v` default).
+    CopyViewport,
+    /// Copy the entire transcript to the clipboard (`Alt+a` default).
+    CopyFullTranscript,
     /// Restore the most recently cancelled prompt back into the
     /// composer (`Ctrl+R` default).
     RestoreCancelledPrompt,
@@ -82,6 +96,11 @@ impl Action {
             Self::ToggleTranscriptOverlay => "transcript_overlay",
             Self::ToggleTaskPanel => "toggle_task_panel",
             Self::CopyLastAssistant => "copy_last_assistant",
+            Self::CopyFocusedEntry => "copy_focused_entry",
+            Self::CopyCurrentToolOutput => "copy_tool_output",
+            Self::CopyCodeBlock => "copy_code_block",
+            Self::CopyViewport => "copy_viewport",
+            Self::CopyFullTranscript => "copy_full_transcript",
             Self::RestoreCancelledPrompt => "restore_cancelled_prompt",
             Self::ScrollTranscriptPageUp => "page_up",
             Self::ScrollTranscriptPageDown => "page_down",
@@ -103,6 +122,11 @@ impl Action {
         Action::ToggleTranscriptOverlay,
         Action::ToggleTaskPanel,
         Action::CopyLastAssistant,
+        Action::CopyFocusedEntry,
+        Action::CopyCurrentToolOutput,
+        Action::CopyCodeBlock,
+        Action::CopyViewport,
+        Action::CopyFullTranscript,
         Action::RestoreCancelledPrompt,
         Action::ScrollTranscriptPageUp,
         Action::ScrollTranscriptPageDown,
@@ -133,6 +157,14 @@ impl Action {
             }
             Self::ToggleTaskPanel => KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             Self::CopyLastAssistant => KeyBinding::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            // Semantic-copy chords use `Alt`+letter to avoid the terminal
+            // flow-control / host collisions of bare `Ctrl`-letters (see the
+            // jump-navigation note below); the letters c/o/k/v/a are free.
+            Self::CopyFocusedEntry => KeyBinding::new(KeyCode::Char('c'), KeyModifiers::ALT),
+            Self::CopyCurrentToolOutput => KeyBinding::new(KeyCode::Char('o'), KeyModifiers::ALT),
+            Self::CopyCodeBlock => KeyBinding::new(KeyCode::Char('k'), KeyModifiers::ALT),
+            Self::CopyViewport => KeyBinding::new(KeyCode::Char('v'), KeyModifiers::ALT),
+            Self::CopyFullTranscript => KeyBinding::new(KeyCode::Char('a'), KeyModifiers::ALT),
             Self::RestoreCancelledPrompt => {
                 KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
             }
@@ -221,6 +253,12 @@ impl KeymapResolver {
         }
         let mut unknown_actions = Vec::new();
         let mut invalid_bindings = Vec::new();
+        // Actions the user explicitly rebound. These win the reverse-lookup
+        // collision over default-bound actions: an explicit `Alt+k = page_up`
+        // override must take effect even if some *default*-bound action also
+        // sits on `Alt+k` (otherwise a freshly-added default could silently
+        // shadow the user's deliberate choice).
+        let mut overridden: std::collections::BTreeSet<Action> = std::collections::BTreeSet::new();
         for (slug, spec) in overrides {
             let Some(action) = Action::from_slug(slug) else {
                 unknown_actions.push((slug.clone(), spec.clone()));
@@ -229,19 +267,26 @@ impl KeymapResolver {
             match parse_keyspec(spec) {
                 Some(binding) => {
                     bindings.insert(action, binding);
+                    overridden.insert(action);
                 }
                 None => {
                     invalid_bindings.push((slug.clone(), spec.clone(), action.slug().to_string()));
                 }
             }
         }
-        // Build the reverse lookup. If two actions land on the same
-        // binding the alphabetically-earlier action wins so `/keymap`
-        // and `lookup` agree on a deterministic pick; the loser keeps
-        // its binding visible so `/keymap` can flag the collision.
-        // Action's BTreeMap iteration is sorted, so the first insert
-        // is the alphabetically-earliest.
+        // Build the reverse lookup. Overridden actions are inserted first so an
+        // explicit user rebind beats a colliding default; within each tier the
+        // alphabetically-earlier action wins so `/keymap` and `lookup` agree on
+        // a deterministic pick. The loser keeps its binding visible so
+        // `/keymap` can flag the collision. `bindings` (a BTreeMap) iterates in
+        // sorted action order, so the first insert per tier is the
+        // alphabetically-earliest.
         let mut by_key: HashMap<KeyBinding, Action> = HashMap::new();
+        for (action, binding) in &bindings {
+            if overridden.contains(action) {
+                by_key.entry(*binding).or_insert(*action);
+            }
+        }
         for (action, binding) in &bindings {
             by_key.entry(*binding).or_insert(*action);
         }

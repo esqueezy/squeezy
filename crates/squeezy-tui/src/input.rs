@@ -341,6 +341,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         &[PermissionCapability::Edit],
     ),
     slash("/keymap", "list current key bindings"),
+    slash_args_caps(
+        "/export",
+        "export the transcript to a file (md/txt/json)",
+        true,
+        "<md|txt|json> [path]",
+        &[PermissionCapability::Edit],
+    ),
 ];
 
 impl SlashCommand {

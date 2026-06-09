@@ -1,0 +1,582 @@
+use super::*;
+use std::collections::HashMap;
+use std::ffi::OsString;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build an env-getter closure backed by a fixture map, mirroring the
+/// DEC-2026 detection tests.
+fn env_map(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+    let map: HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    move |key: &str| map.get(key).map(OsString::from)
+}
+
+/// Decode the bytes a single OSC 52 `write_terminal` call carries back to the
+/// raw base64 payload (strip `ESC ] 52 ; c ;` prefix and `BEL`/`ST` suffix).
+fn osc52_b64_from_terminal_calls(calls: &[SinkCall]) -> String {
+    let mut acc = Vec::new();
+    for call in calls {
+        if let SinkCall::Terminal { bytes } = call {
+            acc.extend_from_slice(bytes);
+        }
+    }
+    let s = String::from_utf8(acc).expect("OSC52 bytes are ascii");
+    // Strip the single-shot form: ESC ] 52 ; c ; <b64> BEL
+    let s = s
+        .strip_prefix("\x1b]52;c;")
+        .map(|rest| rest.trim_end_matches('\x07').to_string())
+        .unwrap_or(s);
+    // Strip chunked terminator if present.
+    s.trim_end_matches("\x1b\\").to_string()
+}
+
+const PLATFORM_OK: SinkScript = SinkScript {
+    terminal_error: None,
+    command_outcome: CommandScript::Success,
+    temp_file_error: None,
+    temp_dir: PathBuf::new(), // replaced below where needed
+};
+
+fn osc52_provider_list(extra: &[PlatformCommand]) -> Vec<ClipboardProvider> {
+    let mut v = vec![ClipboardProvider::Osc52];
+    for cmd in extra {
+        v.push(ClipboardProvider::PlatformCommand(*cmd));
+    }
+    v.push(ClipboardProvider::TempFile);
+    v
+}
+
+const PBCOPY: PlatformCommand = PlatformCommand {
+    program: "pbcopy",
+    args: &[],
+};
+
+// ---------------------------------------------------------------------------
+// 1. OSC 52 selected under the limit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn osc52_selected_under_limit_single_write_exact_bytes() {
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+
+    let req = CopyRequest::new("hello", "assistant message");
+    let outcome = chain.copy(&req);
+
+    assert_eq!(
+        outcome,
+        CopyOutcome::Copied {
+            provider: ClipboardProviderKind::Osc52,
+            lines: 1,
+            bytes: 5,
+        }
+    );
+
+    let recorded = calls.lock().unwrap().clone();
+    // Exactly one terminal write, no command spawn, no temp file.
+    assert_eq!(recorded.len(), 1, "expected exactly one sink call");
+    match &recorded[0] {
+        SinkCall::Terminal { bytes } => {
+            let expected = format!("\x1b]52;c;{}\x07", crate::base64_encode(b"hello"));
+            assert_eq!(bytes, expected.as_bytes());
+            // And the base64 round-trips.
+            assert_eq!(
+                osc52_b64_from_terminal_calls(&recorded),
+                crate::base64_encode(b"hello")
+            );
+        }
+        other => panic!("expected Terminal call, got {other:?}"),
+    }
+}
+
+#[test]
+fn osc52_payload_exactly_at_limit_still_single_write() {
+    // Choose a payload whose base64 length equals the cap precisely.
+    let cap = 8usize; // base64 of 6 bytes -> 8 chars
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    chain.set_osc52_max_bytes(cap);
+
+    let req = CopyRequest::new("abcdef", "x"); // 6 bytes -> 8 b64 chars == cap
+    let outcome = chain.copy(&req);
+    assert!(matches!(
+        outcome,
+        CopyOutcome::Copied {
+            provider: ClipboardProviderKind::Osc52,
+            ..
+        }
+    ));
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Chunking over the limit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn osc52_chunks_over_limit_and_roundtrips() {
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    chain.set_osc52_max_bytes(4).set_osc52_chunk(true);
+
+    let payload = "the quick brown fox jumps"; // b64 well over 4 chars
+    let expected_b64 = crate::base64_encode(payload.as_bytes());
+    let req = CopyRequest::new(payload, "x");
+    let outcome = chain.copy(&req);
+
+    assert!(matches!(
+        outcome,
+        CopyOutcome::Copied {
+            provider: ClipboardProviderKind::Osc52,
+            ..
+        }
+    ));
+
+    let recorded = calls.lock().unwrap().clone();
+    // More than one terminal write (chunked), no platform command.
+    assert!(
+        recorded.len() > 1,
+        "expected multiple chunked writes, got {}",
+        recorded.len()
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|c| matches!(c, SinkCall::Terminal { .. })),
+        "chunked OSC52 must not spawn a command"
+    );
+
+    // First chunk carries the prefix; last chunk carries the ST terminator.
+    if let SinkCall::Terminal { bytes } = &recorded[0] {
+        assert!(
+            bytes.starts_with(b"\x1b]52;c;"),
+            "first chunk must carry prefix"
+        );
+    }
+    if let SinkCall::Terminal { bytes } = recorded.last().unwrap() {
+        assert!(
+            bytes.ends_with(b"\x1b\\"),
+            "last chunk must carry ST terminator"
+        );
+    }
+
+    // Reassembled base64 round-trips to the encoder output.
+    assert_eq!(osc52_b64_from_terminal_calls(&recorded), expected_b64);
+}
+
+#[test]
+fn osc52_over_limit_without_chunking_falls_through_to_platform() {
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    chain.set_osc52_max_bytes(4); // chunking off (default)
+
+    let req = CopyRequest::new("a much longer payload than four base64 chars", "x");
+    let outcome = chain.copy(&req);
+
+    assert!(
+        matches!(
+            outcome,
+            CopyOutcome::Copied {
+                provider: ClipboardProviderKind::Platform("pbcopy"),
+                ..
+            }
+        ),
+        "expected platform fallback, got {outcome:?}"
+    );
+
+    let recorded = calls.lock().unwrap().clone();
+    // No terminal write was attempted (OSC52 refused up front), one command.
+    assert!(
+        !recorded
+            .iter()
+            .any(|c| matches!(c, SinkCall::Terminal { .. })),
+        "over-limit OSC52 without chunking must not write to terminal"
+    );
+    match recorded
+        .iter()
+        .find(|c| matches!(c, SinkCall::Command { .. }))
+    {
+        Some(SinkCall::Command {
+            program, payload, ..
+        }) => {
+            assert_eq!(program, "pbcopy");
+            assert_eq!(payload, b"a much longer payload than four base64 chars");
+        }
+        _ => panic!("expected a Command call, got {recorded:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Platform fallback when OSC 52 is unsupported
+// ---------------------------------------------------------------------------
+
+#[test]
+fn platform_selected_when_osc52_absent_from_chain() {
+    // Capability probe says no OSC52 -> default_chain omits it.
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    let caps = ClipboardCapabilities { osc52: false };
+    let mut chain = ClipboardChain::default_chain(sink, caps, vec![PBCOPY]);
+
+    let req = CopyRequest::new("clipboard please", "transcript");
+    let outcome = chain.copy(&req);
+
+    assert!(matches!(
+        outcome,
+        CopyOutcome::Copied {
+            provider: ClipboardProviderKind::Platform("pbcopy"),
+            ..
+        }
+    ));
+
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        !recorded
+            .iter()
+            .any(|c| matches!(c, SinkCall::Terminal { .. })),
+        "OSC52 must not be attempted when the chain omits it"
+    );
+    assert_eq!(recorded.len(), 1, "exactly the platform command runs");
+}
+
+#[test]
+fn platform_candidates_tried_in_order_until_one_succeeds() {
+    // First candidate spawn-fails, second succeeds. Drive this with two
+    // explicit providers and a script where the command "succeeds" — to test
+    // ordering we instead use a spawn error on the whole sink and a temp-file
+    // success, asserting both commands were tried.
+    let script = SinkScript {
+        command_outcome: CommandScript::SpawnError("not found".to_string()),
+        temp_dir: PathBuf::from("/tmp/squeezy-test"),
+        ..Default::default()
+    };
+    let sink = RecordingSink::with_script(script);
+    let calls = sink.handle();
+    let cmd_a = PlatformCommand {
+        program: "xclip",
+        args: &["-selection", "clipboard"],
+    };
+    let cmd_b = PlatformCommand {
+        program: "xsel",
+        args: &["--clipboard", "--input"],
+    };
+    let providers = vec![
+        ClipboardProvider::PlatformCommand(cmd_a),
+        ClipboardProvider::PlatformCommand(cmd_b),
+        ClipboardProvider::TempFile,
+    ];
+    let mut chain = ClipboardChain::with_providers(sink, providers);
+
+    let req = CopyRequest::new("x", "y");
+    let outcome = chain.copy(&req);
+
+    // Both spawn-fail -> temp-file fallback.
+    assert!(matches!(outcome, CopyOutcome::WroteTempFile { .. }));
+
+    let recorded = calls.lock().unwrap().clone();
+    let programs: Vec<_> = recorded
+        .iter()
+        .filter_map(|c| match c {
+            SinkCall::Command { program, .. } => Some(program.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(programs, vec!["xclip".to_string(), "xsel".to_string()]);
+}
+
+#[test]
+fn platform_nonzero_exit_falls_through_with_stderr_in_reason() {
+    let script = SinkScript {
+        command_outcome: CommandScript::Exit {
+            code: 1,
+            stderr: "no display".to_string(),
+        },
+        temp_file_error: Some("disk full".to_string()),
+        ..Default::default()
+    };
+    let sink = RecordingSink::with_script(script);
+    let mut chain = ClipboardChain::with_providers(
+        sink,
+        vec![
+            ClipboardProvider::PlatformCommand(PBCOPY),
+            ClipboardProvider::TempFile,
+        ],
+    );
+
+    let req = CopyRequest::new("x", "y");
+    let outcome = chain.copy(&req);
+
+    match outcome {
+        CopyOutcome::Failed { reason } => {
+            // The last provider tried was temp-file, so its reason wins.
+            assert!(reason.contains("disk full"), "reason was: {reason}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Temp-file fallback when OSC 52 and platform both fail
+// ---------------------------------------------------------------------------
+
+#[test]
+fn temp_file_fallback_when_osc52_and_platform_fail() {
+    let script = SinkScript {
+        command_outcome: CommandScript::SpawnError("missing binary".to_string()),
+        temp_dir: PathBuf::from("/tmp/squeezy-test"),
+        ..Default::default()
+    };
+    let sink = RecordingSink::with_script(script);
+    let calls = sink.handle();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    chain.set_osc52_max_bytes(2); // force OSC52 to refuse (no chunk)
+
+    let req = CopyRequest::new("payload", "assistant message");
+    let outcome = chain.copy(&req);
+
+    match outcome {
+        CopyOutcome::WroteTempFile { path, bytes } => {
+            assert_eq!(bytes, 7);
+            // Path roots at the scripted temp dir with the sanitized label.
+            assert!(path.starts_with("/tmp/squeezy-test"), "path was {path:?}");
+            assert!(
+                path.to_string_lossy().ends_with("assistant-message.txt"),
+                "path was {path:?}"
+            );
+        }
+        other => panic!("expected WroteTempFile, got {other:?}"),
+    }
+
+    let recorded = calls.lock().unwrap().clone();
+    // OSC52 refused up front (no terminal write); command spawn-failed; then
+    // temp-file. The temp-file payload must be the raw bytes.
+    assert!(matches!(
+        recorded.last().unwrap(),
+        SinkCall::TempFile { .. }
+    ));
+    if let SinkCall::TempFile { payload, .. } = recorded.last().unwrap() {
+        assert_eq!(payload, b"payload");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Failure status when everything fails
+// ---------------------------------------------------------------------------
+
+#[test]
+fn all_providers_fail_yields_failed_with_last_reason() {
+    let script = SinkScript {
+        terminal_error: Some("tty gone".to_string()),
+        command_outcome: CommandScript::SpawnError("nope".to_string()),
+        temp_file_error: Some("read-only fs".to_string()),
+        ..Default::default()
+    };
+    let sink = RecordingSink::with_script(script);
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+
+    let req = CopyRequest::new("x", "y");
+    let outcome = chain.copy(&req);
+
+    match outcome {
+        CopyOutcome::Failed { reason } => {
+            assert!(reason.contains("read-only fs"), "reason was: {reason}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    // status/toast reflect the failure.
+    assert!(
+        chain
+            .copy(&req)
+            .status_message()
+            .starts_with("copy failed:")
+    );
+    let (_, variant) = chain.copy(&req).toast();
+    assert_eq!(variant, ToastVariant::Error);
+}
+
+// ---------------------------------------------------------------------------
+// Confirmation gate (privacy control)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn confirm_threshold_exceeded_without_confirmation_attempts_no_provider() {
+    let sink = RecordingSink::new();
+    let calls = sink.handle();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    chain.set_confirm_threshold(Some(3));
+
+    let req = CopyRequest::new("123456", "secret"); // 6 bytes > 3, unconfirmed
+    let outcome = chain.copy(&req);
+
+    assert_eq!(outcome, CopyOutcome::NeedsConfirmation { bytes: 6 });
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "no sink calls allowed before confirmation"
+    );
+}
+
+#[test]
+fn confirm_threshold_satisfied_when_confirmed() {
+    let sink = RecordingSink::new();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    chain.set_confirm_threshold(Some(3));
+
+    let mut req = CopyRequest::new("123456", "secret");
+    req.confirmed = true;
+    let outcome = chain.copy(&req);
+    assert!(matches!(
+        outcome,
+        CopyOutcome::Copied {
+            provider: ClipboardProviderKind::Osc52,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn confirm_threshold_not_exceeded_proceeds_without_confirmation() {
+    let sink = RecordingSink::new();
+    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
+    chain.set_confirm_threshold(Some(100));
+
+    let req = CopyRequest::new("small", "x"); // 5 bytes < 100
+    let outcome = chain.copy(&req);
+    assert!(matches!(outcome, CopyOutcome::Copied { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// status_message / toast mapping for each outcome
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_and_toast_mapping_for_each_outcome() {
+    let copied = CopyOutcome::Copied {
+        provider: ClipboardProviderKind::Osc52,
+        lines: 3,
+        bytes: 10,
+    };
+    assert_eq!(copied.status_message(), "copied 3 lines");
+    assert_eq!(copied.toast().1, ToastVariant::Success);
+
+    let copied_one = CopyOutcome::Copied {
+        provider: ClipboardProviderKind::Platform("pbcopy"),
+        lines: 1,
+        bytes: 4,
+    };
+    assert_eq!(copied_one.status_message(), "copied 1 line");
+
+    let temp = CopyOutcome::WroteTempFile {
+        path: PathBuf::from("/tmp/squeezy-copy-x.txt"),
+        bytes: 9,
+    };
+    assert_eq!(temp.status_message(), "wrote /tmp/squeezy-copy-x.txt");
+    assert_eq!(temp.toast().1, ToastVariant::Warning);
+
+    let needs = CopyOutcome::NeedsConfirmation { bytes: 42 };
+    assert_eq!(needs.toast().1, ToastVariant::Info);
+
+    let failed = CopyOutcome::Failed {
+        reason: "boom".to_string(),
+    };
+    assert_eq!(failed.status_message(), "copy failed: boom");
+    assert_eq!(failed.toast().1, ToastVariant::Error);
+}
+
+// ---------------------------------------------------------------------------
+// Capability probe truth table (parity with DEC-2026 detection tests)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capability_probe_detects_known_osc52_terminals() {
+    for (k, v) in [
+        ("KITTY_WINDOW_ID", "1"),
+        ("WEZTERM_PANE", "0"),
+        ("GHOSTTY_RESOURCES_DIR", "/x"),
+        ("ITERM_SESSION_ID", "w0t0p0"),
+        ("TMUX", "/tmp/tmux-1000/default,123,0"),
+    ] {
+        let caps = detect_clipboard_capabilities_from_env(env_map(&[(k, v)]));
+        assert!(caps.osc52, "expected osc52=true for {k}");
+    }
+}
+
+#[test]
+fn capability_probe_detects_term_program_and_term() {
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[("TERM_PROGRAM", "iTerm.app")]));
+    assert!(caps.osc52);
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[("TERM_PROGRAM", "vscode")]));
+    assert!(caps.osc52);
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[("TERM", "xterm-kitty")]));
+    assert!(caps.osc52);
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[("TERM", "screen-256color")]));
+    assert!(caps.osc52);
+}
+
+#[test]
+fn capability_probe_false_for_unknown_terminal() {
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[("TERM", "dumb")]));
+    assert!(!caps.osc52);
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[]));
+    assert!(!caps.osc52);
+}
+
+// ---------------------------------------------------------------------------
+// Platform command selection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn platform_commands_are_nonempty_and_consult_env_on_linux() {
+    // macOS/Windows ignore env; Linux consults WAYLAND_DISPLAY. In all cases
+    // the candidate list is non-empty so the chain always has something to
+    // try before temp-file.
+    let with_wayland = platform_commands(env_map(&[("WAYLAND_DISPLAY", "wayland-0")]));
+    assert!(!with_wayland.is_empty());
+    let without = platform_commands(env_map(&[]));
+    assert!(!without.is_empty());
+
+    #[cfg(target_os = "macos")]
+    assert_eq!(without[0].program, "pbcopy");
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Wayland present -> wl-copy is preferred (first).
+        assert_eq!(with_wayland[0].program, "wl-copy");
+        // Without it, X11 helpers lead.
+        assert_eq!(without[0].program, "xclip");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// default_chain ordering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_chain_orders_osc52_then_platform_then_tempfile() {
+    let sink = RecordingSink::new();
+    let chain =
+        ClipboardChain::default_chain(sink, ClipboardCapabilities { osc52: true }, vec![PBCOPY]);
+    assert_eq!(
+        chain.providers,
+        vec![
+            ClipboardProvider::Osc52,
+            ClipboardProvider::PlatformCommand(PBCOPY),
+            ClipboardProvider::TempFile,
+        ]
+    );
+}
+
+// Touch PLATFORM_OK so the constant isn't flagged unused on some toolchains.
+#[test]
+fn platform_ok_script_is_well_formed() {
+    let s = PLATFORM_OK.clone();
+    assert!(s.terminal_error.is_none());
+}

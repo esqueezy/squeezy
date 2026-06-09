@@ -69,9 +69,11 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthStr;
 
 mod approval;
+mod clipboard;
 mod commands;
 mod commands_style;
 mod config_screen;
+mod copy;
 mod events;
 mod fuzzy;
 mod history;
@@ -3342,8 +3344,37 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
-            copy_last_assistant_to_clipboard(app);
-            true
+            copy_transcript_scope(app, copy::CopyScope::LastAssistant, app.copy_format)
+        }
+        keymap::Action::CopyFocusedEntry => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_transcript_scope(app, copy::CopyScope::FocusedEntry, app.copy_format)
+        }
+        keymap::Action::CopyCurrentToolOutput => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_transcript_scope(app, copy::CopyScope::CurrentToolOutput, app.copy_format)
+        }
+        keymap::Action::CopyCodeBlock => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_transcript_scope(app, copy::CopyScope::CodeBlockUnderCursor, app.copy_format)
+        }
+        keymap::Action::CopyViewport => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_transcript_scope(app, copy::CopyScope::Viewport, app.copy_format)
+        }
+        keymap::Action::CopyFullTranscript => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_transcript_scope(app, copy::CopyScope::FullTranscript, app.copy_format)
         }
         keymap::Action::RestoreCancelledPrompt => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
@@ -3904,6 +3935,27 @@ async fn handle_slash_command_on_surface(
     input: &str,
     surface: SlashSurface,
 ) -> bool {
+    // `/export` is a TUI-local command (it reuses the in-memory transcript row
+    // model + copy formatters), so it is handled here before the agent-owned
+    // `DispatchCommand` parser, which does not know it.
+    let raw_head = input.split_whitespace().next().unwrap_or_default();
+    if raw_head == "/export" {
+        let rest = input
+            .strip_prefix(raw_head)
+            .map(str::trim)
+            .unwrap_or_default();
+        record_slash_command_telemetry(
+            agent,
+            "/export",
+            surface,
+            SlashOutcome::Accepted,
+            SlashAliasKind::Canonical,
+            slash_arg_shape_from_rest(input),
+        );
+        handle_export_command(app, agent, rest);
+        return true;
+    }
+
     let cmd = match DispatchCommand::parse(input) {
         Ok(cmd) => cmd,
         // Unknown heads fall through to the user-authored prompt
@@ -5579,29 +5631,273 @@ fn sanitize_inline(text: &str) -> String {
     text.replace(['\n', '\r'], " ")
 }
 
-fn copy_last_assistant_to_clipboard(app: &mut TuiApp) {
-    let Some(text) = last_assistant_clipboard_text(app) else {
-        app.status = "nothing to copy yet".to_string();
-        return;
+/// Build the production clipboard provider chain from env-probed
+/// capabilities. OSC 52 (when believed honoured) → platform command → durable
+/// temp-file fallback. Used by the semantic copy/export path.
+fn build_clipboard_chain() -> clipboard::ClipboardChain<clipboard::RealSink> {
+    let env_get = |key: &str| std::env::var_os(key);
+    let caps = clipboard::detect_clipboard_capabilities_from_env(env_get);
+    let platform = clipboard::platform_commands(env_get);
+    clipboard::ClipboardChain::default_chain(clipboard::RealSink, caps, platform)
+}
+
+/// Pre-build path for [`CopyScope::LastAssistant`]: when the assistant is still
+/// streaming, the live pending text is the freshest answer and has no committed
+/// entry/row yet. Matches the historical `last_assistant_clipboard_text`
+/// pending-stream check.
+fn pending_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
+    if active_subagent_record(app).is_none() && !app.pending_assistant.trim_is_empty() {
+        return Some(app.pending_assistant.text());
+    }
+    None
+}
+
+/// Set of `EntryId`s whose entry is an assistant `Message`. Resolved here (in
+/// `lib.rs`, where `Role` is in scope) so the row model stays role-agnostic;
+/// the `copy` scope resolvers take this as an `is_assistant` predicate.
+fn assistant_entry_ids(app: &TuiApp) -> std::collections::HashSet<u64> {
+    active_transcript_entries(app)
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) if item.role == Role::Assistant => Some(entry.id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Live main-viewport `RowId` range (inclusive) over a row list of
+/// `total_rows`, derived from the cached scrollbar geometry. Returns the whole
+/// list when no cache is present (content fits the viewport).
+fn main_viewport_row_range(
+    app: &TuiApp,
+    total_rows: usize,
+) -> Option<(transcript_surface::RowId, transcript_surface::RowId)> {
+    use transcript_surface::RowId;
+    if total_rows == 0 {
+        return None;
+    }
+    let last = total_rows - 1;
+    let Some(cache) = app.main_scrollbar_cache.get() else {
+        // Content fits: the whole list is visible.
+        return Some((RowId(0), RowId(last)));
     };
-    match app.clipboard.copy_text(&text) {
+    let viewport_h = cache.viewport_h as usize;
+    if viewport_h == 0 {
+        return Some((RowId(last), RowId(last)));
+    }
+    // The logical scroll state holds the destination `from_bottom`; the visible
+    // window is the `viewport_h`-tall slice anchored that far from the bottom.
+    let state = active_transcript_scroll(app);
+    let from_bottom = state.offset_from_bottom(total_rows, viewport_h);
+    let end = last.saturating_sub(from_bottom);
+    let start = end.saturating_sub(viewport_h.saturating_sub(1));
+    Some((RowId(start), RowId(end)))
+}
+
+/// The single semantic-copy entrypoint. Builds the transcript row model at the
+/// live painted width, resolves `scope` to a row subset, formats it in
+/// `format`, and sends the payload through the clipboard provider chain,
+/// reporting the outcome on the status line and as a toast.
+///
+/// Returns `true` when the action was handled (always — even a "nothing to
+/// copy" no-op is a handled keystroke).
+fn copy_transcript_scope(
+    app: &mut TuiApp,
+    scope: copy::CopyScope,
+    format: copy::CopyFormat,
+) -> bool {
+    // Pending-stream special case: the freshest assistant answer may not be a
+    // committed row yet. Copy it directly before building the row model.
+    if scope == copy::CopyScope::LastAssistant
+        && let Some(text) = pending_assistant_clipboard_text(app)
+    {
+        deliver_copy(app, &text, scope.label());
+        return true;
+    }
+
+    let Some(text) = build_scope_payload(app, scope, format) else {
+        let message = format!("nothing to copy for {}", scope.label());
+        app.status = message.clone();
+        app.toasts.push(message, toast::ToastVariant::Info);
+        return true;
+    };
+    deliver_copy(app, &text, scope.label());
+    true
+}
+
+/// Build (but do not deliver) the payload for `scope`/`format`. Split out so
+/// `/export` reuses the exact same scope resolution + formatting the clipboard
+/// copies use. `None` when the scope resolves to nothing.
+fn build_scope_payload(
+    app: &TuiApp,
+    scope: copy::CopyScope,
+    format: copy::CopyFormat,
+) -> Option<String> {
+    // Copy with full detail so a folded tool card yields its complete output,
+    // not the truncated preview — the user-intuitive behaviour, independent of
+    // what is painted.
+    let detail = transcript_surface::DetailPolicy::Expanded;
+    let width = main_text_width(app);
+    let rows = transcript_surface::build_transcript_rows(app, width, detail);
+
+    let assistant_ids = assistant_entry_ids(app);
+    let is_assistant = |id: transcript_surface::EntryId| assistant_ids.contains(&id.0);
+
+    let viewport = if scope == copy::CopyScope::Viewport {
+        main_viewport_row_range(app, rows.len())
+    } else {
+        None
+    };
+
+    copy::gather(
+        &rows,
+        app.copy_focus,
+        scope,
+        format,
+        &is_assistant,
+        viewport,
+    )
+}
+
+/// The width to rebuild the row model at for an off-frame copy/export: the last
+/// painted main text width, falling back to a sane default before the first
+/// frame.
+fn main_text_width(app: &TuiApp) -> u16 {
+    let width = app.main_text_width.get();
+    if width == 0 { 80 } else { width }
+}
+
+/// Send `text` to the clipboard and report the outcome on the status line + a
+/// toast. Used by every semantic copy.
+///
+/// The primary sink is the injectable [`TuiApp::clipboard`] (an
+/// [`Osc52Clipboard`] in production, a recording fake under test). When that
+/// sink rejects an *oversized* payload — past the OSC 52 8 KiB cap, the common
+/// failure for a full-transcript or large-viewport copy — we fall through to
+/// the richer [`clipboard::ClipboardChain`] (`clipboard.rs`), which can still
+/// land the copy via the host's platform command (`pbcopy`/`wl-copy`/…) or,
+/// failing that, a durable temp file. So small copies stay on the fast OSC 52
+/// path and large ones degrade gracefully instead of silently failing. Any
+/// other primary failure (e.g. the terminal clipboard genuinely unavailable)
+/// is reported as-is — the fallback chain only earns its keep for the cap case.
+fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
+    let chars = text.chars().count();
+    match app.clipboard.copy_text(text) {
         Ok(()) => {
-            app.status = format!("copied assistant message ({} chars)", text.chars().count());
+            app.status = format!("copied {label} ({chars} chars)");
+            app.toasts.push(
+                format!("copied {label} ({chars} chars)"),
+                toast::ToastVariant::Success,
+            );
         }
-        Err(error) => {
-            app.status = format!("copy failed: {error}");
+        Err(primary_err) => {
+            // Only an oversized payload (past the OSC 52 cap) benefits from the
+            // richer chain — that is where the platform command / temp file add
+            // value. For any other primary failure, report it directly.
+            if text.len() <= OSC52_MAX_PAYLOAD_BYTES {
+                app.status = format!("copy failed: {primary_err}");
+                app.toasts
+                    .push(app.status.clone(), toast::ToastVariant::Error);
+                return;
+            }
+            let request = clipboard::CopyRequest::new(text, label);
+            let outcome = app.clipboard_chain.copy(&request);
+            let (toast_msg, variant) = outcome.toast();
+            match &outcome {
+                clipboard::CopyOutcome::Copied { .. } => {
+                    app.status = format!("copied {label} ({chars} chars)");
+                }
+                clipboard::CopyOutcome::WroteTempFile { .. } => {
+                    app.status = toast_msg.clone();
+                }
+                _ => {
+                    // Even the fallback chain failed: surface the original
+                    // sink's reason, which is the most actionable.
+                    app.status = format!("copy failed: {primary_err}");
+                }
+            }
+            app.toasts.push(toast_msg, variant);
         }
     }
 }
 
-fn last_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
-    if !app.pending_assistant.trim_is_empty() {
-        return Some(app.pending_assistant.text());
+/// Handle `/export <md|txt|json> [path]`: render the full transcript in the
+/// requested format (reusing the same scope resolution + formatters the
+/// clipboard copies use) and write it atomically to a file. With no explicit
+/// path, the file lands under the session-storage default
+/// (`<workspace>/.squeezy/exports/<session_id>/transcript-<ts>.<ext>`).
+fn handle_export_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
+    let args = match commands::parse_export_args(rest) {
+        Ok(args) => args,
+        Err(usage) => {
+            set_status_with_notice(app, usage.clone(), usage);
+            return;
+        }
+    };
+
+    let Some(payload) = build_scope_payload(app, copy::CopyScope::FullTranscript, args.format)
+    else {
+        set_status_notice(app, "nothing to export yet");
+        return;
+    };
+
+    let target = match args.path {
+        Some(path) => resolve_workspace_path(&app.workspace_root, &path),
+        None => default_export_path(app, agent, args.format),
+    };
+
+    match write_export_atomically(&target, &payload) {
+        Ok(()) => {
+            let bytes = payload.len();
+            app.status = format!("wrote {} ({bytes} bytes)", target.display());
+            app.toasts.push(
+                format!("exported transcript to {}", target.display()),
+                toast::ToastVariant::Success,
+            );
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "Exported transcript ({}) to {} ({bytes} bytes).",
+                args.format.file_extension(),
+                target.display(),
+            )));
+        }
+        Err(error) => {
+            let message = format!("export failed: {error}");
+            app.status = message.clone();
+            app.toasts.push(message.clone(), toast::ToastVariant::Error);
+            app.push_transcript_item(TranscriptItem::system(message));
+        }
     }
-    app.transcript
-        .iter()
-        .rev()
-        .find_map(TranscriptEntry::assistant_content)
+}
+
+/// Default `/export` destination under session storage:
+/// `<workspace>/.squeezy/exports/<session_id>/transcript-<unix_ts>.<ext>`. Uses
+/// `"default"` for the session segment before a session id exists.
+fn default_export_path(app: &TuiApp, agent: &Agent, format: copy::CopyFormat) -> PathBuf {
+    let session = agent
+        .session_id()
+        .or_else(|| app.session_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    app.workspace_root
+        .join(".squeezy")
+        .join("exports")
+        .join(session)
+        .join(format!("transcript-{ts}.{}", format.file_extension()))
+}
+
+/// Write `content` to `target` atomically (write to `<target>.tmp` then
+/// rename), creating the parent directory if missing. Mirrors the best-effort
+/// atomic-write pattern used for plan pointers.
+fn write_export_atomically(target: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = target.with_extension("squeezy-export-tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, target)
 }
 
 fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
@@ -8139,6 +8435,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // narrower column. When the area is too thin to split, fall back to the
     // full width with no gutter.
     let (text_area, scrollbar_area) = transcript_main_text_and_scrollbar_areas(area);
+    // Stamp the live text width so an off-frame copy/export rebuilds the row
+    // model at the real painted width (see `copy_transcript_scope`).
+    app.main_text_width.set(text_area.width);
     let lines = transcript_lines_for_render(app, Some(text_area.width), include_startup_card);
     let total_rows = lines.len();
     let viewport_h = text_area.height as usize;
@@ -8523,7 +8822,7 @@ const RAIL_GUTTER_CHARS: [char; 5] = [' ', '│', '├', '╰', '─'];
 /// Width (in cells) of a rail line's leading gutter: the indent + `│`/`├`/`╰─`
 /// run, plus the node's marker glyph and its trailing space when the run opened
 /// with an elbow. Everything after that is the node's content.
-fn rail_prefix_width(text: &str) -> usize {
+pub(crate) fn rail_prefix_width(text: &str) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     while i < chars.len() && RAIL_GUTTER_CHARS.contains(&chars[i]) {
@@ -16510,7 +16809,7 @@ impl Clipboard for Osc52Clipboard {
     }
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -17180,6 +17479,33 @@ pub(crate) struct TuiApp {
     pub(crate) pending_feedback: Option<PreparedFeedback>,
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
+    /// Resolved clipboard provider chain for semantic copy/export
+    /// (`crate::clipboard::ClipboardChain`): OSC 52 (when the terminal is
+    /// believed to honour it) → platform command (`pbcopy`/`wl-copy`/…) →
+    /// durable temp-file fallback. Built once at startup from the env-probed
+    /// capabilities; the semantic-copy entrypoint
+    /// (`copy_transcript_scope`) drives this richer chain so a copy that is
+    /// too large for OSC 52 still lands via the platform binary or a file
+    /// rather than silently failing. The legacy `clipboard` field above
+    /// stays the source for any pre-existing call site not yet migrated.
+    pub(crate) clipboard_chain: clipboard::ClipboardChain<clipboard::RealSink>,
+    /// Persistent main-view focus cursor for entry/tool/code copies, as a
+    /// `RowId` into the freshly built transcript row list. `None` defaults to
+    /// the live tail (the last entry-owned row), so "copy current entry"
+    /// works before any selection feature lands. Distinct from
+    /// `selected_entry` (the `/pin` picker candidate) on purpose, so copy
+    /// never entangles with the pin modal.
+    pub(crate) copy_focus: Option<transcript_surface::RowId>,
+    /// The active copy/export format. Defaults to `Plain`; `/export` overrides
+    /// per-invocation, and a future modifier chord can flip it for the copy
+    /// chords.
+    pub(crate) copy_format: copy::CopyFormat,
+    /// Last main transcript *text* column width, stamped each frame in
+    /// `render_transcript`. An off-frame copy/export rebuilds the row model at
+    /// the real painted width instead of guessing. A `Cell` (not folded into
+    /// `MainScrollbarCache`) because that cache is `None` when content fits,
+    /// whereas the width is always meaningful.
+    pub(crate) main_text_width: std::cell::Cell<u16>,
     /// Corner toast stack — short-lived overlays for fire-and-forget
     /// status events (telemetry flush, MCP connect, index ready). Toasts
     /// overlay the top-right and stack up to three at a time; durable
@@ -17576,6 +17902,10 @@ impl TuiApp {
             pending_feedback: None,
             pending_report: None,
             clipboard,
+            clipboard_chain: build_clipboard_chain(),
+            copy_focus: None,
+            copy_format: copy::CopyFormat::default_format(),
+            main_text_width: std::cell::Cell::new(0),
             toasts: ToastQueue::new(),
             desktop_notifier: DesktopNotifier::new(config.tui.desktop_notifications),
             config_screen: None,
@@ -18623,17 +18953,6 @@ impl TranscriptEntry {
             started_at: Instant::now(),
             from_lines,
         });
-    }
-
-    fn assistant_content(&self) -> Option<String> {
-        match &self.kind {
-            TranscriptEntryKind::Message(item)
-                if item.role == Role::Assistant && !item.content.trim().is_empty() =>
-            {
-                Some(item.content.clone())
-            }
-            _ => None,
-        }
     }
 
     /// True when the entry is a tool-result card whose status already

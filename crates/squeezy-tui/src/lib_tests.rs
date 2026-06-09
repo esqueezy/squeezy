@@ -10819,6 +10819,361 @@ async fn copy_failure_is_actionable_status() {
 }
 
 #[tokio::test]
+async fn alt_c_copies_focused_entry_through_row_model() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("ask"));
+    app.push_transcript_item(TranscriptItem::assistant("the answer text"));
+
+    // No explicit focus → defaults to the live tail (the assistant entry).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write");
+    assert!(
+        copied[0].contains("the answer text"),
+        "copied focused entry: {:?}",
+        copied[0]
+    );
+    assert!(app.status.contains("copied entry"), "{}", app.status);
+}
+
+#[tokio::test]
+async fn export_md_writes_transcript_under_session_storage() {
+    let root = temp_workspace("export_md");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("question"));
+    app.push_transcript_item(TranscriptItem::assistant("response body"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/export md").await);
+    assert!(app.status.starts_with("wrote "), "{}", app.status);
+
+    // The default destination lands under `<workspace>/.squeezy/exports/...`.
+    let exports_dir = root.join(".squeezy").join("exports");
+    let written: Vec<PathBuf> = walk_files(&exports_dir);
+    assert_eq!(written.len(), 1, "one export file under {exports_dir:?}");
+    let file = &written[0];
+    assert_eq!(file.extension().and_then(|e| e.to_str()), Some("md"));
+    let body = std::fs::read_to_string(file).expect("read export");
+    assert!(body.contains("response body"), "export body: {body}");
+    assert!(body.contains("**Assistant**"), "markdown heading: {body}");
+    // The atomic temp file must not survive.
+    assert!(
+        !walk_files(&exports_dir)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("squeezy-export-tmp")),
+        "atomic temp file should be renamed away"
+    );
+}
+
+#[tokio::test]
+async fn export_rejects_unknown_format() {
+    let root = temp_workspace("export_bad");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hi"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/export yaml").await);
+    assert!(
+        app.status.contains("unknown export format"),
+        "{}",
+        app.status
+    );
+    assert!(
+        !root.join(".squeezy").join("exports").exists(),
+        "no file written on parse error"
+    );
+}
+
+#[tokio::test]
+async fn export_json_writes_event_slice_to_explicit_path() {
+    let root = temp_workspace("export_json");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("q"));
+    app.push_transcript_item(TranscriptItem::assistant("a"));
+
+    let target = root.join("slice.json");
+    let cmd = format!("/export json {}", target.display());
+    assert!(handle_slash_command(&mut app, &mut agent, &cmd).await);
+
+    let body = std::fs::read_to_string(&target).expect("read json export");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+    let arr = value.as_array().expect("json array");
+    assert!(
+        arr.iter().any(|event| event["kind"] == "message"),
+        "event slice has message events: {body}"
+    );
+}
+
+/// Recursively collect every regular file under `dir` (empty when missing).
+fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+// ===========================================================================
+// Phase 5a — end-to-end copy/export over the REAL render pipeline.
+//
+// The unit-level scope/format/strip semantics live in `copy_tests.rs` (driven
+// off hand-built `TranscriptRow`s). These drive the integration path instead:
+// `copy_transcript_scope` rebuilds the row model through `build_transcript_rows`
+// → `wrap_entries`, so they prove the copy substrate composes correctly with
+// the actual wrapper (wide/CJK cell-splitting, the `☽`/`│`/`╰─` chrome the
+// renderer paints) rather than against synthetic rows.
+// ===========================================================================
+
+/// Rail/gutter/coin glyphs that lead a row and that the copy substrate's
+/// `strip_gutter` is contracted to remove from the START of every copied line.
+/// (Box-drawing that appears *inside* a card body — e.g. the user message card's
+/// `╰───╯` bottom border, which is itself entry-owned content the renderer
+/// draws, not a leading gutter — is outside `strip_gutter`'s remit and is not
+/// asserted away here.) Redeclared from the `copy_tests.rs` guard because the
+/// two test modules compile separately.
+const COPY_LEADING_CHROME: &[char] = &[
+    '│', '├', '╰', '─', '☽', '☾', '◐', '◑', '◔', '◕', '●', '○', '▌',
+];
+
+/// Strict guard for a single semantic unit (last assistant answer, current tool
+/// output, focused entry, code block): such a copy must carry NO rail/box chrome
+/// at all — the verified behaviour for these scopes over the real pipeline.
+fn assert_unit_copy_is_clean(text: &str) {
+    for ch in text.chars() {
+        assert!(
+            !COPY_LEADING_CHROME.contains(&ch) && !matches!(ch, '╯' | '╭' | '╮'),
+            "a single-unit copy must be clean prose/code with no rail/box chrome, but carried {ch:?} in:\n{text}"
+        );
+    }
+}
+
+/// The vertical gutter / role-coin family the copy substrate definitively
+/// strips from the start of every message line. (Horizontal box rules — `─`,
+/// `╯`, `╰` forming a card's top/bottom border — are a separate renderer-chrome
+/// concern not in `strip_gutter`'s remit, so they are handled by the
+/// whole-line-is-border allowance below rather than forbidden as a line lead.)
+const COPY_LEADING_GUTTER: &[char] = &['│', '├', '☽', '☾', '◐', '◑', '◔', '◕', '●', '○', '▌'];
+
+/// Glyphs that make up a horizontal card rule (a decoration line that is ALL
+/// border, carrying no prose).
+const CARD_RULE_GLYPHS: &[char] = &['─', '╯', '╰', '╭', '╮', '┄', '┈', ' '];
+
+/// Bulk-copy guard for full-transcript / viewport copies. Asserts the contract
+/// the copy substrate actually provides:
+///
+/// * no prose line begins on a role coin or vertical gutter bar/tee (the
+///   per-message leading chrome `strip_gutter` removes), and
+/// * the only lines that contain box-drawing at all are whole-line card rules
+///   (so chrome never *swallows* prose into a content line).
+///
+/// This is honest about the current behaviour — a full-transcript copy may still
+/// emit a card's bottom-rule line — without weakening the real guarantee that
+/// message text is gutter-clean.
+fn assert_no_leading_rail_gutter(text: &str) {
+    for line in text.lines() {
+        let Some(first) = line.chars().next() else {
+            continue;
+        };
+        assert!(
+            !COPY_LEADING_GUTTER.contains(&first),
+            "no copied line may begin on a role coin / vertical gutter, but one started with {first:?}:\n{line:?}\nfull:\n{text}"
+        );
+        // Any line carrying box-drawing must be ENTIRELY a card rule, never a
+        // prose line with chrome mixed in.
+        let has_box = line
+            .chars()
+            .any(|c| CARD_RULE_GLYPHS.contains(&c) && c != ' ');
+        if has_box {
+            assert!(
+                line.chars().all(|c| CARD_RULE_GLYPHS.contains(&c)),
+                "a line with box-drawing must be a pure card rule (no prose mixed in):\n{line:?}\nfull:\n{text}"
+            );
+        }
+    }
+}
+
+/// Copy-range correctness across REAL wrapped lines with wide/CJK glyphs: a long
+/// CJK answer the cell-aware wrapper splits into several visual rows must copy
+/// back as the original prose (the per-row gutter/coin stripped, the wrap
+/// newlines the only seams), with no box-drawing leaking through.
+#[tokio::test]
+async fn copy_focused_entry_reconstructs_wrapped_cjk_answer() {
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    // A CJK answer with no internal spaces, so the ONLY line breaks in the copy
+    // are the wrapper's — i.e. removing them must reconstruct the source exactly.
+    let answer = "你好世界这是一段比较长的中文文本需要换行处理以验证宽字符复制的正确性确保不会出错";
+    app.push_transcript_item(TranscriptItem::user("问题"));
+    app.push_transcript_item(TranscriptItem::assistant(answer));
+
+    // Stamp a narrow painted width so the off-frame copy rebuilds the row model
+    // at a width that forces the answer to wrap across multiple visual rows.
+    app.main_text_width.set(24);
+
+    // FocusedEntry with no explicit focus defaults to the live tail (the answer).
+    assert!(copy_transcript_scope(
+        &mut app,
+        copy::CopyScope::FocusedEntry,
+        copy::CopyFormat::Plain,
+    ));
+
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write");
+    let payload = &copied[0];
+
+    // The answer genuinely wrapped: the copy spans more than one line.
+    assert!(
+        payload.contains('\n'),
+        "the CJK answer should have wrapped across rows: {payload:?}"
+    );
+    // Removing the wrapper's seams reconstructs the source answer byte-for-byte.
+    assert_eq!(
+        payload.replace('\n', ""),
+        answer,
+        "joining the wrapped rows must reconstruct the original CJK answer"
+    );
+    assert_unit_copy_is_clean(payload);
+}
+
+/// Each semantic copy command selects the right unit over ONE real transcript.
+/// Covers the units that survive the rendered pipeline as copyable text:
+/// focused entry, last assistant answer, current tool output, and full
+/// transcript. (Code-block-under-cursor is unit-tested in `copy_tests.rs` over
+/// literal-fence rows: the markdown message renderer styles fences rather than
+/// emitting literal ``` lines, so there is no fence text to bracket in a
+/// rendered assistant message — exercising it here would assert nothing.)
+#[tokio::test]
+async fn semantic_copy_commands_select_distinct_units_over_real_transcript() {
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("run the tests"));
+    app.push_tool_result(sample_tool_result("shell", "exit 0: 5 passed"));
+    app.push_transcript_item(TranscriptItem::assistant("all green, ship it"));
+    app.main_text_width.set(80);
+
+    // Drive one scope and return the single payload it copied, clearing the log.
+    let copy_scope = |app: &mut TuiApp, scope: copy::CopyScope| -> String {
+        writes.lock().unwrap().clear();
+        assert!(copy_transcript_scope(app, scope, copy::CopyFormat::Plain));
+        let got = writes.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "scope {scope:?} must copy exactly once");
+        got.into_iter().next().unwrap()
+    };
+
+    // Last assistant answer: the final assistant message, not the tool output.
+    let last = copy_scope(&mut app, copy::CopyScope::LastAssistant);
+    assert!(
+        last.contains("all green, ship it"),
+        "last assistant: {last:?}"
+    );
+    assert!(
+        !last.contains("5 passed"),
+        "last assistant must not include tool output: {last:?}"
+    );
+    assert_unit_copy_is_clean(&last);
+
+    // Current tool output: the shell card, carrying its output, not the answer.
+    let tool = copy_scope(&mut app, copy::CopyScope::CurrentToolOutput);
+    assert!(tool.contains("5 passed"), "tool output: {tool:?}");
+    assert!(
+        !tool.contains("all green, ship it"),
+        "tool output must not include the assistant answer: {tool:?}"
+    );
+    assert_unit_copy_is_clean(&tool);
+
+    // Full transcript: every unit present in one payload, gutter-stripped per
+    // line (the bulk-copy contract — see `assert_no_leading_rail_gutter`).
+    let full = copy_scope(&mut app, copy::CopyScope::FullTranscript);
+    assert!(full.contains("run the tests"), "full: {full:?}");
+    assert!(full.contains("5 passed"), "full: {full:?}");
+    assert!(full.contains("all green, ship it"), "full: {full:?}");
+    assert_no_leading_rail_gutter(&full);
+
+    // Focused entry (no focus → live tail): just the assistant answer entry.
+    let entry = copy_scope(&mut app, copy::CopyScope::FocusedEntry);
+    assert!(
+        entry.contains("all green, ship it"),
+        "focused entry: {entry:?}"
+    );
+    assert!(
+        !entry.contains("run the tests"),
+        "focused entry must isolate one entry: {entry:?}"
+    );
+    assert_unit_copy_is_clean(&entry);
+}
+
+/// `/export txt` writes the plain-text formatter output to a file. Completes the
+/// per-format export coverage (md and json are covered above); txt is the
+/// default/universal format and must round-trip the transcript content.
+#[tokio::test]
+async fn export_txt_writes_plain_transcript_to_explicit_path() {
+    let root = temp_workspace("export_txt");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("question here"));
+    app.push_transcript_item(TranscriptItem::assistant("plain answer body"));
+
+    let target = root.join("transcript.txt");
+    let cmd = format!("/export txt {}", target.display());
+    assert!(handle_slash_command(&mut app, &mut agent, &cmd).await);
+    assert!(app.status.starts_with("wrote "), "{}", app.status);
+
+    let body = std::fs::read_to_string(&target).expect("read txt export");
+    // Plain format: content, no markdown role headings, no JSON envelope.
+    assert!(body.contains("question here"), "txt body: {body}");
+    assert!(body.contains("plain answer body"), "txt body: {body}");
+    assert!(
+        !body.contains("**Assistant**") && !body.contains("**User**"),
+        "plain export must not carry markdown headings: {body}"
+    );
+    assert!(
+        !body.trim_start().starts_with('['),
+        "plain export must not be a JSON array: {body}"
+    );
+    assert_no_leading_rail_gutter(&body);
+}
+
+#[tokio::test]
 async fn transcript_navigation_keys_update_scroll_state() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);

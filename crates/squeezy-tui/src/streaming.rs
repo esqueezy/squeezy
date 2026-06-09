@@ -167,16 +167,25 @@ impl StreamingController {
     }
 
     fn line_is_fence(line: &str) -> bool {
-        // A line counts as a fence toggle if its trimmed body starts with
-        // three or more backticks (Markdown CommonMark §4.5).
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("```") && !trimmed.starts_with("~~~") {
-            return false;
-        }
-        // The remainder must not contain a bare quote/heading mark mid-line
-        // (we keep this loose; only the opening prefix matters).
-        true
+        // Delegates to the crate-private free function so the copy substrate
+        // (`crate::copy`) can reuse the exact same CommonMark §4.5 fence test
+        // without depending on the streaming controller's private method.
+        line_is_fence(line)
     }
+}
+
+/// Whether `line` is a CommonMark §4.5 code-fence line: its trimmed body
+/// starts with three or more backticks (```` ``` ````) or three or more
+/// tildes (`~~~`). The opening fence may carry an info string (a language
+/// tag) after the run; only the leading prefix decides.
+///
+/// Extracted from [`StreamingController::line_is_fence`] (which now delegates
+/// here) so the semantic-copy code-block resolver in `crate::copy` can detect
+/// fenced blocks with the identical rule the streamer uses. Kept loose on
+/// purpose: we only key off the opening prefix, not the info string.
+pub(crate) fn line_is_fence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 impl fmt::Display for StreamingController {

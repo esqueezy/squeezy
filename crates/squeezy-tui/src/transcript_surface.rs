@@ -156,6 +156,71 @@ impl RowKind {
     fn from_entry_kind(kind: &crate::TranscriptEntryKind) -> Self {
         RowKind::from(kind)
     }
+
+    /// Stable, machine-readable identifier for this kind. Mirrors the
+    /// `keymap::Action::slug` convention so the `JsonSlice` copy format can
+    /// emit a fixed `"kind"` tag per entry that scripts can match on. The
+    /// strings are part of the copy/export wire shape — do not rename without
+    /// a migration note.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            RowKind::Message => "message",
+            RowKind::ToolResult => "tool_result",
+            RowKind::Log => "log",
+            RowKind::PlanCard => "plan_card",
+            RowKind::Diff => "diff",
+            RowKind::Reasoning => "reasoning",
+            RowKind::SlashEcho => "slash_echo",
+        }
+    }
+}
+
+/// Message-prompt marker glyphs a message header may carry before its content:
+/// the assistant/user "coin" moon-phase family (`☽ ☾ ◐ ◑ ◔ ◕ ● ○`) and the
+/// composer cursor bar (`▌`). A copy of an answer should begin at the first
+/// content character, not on the marker — so [`strip_gutter`] drops a leading
+/// `<marker> ` (marker plus its single trailing space) once the rail run is
+/// removed. Kept narrow on purpose: only these known role bullets are stripped,
+/// so ordinary content that happens to start with punctuation is untouched.
+const MESSAGE_MARKER_GLYPHS: [char; 9] = ['☽', '☾', '◐', '◑', '◔', '◕', '●', '○', '▌'];
+
+/// Strip a row's leading rail/gutter run (`│ ├ ╰─` and the node marker glyph)
+/// AND any leading message-prompt marker (`☽`/`▌`/role bullet) so a copied line
+/// begins at the first content character, not the rail chrome or role coin.
+/// Reuses the crate-root [`crate::rail_prefix_width`] — the single canonical
+/// gutter definition the renderer measures with — so a copy strips exactly what
+/// the rail painted. This is the strip the historical [`copy_range`] TODO
+/// deferred; the copy formatters in [`crate::copy`] apply it per line.
+pub(crate) fn strip_gutter(line: &str) -> &str {
+    let prefix = crate::rail_prefix_width(line);
+    // `rail_prefix_width` counts *chars*; advance by that many char boundaries.
+    let after_gutter = match line.char_indices().nth(prefix) {
+        Some((byte_idx, _)) => &line[byte_idx..],
+        None if prefix == 0 => line,
+        None => "",
+    };
+    strip_message_marker(after_gutter)
+}
+
+/// Drop a leading message-prompt marker glyph and its single following space
+/// (`"☽ answer"` → `"answer"`). A no-op when the line does not open on a known
+/// marker, so non-message content is preserved verbatim.
+fn strip_message_marker(line: &str) -> &str {
+    let mut chars = line.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return line;
+    };
+    if !MESSAGE_MARKER_GLYPHS.contains(&first) {
+        return line;
+    }
+    match chars.next() {
+        // Marker followed by a space: drop both.
+        Some((idx, ' ')) => &line[idx + 1..],
+        // Marker at end of line, or marker immediately followed by content
+        // (no space): drop just the marker.
+        Some((idx, _)) => &line[idx..],
+        None => "",
+    }
 }
 
 /// A click target inside a row: a half-open `text_range` (in `copy_text`
