@@ -7042,6 +7042,21 @@ async fn shell_timeout_returns_structured_error_and_kills_process() {
             .contains("timed out")
     );
     assert_eq!(result.content["truncated"], true);
+    #[cfg(unix)]
+    {
+        let kill_meta = result.content["kill_meta"]
+            .as_object()
+            .expect("timeout result must include Unix kill metadata");
+        assert!(
+            kill_meta["pgid"].as_u64().is_some_and(|pgid| pgid > 0),
+            "kill metadata must report the signaled process group: {kill_meta:?}"
+        );
+        assert_eq!(kill_meta["sigterm_ok"], true);
+        assert_eq!(kill_meta["sigkill_sent"], false);
+        assert_eq!(kill_meta["direct_child_fallback"], false);
+    }
+    #[cfg(not(unix))]
+    assert!(result.content.get("kill_meta").is_none());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -12298,6 +12313,8 @@ fn shell_best_effort_does_not_retry_signal_exit_without_output() {
         tty_downgraded: false,
         windows_job_assigned: None,
         windows_timeout_job_cleanup_ok: None,
+        kill_meta: None,
+        ask_server_start_error: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run);
@@ -12456,6 +12473,8 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         tty_downgraded: false,
         windows_job_assigned: None,
         windows_timeout_job_cleanup_ok: None,
+        kill_meta: None,
+        ask_server_start_error: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
@@ -12704,6 +12723,51 @@ fn linux_seccomp_plan_does_not_export_ask_socket() {
         assert!(
             plan.exports_ask_socket(),
             "backend {backend} should export the ask socket",
+        );
+    }
+}
+
+#[test]
+fn nested_ask_disabled_reason_is_set_for_suppressing_backends() {
+    // Backends that suppress AF_UNIX sockets must provide a human-readable
+    // reason so the model and user get a clear explanation rather than seeing
+    // a missing SQUEEZY_ASK_SOCKET as a mysterious misconfiguration.
+    // Each backend gets a differentiated message explaining the actual
+    // mechanism (seccomp deny vs. missing Win32 transport).
+    let linux_plan = fake_sandbox_plan("linux-direct-syscalls", false);
+    let linux_reason = linux_plan
+        .nested_ask_disabled_reason()
+        .expect("linux-direct-syscalls must report a disabled reason");
+    assert!(
+        linux_reason.contains("seccomp"),
+        "linux reason must mention seccomp filter: {linux_reason}"
+    );
+    assert!(
+        linux_reason.contains("nested ask disabled"),
+        "linux reason must describe the constraint: {linux_reason}"
+    );
+
+    for backend in ["windows-restricted-token", "windows-elevated"] {
+        let plan = fake_sandbox_plan(backend, false);
+        let reason = plan
+            .nested_ask_disabled_reason()
+            .unwrap_or_else(|| panic!("backend {backend} must report a disabled reason"));
+        assert!(
+            reason.contains("Win32"),
+            "windows reason for {backend} must mention Win32: {reason}"
+        );
+        assert!(
+            reason.contains("nested ask disabled"),
+            "reason for {backend} must describe the constraint: {reason}"
+        );
+    }
+
+    // Backends that allow ask must return None.
+    for backend in ["none", "external", "macos-sandbox-exec"] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            plan.nested_ask_disabled_reason().is_none(),
+            "backend {backend} must not report a disabled reason"
         );
     }
 }

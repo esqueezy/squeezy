@@ -365,6 +365,30 @@ impl ShellSandboxPlan {
             "linux-direct-syscalls" | "windows-restricted-token" | "windows-elevated"
         )
     }
+
+    /// When `exports_ask_socket` is false, returns a human-readable reason
+    /// explaining why nested `squeezy ask` approvals are unavailable under
+    /// this sandbox backend. Returns `None` when ask is available.
+    ///
+    /// The reason is differentiated by backend to explain the actual
+    /// mechanism (seccomp filter vs. missing Win32 transport) rather than
+    /// just naming the backend.
+    pub(crate) fn nested_ask_disabled_reason(&self) -> Option<String> {
+        if self.exports_ask_socket() {
+            return None;
+        }
+        let reason = match self.backend {
+            "linux-direct-syscalls" => {
+                "nested ask disabled: seccomp filter denies AF_UNIX socket(2) in this sandbox"
+                    .to_string()
+            }
+            "windows-restricted-token" | "windows-elevated" => {
+                "nested ask disabled: Win32 sandbox spawn has no AF_UNIX ask transport".to_string()
+            }
+            other => format!("nested ask disabled by {} sandbox", other),
+        };
+        Some(reason)
+    }
 }
 
 fn best_effort_fallback_json(record: BestEffortFallback) -> Value {
