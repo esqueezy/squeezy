@@ -82,6 +82,7 @@ mod keymap;
 mod keymap_config;
 mod mcp_settings_edit;
 mod mention;
+mod modal;
 mod notification;
 mod overlay;
 mod prompt_history;

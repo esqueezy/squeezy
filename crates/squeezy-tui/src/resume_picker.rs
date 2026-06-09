@@ -17,19 +17,18 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Wrap,
-    },
+    widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use squeezy_core::{AppConfig, SqueezyError};
 use squeezy_store::{
     EventBranchTip, GlobalSessionIndexEntry, SessionMetadata, SessionQuery, SessionStore,
     detect_branches,
 };
+
+use crate::modal;
 
 /// Maximum number of sessions shown in the overlay, newest-first. The picker
 /// is opt-in (`--resume`) and scrolls, so the user came here deliberately to
@@ -569,25 +568,27 @@ pub(crate) fn run_picker<W: io::Write>(
     if state.candidates.is_empty() {
         return Ok(ResumeChoice::StartFresh);
     }
-    loop {
+    let choice = loop {
         terminal.draw(|frame| render_picker(frame, &state))?;
         match event::read()? {
             Event::Key(key) => {
                 if let Some(choice) = state.dispatch(key) {
-                    return Ok(choice);
+                    break choice;
                 }
             }
             Event::Resize(_, _) => continue,
             _ => continue,
         }
-    }
+    };
+    // The loop drew the modal block at least once; clear the shared terminal
+    // exactly once on close so the block leaves no ghost rows behind. The
+    // early `StartFresh` return above never drew, so it skips this.
+    modal::clear_after_close(terminal)?;
+    Ok(choice)
 }
 
 fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     let full = frame.area();
-    let area = centered_area(full);
-
-    frame.render_widget(Clear, full);
 
     let title_suffix = if state.can_go_back() {
         "first run setup"
@@ -609,14 +610,9 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         ),
         Span::raw(" "),
     ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::render::theme::accent()))
-        .title(title)
-        .title_alignment(Alignment::Left);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    // Most of the terminal so long session labels have room, capped so the
+    // overlay stays scannable (and centered) on ultra-wide monitors.
+    let inner = modal::surface(frame, full, 160, 32, title);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -946,25 +942,6 @@ fn render_start_fresh_row(active: bool) -> Line<'static> {
         Span::styled("Start fresh", label_style),
         Span::styled("    — new conversation", hint_style),
     ])
-}
-
-/// Center a fixed-size area inside `full` with reasonable bounds for small
-/// terminals.
-fn centered_area(full: Rect) -> Rect {
-    // Use most of the terminal so long session labels have room, capped so the
-    // overlay stays scannable (and centered) on ultra-wide monitors.
-    let max_width = 160u16;
-    let max_height = 32u16;
-    let width = full.width.min(max_width);
-    let height = full.height.min(max_height);
-    let x = full.x + full.width.saturating_sub(width) / 2;
-    let y = full.y + full.height.saturating_sub(height) / 2;
-    Rect {
-        x,
-        y,
-        width,
-        height,
-    }
 }
 
 fn format_started_at(started_at_ms: u64) -> String {

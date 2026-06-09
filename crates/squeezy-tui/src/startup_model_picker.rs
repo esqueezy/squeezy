@@ -9,17 +9,17 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use squeezy_core::{
     AppConfig, ReasoningEffort,
     settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits},
 };
 
-use crate::render::theme;
+use crate::{modal, render::theme};
 
 const REASONING_EFFORTS: [ReasoningEffort; 4] = [
     ReasoningEffort::Low,
@@ -367,9 +367,15 @@ pub(crate) fn run_picker<W: io::Write>(
                     crate::apply_theme_overrides(&next);
                 }
                 Some(PickerOutcome::Selected(selection)) => {
+                    // Both exit paths drew the modal block at least once; clear
+                    // the shared terminal once on close so no ghost rows remain.
+                    modal::clear_after_close(terminal)?;
                     return Ok(Some(StartupModelPickerResult::Selected(selection)));
                 }
-                Some(PickerOutcome::Quit) => return Ok(None),
+                Some(PickerOutcome::Quit) => {
+                    modal::clear_after_close(terminal)?;
+                    return Ok(None);
+                }
                 None => {}
             },
             Event::Resize(_, _) => continue,
@@ -392,8 +398,6 @@ fn persist_theme(settings_path: &Path, theme: &str) -> io::Result<()> {
 
 fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState, path: &Path) {
     let full = frame.area();
-    let area = centered_area(full);
-    frame.render_widget(Clear, full);
 
     let title = Line::from(vec![
         Span::styled(" ◆ ", Style::default().fg(theme::accent())),
@@ -407,14 +411,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState
         Span::styled("first run setup", Style::default().fg(theme::foreground())),
         Span::raw(" "),
     ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::accent()))
-        .title(title)
-        .title_alignment(Alignment::Left);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = modal::surface(frame, full, 98, 20, title);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -657,21 +654,6 @@ fn visible_window(total: usize, cursor: usize, height: usize) -> (usize, usize, 
         }
         show_above = next_show_above;
         show_below = next_show_below;
-    }
-}
-
-fn centered_area(full: Rect) -> Rect {
-    let max_width = 98u16;
-    let max_height = 20u16;
-    let width = full.width.min(max_width);
-    let height = full.height.min(max_height);
-    let x = full.x + full.width.saturating_sub(width) / 2;
-    let y = full.y + full.height.saturating_sub(height) / 2;
-    Rect {
-        x,
-        y,
-        width,
-        height,
     }
 }
 
