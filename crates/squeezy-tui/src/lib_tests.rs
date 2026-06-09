@@ -1709,6 +1709,7 @@ async fn wheel_scroll_targets_transcript_overlay_when_open() {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     handle_mouse(
@@ -7436,7 +7437,12 @@ fn finalized_reasoning_defaults_to_compact_visible_in_compact_transcript() {
     assert!(!rendered.contains("▏ second thought"), "{rendered}");
 
     app.transcript_overlay = Some(TranscriptOverlayState::default());
-    let overlay = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(100), true));
+    let overlay = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(100),
+        true,
+        OverlayFilter::All,
+    ));
     assert!(overlay.contains("▾ reasoning"), "{overlay}");
     assert!(overlay.contains("▏ first thought"), "{overlay}");
     assert!(overlay.contains("▏ second thought"), "{overlay}");
@@ -9390,7 +9396,12 @@ gctoolkit-parser gctoolkit-vertx gctoolkit-sample gctoolkit-integration
     app.transcript[0].collapsed = true;
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(160), true));
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(160),
+        true,
+        OverlayFilter::All,
+    ));
 
     assert!(
         rendered.contains("     │    │            │"),
@@ -15409,6 +15420,177 @@ fn apply_patch_card_is_not_truncated_to_five_lines() {
 }
 
 #[tokio::test]
+async fn slash_opens_search_in_overlay_and_finds_matches() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("explain widget rendering"));
+    app.push_transcript_item(TranscriptItem::assistant("the widget renders here"));
+
+    // Open the Ctrl+T overlay (the unambiguous search context — no composer).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("open overlay");
+    assert!(app.transcript_overlay.is_some());
+    // Render so the overlay row geometry/caches are populated.
+    let _ = render_to_string(&app, 80, 24);
+
+    // `/` opens search on the overlay surface.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open search");
+    let state = app.search.as_ref().expect("search open");
+    assert_eq!(state.surface, selection::SelectionSurface::Overlay);
+    assert!(app.transcript_overlay.is_some(), "overlay stays open");
+
+    // Type a query; matches accumulate against the painted overlay rows.
+    for ch in "widget".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let state = app.search.as_ref().expect("search open");
+    assert_eq!(state.query, "widget");
+    assert!(
+        !state.matches.is_empty(),
+        "should find 'widget' in the transcript"
+    );
+    assert_eq!(state.current, Some(0));
+
+    // Esc closes search but leaves the overlay open (search closes first).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("close search");
+    assert!(app.search.is_none(), "Esc closes search");
+    assert!(
+        app.transcript_overlay.is_some(),
+        "the same Esc leaves the overlay open"
+    );
+
+    // A second Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("close overlay");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "second Esc closes overlay"
+    );
+}
+
+#[tokio::test]
+async fn slash_in_empty_composer_does_not_open_search() {
+    // `/` on the main surface with an empty composer must keep typing a
+    // slash-command, NOT open transcript search (which would break `/help`).
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type slash");
+    assert!(app.search.is_none(), "/ should not open search in composer");
+    assert_eq!(app.input, "/", "/ types into the composer");
+}
+
+#[tokio::test]
+async fn search_next_prev_cycle_through_matches_with_wraparound() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "alpha line\nalpha middle\nalpha end",
+    ));
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("open overlay");
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open search");
+    for ch in "alpha".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let total = app.search.as_ref().expect("search").matches.len();
+    assert!(
+        total >= 3,
+        "expected at least 3 'alpha' matches, got {total}"
+    );
+    assert_eq!(app.search.as_ref().unwrap().current, Some(0));
+
+    // Down advances; wrap back to 0 after the last match.
+    for expected in 1..total {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .expect("next");
+        assert_eq!(app.search.as_ref().unwrap().current, Some(expected));
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("wrap");
+    assert_eq!(
+        app.search.as_ref().unwrap().current,
+        Some(0),
+        "next wraps to the first match"
+    );
+
+    // Up retreats with wraparound to the last match.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("prev wrap");
+    assert_eq!(
+        app.search.as_ref().unwrap().current,
+        Some(total - 1),
+        "prev wraps to the last match"
+    );
+}
+
+#[tokio::test]
 async fn ctrl_t_opens_and_closes_transcript_overlay() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -15561,6 +15743,7 @@ fn transcript_overlay_drag_release_keeps_scrollbar_drag_mode() {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     let changed = handle_mouse(
@@ -15593,6 +15776,7 @@ fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
     let events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -15646,6 +15830,7 @@ fn input_batch_prioritizes_key_before_transcript_drag_flood() {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
     let mut events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -15735,6 +15920,7 @@ fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     assert_eq!(
@@ -15751,6 +15937,7 @@ fn input_batch_does_not_coalesce_drags_outside_scrollbar_drag_mode() {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
     let events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -15783,6 +15970,7 @@ fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
     app.transcript_overlay_scrollbar_cache
         .set(Some(TranscriptOverlayScrollbarCache {
@@ -15828,6 +16016,7 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     handle_key(
@@ -15861,6 +16050,7 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
     let quit = handle_key(
         &mut app,
@@ -15889,6 +16079,7 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     handle_key(
@@ -15952,6 +16143,7 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     tx.send(AgentEvent::Completed {
@@ -15989,6 +16181,7 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     tx.send(AgentEvent::Completed {
@@ -16031,6 +16224,7 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
     });
 
     tx.send(AgentEvent::Completed {
@@ -16121,7 +16315,12 @@ fn transcript_overlay_shows_full_generic_tool_json_content() {
     app.push_tool_result(result);
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(160), true));
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(160),
+        true,
+        OverlayFilter::All,
+    ));
 
     assert!(
         rendered.contains("skill-line-350"),
@@ -16155,7 +16354,12 @@ fn transcript_overlay_shows_full_repo_map_payload() {
     app.push_tool_result(result);
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(180), true));
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(180),
+        true,
+        OverlayFilter::All,
+    ));
 
     assert!(
         rendered.contains("very_unique_repo_map_child_symbol"),
@@ -16190,7 +16394,12 @@ fn transcript_overlay_shows_full_decl_search_payload() {
     app.push_tool_result(result);
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(180), true));
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(180),
+        true,
+        OverlayFilter::All,
+    ));
 
     assert!(
         rendered.contains("very_unique_decl_search_packet"),
@@ -16224,7 +16433,12 @@ fn transcript_overlay_shows_full_grep_matches_and_lines() {
     app.push_tool_result(result);
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(220), true));
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(220),
+        true,
+        OverlayFilter::All,
+    ));
 
     assert!(
         rendered.contains("match-20"),
@@ -16247,7 +16461,12 @@ fn transcript_overlay_shows_full_note_text() {
     app.push_note(message);
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(140), true));
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(140),
+        true,
+        OverlayFilter::All,
+    ));
 
     assert!(
         rendered.contains("UNIQUE_NOTE_TAIL"),
@@ -16266,7 +16485,12 @@ fn transcript_overlay_shows_full_assistant_answer_even_if_collapsed() {
     app.transcript[0].collapsed = true;
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(140), true));
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(140),
+        true,
+        OverlayFilter::All,
+    ));
 
     assert!(rendered.contains("answer-row-30"), "{rendered}");
     assert!(rendered.contains("answer-row-59"), "{rendered}");
@@ -16284,7 +16508,7 @@ fn transcript_overlay_includes_pending_assistant_mid_turn() {
     app.pending_assistant.push_delta("Once the lantern woke,");
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let lines = transcript_lines_for_overlay(&app, Some(100), true);
+    let lines = transcript_lines_for_overlay(&app, Some(100), true, OverlayFilter::All);
     let rendered = lines_to_plain_text(&lines);
 
     assert!(
@@ -16483,7 +16707,7 @@ fn transcript_overlay_tool_cards_are_expanded_and_plain() {
     };
     app.push_tool_result_with_call(result, Some(call));
 
-    let lines = transcript_lines_for_overlay(&app, Some(100), true);
+    let lines = transcript_lines_for_overlay(&app, Some(100), true, OverlayFilter::All);
     let rendered = lines_to_plain_text(&lines);
 
     assert!(
@@ -18016,10 +18240,15 @@ fn overlay_collapsed_folds_long_output_expanded_shows_all() {
     let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
     app.push_tool_result(sample_tool_result("explore", &body));
     let shown = |expand_all: bool| {
-        lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(80), expand_all))
-            .lines()
-            .filter(|l| l.contains("line "))
-            .count()
+        lines_to_plain_text(&transcript_lines_for_overlay(
+            &app,
+            Some(80),
+            expand_all,
+            OverlayFilter::All,
+        ))
+        .lines()
+        .filter(|l| l.contains("line "))
+        .count()
     };
     let collapsed = shown(false);
     let expanded = shown(true);
@@ -18097,7 +18326,12 @@ fn subagent_view_renders_tool_results_as_rail_cards() {
         sample_tool_result("glob", "a.rs\nb.rs"),
     );
     app.subagent_pane.active = ConversationSource::Subagent(7);
-    let view = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(70), false));
+    let view = lines_to_plain_text(&transcript_lines_for_overlay(
+        &app,
+        Some(70),
+        false,
+        OverlayFilter::All,
+    ));
     // The subagent's tools thread the rail as ├─✔ cards, not the flat off-rail
     // `completed X` lifecycle line they used to render as.
     assert!(view.contains("├─✔ Explored repo map"), "{view}");
@@ -18167,8 +18401,9 @@ fn wrap_entries_lines_match_overlay_rows() {
 
     for expand_all in [true, false] {
         for &width in &[24u16, 40, 100] {
-            let expected = transcript_lines_for_overlay(&app, Some(width), expand_all);
-            let attributed = wrap_entries(&app, width, expand_all);
+            let expected =
+                transcript_lines_for_overlay(&app, Some(width), expand_all, OverlayFilter::All);
+            let attributed = wrap_entries(&app, width, expand_all, OverlayFilter::All);
             let attributed_lines: Vec<String> = attributed
                 .iter()
                 .map(|row| rendered_line_text(&row.line))
@@ -18770,6 +19005,55 @@ async fn esc_clears_the_selection_before_any_other_consumer() {
     assert!(
         app.status.contains("selection cleared"),
         "status: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn esc_with_main_selection_and_open_overlay_closes_overlay_first() {
+    // Regression: a lingering MAIN-view selection must NOT steal the first Esc
+    // from an open modal surface. With the transcript overlay open, a single Esc
+    // closes the overlay (the overlay owns its own Esc) — it does not just clear
+    // the selection and leave the overlay stranded open.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("selectable text"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "selectable text").expect("painted");
+
+    // Arm a main-view selection by mouse drag.
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag(x + 6, y));
+    handle_mouse(&mut app, left_up(x + 6, y));
+    assert!(app.selection.is_some(), "drag armed a selection");
+    assert_eq!(
+        app.selection.as_ref().map(|s| s.surface),
+        Some(crate::selection::SelectionSurface::Main),
+        "selection lives on the main view"
+    );
+
+    // Open the Ctrl+T full-transcript overlay over the live selection.
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+
+    assert!(
+        app.transcript_overlay.is_none(),
+        "a single Esc closes the overlay, not just the selection"
+    );
+    assert!(
+        app.selection.is_some(),
+        "the selection-clear gate deferred to the overlay; the main selection survives"
+    );
+    assert!(
+        !app.status.contains("selection cleared"),
+        "Esc went to the overlay, not the selection-clear path; status: {}",
         app.status
     );
 }

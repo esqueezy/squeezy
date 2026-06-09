@@ -342,12 +342,25 @@ pub(crate) fn build_transcript_rows(
     width: u16,
     detail: DetailPolicy,
 ) -> Vec<TranscriptRow> {
+    build_transcript_rows_filtered(app, width, detail, crate::OverlayFilter::All)
+}
+
+/// As [`build_transcript_rows`], but with an explicit overlay entry `filter`.
+/// The main surface always passes `All`; the Ctrl+T overlay passes its active
+/// filter so the row model selection/search/copy index into matches the painted
+/// (filtered) overlay rows exactly.
+pub(crate) fn build_transcript_rows_filtered(
+    app: &crate::TuiApp,
+    width: u16,
+    detail: DetailPolicy,
+    filter: crate::OverlayFilter,
+) -> Vec<TranscriptRow> {
     let width = width.max(1);
-    let key = row_cache_key(app, width, detail);
+    let key = row_cache_key(app, width, detail, filter);
     if let Some(cached) = row_cache_get(&key) {
         return cached;
     }
-    let rows = build_transcript_rows_uncached(app, width, detail);
+    let rows = build_transcript_rows_uncached(app, width, detail, filter);
     row_cache_put(key, rows.clone());
     rows
 }
@@ -358,6 +371,7 @@ fn build_transcript_rows_uncached(
     app: &crate::TuiApp,
     width: u16,
     detail: DetailPolicy,
+    filter: crate::OverlayFilter,
 ) -> Vec<TranscriptRow> {
     let width = width.max(1);
     let expand_all = detail.expand_all();
@@ -365,7 +379,7 @@ fn build_transcript_rows_uncached(
 
     // Faithfully attributed, width-wrapped rows — byte-identical lines to the
     // overlay draw, each tagged with its owning entry id (or `None`).
-    let attributed = crate::wrap_entries(app, width, expand_all);
+    let attributed = crate::wrap_entries(app, width, expand_all, filter);
 
     // Map entry ids to their `RowKind` once so attribution is O(1) per row.
     let entries = crate::active_transcript_entries(app);
@@ -496,6 +510,9 @@ struct RowCacheKey {
     render_cache_session: u64,
     width: u16,
     expand_all: bool,
+    /// Active overlay entry filter (`All` for the main surface). Part of the key
+    /// so a filter cycle rebuilds the row list instead of serving the prior set.
+    filter: crate::OverlayFilter,
     palette_generation: u64,
     selected_entry: Option<usize>,
     tool_output_verbosity: u8,
@@ -529,7 +546,12 @@ fn row_cache() -> &'static Mutex<LruCache<RowCacheKey, std::sync::Arc<Vec<Transc
 /// Compute the cache composite for the current app/width/detail. Reuses the
 /// crate-private accessors the overlay render key uses, so the row cache
 /// invalidates on exactly the same events the overlay does.
-fn row_cache_key(app: &crate::TuiApp, width: u16, detail: DetailPolicy) -> RowCacheKey {
+fn row_cache_key(
+    app: &crate::TuiApp,
+    width: u16,
+    detail: DetailPolicy,
+    filter: crate::OverlayFilter,
+) -> RowCacheKey {
     use std::hash::{Hash, Hasher};
 
     let entries = crate::active_transcript_entries(app);
@@ -552,6 +574,7 @@ fn row_cache_key(app: &crate::TuiApp, width: u16, detail: DetailPolicy) -> RowCa
         render_cache_session: app.render_cache_session,
         width,
         expand_all: detail.expand_all(),
+        filter,
         palette_generation: crate::render::palette::palette_generation(),
         selected_entry: crate::active_selected_entry(app),
         tool_output_verbosity: app.tool_output_verbosity as u8,

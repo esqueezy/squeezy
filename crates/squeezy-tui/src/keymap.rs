@@ -37,6 +37,9 @@ pub(crate) enum Action {
     ToggleConfigScreen,
     /// Open / close the transcript overlay (`Ctrl+T` default).
     ToggleTranscriptOverlay,
+    /// Open incremental transcript search (`/` default). Searches the active
+    /// surface (main view, or the Ctrl+T overlay when it is open).
+    OpenSearch,
     /// Expand or collapse the live task panel (`Ctrl+P` default).
     ToggleTaskPanel,
     /// Copy the last assistant response to the system clipboard
@@ -91,6 +94,15 @@ pub(crate) enum Action {
     JumpPrevError,
     /// Jump the transcript to the next error (`Alt+]` default).
     JumpNextError,
+    /// Move the focused-entry cursor to the previous transcript entry
+    /// (`Ctrl+Up` default). Used by the per-entry fold controls.
+    FocusPrevEntry,
+    /// Move the focused-entry cursor to the next transcript entry
+    /// (`Ctrl+Down` default).
+    FocusNextEntry,
+    /// Toggle the collapsed state of the focused transcript entry in the
+    /// main inline view (`Ctrl+Space` default).
+    ToggleFocusedFold,
 }
 
 impl Action {
@@ -98,6 +110,7 @@ impl Action {
         match self {
             Self::ToggleConfigScreen => "toggle_config_screen",
             Self::ToggleTranscriptOverlay => "transcript_overlay",
+            Self::OpenSearch => "open_search",
             Self::ToggleTaskPanel => "toggle_task_panel",
             Self::CopyLastAssistant => "copy_last_assistant",
             Self::CopyFocusedEntry => "copy_focused_entry",
@@ -119,12 +132,16 @@ impl Action {
             Self::JumpNextToolCall => "jump_next_tool_call",
             Self::JumpPrevError => "jump_prev_error",
             Self::JumpNextError => "jump_next_error",
+            Self::FocusPrevEntry => "focus_prev_entry",
+            Self::FocusNextEntry => "focus_next_entry",
+            Self::ToggleFocusedFold => "toggle_focused_fold",
         }
     }
 
     pub(crate) const ALL: &'static [Action] = &[
         Action::ToggleConfigScreen,
         Action::ToggleTranscriptOverlay,
+        Action::OpenSearch,
         Action::ToggleTaskPanel,
         Action::CopyLastAssistant,
         Action::CopyFocusedEntry,
@@ -146,6 +163,9 @@ impl Action {
         Action::JumpNextToolCall,
         Action::JumpPrevError,
         Action::JumpNextError,
+        Action::FocusPrevEntry,
+        Action::FocusNextEntry,
+        Action::ToggleFocusedFold,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -161,6 +181,7 @@ impl Action {
             Self::ToggleTranscriptOverlay => {
                 KeyBinding::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
             }
+            Self::OpenSearch => KeyBinding::new(KeyCode::Char('/'), KeyModifiers::NONE),
             Self::ToggleTaskPanel => KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             Self::CopyLastAssistant => KeyBinding::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
             // Semantic-copy chords use `Alt`+letter to avoid the terminal
@@ -193,6 +214,12 @@ impl Action {
             Self::JumpNextToolCall => KeyBinding::new(KeyCode::Char('.'), KeyModifiers::ALT),
             Self::JumpPrevError => KeyBinding::new(KeyCode::Char('['), KeyModifiers::ALT),
             Self::JumpNextError => KeyBinding::new(KeyCode::Char(']'), KeyModifiers::ALT),
+            // Per-entry fold cursor. `Alt`+arrow is already the user/assistant
+            // jump nav, so the fold cursor uses `Ctrl`+arrow; `Ctrl+Space`
+            // toggles the focused entry's fold (a free chord in the composer).
+            Self::FocusPrevEntry => KeyBinding::new(KeyCode::Up, KeyModifiers::CONTROL),
+            Self::FocusNextEntry => KeyBinding::new(KeyCode::Down, KeyModifiers::CONTROL),
+            Self::ToggleFocusedFold => KeyBinding::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
         }
     }
 }

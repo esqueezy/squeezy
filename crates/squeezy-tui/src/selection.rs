@@ -51,14 +51,16 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::transcript_surface::{plain_text_of_line, strip_gutter};
 
-/// Which drawn surface the selection lives on. The two surfaces have
-/// independent row `Vec`s, so a selection is only meaningful against one of
-/// them at a time.
+/// Which drawn transcript surface a row-indexed feature is anchored to. The two
+/// surfaces have independent wrapped row `Vec`s, so an index is only meaningful
+/// against one of them at a time. Visual selection is MAIN-view only; the
+/// incremental search session uses this to follow whichever surface is active
+/// (it can run over the overlay while the Ctrl+T overlay is open).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectionSurface {
     /// The always-on main transcript pane.
     Main,
-    /// The Ctrl+T full-transcript overlay.
+    /// The Ctrl+T full-transcript overlay (search only).
     Overlay,
 }
 
@@ -310,7 +312,11 @@ pub(crate) fn rows_with_selection_highlight(
 
 /// Split `line`'s spans at the char-offset boundaries of `span` and patch the
 /// selected middle slice with `highlight`, preserving the surrounding styles.
-fn highlight_line(line: &Line<'static>, span: Range<usize>, highlight: Style) -> Line<'static> {
+pub(crate) fn highlight_line(
+    line: &Line<'static>,
+    span: Range<usize>,
+    highlight: Style,
+) -> Line<'static> {
     let (before, rest) = split_spans_at_char(&line.spans, span.start);
     let (mid, after) = split_spans_at_char(&rest, span.end - span.start);
     let mut out: Vec<Span<'static>> = Vec::with_capacity(before.len() + mid.len() + after.len());

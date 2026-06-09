@@ -91,6 +91,7 @@ mod proposed_plan;
 mod render;
 mod resume_picker;
 mod scroll;
+mod search;
 mod selection;
 mod settings_watcher;
 mod size_source;
@@ -2138,7 +2139,6 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                     let (total_rows, _) = active_transcript_geometry(app);
                     scroll_selection_cursor_into_view(
                         app,
-                        selection::SelectionSurface::Main,
                         cursor_row,
                         total_rows.saturating_sub(1),
                     );
@@ -2349,8 +2349,9 @@ fn main_pos_for_cell(
     selection::Pos::new(row_idx, col)
 }
 
-/// The active selection surface: the overlay when it is open, else the main
-/// view. Selections do not survive crossing surfaces (the row `Vec`s differ).
+/// The surface a fresh incremental search opens on: the overlay when it is open,
+/// else the main view. (Visual selection is main-view only; this is consumed by
+/// the search session, which follows the active surface across the Ctrl+T toggle.)
 fn active_selection_surface(app: &TuiApp) -> selection::SelectionSurface {
     if app.transcript_overlay.is_some() {
         selection::SelectionSurface::Overlay
@@ -2359,37 +2360,16 @@ fn active_selection_surface(app: &TuiApp) -> selection::SelectionSurface {
     }
 }
 
-/// The `(row_count, viewport_h, from_bottom)` of the active selection surface,
-/// for keyboard extends + auto-scroll. The overlay uses its own scroll; the main
-/// view uses the cached painted geometry.
-fn selection_surface_geometry(
-    app: &TuiApp,
-    surface: selection::SelectionSurface,
-) -> (usize, usize) {
-    match surface {
-        selection::SelectionSurface::Main => {
-            let cache = app.main_text_area_cache.get();
-            match cache {
-                Some(c) => (c.total_rows, usize::from(c.viewport_h)),
-                None => {
-                    let (rows, vh) = active_transcript_geometry(app);
-                    (rows, vh)
-                }
-            }
-        }
-        selection::SelectionSurface::Overlay => {
-            let width = app
-                .main_text_area_cache
-                .get()
-                .map(|c| c.text_area.width)
-                .unwrap_or_else(|| main_text_width(app));
-            let row_count = with_transcript_overlay_rows(app, width.max(1), |rows| rows.len());
-            let viewport_h = app
-                .transcript_overlay_scrollbar_cache
-                .get()
-                .map(|c| usize::from(c.scrollbar_area.height))
-                .unwrap_or(0);
-            (row_count, viewport_h)
+/// The `(row_count, viewport_h)` of the MAIN view, for keyboard selection
+/// extends + auto-scroll, from the cached painted geometry. Selection is
+/// main-view only, so there is no overlay branch here.
+fn selection_surface_geometry(app: &TuiApp) -> (usize, usize) {
+    let cache = app.main_text_area_cache.get();
+    match cache {
+        Some(c) => (c.total_rows, usize::from(c.viewport_h)),
+        None => {
+            let (rows, vh) = active_transcript_geometry(app);
+            (rows, vh)
         }
     }
 }
@@ -2418,15 +2398,13 @@ fn set_selection_cursor(app: &mut TuiApp, pos: selection::Pos) {
     }
 }
 
-/// Seed a selection at the surface's tail when none exists, then drive a
-/// keyboard extend (`mv`) over the surface rows, auto-scrolling to keep the
-/// cursor visible.
+/// Seed a selection at the main view's tail when none exists, then drive a
+/// keyboard extend (`mv`) over the main rows, auto-scrolling to keep the cursor
+/// visible. Keyboard selection is MAIN-view only — every caller is gated to
+/// `transcript_overlay.is_none()`, so the surface is always `Main`.
 fn extend_selection(app: &mut TuiApp, mv: SelectionMove) {
-    let surface = match app.selection.as_ref() {
-        Some(sel) => sel.surface,
-        None => active_selection_surface(app),
-    };
-    let (row_count, viewport_h) = selection_surface_geometry(app, surface);
+    let surface = selection::SelectionSurface::Main;
+    let (row_count, viewport_h) = selection_surface_geometry(app);
     if row_count == 0 {
         return;
     }
@@ -2434,14 +2412,11 @@ fn extend_selection(app: &mut TuiApp, mv: SelectionMove) {
 
     if app.selection.is_none() {
         // Seed at the bottom visible row, column 0.
-        let from_bottom = match surface {
-            selection::SelectionSurface::Main => app
-                .main_text_area_cache
-                .get()
-                .map(|c| c.from_bottom)
-                .unwrap_or(0),
-            selection::SelectionSurface::Overlay => 0,
-        };
+        let from_bottom = app
+            .main_text_area_cache
+            .get()
+            .map(|c| c.from_bottom)
+            .unwrap_or(0);
         let seed_row = last.saturating_sub(from_bottom);
         let width = app
             .main_text_area_cache
@@ -2493,51 +2468,25 @@ fn extend_selection(app: &mut TuiApp, mv: SelectionMove) {
     }
 
     let cursor_row = app.selection.as_ref().expect("seeded above").cursor.row;
-    scroll_selection_cursor_into_view(app, surface, cursor_row, last);
+    scroll_selection_cursor_into_view(app, cursor_row, last);
 }
 
-/// Auto-scroll the active surface so `cursor_row` is inside the viewport.
-fn scroll_selection_cursor_into_view(
-    app: &mut TuiApp,
-    surface: selection::SelectionSurface,
-    cursor_row: usize,
-    last: usize,
-) {
-    match surface {
-        selection::SelectionSurface::Main => {
-            let (total_rows, viewport_h) = active_transcript_geometry(app);
-            if viewport_h == 0 || total_rows == 0 {
-                return;
-            }
-            let from_bottom =
-                active_transcript_scroll(app).offset_from_bottom(total_rows, viewport_h);
-            let last = last.min(total_rows.saturating_sub(1));
-            let bottom_visible = last.saturating_sub(from_bottom);
-            let top_visible = bottom_visible.saturating_sub(viewport_h.saturating_sub(1));
-            if cursor_row < top_visible {
-                scroll_transcript_up(app, top_visible - cursor_row);
-            } else if cursor_row > bottom_visible {
-                scroll_transcript_down(app, cursor_row - bottom_visible);
-            }
-        }
-        selection::SelectionSurface::Overlay => {
-            // Bring the cursor row to the top of the overlay viewport if it's
-            // off-screen above/below.
-            let scroll = resolved_transcript_overlay_scroll(app);
-            let viewport_h = app
-                .transcript_overlay_scrollbar_cache
-                .get()
-                .map(|c| usize::from(c.scrollbar_area.height))
-                .unwrap_or(0);
-            if viewport_h == 0 {
-                return;
-            }
-            if cursor_row < scroll {
-                set_transcript_overlay_scroll(app, cursor_row);
-            } else if cursor_row >= scroll + viewport_h {
-                set_transcript_overlay_scroll(app, cursor_row + 1 - viewport_h);
-            }
-        }
+/// Auto-scroll the MAIN view so `cursor_row` is inside the viewport. Selection is
+/// main-view only, so there is no overlay branch here (the overlay search match
+/// scroll lives in [`scroll_search_match_into_view`]).
+fn scroll_selection_cursor_into_view(app: &mut TuiApp, cursor_row: usize, last: usize) {
+    let (total_rows, viewport_h) = active_transcript_geometry(app);
+    if viewport_h == 0 || total_rows == 0 {
+        return;
+    }
+    let from_bottom = active_transcript_scroll(app).offset_from_bottom(total_rows, viewport_h);
+    let last = last.min(total_rows.saturating_sub(1));
+    let bottom_visible = last.saturating_sub(from_bottom);
+    let top_visible = bottom_visible.saturating_sub(viewport_h.saturating_sub(1));
+    if cursor_row < top_visible {
+        scroll_transcript_up(app, top_visible - cursor_row);
+    } else if cursor_row > bottom_visible {
+        scroll_transcript_down(app, cursor_row - bottom_visible);
     }
 }
 
@@ -3046,20 +2995,40 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
-    // Esc clears an active visual selection BEFORE any search / detail / exit
-    // consumer. Highest precedence among Esc handlers: a first Esc drops the
-    // selection, only a second reaches the turn-interrupt / bare-Esc no-op
-    // below. Gated so it never steals Esc from a modal surface. The overlay
-    // owns its own selection, so allow the clear there too.
+    // Esc clears an active visual selection BEFORE the turn-interrupt / bare-Esc
+    // no-op below: a first Esc drops the selection, only a second reaches the
+    // interrupt. Selection is MAIN-view only (the overlay/statusline/queue
+    // overlays do not paint a selection), so this gate defers to every in-app
+    // modal surface — when one is open it owns its own Esc, and a lingering
+    // main-view selection must NOT steal that first Esc from it.
     if key.code == KeyCode::Esc
         && app.selection.is_some()
         && app.config_screen.is_none()
+        && app.transcript_overlay.is_none()
+        && app.status_line_setup.is_none()
+        && app.prompt_queue_overlay.is_none()
         && !app.pin_picker_active
         && app.pending_chord.is_none()
     {
         app.selection = None;
         app.status = "selection cleared".to_string();
         return Ok(false);
+    }
+
+    // Incremental search owns the keyboard like a modal mini-buffer while it is
+    // open, intercepting BEFORE the pin-picker guard, the keymap dispatch, and
+    // the composer arms. Esc closes search FIRST (after the selection-clear
+    // above): a selection made inside search clears on the first Esc, the next
+    // closes search; closing search leaves a Ctrl+T overlay open (a second Esc
+    // then closes the overlay). Gated like the selection-clear block so it never
+    // steals Esc from the config screen / pin picker / a pending chord.
+    if app.search.is_some()
+        && app.config_screen.is_none()
+        && !app.pin_picker_active
+        && app.pending_chord.is_none()
+        && let Some(outcome) = handle_search_key(app, key)
+    {
+        return Ok(outcome);
     }
 
     // The /pin picker is fully modal: it owns ↑/↓/Enter/Esc until it closes,
@@ -3780,16 +3749,164 @@ fn is_large_prompt_paste(text: &str) -> bool {
 /// Composer basics (Enter / Esc / Backspace / character input) are
 /// intentionally outside this dispatch — they stay hardcoded below
 /// since rebinding them breaks every workflow.
+/// Open a fresh incremental-search session on the active surface and run the
+/// first find pass. The `/` open key (or its rebind) routes here.
+fn open_search(app: &mut TuiApp) {
+    let surface = active_selection_surface(app);
+    let width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .unwrap_or_else(|| main_text_width(app));
+    app.search = Some(search::SearchState::open(surface, width.max(1)));
+    refresh_search(app);
+    app.status = app
+        .search
+        .as_ref()
+        .map(search_status_text)
+        .unwrap_or_default();
+}
+
+/// In-search mini-buffer key handling, run while `app.search.is_some()` and no
+/// higher modal owns the keyboard. Returns:
+/// - `Some(false)` — the key was consumed by search (swallowed, like a modal),
+/// - `None` — the key is NOT a search key and should fall through to the normal
+///   dispatch (so the Ctrl+T overlay toggle stays live to move search between
+///   surfaces).
+///
+/// No key here ever returns `Ok(true)` (quit); search is dismissed with Esc.
+fn handle_search_key(app: &mut TuiApp, key: KeyEvent) -> Option<bool> {
+    let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Esc closes search (the selection-clear above already ran, so a selection
+    // inside search clears first). Leaves any Ctrl+T overlay open.
+    if key.code == KeyCode::Esc {
+        app.search = None;
+        app.status = "search closed".to_string();
+        return Some(false);
+    }
+
+    // Let the Ctrl+T overlay toggle through so a user can move search between
+    // surfaces; after the toggle the surface re-sync happens at the call site.
+    if has_ctrl && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T')) && !has_alt {
+        return None;
+    }
+
+    // Toggle tool-output (Ctrl+O) / reasoning (Ctrl+R) inclusion, then re-find.
+    if has_ctrl && !has_alt {
+        match key.code {
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                if let Some(state) = app.search.as_mut() {
+                    state.include_tool_output = !state.include_tool_output;
+                }
+                refresh_search(app);
+                if let Some(state) = app.search.as_ref() {
+                    app.status = search_status_text(state);
+                }
+                return Some(false);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(state) = app.search.as_mut() {
+                    state.include_reasoning = !state.include_reasoning;
+                }
+                refresh_search(app);
+                if let Some(state) = app.search.as_ref() {
+                    app.status = search_status_text(state);
+                }
+                return Some(false);
+            }
+            _ => {}
+        }
+    }
+
+    match key.code {
+        // Type into the query.
+        KeyCode::Char(c) if !has_ctrl && !has_alt => {
+            if let Some(state) = app.search.as_mut() {
+                search::push_char(state, c);
+            }
+            refresh_search(app);
+            if let Some(state) = app.search.as_ref() {
+                app.status = search_status_text(state);
+            }
+            Some(false)
+        }
+        KeyCode::Backspace => {
+            if let Some(state) = app.search.as_mut() {
+                search::pop_char(state);
+            }
+            refresh_search(app);
+            if let Some(state) = app.search.as_ref() {
+                app.status = search_status_text(state);
+            }
+            Some(false)
+        }
+        // Next match: Enter / Down (and `n` is handled by the Char arm above as
+        // a query keystroke, so the explicit nav keys are Enter / arrows).
+        KeyCode::Enter | KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            move_search_match(app, search::next);
+            if let Some(state) = app.search.as_ref() {
+                app.status = search_status_text(state);
+            }
+            Some(false)
+        }
+        // Previous match: Shift+Enter / Up.
+        KeyCode::Up => {
+            move_search_match(app, search::prev);
+            if let Some(state) = app.search.as_ref() {
+                app.status = search_status_text(state);
+            }
+            Some(false)
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            move_search_match(app, search::prev);
+            if let Some(state) = app.search.as_ref() {
+                app.status = search_status_text(state);
+            }
+            Some(false)
+        }
+        // Everything else is swallowed: search is modal.
+        _ => Some(false),
+    }
+}
+
 fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
     let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
         return false;
     };
-    if app.transcript_overlay.is_some() && action != keymap::Action::ToggleTranscriptOverlay {
+    if app.transcript_overlay.is_some()
+        && action != keymap::Action::ToggleTranscriptOverlay
+        && action != keymap::Action::OpenSearch
+    {
         return false;
     }
     match action {
         keymap::Action::ToggleConfigScreen => {
             toggle_config_screen(app, agent, None);
+            true
+        }
+        keymap::Action::OpenSearch => {
+            // `/` opens transcript search ONLY in an unambiguous
+            // transcript-navigation context, so it never steals `/command`
+            // typing in the composer:
+            //   - the Ctrl+T overlay is open (it has no composer at all), or
+            //   - a visual selection is active on the main surface (a clear "I'm
+            //     navigating the transcript, not composing" signal).
+            // In every other main-surface case `/` falls through to the composer
+            // so `/help`, `/keymap`, etc. keep working.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            let overlay_open = app.transcript_overlay.is_some();
+            let main_selection_active = app
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.surface == selection::SelectionSurface::Main);
+            if !overlay_open && !main_selection_active {
+                return false;
+            }
+            open_search(app);
             true
         }
         keymap::Action::ToggleTranscriptOverlay => {
@@ -3804,22 +3921,38 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             // Expanded in place, an already-expanded overlay closes (backing out
             // to the main conversation when it was a subagent), and opening from
             // nothing goes straight to expanded — the "see everything" view.
-            app.status = match app.transcript_overlay.map(|state| state.detail) {
+            // The `Expanded` arm closes the overlay; `close_transcript_overlay`
+            // sets its own status, so don't clobber it. The other arms set their
+            // own status string here.
+            match app.transcript_overlay.map(|state| state.detail) {
                 Some(OverlayDetail::Collapsed) => {
                     if let Some(state) = app.transcript_overlay.as_mut() {
                         state.detail = OverlayDetail::Expanded;
                     }
-                    "transcript expanded — Esc to close".to_string()
+                    app.status = "transcript expanded — Esc to close".to_string();
                 }
                 Some(OverlayDetail::Expanded) => {
                     close_transcript_overlay(app);
-                    return true;
                 }
                 None => {
                     app.transcript_overlay = Some(TranscriptOverlayState::default());
-                    "transcript overlay (Esc to close)".to_string()
+                    app.status = "transcript overlay (Esc to close)".to_string();
                 }
-            };
+            }
+            // While search is live, follow it onto whichever surface is now
+            // active (the overlay just opened/closed/expanded), then re-find so
+            // the match set matches the painted rows of the new surface and
+            // surface the search status over the overlay-toggle status.
+            if app.search.is_some() {
+                let surface = active_selection_surface(app);
+                if let Some(state) = app.search.as_mut() {
+                    state.surface = surface;
+                }
+                refresh_search(app);
+                if let Some(state) = app.search.as_ref() {
+                    app.status = search_status_text(state);
+                }
+            }
             true
         }
         keymap::Action::ToggleTaskPanel => {
@@ -3952,6 +4085,41 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
         keymap::Action::JumpNextError => {
             jump_transcript_nav(app, JumpTarget::Error, JumpDirection::Next)
         }
+        keymap::Action::FocusPrevEntry => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            select_previous_transcript_entry(app);
+            true
+        }
+        keymap::Action::FocusNextEntry => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            select_next_transcript_entry(app);
+            true
+        }
+        keymap::Action::ToggleFocusedFold => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // Fold the focused inline entry. The overlay guard above already
+            // blocks this while Ctrl+T is open (folding is a main-view action;
+            // the overlay has its own expand-all/collapse-all keys).
+            if let Some(index) = app.selected_entry {
+                if toggle_transcript_entry_fold(app, index) {
+                    let collapsed = app.transcript[index].collapsed;
+                    app.status = if collapsed {
+                        "entry collapsed".to_string()
+                    } else {
+                        "entry expanded".to_string()
+                    };
+                }
+            } else {
+                app.status = "no focused entry — Ctrl+↑/↓ to focus one".to_string();
+            }
+            true
+        }
     }
 }
 
@@ -4016,6 +4184,93 @@ fn entry_is_error(entries: &[TranscriptEntry], index: usize) -> bool {
         }
         _ => false,
     }
+}
+
+/// The distinct tool names appearing in `entries`, in first-seen order. Used to
+/// build the per-tool overlay filter set ([`OverlayFilter::Tool`] indexes into
+/// this list). Only tool-result leads contribute, so a coalesced run's name is
+/// counted once.
+fn distinct_overlay_tool_names(entries: &[TranscriptEntry]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        if let TranscriptEntryKind::ToolResult(tool) = &entry.kind {
+            let name = &tool.result.tool_name;
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// Index of the last user-message entry, i.e. the start of the "current turn".
+/// `0` when there is no user message (the whole transcript is the current
+/// turn). Computed once over the unfiltered slice so [`OverlayFilter::CurrentTurn`]
+/// keeps the right boundary even while filtering.
+fn current_turn_start(entries: &[TranscriptEntry]) -> usize {
+    entries
+        .iter()
+        .rposition(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::User)
+        })
+        .unwrap_or(0)
+}
+
+/// True when entry `index` survives the active overlay `filter`. Pure over the
+/// entry slice; reuses [`entry_matches_jump_target`] / [`entry_is_error`] so the
+/// classifications match the renderer and jump-nav. `tool_names` is the derived
+/// distinct-tool-name list; `turn_start` is [`current_turn_start`] of the same
+/// (unfiltered) slice.
+fn entry_matches_overlay_filter(
+    entries: &[TranscriptEntry],
+    index: usize,
+    filter: OverlayFilter,
+    coalesce_tool_runs: bool,
+    tool_names: &[String],
+    turn_start: usize,
+) -> bool {
+    let Some(entry) = entries.get(index) else {
+        return false;
+    };
+    match filter {
+        OverlayFilter::All => true,
+        OverlayFilter::Conversation => {
+            matches!(&entry.kind, TranscriptEntryKind::Message(_))
+        }
+        OverlayFilter::ToolCalls => {
+            entry_matches_jump_target(entries, index, JumpTarget::ToolCall, coalesce_tool_runs)
+        }
+        OverlayFilter::Errors => entry_is_error(entries, index),
+        OverlayFilter::Subagent => {
+            matches!(&entry.kind, TranscriptEntryKind::Log(log) if log.kind == LogKind::Subagent)
+        }
+        OverlayFilter::Tool(i) => {
+            matches!(&entry.kind, TranscriptEntryKind::ToolResult(tool)
+                if tool_names.get(i).is_some_and(|name| name == &tool.result.tool_name))
+        }
+        OverlayFilter::CurrentTurn => index >= turn_start,
+    }
+}
+
+/// The list of overlay filters worth cycling through for the current
+/// transcript: the always-available ones, plus one `Tool(i)` per distinct tool
+/// when more than one tool appears (a single-tool transcript already has
+/// `ToolCalls`). Order is the cycle order the overlay's `f` key walks.
+fn overlay_filter_cycle(tool_names: &[String]) -> Vec<OverlayFilter> {
+    let mut filters = vec![
+        OverlayFilter::All,
+        OverlayFilter::Conversation,
+        OverlayFilter::ToolCalls,
+        OverlayFilter::Errors,
+        OverlayFilter::Subagent,
+        OverlayFilter::CurrentTurn,
+    ];
+    if tool_names.len() > 1 {
+        for i in 0..tool_names.len() {
+            filters.push(OverlayFilter::Tool(i));
+        }
+    }
+    filters
 }
 
 /// Execute a jump-navigation command: find the previous/next entry matching
@@ -6565,7 +6820,13 @@ fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Optio
     app.status = format!("tool output verbosity → {}", verbosity.as_str());
 }
 
-#[cfg(test)]
+/// Collapse (or expand) every transcript entry, returning the number of
+/// revision bumps applied. Driven by the Ctrl+T overlay's `c`/`e` keys. Each
+/// toggle cancels any in-flight settle-fold so the requested state sticks, then
+/// flips `collapsed`; both mutations bump the entry's revision so the line cache
+/// (keyed on `revision`) re-renders. Fold state lives on the entry (id-keyed,
+/// layout-independent), so it is preserved through resize and remembered across
+/// overlay opens.
 fn set_all_transcript_collapsed(app: &mut TuiApp, collapsed: bool) -> usize {
     let mut changed = 0;
     for entry in &mut app.transcript {
@@ -6586,10 +6847,28 @@ fn set_all_transcript_collapsed(app: &mut TuiApp, collapsed: bool) -> usize {
     changed
 }
 
-// Retained for the `/pin` `selected_entry` candidate model (and its test
-// coverage). Shift+Up/Down now drive the row-level visual selection instead, so
-// these are no longer wired to a key in production.
-#[allow(dead_code)]
+/// Toggle the collapsed state of a single transcript entry by index. Mirrors
+/// `set_all_transcript_collapsed`'s per-entry recipe exactly (cancel any
+/// in-flight settle-fold, then flip `collapsed`, bumping the revision on each
+/// mutation so the line cache invalidates). The fold state it sets lives on the
+/// entry itself, which `transcript_lines_for_render` already honours, so it
+/// survives resize and persists after the overlay closes. Returns `false` when
+/// `index` is out of range.
+fn toggle_transcript_entry_fold(app: &mut TuiApp, index: usize) -> bool {
+    let Some(entry) = app.transcript.get_mut(index) else {
+        return false;
+    };
+    if entry.settle.take().is_some() {
+        entry.bump_revision();
+    }
+    entry.collapsed = !entry.collapsed;
+    entry.bump_revision();
+    true
+}
+
+/// Move the focused-entry cursor (`app.selected_entry`) one entry earlier, used
+/// by the per-entry fold controls. Wraps to the last entry when nothing is
+/// focused yet.
 fn select_previous_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
@@ -6603,7 +6882,9 @@ fn select_previous_transcript_entry(app: &mut TuiApp) {
     app.status = format!("selected transcript entry {}", entry.id + 1);
 }
 
-#[allow(dead_code)]
+/// Move the focused-entry cursor (`app.selected_entry`) one entry later, used by
+/// the per-entry fold controls. Wraps to the first entry when nothing is focused
+/// yet.
 fn select_next_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
@@ -6681,8 +6962,76 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             toggle_transcript_overlay_mouse_capture(app);
             true
         }
+        KeyCode::Char('f') | KeyCode::Char('F')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+        {
+            // Cycle the overlay entry filter. Backward when Shift is held
+            // (uppercase `F`), forward otherwise. Like `m`, this is a local key
+            // handled here rather than through the global keymap (the dispatch
+            // guard blocks non-toggle actions while the overlay is open).
+            let backward = key.modifiers.contains(KeyModifiers::SHIFT);
+            cycle_transcript_overlay_filter(app, backward);
+            true
+        }
+        KeyCode::Char('e') | KeyCode::Char('E')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+        {
+            // Expand every entry. Force `detail = Collapsed` so the per-entry
+            // `collapsed` flag is honoured in the overlay (Expanded would force
+            // every body open regardless of the flag, hiding the effect); the
+            // expand still applies inline after the overlay closes.
+            let n = set_all_transcript_collapsed(app, false);
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.detail = OverlayDetail::Collapsed;
+            }
+            set_transcript_overlay_scroll(app, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM);
+            app.status = format!("expanded all entries ({n} updated)");
+            true
+        }
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+        {
+            // Collapse every entry. `detail = Collapsed` so the fold is visible
+            // in the overlay too (not just inline after it closes).
+            let n = set_all_transcript_collapsed(app, true);
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.detail = OverlayDetail::Collapsed;
+            }
+            set_transcript_overlay_scroll(app, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM);
+            app.status = format!("collapsed all entries ({n} updated)");
+            true
+        }
         _ => true, // swallow everything else so the overlay stays modal
     }
+}
+
+/// Advance the overlay's entry filter to the next (or previous, when
+/// `backward`) variant in [`overlay_filter_cycle`], wrapping around. Resets the
+/// overlay scroll to the bottom (the filtered row count changed, so the old
+/// offset is meaningless) and reports the new filter in the status line.
+fn cycle_transcript_overlay_filter(app: &mut TuiApp, backward: bool) {
+    let tool_names = distinct_overlay_tool_names(active_transcript_entries(app));
+    let cycle = overlay_filter_cycle(&tool_names);
+    let Some(state) = app.transcript_overlay.as_mut() else {
+        return;
+    };
+    let current = cycle.iter().position(|f| *f == state.filter).unwrap_or(0);
+    let len = cycle.len();
+    let next = if backward {
+        (current + len - 1) % len
+    } else {
+        (current + 1) % len
+    };
+    state.filter = cycle[next];
+    let label = state.filter.label(&tool_names);
+    set_transcript_overlay_scroll(app, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM);
+    app.status = format!("filter: {label}");
 }
 
 fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
@@ -8989,6 +9338,236 @@ fn selection_highlight_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
+/// Style for every search match: a muted accent background so all hits are
+/// visible at once without overwhelming the current one. Uses an explicit
+/// theme color rather than reverse-video so it composes on top of a selection
+/// (which already reverses) and stays distinct from it.
+fn search_match_style() -> Style {
+    Style::default()
+        .bg(crate::render::theme::secondary())
+        .fg(Color::Black)
+}
+
+/// Style for the CURRENT search match: brighter than the rest so the focused
+/// hit stands out among the dimmer matches as next/prev steps through them.
+fn search_current_match_style() -> Style {
+    Style::default()
+        .bg(crate::render::theme::accent())
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Bake the search-match highlight onto a clone of `rows` for matches on
+/// `surface`. The current match gets [`search_current_match_style`]; the rest
+/// get [`search_match_style`]. Like the selection highlight this restyles only
+/// the matched char-offset ranges (the same basis copy uses) and is applied to
+/// the full PRE-scroll `Vec<Line>` so off-screen matches are clipped by the
+/// surface's own skip/scroll. The third consumer of the selection
+/// per-painted-row pattern.
+fn rows_with_search_highlight(
+    rows: Vec<Line<'static>>,
+    state: &search::SearchState,
+    surface: selection::SelectionSurface,
+) -> Vec<Line<'static>> {
+    if state.surface != surface {
+        return rows;
+    }
+    let mut rows = rows;
+    // Non-current matches first, then the current on top, so the brighter
+    // current style always wins overlap precedence even if two matches abut.
+    let mut ordered: Vec<(usize, std::ops::Range<usize>, bool)> =
+        search::match_ranges_by_row(state).collect();
+    ordered.sort_by_key(|(_, _, is_current)| *is_current);
+    for (row, col, is_current) in ordered {
+        if col.is_empty() {
+            continue;
+        }
+        let Some(line) = rows.get(row) else {
+            continue;
+        };
+        let style = if is_current {
+            search_current_match_style()
+        } else {
+            search_match_style()
+        };
+        rows[row] = selection::highlight_line(line, col, style);
+    }
+    rows
+}
+
+/// Build a `Vec<search::RowKind>` parallel to the painted rows of `surface`, so
+/// the search find pass can honour the include-tool-output / include-reasoning
+/// toggles. Classification reuses the shared row model
+/// ([`transcript_surface::build_transcript_rows`]) which carries each row's
+/// owning entry kind; rows the model classifies as a tool result map to
+/// [`search::RowKind::ToolOutput`] and reasoning rows to
+/// [`search::RowKind::Reasoning`], everything else (and chrome) to `Normal`.
+///
+/// The shared row model only faithfully mirrors the OVERLAY surface today (see
+/// `transcript_surface`'s module doc); for the main surface its row count can
+/// diverge from the painted rows, so a length mismatch falls back to an
+/// all-`Normal` slice (every row searched). That is the correct default: when
+/// both toggles are on — the common case — classification is irrelevant anyway,
+/// and an over-broad search is the safe failure mode.
+fn search_row_kinds(
+    app: &TuiApp,
+    surface: selection::SelectionSurface,
+    painted_len: usize,
+) -> Vec<search::RowKind> {
+    let width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .unwrap_or_else(|| main_text_width(app));
+    let (detail, filter) = match surface {
+        selection::SelectionSurface::Overlay => (
+            transcript_surface::DetailPolicy::from(overlay_detail(app)),
+            overlay_filter(app),
+        ),
+        selection::SelectionSurface::Main => (
+            transcript_surface::DetailPolicy::Collapsed,
+            OverlayFilter::All,
+        ),
+    };
+    let model =
+        transcript_surface::build_transcript_rows_filtered(app, width.max(1), detail, filter);
+    if model.len() != painted_len {
+        return vec![search::RowKind::Normal; painted_len];
+    }
+    model
+        .iter()
+        .map(|row| match row.entry_kind {
+            Some(transcript_surface::RowKind::ToolResult) => search::RowKind::ToolOutput,
+            Some(transcript_surface::RowKind::Reasoning) => search::RowKind::Reasoning,
+            _ => search::RowKind::Normal,
+        })
+        .collect()
+}
+
+/// Re-run the search find pass against the live painted rows of `state.surface`
+/// and re-anchor the current match, then scroll it into view. Called after every
+/// query edit, toggle flip, surface switch, or resize while search is open.
+fn refresh_search(app: &mut TuiApp) {
+    let Some(surface) = app.search.as_ref().map(|s| s.surface) else {
+        return;
+    };
+    let rows = selection_surface_rows(app, surface);
+    let kinds = search_row_kinds(app, surface, rows.len());
+    if let Some(state) = app.search.as_mut() {
+        search::rebuild(state, &rows, &kinds);
+    }
+    scroll_search_match_into_view(app);
+}
+
+/// Advance/retreat the current match (via `step`) and scroll it into view.
+fn move_search_match(app: &mut TuiApp, step: impl FnOnce(&mut search::SearchState)) {
+    if let Some(state) = app.search.as_mut() {
+        step(state);
+    }
+    scroll_search_match_into_view(app);
+}
+
+/// Scroll the active surface so the current search match's row is visible, using
+/// the existing scroll model only — no new primitive. Only scrolls when the row
+/// is off-screen, so a next-match already in the viewport doesn't jump.
+fn scroll_search_match_into_view(app: &mut TuiApp) {
+    let Some((surface, row)) = app
+        .search
+        .as_ref()
+        .and_then(|s| search::current_match(s).map(|m| (s.surface, m.row)))
+    else {
+        return;
+    };
+    match surface {
+        selection::SelectionSurface::Main => {
+            let cache = match app.main_text_area_cache.get() {
+                Some(c) => c,
+                None => return,
+            };
+            let total_rows = cache.total_rows;
+            let viewport_h = usize::from(cache.viewport_h);
+            if viewport_h == 0 || total_rows == 0 {
+                return;
+            }
+            // `top_row = total_rows - viewport_h - from_bottom` (the same relation
+            // `main_pos_for_cell` / `scroll_offset_for_from_bottom` encode).
+            let max_from_bottom = total_rows.saturating_sub(viewport_h);
+            let current_from_bottom =
+                active_transcript_scroll(app).offset_from_bottom(total_rows, viewport_h);
+            let top_row = total_rows
+                .saturating_sub(viewport_h)
+                .saturating_sub(current_from_bottom);
+            let bottom_row = top_row + viewport_h.saturating_sub(1);
+            if row >= top_row && row <= bottom_row {
+                return; // already visible
+            }
+            // Choose a `from_bottom` that places `row` at the viewport top (when
+            // scrolling up) or bottom (when scrolling down).
+            let target_top = if row < top_row {
+                row
+            } else {
+                row.saturating_sub(viewport_h.saturating_sub(1))
+            };
+            // from_bottom = total_rows - viewport_h - top_row
+            let target_from_bottom = max_from_bottom
+                .saturating_sub(target_top)
+                .min(max_from_bottom);
+            active_transcript_scroll_mut(app).set_from_bottom(
+                target_from_bottom,
+                total_rows,
+                viewport_h,
+            );
+        }
+        selection::SelectionSurface::Overlay => {
+            let width = app
+                .main_text_area_cache
+                .get()
+                .map(|c| c.text_area.width)
+                .unwrap_or_else(|| main_text_width(app));
+            let row_count = with_transcript_overlay_rows(app, width.max(1), |rows| rows.len());
+            let viewport_h = app
+                .transcript_overlay_scrollbar_cache
+                .get()
+                .map(|c| usize::from(c.scrollbar_area.height))
+                .unwrap_or(0);
+            let Some(state) = app.transcript_overlay.as_mut() else {
+                return;
+            };
+            if viewport_h == 0 {
+                return;
+            }
+            let current =
+                resolved_transcript_overlay_scroll_for_state(*state, row_count, viewport_h as u16);
+            let bottom = current + viewport_h.saturating_sub(1);
+            if row >= current && row <= bottom {
+                return; // already visible
+            }
+            let target = if row < current {
+                row
+            } else {
+                row.saturating_sub(viewport_h.saturating_sub(1))
+            };
+            state.scroll = target.min(row_count.saturating_sub(viewport_h));
+        }
+    }
+}
+
+/// Status string for the search mini-buffer footer: `"/query  3/17"`, or
+/// `"/query  no matches"` when the query has no hits.
+fn search_status_text(state: &search::SearchState) -> String {
+    let count = state.matches.len();
+    if count == 0 {
+        if state.query.is_empty() {
+            "search: type to find".to_string()
+        } else {
+            format!("/{}  no matches", state.query)
+        }
+    } else {
+        let pos = state.current.map(|i| i + 1).unwrap_or(0);
+        format!("/{}  {}/{}", state.query, pos, count)
+    }
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     // Reserve a 1-cell right gutter for the scrollbar; the text wraps to the
     // narrower column. When the area is too thin to split, fall back to the
@@ -9032,6 +9611,13 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
             selection::rows_with_selection_highlight(&lines, sel, selection_highlight_style())
         }
         _ => lines,
+    };
+    // Bake the search-match highlight AFTER the selection so the active match
+    // stays visible inside a selection. Surface-local: only matches on the main
+    // surface are applied here.
+    let lines = match app.search.as_ref() {
+        Some(state) => rows_with_search_highlight(lines, state, selection::SelectionSurface::Main),
+        None => lines,
     };
     let paragraph = Paragraph::new(lines)
         .scroll((scroll, 0))
@@ -9213,14 +9799,58 @@ impl OverlayDetail {
     }
 }
 
+/// Which transcript entries the Ctrl+T overlay shows. Overlay-scoped UI state
+/// (lives on [`TranscriptOverlayState`], not the app) cycled with the overlay's
+/// local `f` key. `All` is the default; the other variants filter the entry
+/// list down to one category so the user can isolate (say) just the tool calls
+/// or just the errors in a long transcript. `Tool` carries an index into the
+/// derived distinct-tool-name list ([`distinct_overlay_tool_names`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum OverlayFilter {
+    /// No filter — every entry renders.
+    All,
+    /// User + assistant messages only.
+    Conversation,
+    /// Tool-result entries (the lead of each coalesced run).
+    ToolCalls,
+    /// Failure surfaces ([`entry_is_error`]).
+    Errors,
+    /// Subagent lifecycle breadcrumbs (`Log` with `LogKind::Subagent`).
+    Subagent,
+    /// A single tool, indexed into the distinct-tool-name list.
+    Tool(usize),
+    /// Entries at/after the last user message (the current turn).
+    CurrentTurn,
+}
+
+impl OverlayFilter {
+    /// Short human label for the overlay title + status line.
+    fn label(self, tool_names: &[String]) -> String {
+        match self {
+            Self::All => "all".to_string(),
+            Self::Conversation => "conversation".to_string(),
+            Self::ToolCalls => "tool calls".to_string(),
+            Self::Errors => "errors".to_string(),
+            Self::Subagent => "subagent".to_string(),
+            Self::Tool(i) => tool_names
+                .get(i)
+                .map(|name| format!("tool: {name}"))
+                .unwrap_or_else(|| "tool".to_string()),
+            Self::CurrentTurn => "current turn".to_string(),
+        }
+    }
+}
+
 /// State for the full-screen transcript overlay (Ctrl+T). `detail` selects
-/// whether entries render folded (like the inline view) or fully expanded; the
-/// user scrolls with PgUp/PgDn/arrows.
+/// whether entries render folded (like the inline view) or fully expanded;
+/// `filter` selects which entries appear; the user scrolls with
+/// PgUp/PgDn/arrows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TranscriptOverlayState {
     pub(crate) scroll: usize,
     pub(crate) mode: TranscriptOverlayMode,
     pub(crate) detail: OverlayDetail,
+    pub(crate) filter: OverlayFilter,
 }
 
 impl Default for TranscriptOverlayState {
@@ -9229,6 +9859,7 @@ impl Default for TranscriptOverlayState {
             scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
             mode: TranscriptOverlayMode::NativeSelection,
             detail: OverlayDetail::Expanded,
+            filter: OverlayFilter::All,
         }
     }
 }
@@ -9246,6 +9877,7 @@ struct TranscriptOverlayRenderKey {
     animation_tick: u64,
     palette_generation: u64,
     detail: OverlayDetail,
+    filter: OverlayFilter,
 }
 
 #[derive(Debug, Default)]
@@ -9280,9 +9912,20 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Some(state) => state,
         None => return,
     };
+    // Surface the active entry filter in the title when it is narrowing the
+    // view, so the user always sees that some entries are hidden (and the `f`
+    // hint for how to change it).
+    let filter_suffix = match state.filter {
+        OverlayFilter::All => String::new(),
+        other => {
+            let tool_names = distinct_overlay_tool_names(active_transcript_entries(app));
+            format!("· filter: {} (f) ", other.label(&tool_names))
+        }
+    };
     let title = format!(
-        " Transcript — {} or Esc to close · PgUp/PgDn or wheel scroll ",
-        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+        " Transcript — {} or Esc to close · PgUp/PgDn or wheel scroll {}",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay),
+        filter_suffix
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -9310,11 +9953,14 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let row_count = rows.len();
         let scroll =
             resolved_transcript_overlay_scroll_for_state(state, row_count, text_area.height);
-        let overlay_selection = app
-            .selection
+        // Selection is main-view only — the overlay paints no selection
+        // highlight. Search, however, can follow the active surface onto the
+        // overlay and is honoured here.
+        let overlay_search = app
+            .search
             .as_ref()
             .filter(|s| s.surface == selection::SelectionSurface::Overlay);
-        render_transcript_overlay_rows(frame, text_area, rows, scroll, overlay_selection);
+        render_transcript_overlay_rows(frame, text_area, rows, scroll, overlay_search);
         if scrollbar_area.width > 0
             && let Some(geometry) =
                 transcript_overlay_scrollbar_geometry(row_count, scrollbar_area.height, scroll)
@@ -9345,8 +9991,12 @@ fn with_transcript_overlay_rows<R>(
     let key = transcript_overlay_render_key(app, width);
     let mut cache = app.transcript_overlay_render_cache.borrow_mut();
     if cache.key != Some(key) {
-        let logical_lines =
-            transcript_lines_for_overlay(app, Some(width), overlay_detail(app).expand_all());
+        let logical_lines = transcript_lines_for_overlay(
+            app,
+            Some(width),
+            overlay_detail(app).expand_all(),
+            overlay_filter(app),
+        );
         cache.rows = wrap_transcript_overlay_rows(&logical_lines, width);
         cache.key = Some(key);
     }
@@ -9360,6 +10010,15 @@ fn overlay_detail(app: &TuiApp) -> OverlayDetail {
         .as_ref()
         .map(|state| state.detail)
         .unwrap_or(OverlayDetail::Expanded)
+}
+
+/// The entry filter the transcript overlay is currently showing, defaulting to
+/// `All` when no overlay is open (the value the render cache keys on).
+fn overlay_filter(app: &TuiApp) -> OverlayFilter {
+    app.transcript_overlay
+        .as_ref()
+        .map(|state| state.filter)
+        .unwrap_or(OverlayFilter::All)
 }
 
 fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayRenderKey {
@@ -9389,6 +10048,7 @@ fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayR
         animation_tick: app.animation_tick,
         palette_generation: render::palette::palette_generation(),
         detail: overlay_detail(app),
+        filter: overlay_filter(app),
     }
 }
 
@@ -9583,20 +10243,24 @@ fn render_transcript_overlay_rows(
     area: Rect,
     rows: &[Line<'static>],
     scroll: usize,
-    selection: Option<&selection::Selection>,
+    search: Option<&search::SearchState>,
 ) {
     frame.render_widget(ratatui::widgets::Clear, area);
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Bake the selection highlight onto the full pre-scroll row list (the same
-    // char-offset basis copy uses), THEN skip/take the visible window.
-    let highlighted;
-    let source: &[Line<'static>] = match selection {
-        Some(sel) => {
-            highlighted =
-                selection::rows_with_selection_highlight(rows, sel, selection_highlight_style());
-            &highlighted
+    // Bake the search-match highlight onto the full pre-scroll row list, THEN
+    // skip/take the visible window. Selection is main-view only, so the overlay
+    // paints no selection highlight here.
+    let searched;
+    let source: &[Line<'static>] = match search {
+        Some(state) => {
+            searched = rows_with_search_highlight(
+                rows.to_vec(),
+                state,
+                selection::SelectionSurface::Overlay,
+            );
+            &searched
         }
         None => rows,
     };
@@ -9878,6 +10542,7 @@ fn transcript_lines_for_overlay(
     app: &TuiApp,
     width: Option<u16>,
     expand_all: bool,
+    filter: OverlayFilter,
 ) -> Vec<Line<'static>> {
     // Expanded Ctrl+T is the raw/full transcript surface. Keep it distinct
     // from `/tool-verbosity verbose`, which is still a bounded inline preview.
@@ -9900,7 +10565,23 @@ fn transcript_lines_for_overlay(
     let turn_divider = overlay_turn_divider_snapshot(app);
     let turn_divider_width = width.unwrap_or(SETTLE_MEASURE_WIDTH);
     let mut turn_divider_pushed = false;
+    // The filter rejects whole entries before any formatting. The index loop
+    // still walks the full slice (so coalescing / divider boundaries stay
+    // correct); a rejected entry just emits nothing — including no divider — so
+    // filtered-out spans leave no gap.
+    let tool_names = distinct_overlay_tool_names(entries);
+    let turn_start = current_turn_start(entries);
     for (index, entry) in entries.iter().enumerate() {
+        if !entry_matches_overlay_filter(
+            entries,
+            index,
+            filter,
+            app.coalesce_tool_runs,
+            &tool_names,
+            turn_start,
+        ) {
+            continue;
+        }
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {
@@ -10048,7 +10729,12 @@ pub(crate) struct AttributedRow {
 /// Per-entry formatting goes through [`cached_transcript_entry_lines`], so this
 /// shares the per-entry render LRU with the real overlay/inline draws and only
 /// the cheap cross-entry assembly (coalescing, rail, wrap) re-runs.
-pub(crate) fn wrap_entries(app: &TuiApp, width: u16, expand_all: bool) -> Vec<AttributedRow> {
+pub(crate) fn wrap_entries(
+    app: &TuiApp,
+    width: u16,
+    expand_all: bool,
+    filter: OverlayFilter,
+) -> Vec<AttributedRow> {
     let width = width.max(1);
 
     // --- Phase 1: build the logical line list + a parallel provenance vector,
@@ -10091,7 +10777,23 @@ pub(crate) fn wrap_entries(app: &TuiApp, width: u16, expand_all: bool) -> Vec<At
     let turn_divider = overlay_turn_divider_snapshot(app);
     let turn_divider_width = width;
     let mut turn_divider_pushed = false;
+    // Same filter the painted overlay applies (see `transcript_lines_for_overlay`),
+    // so the attributed row model selection/copy index into stays aligned with
+    // what is on screen. A rejected entry emits nothing — including no provenance
+    // and no divider.
+    let tool_names = distinct_overlay_tool_names(entries);
+    let turn_start = current_turn_start(entries);
     for (index, entry) in entries.iter().enumerate() {
+        if !entry_matches_overlay_filter(
+            entries,
+            index,
+            filter,
+            app.coalesce_tool_runs,
+            &tool_names,
+            turn_start,
+        ) {
+            continue;
+        }
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {
@@ -17910,6 +18612,11 @@ pub(crate) struct TuiApp {
     /// active surface's wrapped `Vec<Line>`. Drives copy when present and the
     /// highlight in both renders.
     pub(crate) selection: Option<selection::Selection>,
+    /// Live incremental-search session over the painted transcript rows (main
+    /// view or Ctrl+T overlay), or `None`. Surface-local match positions index
+    /// the active surface's wrapped `Vec<Line>`; drives the in-search key
+    /// mini-buffer, the match highlight in both renders, and scroll-into-view.
+    pub(crate) search: Option<search::SearchState>,
     /// Timestamp + cell + running count of the last left press, for
     /// synthesising double/triple clicks (crossterm delivers no click-count). A
     /// press within the multi-click window at the same cell escalates word →
@@ -18477,6 +19184,7 @@ impl TuiApp {
             main_scrollbar_cache: std::cell::Cell::new(None),
             main_text_area_cache: std::cell::Cell::new(None),
             selection: None,
+            search: None,
             last_click: None,
             wheel_accum: 0,
             main_scroll_anim: None,
