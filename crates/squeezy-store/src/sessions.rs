@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -444,7 +445,8 @@ impl SessionStore {
         }
         let mut raw_entries = Vec::new();
         // Read the legacy path first (lower priority) so primary-path entries win.
-        if legacy_differs && let Some(ref lp) = legacy_path
+        if legacy_differs
+            && let Some(ref lp) = legacy_path
             && let Ok(entries) = read_global_index_entries(lp)
         {
             raw_entries.extend(entries);
@@ -1619,10 +1621,10 @@ fn run_session_log_writer(
                         store.durability,
                         CacheDurability::Turn | CacheDurability::Strict
                     )
-                    && let Err(error) =
-                        sync_file_if_exists(&path).and_then(|()| sync_parent_dir(&path))
-                            .and_then(|()| sync_file_if_exists(&replay_path))
-                            .and_then(|()| sync_parent_dir(&replay_path))
+                    && let Err(error) = sync_file_if_exists(&path)
+                        .and_then(|()| sync_parent_dir(&path))
+                        .and_then(|()| sync_file_if_exists(&replay_path))
+                        .and_then(|()| sync_parent_dir(&replay_path))
                 {
                     let message = error.to_string();
                     if let Some(writer) = writer.upgrade() {
@@ -1638,10 +1640,10 @@ fn run_session_log_writer(
                         store.durability,
                         CacheDurability::Turn | CacheDurability::Strict
                     )
-                    && let Err(error) =
-                        sync_file_if_exists(&path).and_then(|()| sync_parent_dir(&path))
-                            .and_then(|()| sync_file_if_exists(&replay_path))
-                            .and_then(|()| sync_parent_dir(&replay_path))
+                    && let Err(error) = sync_file_if_exists(&path)
+                        .and_then(|()| sync_parent_dir(&path))
+                        .and_then(|()| sync_file_if_exists(&replay_path))
+                        .and_then(|()| sync_parent_dir(&replay_path))
                 {
                     let message = error.to_string();
                     if let Some(writer) = writer.upgrade() {

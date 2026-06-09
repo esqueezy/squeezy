@@ -104,20 +104,20 @@ fn pre_classify_shell_falls_through_on_cargo() {
 }
 
 #[test]
-fn pre_classify_shell_falls_through_on_sonar_cli() {
-    let result = pre_classify_shell("sonar context list --json", &sandbox());
+fn pre_classify_shell_falls_through_on_rg_json() {
+    let result = pre_classify_shell("rg --json pattern", &sandbox());
     assert_eq!(result, ShellPreClassification::AskAi);
 }
 
 #[test]
-fn pre_classify_shell_falls_through_on_sonar_cli_with_dev_null_redirect() {
-    let result = pre_classify_shell("sonar context list --json 2>/dev/null", &sandbox());
+fn pre_classify_shell_falls_through_on_rg_json_with_dev_null_redirect() {
+    let result = pre_classify_shell("rg --json pattern 2>/dev/null", &sandbox());
     assert_eq!(result, ShellPreClassification::AskAi);
 }
 
 #[test]
 fn pre_classify_shell_names_redirect_instead_of_first_token() {
-    let result = pre_classify_shell("sonar context list > report.json", &sandbox());
+    let result = pre_classify_shell("rg --json pattern > report.json", &sandbox());
     match result {
         ShellPreClassification::RequiresApproval { reason } => {
             assert_eq!(reason, "destructive redirect");

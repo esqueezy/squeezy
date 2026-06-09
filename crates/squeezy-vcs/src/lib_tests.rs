@@ -1573,8 +1573,12 @@ fn checkpoint_records_rename_as_single_renamed_entry() {
 #[test]
 fn checkpoint_rollback_conflicts_when_rename_source_was_recreated() {
     let root = temp_repo("checkpoint_rename_source_conflict");
-    fs::write(root.join("alpha.txt"), "alpha contents
-").expect("seed alpha");
+    fs::write(
+        root.join("alpha.txt"),
+        "alpha contents
+",
+    )
+    .expect("seed alpha");
     let store = CheckpointStore::open(&root).expect("checkpoint store");
     let before = store.track_tree().expect("track before");
 
@@ -1590,8 +1594,12 @@ fn checkpoint_rollback_conflicts_when_rename_source_was_recreated() {
         )
         .expect("create checkpoint")
         .expect("checkpoint");
-    fs::write(root.join("alpha.txt"), "user recreated
-").expect("user recreated source");
+    fs::write(
+        root.join("alpha.txt"),
+        "user recreated
+",
+    )
+    .expect("user recreated source");
 
     let rollback = store
         .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
@@ -1624,8 +1632,12 @@ fn checkpoint_rollback_conflicts_when_rename_source_was_recreated() {
 #[test]
 fn rollback_paths_include_rename_source_and_destination() {
     let root = temp_repo("checkpoint_rename_paths");
-    fs::write(root.join("alpha.txt"), "alpha contents
-").expect("seed alpha");
+    fs::write(
+        root.join("alpha.txt"),
+        "alpha contents
+",
+    )
+    .expect("seed alpha");
     let store = CheckpointStore::open(&root).expect("checkpoint store");
     let before = store.track_tree().expect("track before");
 

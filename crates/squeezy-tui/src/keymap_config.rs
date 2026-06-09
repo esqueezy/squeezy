@@ -240,9 +240,8 @@ impl KeybindingsFile {
 /// `$USERPROFILE`; the fallback keeps the process-cached platform lookup
 /// from `squeezy_core::cached_home_dir()` for other platform home sources.
 pub(crate) fn default_keybindings_path() -> Option<PathBuf> {
-    let home = default_home_dir_from_env(|key| env::var_os(key)).or_else(|| {
-        squeezy_core::cached_home_dir().filter(|home| !home.as_os_str().is_empty())
-    })?;
+    let home = default_home_dir_from_env(|key| env::var_os(key))
+        .or_else(|| squeezy_core::cached_home_dir().filter(|home| !home.as_os_str().is_empty()))?;
     Some(home.join(".squeezy").join("keybindings.toml"))
 }
 

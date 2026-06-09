@@ -125,8 +125,12 @@ fn run_powershell_inner(
                 stdout: stdout_text,
                 stderr: stderr_text,
             }),
-            Ok(Err(err)) => Err(format!("wait failed: {err}; stdout={stdout_text:?}; stderr={stderr_text:?}")),
-            Err(_) => Err(format!("timed out after {timeout:?}; stdout={stdout_text:?}; stderr={stderr_text:?}")),
+            Ok(Err(err)) => Err(format!(
+                "wait failed: {err}; stdout={stdout_text:?}; stderr={stderr_text:?}"
+            )),
+            Err(_) => Err(format!(
+                "timed out after {timeout:?}; stdout={stdout_text:?}; stderr={stderr_text:?}"
+            )),
         }
     })
 }

@@ -3192,6 +3192,7 @@ fn crawl_options_from_graph(config: &GraphConfig) -> CrawlOptions {
         include_hidden: config.include_hidden,
         max_file_bytes: config.max_file_bytes,
         require_indexing_signal: config.require_indexing_signal,
+        languages: config.languages.clone(),
         policy: IndexingPolicy {
             include: config.include.clone(),
             exclude: config.exclude.clone(),
@@ -4615,11 +4616,9 @@ fn resolve_resume_session(
         },
         ResumeFlag::Continue => {
             let cwd_norm = normalize_cwd_for_compare(cwd_str);
-            let found = sessions
-                .iter()
-                .find(|meta| {
-                    meta.resume_available && normalize_cwd_for_compare(&meta.cwd) == cwd_norm
-                });
+            let found = sessions.iter().find(|meta| {
+                meta.resume_available && normalize_cwd_for_compare(&meta.cwd) == cwd_norm
+            });
             if let Some(meta) = found {
                 // Emit a hint when the match was via path normalization (e.g.
                 // drive-letter case on Windows) so the user can see which

@@ -1375,24 +1375,12 @@ fn is_plan_mode_read_only_compiler_segment(segment: &str) -> bool {
     }
 }
 
-fn is_sonar_context_read_only_segment(segment: &str) -> bool {
-    let tokens = tokenize_shell_segment(segment);
-    matches!(
-        (
-            tokens.first().map(|token| dequote_token(token)),
-            tokens.get(1).map(|token| dequote_token(token))
-        ),
-        (Some("sonar"), Some("context"))
-    )
-}
-
 fn is_plan_mode_read_only_shell_segment(segment: &str) -> bool {
     is_read_only_shell_segment(segment)
         || is_plan_mode_read_only_find_segment(segment)
         || is_plan_mode_read_only_filter_segment(segment)
         || is_plan_mode_read_only_sed_segment(segment)
         || is_plan_mode_read_only_python_filter_segment(segment)
-        || is_sonar_context_read_only_segment(segment)
         || is_plan_mode_read_only_git_segment(segment)
         || is_plan_mode_read_only_compiler_segment(segment)
 }

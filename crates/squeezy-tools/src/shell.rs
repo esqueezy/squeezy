@@ -404,7 +404,6 @@ impl ToolRegistry {
             Err(ShellRunError::Cancelled {
                 kill_meta,
                 windows_job_cleanup_ok,
-                kill_meta,
             }) => {
                 let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
                 self.audit_shell(
@@ -589,7 +588,6 @@ impl ToolRegistry {
                 Err(ShellRunError::Cancelled {
                     kill_meta,
                     windows_job_cleanup_ok,
-                    kill_meta,
                 }) => {
                     let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
                     self.audit_shell(
@@ -1359,7 +1357,6 @@ impl ToolRegistry {
                 return Err(ShellRunError::Cancelled {
                     kill_meta: cancel_kill_meta,
                     windows_job_cleanup_ok: cancel_job_cleanup_ok,
-                    kill_meta: cancel_kill_meta,
                 });
             }
             result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,

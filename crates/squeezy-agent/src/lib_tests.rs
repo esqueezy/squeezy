@@ -4946,7 +4946,7 @@ fn plan_mode_keeps_discovery_capabilities_on_normal_policy_path() {
     }
     for request in [
         shell_permission_request(
-            "sonar context list --json",
+            "rg --json pattern",
             PermissionCapability::Shell,
             PermissionRisk::Medium,
         ),
@@ -4976,7 +4976,7 @@ fn plan_mode_keeps_discovery_capabilities_on_normal_policy_path() {
 fn plan_mode_shell_requests_must_be_proven_read_only() {
     for (command, capability) in [
         (
-            "sonar context guidelines get --languages java 2>/dev/null",
+            "rg -l 'fn main' --type rust 2>/dev/null",
             PermissionCapability::Shell,
         ),
         (
@@ -4984,7 +4984,7 @@ fn plan_mode_shell_requests_must_be_proven_read_only() {
             PermissionCapability::Shell,
         ),
         (
-            "sonar context navigation search-signatures --pattern \".*\" --fields \"fqn,file_path,start_line\" --limit 20 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(x['fqn'],'->',x['file_path']) for x in d.get('results',[])]\" 2>/dev/null || true",
+            "rg -l 'fn main' 2>/dev/null | python3 -c \"import sys; [print(l.strip()) for l in sys.stdin]\" 2>/dev/null || true",
             PermissionCapability::Shell,
         ),
         ("cargo fmt --check", PermissionCapability::Compiler),
@@ -12088,7 +12088,7 @@ fn conversation_shape_attributes_load_skill_outputs_to_skills_bucket() {
         LlmInputItem::FunctionCall {
             call_id: "call-skill".to_string(),
             name: "load_skill".to_string(),
-            arguments: json!({"name": "sonar"}),
+            arguments: json!({"name": "example-skill"}),
         },
         LlmInputItem::FunctionCallOutput {
             call_id: "call-skill".to_string(),

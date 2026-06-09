@@ -25,8 +25,8 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, VCS_AND_CACHE_DIR_NAMES,
-    PathConflict, WorkspaceCrawler, filesystem_paths_match,
+    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict,
+    VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler, filesystem_paths_match,
 };
 use tracing::{error, warn};
 

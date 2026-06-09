@@ -4897,7 +4897,7 @@ fn context_breaks_out_skills_and_mcp_sources() {
         loaded: 1,
         entries: vec![
             SkillAccountingEntry {
-                name: "sonar-context-augmentation".to_string(),
+                name: "code-navigation".to_string(),
                 description: "always invoke".to_string(),
                 loaded: true,
                 metadata_bytes: 400,
@@ -6383,13 +6383,13 @@ fn tool_call_label_flattens_multiline_shell_commands() {
         call_id: "s-1".to_string(),
         name: "shell".to_string(),
         arguments: serde_json::json!({
-            "command": "sonar context navigation get-source\n  | python3 -c \"print('signature')\"",
+            "command": "rg -l 'fn main'\n  | python3 -c \"print('signature')\"",
         }),
     };
 
     assert_eq!(
         tool_call_label(&call),
-        "sonar context navigation get-source | python3 -c \"print('signature')\""
+        "rg -l 'fn main' | python3 -c \"print('signature')\""
     );
 }
 
@@ -8060,8 +8060,8 @@ fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
     let command = concat!(
         "echo \"=== .mcp.json ===\"; cat .mcp.json; echo; ",
         "echo \"=== .codex/hooks.json ===\"; cat .codex/hooks.json; echo; ",
-        "echo \"=== sonar on PATH? ===\";\n",
-        "command -v sonar || echo \"no sonar binary\"; echo; ",
+        "echo \"=== squeezy on PATH? ===\";\n",
+        "command -v squeezy || echo \"no squeezy binary\"; echo; ",
         "echo \"=== docker? ===\"; command -v docker || echo \"no docker\""
     );
     let call = ToolCall {
@@ -8662,7 +8662,7 @@ fn assistant_message_never_uses_collapsed_summary() {
 #[test]
 fn assistant_message_tables_do_not_abbreviate_cells() {
     let body = "\
-| Dimension | repo_map | sonar context |
+| Dimension | repo_map | semantic graph |
 |---|---|---|
 | Module names | Directory names from the repository tree | Artifact IDs from Maven module dependencies |
 | Symbol-level detail | Classes, fields, methods, and package-level structure | Stopped at module dependency analysis |
@@ -16245,7 +16245,7 @@ fn rail_wrap_flattens_embedded_line_breaks_before_measuring() {
         Span::raw("   ├─"),
         Span::styled("✔ ", Style::default().fg(crate::render::theme::green())),
         Span::raw("Ran "),
-        Span::raw("sonar context\nnavigation get-source"),
+        Span::raw("rg --json pattern\n| head -5"),
     ])];
 
     let rows = wrap_transcript_overlay_rows(&lines, 80);
@@ -16253,10 +16253,7 @@ fn rail_wrap_flattens_embedded_line_breaks_before_measuring() {
 
     assert_eq!(rows.len(), 1, "{text}");
     assert!(!text.contains('\n') || text.lines().count() == 1, "{text}");
-    assert!(
-        text.contains("Ran sonar context navigation get-source"),
-        "{text}"
-    );
+    assert!(text.contains("Ran rg --json pattern| head -5"), "{text}");
 }
 
 #[test]

@@ -2058,8 +2058,12 @@ impl CheckpointStore {
                     });
                 }
                 if let Some(from_path) = file.from_path.as_deref()
-                    && let Some(action) =
-                        self.restore_tree_path(&record.before_tree, from_path, &record.id, file.before_worktree_sha256.as_deref())?
+                    && let Some(action) = self.restore_tree_path(
+                        &record.before_tree,
+                        from_path,
+                        &record.id,
+                        file.before_worktree_sha256.as_deref(),
+                    )?
                 {
                     result.restored_files.push(from_path.to_string());
                     result.file_actions.push(action);
@@ -2067,9 +2071,12 @@ impl CheckpointStore {
                 continue;
             }
 
-            if let Some(action) =
-                self.restore_tree_path(&record.before_tree, &file.path, &record.id, file.before_worktree_sha256.as_deref())?
-            {
+            if let Some(action) = self.restore_tree_path(
+                &record.before_tree,
+                &file.path,
+                &record.id,
+                file.before_worktree_sha256.as_deref(),
+            )? {
                 result.restored_files.push(file.path.clone());
                 result.file_actions.push(action);
             } else if remove_workspace_file(&path)? {
@@ -2352,9 +2359,11 @@ impl CheckpointStore {
             )));
         }
         let path = safe_workspace_path(&self.root, rel)?;
-        let bytes = self.restore_bytes(worktree_sha256, tree, rel).map_err(|err| {
-            SqueezyError::Tool(format!("checkpoint object for {rel} is missing: {err}"))
-        })?;
+        let bytes = self
+            .restore_bytes(worktree_sha256, tree, rel)
+            .map_err(|err| {
+                SqueezyError::Tool(format!("checkpoint object for {rel} is missing: {err}"))
+            })?;
         let file_type = entry.checkpoint_file_type();
         let mode = entry.mode.clone();
         let action = if entry.is_symlink() {
@@ -2801,6 +2810,51 @@ impl CheckpointStore {
             let _ = self.git(["gc", "--prune=now"]);
         }
         Ok(())
+    }
+
+    fn prune_orphan_raw_blobs(&self, keep: &[CheckpointRecord]) {
+        if !self.raw_blob_dir.exists() {
+            return;
+        }
+        let mut referenced = BTreeSet::new();
+        for record in keep {
+            for file in &record.files {
+                if let Some(sha) = file.before_worktree_sha256.as_deref() {
+                    referenced.insert(sha.to_string());
+                }
+                if let Some(sha) = file.after_worktree_sha256.as_deref() {
+                    referenced.insert(sha.to_string());
+                }
+            }
+        }
+        let Ok(prefix_entries) = fs::read_dir(&self.raw_blob_dir) else {
+            return;
+        };
+        for prefix_entry in prefix_entries.flatten() {
+            let prefix_path = prefix_entry.path();
+            if !prefix_path.is_dir() {
+                continue;
+            }
+            let Ok(blob_entries) = fs::read_dir(&prefix_path) else {
+                continue;
+            };
+            for blob_entry in blob_entries.flatten() {
+                let blob_path = blob_entry.path();
+                let Some(name) = blob_path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                // Skip mid-write temp blobs (`<sha>.tmp`) so a concurrent
+                // `write_raw_blob` does not race with the cleanup.
+                if name.ends_with(".tmp") {
+                    continue;
+                }
+                if referenced.contains(name) {
+                    continue;
+                }
+                let _ = fs::remove_file(&blob_path);
+            }
+            let _ = fs::remove_dir(&prefix_path);
+        }
     }
 
     fn cleanup_old_checkpoints_if_due(&self) -> Result<()> {
@@ -3714,7 +3768,11 @@ fn cleanup_stale_shadow_dirs(checkpoints_dir: &Path, retention_days: u64) {
         };
         if matches!(
             name,
-            "git" | "raw-blobs" | "journal.jsonl" | SHADOW_LOCK_FILENAME | SHADOW_LAST_CLEANUP_FILENAME
+            "git"
+                | "raw-blobs"
+                | "journal.jsonl"
+                | SHADOW_LOCK_FILENAME
+                | SHADOW_LAST_CLEANUP_FILENAME
         ) {
             continue;
         }
@@ -4191,6 +4249,13 @@ fn diff_raw_files(
         }
     }
     changed.into_iter().collect()
+}
+
+fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn file_len(path: &Path) -> std::io::Result<u64> {

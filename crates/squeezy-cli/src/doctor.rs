@@ -2518,10 +2518,7 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
         } else {
             detail.push_str("; landlock-abi: unavailable");
         }
-        extra.insert(
-            "landlock_abi".to_string(),
-            json!(abi),
-        );
+        extra.insert("landlock_abi".to_string(), json!(abi));
     }
     if let Some(seccomp) = report.linux_seccomp_available {
         detail.push_str(if seccomp {

@@ -192,11 +192,11 @@ fn parses_folded_block_scalar_description() {
     // for other agents. The continuation line must fold into the value rather
     // than be rejected as an "invalid frontmatter line".
     let (metadata, body) = parse_skill_file(
-        "---\nname: sonar\ndescription: >-\n  ALWAYS invoke this skill on the first prompt,\n  whether you are the Agent or a subagent.\n---\n# Body\n",
+        "---\nname: example-skill\ndescription: >-\n  ALWAYS invoke this skill on the first prompt,\n  whether you are the Agent or a subagent.\n---\n# Body\n",
     )
     .expect("parse");
 
-    assert_eq!(metadata.name, "sonar");
+    assert_eq!(metadata.name, "example-skill");
     assert_eq!(
         metadata.description,
         "ALWAYS invoke this skill on the first prompt, whether you are the Agent or a subagent."
@@ -206,9 +206,10 @@ fn parses_folded_block_scalar_description() {
 
 #[test]
 fn parses_literal_block_scalar_preserving_newlines() {
-    let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: |\n  line one\n  line two\n---\nbody\n")
-            .expect("parse");
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: example-skill\ndescription: |\n  line one\n  line two\n---\nbody\n",
+    )
+    .expect("parse");
 
     // Literal `|` keeps the line break; default (clip) chomping keeps a single
     // trailing newline.
@@ -217,9 +218,10 @@ fn parses_literal_block_scalar_preserving_newlines() {
 
 #[test]
 fn literal_block_scalar_strip_chomping_drops_trailing_newline() {
-    let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: |-\n  line one\n  line two\n---\nbody\n")
-            .expect("parse");
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: example-skill\ndescription: |-\n  line one\n  line two\n---\nbody\n",
+    )
+    .expect("parse");
 
     // `|-` strips every trailing line break.
     assert_eq!(metadata.description, "line one\nline two");
@@ -228,7 +230,7 @@ fn literal_block_scalar_strip_chomping_drops_trailing_newline() {
 #[test]
 fn literal_block_scalar_keep_chomping_preserves_trailing_blanks() {
     let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: |+\n  line one\n\n---\nbody\n")
+        parse_skill_file("---\nname: example-skill\ndescription: |+\n  line one\n\n---\nbody\n")
             .expect("parse");
 
     // `|+` keeps the final line break plus the trailing blank line.
@@ -240,7 +242,7 @@ fn block_scalar_indicator_in_ordinary_value_is_not_treated_as_block() {
     // A value that merely starts with `>` but is not a bare block indicator
     // (here `>` followed by text) must stay an ordinary single-line scalar.
     let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: > 50% coverage\n---\nbody\n")
+        parse_skill_file("---\nname: example-skill\ndescription: > 50% coverage\n---\nbody\n")
             .expect("parse");
 
     assert_eq!(metadata.description, "> 50% coverage");
@@ -249,7 +251,7 @@ fn block_scalar_indicator_in_ordinary_value_is_not_treated_as_block() {
 #[test]
 fn block_scalar_ends_at_dedented_next_key() {
     let (metadata, _body) = parse_skill_file(
-        "---\nname: sonar\ndescription: >-\n  folded value\nwhen_to_use: after the block\n---\nbody\n",
+        "---\nname: example-skill\ndescription: >-\n  folded value\nwhen_to_use: after the block\n---\nbody\n",
     )
     .expect("parse");
 
@@ -260,7 +262,7 @@ fn block_scalar_ends_at_dedented_next_key() {
 #[test]
 fn folded_block_scalar_folds_blank_line_to_newline() {
     let (metadata, _body) = parse_skill_file(
-        "---\nname: sonar\ndescription: >-\n  first paragraph\n\n  second paragraph\n---\nbody\n",
+        "---\nname: example-skill\ndescription: >-\n  first paragraph\n\n  second paragraph\n---\nbody\n",
     )
     .expect("parse");
 

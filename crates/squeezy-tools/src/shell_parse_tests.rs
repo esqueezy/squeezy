@@ -144,11 +144,11 @@ fn js_arrow_inside_heredoc_body_is_not_destructive_redirect() {
 }
 
 #[test]
-fn sonar_cli_is_not_destructive() {
-    let analysis = analyze_shell_command("sonar context list --json");
+fn rg_json_reads_are_not_destructive() {
+    let analysis = analyze_shell_command("rg --json pattern");
     assert!(
         !analysis.destructive,
-        "sonar CLI reads must not be flagged destructive: {analysis:?}",
+        "rg JSON reads must not be flagged destructive: {analysis:?}",
     );
     assert_ne!(analysis.capability, PermissionCapability::Destructive);
 }
@@ -335,8 +335,8 @@ fn write_targets_expand_env_vars() {
     let home = test_home();
     let home = home.trim_end_matches('/');
     assert_eq!(
-        extract_shell_write_targets("touch \"$HOME/abbas.txt\""),
-        vec![format!("{home}/abbas.txt")],
+        extract_shell_write_targets("touch \"$HOME/example.txt\""),
+        vec![format!("{home}/example.txt")],
         "$HOME must expand so the home write is seen as out-of-workspace"
     );
     assert_eq!(

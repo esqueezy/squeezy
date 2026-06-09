@@ -71,7 +71,9 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         return true;
     }
     if matches!(command_name, "start-process" | "start") {
-        let has_verb_runas = tokens.windows(2).any(|pair| pair[0] == "-verb" && pair[1] == "runas")
+        let has_verb_runas = tokens
+            .windows(2)
+            .any(|pair| pair[0] == "-verb" && pair[1] == "runas")
             || tokens
                 .iter()
                 .any(|t| matches!(*t, "-verb:runas" | "-verb=runas"));

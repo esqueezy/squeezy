@@ -2297,11 +2297,13 @@ impl ToolRegistry {
             "read_slice" if self.read_slice_targets_ignored_policy(&call.arguments) => {
                 PermissionScope::IgnoredSearch
             }
-            "checkpoint_check" | "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show" | "decl_search"
-            | "definition_search" | "diff_context" | "downstream_flow" | "glob" | "grep"
-            | "hierarchy" | "plan_patch" | "read_file" | "read_slice" | "read_tool_output"
-            | "reference_search" | "repo_map" | "symbol_context" | "upstream_flow"
-            | "list_skills" | "load_skill" | "observations" => PermissionScope::Read,
+            "checkpoint_check" | "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show"
+            | "decl_search" | "definition_search" | "diff_context" | "downstream_flow" | "glob"
+            | "grep" | "hierarchy" | "plan_patch" | "read_file" | "read_slice"
+            | "read_tool_output" | "reference_search" | "repo_map" | "symbol_context"
+            | "upstream_flow" | "list_skills" | "load_skill" | "observations" => {
+                PermissionScope::Read
+            }
             _ => PermissionScope::Read,
         }
     }
