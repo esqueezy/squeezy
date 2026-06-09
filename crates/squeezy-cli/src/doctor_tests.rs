@@ -189,7 +189,9 @@ fn session_paths_check_warns_on_relative_xdg_state_home() {
         assert!(
             paths.detail.contains(
                 &home
-                    .join(".squeezy/sessions/index.jsonl")
+                    .join(".squeezy")
+                    .join("sessions")
+                    .join("index.jsonl")
                     .display()
                     .to_string()
             ),
