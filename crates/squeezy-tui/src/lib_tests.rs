@@ -15291,6 +15291,7 @@ fn synchronized_output_auto_detects_known_capable_terminals() {
         &[("ALACRITTY_LOG", "/tmp/alacritty.log")],
         &[("ALACRITTY_WINDOW_ID", "1")],
         &[("ITERM_SESSION_ID", "w0t0p0")],
+        &[("WT_SESSION", "{11111111-2222-3333-4444-555555555555}")],
         &[("TERM_PROGRAM", "iTerm.app")],
         &[("TERM_PROGRAM", "WezTerm")],
         &[("TERM_PROGRAM", "ghostty")],
@@ -15349,6 +15350,101 @@ fn synchronized_output_auto_stays_off_for_unknown_terminals() {
         !super::detect_synchronized_output_support_from_env(only_dumb),
         "dumb terminal must not auto-enable BSU"
     );
+}
+
+#[test]
+fn compact_path_with_home_uses_tilde_and_normalized_separators() {
+    let home = PathBuf::from("/home/alice");
+    let path = home.join("projects").join("squeezy");
+
+    assert_eq!(
+        super::compact_path_with_home(&path, &home).as_deref(),
+        Some("~/projects/squeezy")
+    );
+    assert_eq!(
+        super::compact_path_with_home(&home, &home).as_deref(),
+        Some("~")
+    );
+}
+
+#[test]
+fn compact_path_with_home_normalizes_backslashes_in_stripped_portion() {
+    // Force the stripped portion to contain backslash bytes regardless
+    // of platform. On Unix `\` is a regular byte in a single filename;
+    // on Windows it is the native separator and naturally appears in
+    // nested paths. Either way the unconditional `replace('\\', "/")`
+    // must rewrite it so the display surface (terminal title, status
+    // line, plan paths) stays consistent on both platforms.
+    let home = PathBuf::from("/home/alice");
+    let mut path = home.clone();
+    path.push("projects\\squeezy");
+
+    assert_eq!(
+        super::compact_path_with_home(&path, &home).as_deref(),
+        Some("~/projects/squeezy")
+    );
+}
+
+#[test]
+fn compact_path_home_env_uses_home() {
+    let home = super::home_path_from_env(|key| {
+        (key == "HOME").then(|| std::ffi::OsString::from("/home/alice"))
+    });
+
+    assert_eq!(home, Some(PathBuf::from("/home/alice")));
+}
+
+#[test]
+fn compact_path_home_env_treats_empty_home_as_unset() {
+    // An empty `HOME` (`HOME=""`) used to slip through as
+    // `Some(PathBuf::from(""))`, which `strip_prefix("")` accepts as a
+    // prefix of every path — so `compact_path_with_home` would format
+    // the entire path as `~/...`. Guard against that regression on Unix
+    // (where `USERPROFILE` is ignored) by asserting we resolve to `None`.
+    #[cfg(not(windows))]
+    {
+        let home =
+            super::home_path_from_env(|key| (key == "HOME").then(|| std::ffi::OsString::from("")));
+        assert_eq!(home, None);
+    }
+    // On Windows, empty `HOME` should also be ignored, and we should
+    // fall back to `USERPROFILE` (or `None` when it is missing/empty).
+    #[cfg(windows)]
+    {
+        let home = super::home_path_from_env(|key| match key {
+            "HOME" => Some(std::ffi::OsString::from("")),
+            "USERPROFILE" => Some(std::ffi::OsString::from("")),
+            _ => None,
+        });
+        assert_eq!(home, None);
+
+        let userprofile = super::home_path_from_env(|key| match key {
+            "HOME" => Some(std::ffi::OsString::from("")),
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\Alice")),
+            _ => None,
+        });
+        assert_eq!(userprofile, Some(PathBuf::from(r"C:\Users\Alice")));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn compact_path_home_env_falls_back_to_userprofile_on_windows() {
+    let home = super::home_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| std::ffi::OsString::from(r"C:\Users\Alice"))
+    });
+
+    assert_eq!(home, Some(PathBuf::from(r"C:\Users\Alice")));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn compact_path_home_env_ignores_userprofile_off_windows() {
+    let home = super::home_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| std::ffi::OsString::from("/Users/Alice"))
+    });
+
+    assert_eq!(home, None);
 }
 
 #[tokio::test]

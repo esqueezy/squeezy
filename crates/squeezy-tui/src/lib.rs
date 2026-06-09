@@ -332,6 +332,8 @@ where
         || env_get("ALACRITTY_LOG").is_some()
         || env_get("ALACRITTY_WINDOW_ID").is_some()
         || env_get("ITERM_SESSION_ID").is_some()
+        // Windows Terminal sets WT_SESSION per-tab; it supports DEC 2026.
+        || env_get("WT_SESSION").is_some()
     {
         return true;
     }
@@ -14888,7 +14890,7 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .map(|(index, path)| {
             let selected = index == popup.selected;
             let marker = if selected { "› " } else { "  " };
-            let display = path.display().to_string();
+            let display = mention::path_display_normalized(path);
             let style = if selected {
                 Style::default()
                     .fg(crate::render::theme::secondary())
@@ -16028,18 +16030,47 @@ fn parse_shortstat(text: &str) -> Option<(u32, u32)> {
 }
 
 fn compact_path(path: &std::path::Path) -> String {
-    let display = path.display().to_string();
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-        return display;
+    let fallback = mention::path_display_normalized(path);
+    let Some(home) = home_path_from_env(|key| env::var_os(key)) else {
+        return fallback;
     };
-    if let Ok(stripped) = path.strip_prefix(&home) {
-        if stripped.as_os_str().is_empty() {
+    compact_path_with_home(path, &home).unwrap_or(fallback)
+}
+
+fn home_path_from_env<F>(env_get: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let home = match env_get("HOME").filter(|v| !v.is_empty()) {
+        Some(home) => home,
+        None => {
+            // On Windows, HOME is often unset; USERPROFILE is the canonical home.
+            #[cfg(windows)]
+            {
+                env_get("USERPROFILE").filter(|v| !v.is_empty())?
+            }
+            #[cfg(not(windows))]
+            {
+                return None;
+            }
+        }
+    };
+    Some(PathBuf::from(home))
+}
+
+fn compact_path_with_home(path: &Path, home: &Path) -> Option<String> {
+    if let Ok(stripped) = path.strip_prefix(home) {
+        // Normalize to forward slashes for consistent display across
+        // platforms. On Windows, `stripped.display()` would produce
+        // backslashes, yielding a mixed `~/projects\foo` form.
+        let normalized = stripped.to_string_lossy().replace('\\', "/");
+        Some(if normalized.is_empty() {
             "~".to_string()
         } else {
-            format!("~/{}", stripped.display())
-        }
+            format!("~/{normalized}")
+        })
     } else {
-        display
+        None
     }
 }
 
@@ -16604,10 +16635,12 @@ pub(crate) struct PendingDiffResult {
 
 /// Build the runtime [`keymap::KeymapResolver`] by layering the optional
 /// user-editable `~/.squeezy/keybindings.toml` on top of the
-/// `[tui.keymap]` overrides from `settings.toml`. Failures (missing
-/// `$HOME`, unreadable file, malformed TOML, reserved-key violation)
-/// emit a warning and fall back to the base overrides so a broken
-/// keybindings file never prevents the TUI from starting.
+/// `[tui.keymap]` overrides from `settings.toml`. The home directory is
+/// resolved from `$HOME`, falling back to `$USERPROFILE` on Windows
+/// where `$HOME` is typically unset. Failures (no home env var,
+/// unreadable file, malformed TOML, reserved-key violation) emit a
+/// warning and fall back to the base overrides so a broken keybindings
+/// file never prevents the TUI from starting.
 fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResolver {
     let user_path = keymap_config::default_keybindings_path();
     match keymap_config::merge_user_overrides(base.clone(), user_path.as_deref()) {

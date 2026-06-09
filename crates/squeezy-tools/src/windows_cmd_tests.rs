@@ -54,7 +54,7 @@ fn flags_remove_item_literalpath_recurse() {
     assert!(is_destructive_windows_segment(
         "Remove-Item -LiteralPath C:\\x -Recurse -Force"
     ));
-    assert!(!is_destructive_windows_segment(
+    assert!(is_destructive_windows_segment(
         "remove-item -literalpath C:\\x -r"
     ));
 }
@@ -114,6 +114,32 @@ fn flags_invoked_and_module_qualified_remove_item() {
 }
 
 #[test]
+fn flags_remove_item_literalpath() {
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -LiteralPath C:\\Temp\\file.txt -Force"
+    ));
+    assert!(is_destructive_windows_segment(
+        "remove-item -literalpath 'C:\\Foo' -Recurse"
+    ));
+}
+
+#[test]
+fn flags_ri_alias_recurse_force_orderings() {
+    assert!(is_destructive_windows_segment("ri -Recurse -Force C:\\Tmp"));
+    assert!(is_destructive_windows_segment("ri -Force -Recurse C:\\Tmp"));
+    assert!(is_destructive_windows_segment("ri -r -Force C:\\x"));
+    assert!(is_destructive_windows_segment("ri -Force -r C:\\x"));
+}
+
+#[test]
+fn flags_rm_alias_recurse_force() {
+    assert!(is_destructive_windows_segment("rm -Recurse -Force .git"));
+    assert!(is_destructive_windows_segment("rm -Force -Recurse C:\\Log"));
+    assert!(is_destructive_windows_segment("rm -r -Force src/"));
+    assert!(is_destructive_windows_segment("rm -Force -r src/"));
+}
+
+#[test]
 fn flags_set_executionpolicy() {
     assert!(is_destructive_windows_segment(
         "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process"
@@ -124,6 +150,9 @@ fn flags_set_executionpolicy() {
 fn flags_stop_and_restart_computer() {
     assert!(is_destructive_windows_segment("Stop-Computer"));
     assert!(is_destructive_windows_segment("Restart-Computer -Force"));
+    assert!(is_destructive_windows_segment(
+        "Restart-Computer -Force -Wait"
+    ));
 }
 
 #[test]
@@ -221,15 +250,55 @@ fn ignores_remove_item_path_without_recursive_force() {
     assert!(!is_destructive_windows_segment(
         "Remove-Item -Path C:\\tmp\\foo.txt"
     ));
-    assert!(!is_destructive_windows_segment(
-        "Remove-Item -LiteralPath C:\\tmp\\foo.txt -Force"
-    ));
 }
 
 #[test]
 fn flags_unregister_scheduledtask() {
     assert!(is_destructive_windows_segment(
         "Unregister-ScheduledTask -TaskName Foo -Confirm:$false"
+    ));
+}
+
+#[test]
+fn flags_iex_alias_bypass_shapes() {
+    // No-space invocation: `iex("...")`
+    assert!(is_destructive_windows_segment(
+        "iex(\"Get-Process | Out-File evil.log\")"
+    ));
+    // Pipeline terminator with no following whitespace: `... | iex`
+    assert!(is_destructive_windows_segment(
+        "Get-Content payload.ps1 | iex"
+    ));
+    // No-whitespace pipeline: `...|iex`
+    assert!(is_destructive_windows_segment("cat payload.ps1|iex"));
+    // Statement-separator prefix: `;iex`
+    assert!(is_destructive_windows_segment("$x = 1;iex $payload"));
+    // PowerShell call-operator prefix: `&iex`
+    assert!(is_destructive_windows_segment("& iex $cmd"));
+    assert!(is_destructive_windows_segment("&iex $cmd"));
+}
+
+#[test]
+fn iex_alias_does_not_match_substring_identifiers() {
+    // Identifiers containing the literal `iex` must not trip the alias check.
+    assert!(!is_destructive_windows_segment("Get-Hexbin file"));
+    assert!(!is_destructive_windows_segment("write-host 'iexample'"));
+    assert!(!is_destructive_windows_segment("./find-iex.ps1 search"));
+}
+
+#[test]
+fn flags_wmic_delete() {
+    assert!(is_destructive_windows_segment(
+        "wmic process delete where name='notepad.exe'"
+    ));
+    assert!(is_destructive_windows_segment("wmic product delete"));
+}
+
+#[test]
+fn flags_clear_content() {
+    assert!(is_destructive_windows_segment("Clear-Content C:\\log.txt"));
+    assert!(is_destructive_windows_segment(
+        "clear-content -path C:\\data\\file.txt"
     ));
 }
 
@@ -282,6 +351,7 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("cargo build"));
     // `ri` alone (e.g. during tab completion) must not trigger.
     assert!(!is_destructive_windows_segment("ri C:\\tmp\\foo.txt"));
+    assert!(!is_destructive_windows_segment("rm file.log"));
     // `sc` with a benign subcommand must not trigger.
     assert!(!is_destructive_windows_segment("sc query MySvc"));
     assert!(!is_destructive_windows_segment("sc start MySvc"));
@@ -295,6 +365,11 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment(
         "Remove-Item C:\\logs\\app.log"
     ));
+    // -LiteralPath without -Force/-Recurse matches the plain Remove-Item
+    // policy: a single named file delete is not destructive.
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -LiteralPath C:\\Tmp\\file.txt"
+    ));
     // Cmdlet names mentioned as ordinary arguments must not trigger the
     // destructive classifier.
     assert!(!is_destructive_windows_segment(
@@ -303,7 +378,8 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment(
         "Write-Output set-executionpolicy"
     ));
-    // Remove-Item without -Recurse is not caught by this heuristic
+    // Remove-Item without both Recurse and Force is not caught by this
+    // heuristic unless it uses -LiteralPath or suppresses confirmation.
     assert!(!is_destructive_windows_segment("Remove-Item -Force ."));
     // ri alias without both flags
     assert!(!is_destructive_windows_segment("ri foo.txt"));
@@ -364,4 +440,22 @@ fn does_not_flag_safe_net_user_add() {
     assert!(!is_destructive_windows_segment(
         "net user bob Password1 /add"
     ));
+}
+
+#[test]
+fn ignores_benign_forms_of_existing_entries() {
+    // vssadmin list/query operations are read-only
+    assert!(!is_destructive_windows_segment(
+        "vssadmin list shadows /all"
+    ));
+    // reg query is read-only; only reg delete triggers
+    assert!(!is_destructive_windows_segment(
+        "reg query HKLM\\Software\\Foo /v Bar"
+    ));
+    // bcdedit /enum only reads the boot config
+    assert!(!is_destructive_windows_segment("bcdedit /enum firmware"));
+    // cipher /e encrypts (not the /w wipe-free-space trigger)
+    assert!(!is_destructive_windows_segment("cipher /e file.txt"));
+    // wmic without "delete" is benign
+    assert!(!is_destructive_windows_segment("wmic process list brief"));
 }

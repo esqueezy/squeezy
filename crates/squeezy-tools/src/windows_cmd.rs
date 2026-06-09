@@ -28,29 +28,31 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         .next()
         .unwrap_or(powershell_command);
 
-    // Remove-Item / ri (PowerShell).
+    // Remove-Item / ri / rm (PowerShell).
     // Destructive when any of:
     //   - valid recurse + force parameters are present (any order)
+    //   - -LiteralPath is paired with either recurse or force
     //   - -Confirm:$false suppresses the safety prompt
     //
-    // The `ri` check matches the built-in PowerShell alias; `rm` / `rmdir`
-    // are already flagged by the POSIX destructive-verb list in
-    // `destructive_shell_segment_reason`.
-    let is_remove_item = command_name == "remove-item" || command_name == "ri";
+    // `ri` and `rm` are built-in PowerShell aliases for Remove-Item.
+    let is_remove_item = matches!(command_name, "remove-item" | "ri" | "rm");
     if is_remove_item
         && ((powershell_has_recurse_flag(&tokens) && powershell_has_force_flag(&tokens))
+            || (powershell_has_literalpath_flag(&tokens)
+                && (powershell_has_recurse_flag(&tokens) || powershell_has_force_flag(&tokens)))
             || lower.contains("-confirm:$false")
             || lower.contains("-confirm=false"))
     {
         return true;
     }
-    if command_name == "invoke-expression" || command_name == "iex" {
+    if command_name == "invoke-expression" || contains_iex_alias(&lower) {
         return true;
     }
 
     // Other unambiguously destructive PowerShell cmdlets.
     if [
         "set-executionpolicy",
+        // User/group management
         "new-localuser",
         "remove-localuser",
         "disable-localuser",
@@ -100,6 +102,7 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         }
         "reg" => return flag_matches("delete"),
         "cipher" => return flag_matches("/w"),
+        "wmic" => return flag_matches("delete"),
         // Service deletion via sc.exe / net stop+delete
         "sc" | "sc.exe" => return flag_matches("delete"),
         // Scheduled task deletion
@@ -126,6 +129,14 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     }
 
     false
+}
+
+/// True when the token list contains a `-LiteralPath` flag.
+fn powershell_has_literalpath_flag(tokens: &[&str]) -> bool {
+    tokens
+        .iter()
+        .skip(1)
+        .any(|tok| tok.starts_with("-literalpath"))
 }
 
 /// True when the token list contains a `-Recurse` flag or an unambiguous
@@ -160,6 +171,32 @@ fn powershell_has_force_flag(tokens: &[&str]) -> bool {
         }
         matches!(t.as_str(), "-fo" | "-for" | "-forc")
     })
+}
+
+/// True when `lower` contains the PowerShell `iex` alias as a statement
+/// or pipeline element. Boundary characters on either side mirror the
+/// way PowerShell parses tokens: whitespace, `|`, `;`, `&` separate
+/// statements; `(`, `"`, `'`, `$` are valid first characters of the
+/// expression argument; end-of-string is also a valid boundary so
+/// `cat payload | iex` and a trailing `;iex` both classify.
+fn contains_iex_alias(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("iex") {
+        let start = search_from + rel;
+        let end = start + 3;
+        let before_ok = start == 0 || matches!(bytes[start - 1], b' ' | b'\t' | b'|' | b';' | b'&');
+        let after_ok = end == bytes.len()
+            || matches!(
+                bytes[end],
+                b' ' | b'\t' | b'(' | b'\'' | b'"' | b'$' | b'|' | b';' | b'&'
+            );
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
 }
 
 #[cfg(test)]
