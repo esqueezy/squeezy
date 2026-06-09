@@ -1006,6 +1006,12 @@ impl AppConfig {
                     .as_deref()
                     .and_then(OllamaRoute::parse)
                     .unwrap_or_default(),
+                api_key_env: get_var("OLLAMA_API_KEY_ENV")
+                    .or_else(|| provider_setting(&providers, "ollama", "api_key_env"))
+                    .unwrap_or_else(|| "OLLAMA_API_KEY".to_string()),
+                api_key: provider_setting(&providers, "ollama", "api_key"),
+                keep_alive: get_var("OLLAMA_KEEP_ALIVE")
+                    .or_else(|| provider_setting(&providers, "ollama", "keep_alive")),
                 transport: provider_transport_settings(&providers, &["ollama"]),
             }),
             "openai" => ProviderConfig::OpenAi(OpenAiConfig {
@@ -2808,10 +2814,9 @@ pub enum ProviderConfig {
 /// auto-injected into every Vercel function runtime) flows in as
 /// `api_key_env` when no explicit `AI_GATEWAY_API_KEY` is set.
 ///
-/// M-63: redaction applies to the serde `Serialize` path only; the derived
-/// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
-/// `OpenAiCompatibleConfig`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// M-63: custom `Debug` below redacts `api_key` and `extra_headers` values so
+/// logs and panic messages cannot leak credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiCompatibleConfig {
     pub preset: OpenAiCompatiblePreset,
     pub api_key_env: String,
@@ -2866,6 +2871,24 @@ pub struct OpenAiCompatibleConfig {
     /// behavior.
     #[serde(default, skip_serializing_if = "is_default_bool")]
     pub use_oauth: bool,
+}
+
+impl fmt::Debug for OpenAiCompatibleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiCompatibleConfig")
+            .field("preset", &self.preset)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("extra_headers", &RedactedMap(&self.extra_headers))
+            .field("transport", &self.transport)
+            .field("account_id", &self.account_id)
+            .field("gateway_id", &self.gateway_id)
+            .field("deployment_id", &self.deployment_id)
+            .field("cf_ai_gateway", &self.cf_ai_gateway)
+            .field("use_oauth", &self.use_oauth)
+            .finish()
+    }
 }
 
 /// Typed `cf-aig-*` knob surface for the Cloudflare AI Gateway preset.
@@ -3190,7 +3213,9 @@ impl OpenAiCompatiblePreset {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// M-63: derived `Debug` would print `api_key` verbatim; custom impl below
+/// redacts it so logs and panic messages cannot leak the credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3217,6 +3242,20 @@ pub struct OpenAiConfig {
     pub transport: ProviderTransportConfig,
 }
 
+impl fmt::Debug for OpenAiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("organization", &self.organization)
+            .field("project", &self.project)
+            .field("service_tier", &self.service_tier)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
 /// ChatGPT Plus/Pro subscription provider settings. The OAuth token
 /// itself lives outside the TOML (under `~/.squeezy/auth/openai-codex.json`
 /// with `chmod 600`); only the endpoint and the originator label are
@@ -3235,7 +3274,8 @@ pub struct GitHubCopilotConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// M-63: derived `Debug` would print `api_key` verbatim; custom impl below redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3244,7 +3284,19 @@ pub struct AnthropicConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// M-63: derived `Debug` would print `api_key` verbatim; custom impl below redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3253,10 +3305,20 @@ pub struct GoogleConfig {
     pub transport: ProviderTransportConfig,
 }
 
-// M-63: redaction applies to the serde `Serialize` path only; the derived
-// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
-// `AzureOpenAiConfig`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for GoogleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+// M-63: custom `Debug` below redacts `api_key`, `entra_bearer_token`, and
+// `extra_headers` values so logs and panic messages cannot leak credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AzureOpenAiConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3308,7 +3370,25 @@ pub struct AzureOpenAiConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for AzureOpenAiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureOpenAiConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("api_version", &self.api_version)
+            .field("deployment_name_map", &self.deployment_name_map)
+            .field("extra_headers", &RedactedMap(&self.extra_headers))
+            .field("use_entra_id", &self.use_entra_id)
+            .field("entra_bearer_token", &RedactedOpt(&self.entra_bearer_token))
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// M-63: custom `Debug` below redacts `bearer_token` so logs and panic
+/// messages cannot leak the short-lived AWS bearer credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BedrockConfig {
     pub region: String,
     pub base_url: Option<String>,
@@ -3331,7 +3411,22 @@ pub struct BedrockConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for BedrockConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BedrockConfig")
+            .field("region", &self.region)
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &RedactedOpt(&self.bearer_token))
+            .field("request_metadata", &self.request_metadata)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// M-63: redaction applies to the serde `Serialize` path only; the derived
+/// `Debug` would print the resolved `api_key` verbatim. A custom `Debug`
+/// impl below masks it so accidental logs do not leak credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaConfig {
     pub base_url: String,
     /// Wire route for `POST <model>` traffic. `Native` keeps the proprietary
@@ -3340,7 +3435,63 @@ pub struct OllamaConfig {
     /// so users with portable tooling can pin Ollama to a uniform contract.
     #[serde(default)]
     pub route_style: OllamaRoute,
+    /// Name of the environment variable that holds the bearer token for
+    /// Ollama Cloud or a reverse-proxy-protected self-hosted deployment.
+    /// Defaults to `"OLLAMA_API_KEY"`. No-key local deployments still work —
+    /// the key is simply not attached when the env var is unset and no
+    /// inline `api_key` is provided.
+    #[serde(default = "default_ollama_api_key_env")]
+    pub api_key_env: String,
+    /// Inline plaintext bearer token for Ollama Cloud / protected
+    /// reverse-proxy Ollama. `None` falls back to `api_key_env` resolution
+    /// at request time. Never serialized in plain text — emits `"<redacted>"`
+    /// for accidental dumps.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "redact_secret_opt"
+    )]
+    pub api_key: Option<String>,
+    /// Optional `keep_alive` duration forwarded to every native `/api/chat`
+    /// request. Ollama's server default is 5 minutes; agent sessions that
+    /// idle longer than that pay a full model-reload cost on the next turn.
+    /// Accepts duration strings (`"5m"`, `"24h"`), integer seconds (`"30"`),
+    /// `"0"` for immediate eviction, or `"-1"` to pin the model indefinitely.
+    /// Reads `OLLAMA_KEEP_ALIVE` env var, then `providers.ollama.keep_alive`
+    /// TOML key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<String>,
     pub transport: ProviderTransportConfig,
+}
+
+fn default_ollama_api_key_env() -> String {
+    "OLLAMA_API_KEY".to_string()
+}
+
+impl fmt::Debug for OllamaConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OllamaConfig")
+            .field("base_url", &self.base_url)
+            .field("route_style", &self.route_style)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("keep_alive", &self.keep_alive)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
+            route_style: OllamaRoute::default(),
+            api_key_env: default_ollama_api_key_env(),
+            api_key: None,
+            keep_alive: None,
+            transport: ProviderTransportConfig::default(),
+        }
+    }
 }
 
 /// Configuration for the in-process faux provider used by tests and the
@@ -3915,6 +4066,13 @@ pub struct ProviderSettings {
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
+    /// Ollama-only: `keep_alive` value forwarded on every native `/api/chat`
+    /// request to control how long the server retains the model between turns.
+    /// Accepts duration strings (`"5m"`, `"24h"`), integer seconds, `"0"` for
+    /// immediate eviction, or `"-1"` to pin the model indefinitely. Ignored by
+    /// every other provider. Can also be supplied via the `OLLAMA_KEEP_ALIVE`
+    /// env var (env var takes precedence over TOML).
+    pub keep_alive: Option<String>,
     /// Faux-only: path to a TOML script file consumed by the in-process
     /// faux provider. Other providers ignore this field.
     pub script: Option<String>,
@@ -3996,6 +4154,7 @@ impl ProviderSettings {
                 "request_metadata",
                 "deployment_name_map",
                 "route_style",
+                "keep_alive",
                 "script",
                 "use_entra_id",
                 "organization",
@@ -4248,6 +4407,7 @@ impl ProviderSettings {
             request_metadata: None,
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
+            keep_alive: string_value(table, "keep_alive", source, &field(path, "keep_alive"))?,
             script: string_value(table, "script", source, &field(path, "script"))?,
             use_entra_id: bool_value(table, "use_entra_id", source, &field(path, "use_entra_id"))?,
             organization: string_value(
@@ -4314,6 +4474,7 @@ impl ProviderSettings {
         replace_if_some(&mut self.max_retry_delay_ms, next.max_retry_delay_ms);
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
+        replace_if_some(&mut self.keep_alive, next.keep_alive);
         replace_if_some(&mut self.script, next.script);
         replace_if_some(&mut self.use_entra_id, next.use_entra_id);
         replace_if_some(&mut self.organization, next.organization);
@@ -4331,6 +4492,37 @@ impl ProviderSettings {
 
 /// Serde Serializer hook for `Option<String>` fields holding a secret.
 /// `None` round-trips as null/absent; `Some(_)` emits the literal
+/// Debug wrapper for `Option<String>` fields that may carry secrets (API keys,
+/// bearer tokens). Displays as `Some("<redacted>")` when the value is set and
+/// `None` otherwise, so `{:?}`-formatted log lines and panic messages cannot
+/// leak credentials. Used by manual `Debug` impls on secret-bearing config
+/// structs as the fix for M-63.
+struct RedactedOpt<'a>(&'a Option<String>);
+
+impl fmt::Debug for RedactedOpt<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => write!(f, "Some(\"<redacted>\")"),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+/// Debug wrapper for `BTreeMap<String, String>` fields whose values may carry
+/// secrets (e.g. `Authorization` header values in `extra_headers`). Displays
+/// keys verbatim and masks every value as `"<redacted>"`.
+struct RedactedMap<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedMap<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = f.debug_map();
+        for key in self.0.keys() {
+            map.entry(key, &"<redacted>");
+        }
+        map.finish()
+    }
+}
+
 /// `"<redacted>"` so any path that serializes the struct (debug dumps,
 /// inspect output, accidental `to_string`) can't leak the plaintext.
 fn redact_secret_opt<S>(
@@ -10838,6 +11030,7 @@ fn provider_setting(
         "vertex_project" => settings.vertex_project.as_ref(),
         "vertex_location" => settings.vertex_location.as_ref(),
         "route_style" => settings.route_style.as_ref(),
+        "keep_alive" => settings.keep_alive.as_ref(),
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         "script" => settings.script.as_ref(),

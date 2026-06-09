@@ -3,8 +3,8 @@ use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
 use clap::Args;
 use serde_json::json;
 use squeezy_core::{
-    AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
-    SettingsFile, default_settings_path,
+    AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
+    Result, SettingsFile, default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -292,13 +292,7 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
                 format!("region={} (uses AWS credential chain)", c.region),
             ),
         ),
-        ProviderConfig::Ollama(c) => (
-            "ollama",
-            (
-                Status::Ok,
-                format!("base_url={} (no API key required)", c.base_url),
-            ),
-        ),
+        ProviderConfig::Ollama(c) => ("ollama", ollama_credential_check(c)),
         ProviderConfig::OpenAiCodex(_) => ("openai_codex", openai_codex_auth_check()),
         ProviderConfig::GitHubCopilot(_) => ("github_copilot", github_copilot_auth_check()),
         ProviderConfig::OpenAiCompatible(c) => (
@@ -387,6 +381,57 @@ fn credential_check(inline: Option<&str>, env_name: &str) -> (Status, String) {
                  ~/.squeezy/settings.toml, or run `squeezy auth set <provider>`"
             ),
         ),
+    }
+}
+
+const DEFAULT_OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
+
+/// Credential check for the Ollama provider. Ollama operates without auth by
+/// default, so an absent `OLLAMA_API_KEY` is not a failure. However, if a
+/// user has configured a *custom* `api_key_env` (e.g. pointing at an Ollama
+/// Cloud token) and that env var is unset, we surface a `Warn` so the
+/// misconfiguration is caught early rather than producing a silent 401.
+fn ollama_credential_check(c: &OllamaConfig) -> (Status, String) {
+    let has_inline = c.api_key.as_deref().is_some_and(|v| !v.trim().is_empty());
+    if has_inline || !c.api_key_env.is_empty() {
+        match resolve_api_key_with_inline(c.api_key.as_deref(), &c.api_key_env) {
+            Ok(resolved) => (
+                Status::Ok,
+                format!(
+                    "base_url={}, bearer token resolved via {}",
+                    c.base_url,
+                    key_source_label(resolved.source, &c.api_key_env)
+                ),
+            ),
+            Err(_) => {
+                // Only warn when the user explicitly configured a non-default
+                // key env — that signals they expect auth to be required.
+                // For the default OLLAMA_API_KEY case, absence is expected.
+                if c.api_key_env != DEFAULT_OLLAMA_API_KEY_ENV {
+                    (
+                        Status::Warn,
+                        format!(
+                            "base_url={} — {} is not set; set it or remove api_key_env to use \
+                             the default no-auth local Ollama path",
+                            c.base_url, c.api_key_env
+                        ),
+                    )
+                } else {
+                    (
+                        Status::Ok,
+                        format!(
+                            "base_url={} (OLLAMA_API_KEY unset; no-auth local deployment assumed)",
+                            c.base_url
+                        ),
+                    )
+                }
+            }
+        }
+    } else {
+        (
+            Status::Ok,
+            format!("base_url={} (no API key required)", c.base_url),
+        )
     }
 }
 
