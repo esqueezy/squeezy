@@ -239,9 +239,18 @@ pub fn save_codex_token(path: &Path, token: &OpenAiCodexTokenSet) -> Result<()> 
 
 #[cfg(windows)]
 fn replace_codex_token_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    // `std::fs::rename` on Windows already calls `MoveFileExW` with
+    // `MOVEFILE_REPLACE_EXISTING`, so the destination is overwritten
+    // when the rename completes normally. The fallback only fires on
+    // an explicit `AlreadyExists` (e.g. a stale destination held open
+    // by another process during `MoveFileExW`'s replace step) — we
+    // remove and rename a second time so the next save still lands.
+    // We deliberately do **not** widen the guard to "any error when
+    // `path.exists()`": that swallows the original cause and replaces
+    // it with the second `rename` failure.
     match std::fs::rename(tmp, path) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists || path.exists() => {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
@@ -673,9 +682,18 @@ where
 /// 1. Generate PKCE + state.
 /// 2. Call `on_open_url` with the authorize URL.
 /// 3. Call `read_input` to get the user-pasted redirect URL or bare code.
-/// 4. Parse the code + optional state from the input; validate state.
+/// 4. Parse the code + optional state from the input; validate state when
+///    the input includes one (see [`extract_code_from_paste`] for the
+///    bare-code contract).
 /// 5. Exchange the code against the token endpoint.
 /// 6. Persist the token set to `auth_path`.
+///
+/// State verification is skipped when the user pastes a bare
+/// authorization code (no `state` parameter is present). PKCE still
+/// binds the code to this session via `code_verifier`, so an attacker
+/// cannot exchange a code minted for a different `code_challenge`.
+/// Callers that want strict state binding should require the full
+/// callback URL or `code#state` form.
 pub async fn login_openai_codex_manual<F, R>(
     originator: &str,
     auth_path: &Path,
@@ -797,17 +815,23 @@ where
 
 /// Parse a code from user-pasted input (a full redirect URL, bare code,
 /// `code#state` pair, or query-string fragment). Validates the state
-/// parameter if present. Helper used by both `login_openai_codex_manual`
-/// and `login_openai_codex_with_auto_fallback`.
+/// parameter if present. Helper used by both [`login_openai_codex_manual`]
+/// and [`login_openai_codex_with_auto_fallback`].
+///
+/// State verification is skipped when the user pastes a bare
+/// authorization code (the parsed `state` is `None`). PKCE still binds
+/// the code to this session via `code_verifier`, so the token exchange
+/// fails server-side if an attacker injects a code minted for a
+/// different `code_challenge`. Callers that want strict state binding
+/// should require the full callback URL or `code#state` form.
 fn extract_code_from_paste(raw: &str, expected_state: &str) -> Result<String> {
     let parsed = crate::oauth::anthropic::parse_authorization_input(raw);
     let code = parsed.code.ok_or_else(|| {
-        SqueezyError::ProviderNotConfigured(
+        SqueezyError::ProviderNotConfigured(format!(
             "no `code` parameter found in the pasted input; paste either the full \
-             callback URL (http://localhost:1455/auth/callback?code=...&state=...), \
+             callback URL ({OPENAI_CODEX_REDIRECT_URI}?code=...&state=...), \
              the bare authorization code, or a `code#state` pair"
-                .to_string(),
-        )
+        ))
     })?;
     if let Some(pasted_state) = parsed.state
         && pasted_state != expected_state

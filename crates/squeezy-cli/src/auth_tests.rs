@@ -372,7 +372,7 @@ fn compute_status_row_prefers_inline_over_env() {
     .expect("seed");
     let sources = synthetic_sources(None, None, Some(repo_path));
     let env = env_from(&[("SQUEEZY_OPENAI_KEY", "sk-env-should-not-win")]);
-    let row = compute_status_row(openai, &sources, &env);
+    let row = compute_status_row(openai, &sources, &env, None);
     assert_eq!(row.effective_source(), "inline");
     assert!(row.env_set, "env still detected, just not preferred");
 }
@@ -388,7 +388,7 @@ fn compute_status_row_falls_back_to_fallback_env() {
         .expect("openai known");
     let sources = synthetic_sources(None, None, None);
     let env = env_from(&[("OPENAI_API_KEY", "sk-vendor-style")]);
-    let row = compute_status_row(openai, &sources, &env);
+    let row = compute_status_row(openai, &sources, &env, None);
     assert_eq!(row.effective_source(), "env (fallback)");
     assert!(row.fallback_env_set);
     assert!(!row.env_set);
@@ -404,7 +404,7 @@ fn compute_status_row_reports_missing_when_no_source() {
         .copied()
         .expect("openai known");
     let sources = synthetic_sources(None, None, None);
-    let row = compute_status_row(openai, &sources, &|_| None);
+    let row = compute_status_row(openai, &sources, &|_| None, None);
     assert_eq!(row.effective_source(), "missing");
 }
 
@@ -448,7 +448,7 @@ fn deepinfra_status_row_reports_api_key_env_when_set() {
         .expect("deepinfra known");
     let sources = synthetic_sources(None, None, None);
     let env = env_from(&[("DEEPINFRA_API_KEY", "fake-deepinfra-api-key")]);
-    let row = compute_status_row(deepinfra, &sources, &env);
+    let row = compute_status_row(deepinfra, &sources, &env, None);
     assert_eq!(row.effective_source(), "env");
     assert!(row.env_set);
     assert_eq!(row.env_var, "DEEPINFRA_API_KEY");
@@ -466,7 +466,7 @@ fn deepinfra_status_row_falls_back_to_token_env() {
         .expect("deepinfra known");
     let sources = synthetic_sources(None, None, None);
     let env = env_from(&[("DEEPINFRA_TOKEN", "fake-deepinfra-token")]);
-    let row = compute_status_row(deepinfra, &sources, &env);
+    let row = compute_status_row(deepinfra, &sources, &env, None);
     assert_eq!(row.effective_source(), "env (fallback)");
     assert!(row.fallback_env_set);
     assert!(!row.env_set);

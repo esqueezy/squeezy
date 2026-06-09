@@ -294,12 +294,9 @@ pub struct OpenAiCodexLoginArgs {
     /// redirect URL or bare authorization code pasted from the browser.
     /// Use this on locked-down Windows desktops where firewall rules,
     /// browser isolation, or enterprise endpoint software blocks the
-    /// localhost callback, or in any environment where binding
-    /// 127.0.0.1:1455 is not possible.
-    #[arg(
-        long,
-        help = "Skip localhost callback; paste redirect URL or code instead (Windows/locked-down)"
-    )]
+    /// localhost callback, or in any environment where binding the
+    /// OAuth callback port is not possible.
+    #[arg(long)]
     pub manual: bool,
 }
 
@@ -405,7 +402,7 @@ async fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core:
     let outcome: OpenAiCodexLoginOutcome = if manual {
         // --manual: skip the localhost listener entirely and accept a
         // pasted redirect URL or bare code. Useful on Windows when the
-        // firewall or browser isolation blocks 127.0.0.1:1455.
+        // firewall or browser isolation blocks the OAuth callback port.
         login_openai_codex_manual(
             &originator,
             &auth_path_for_login,
@@ -415,7 +412,10 @@ async fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core:
                 eprintln!("    {url}");
                 eprintln!();
                 eprintln!("After approving the consent screen, paste the full redirect URL");
-                eprintln!("  (http://localhost:1455/auth/callback?code=…&state=…) or the");
+                eprintln!(
+                    "  ({}?code=…&state=…) or the",
+                    squeezy_llm::OPENAI_CODEX_REDIRECT_URI
+                );
                 eprintln!("  bare authorization code here:");
                 if !no_browser {
                     if !try_open_browser(url) {
@@ -432,7 +432,7 @@ async fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core:
     } else {
         // Interactive path with automatic in-session fallback:
         // - Show the URL and try to open a browser.
-        // - Bind 127.0.0.1:1455 and wait for the OAuth callback.
+        // - Bind the OAuth callback port and wait for the redirect.
         // - On port bind failure or timeout, fall back to the paste flow
         //   in the same invocation, reusing the same URL so the user
         //   does not need to start over.
@@ -445,8 +445,8 @@ async fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core:
                 eprintln!("    {url}");
                 eprintln!();
                 eprintln!(
-                    "Squeezy is listening for the OAuth callback on \
-                     http://localhost:1455/auth/callback"
+                    "Squeezy is listening for the OAuth callback on {}",
+                    squeezy_llm::OPENAI_CODEX_REDIRECT_URI
                 );
                 #[cfg(target_os = "windows")]
                 eprintln!(
@@ -460,8 +460,9 @@ async fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core:
                 if !try_open_browser(url) {
                     eprintln!("Could not launch browser. Open the URL above manually.");
                     eprintln!(
-                        "Waiting for the callback on port 1455, or it will fall back \
+                        "Waiting for the callback on port {}, or it will fall back \
                          to the paste flow after {} seconds.",
+                        squeezy_llm::OPENAI_CODEX_CALLBACK_PORT,
                         squeezy_llm::OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS
                     );
                 } else {
@@ -1004,6 +1005,10 @@ pub(crate) fn handle_auth_status_with_env(
     sources: &SeparatedSources,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> squeezy_core::Result<()> {
+    // Read `~/.squeezy/credentials.json` once per `auth status`
+    // invocation so walking `KNOWN_PROVIDERS` doesn't re-`metadata`,
+    // re-read, and re-parse the same file once per row.
+    let credentials_map = squeezy_llm::load_credentials_file_map();
     let rows: Vec<StatusRow> = match &args.provider {
         Some(provider) => {
             let section = provider_section_for(provider)?;
@@ -1023,12 +1028,17 @@ pub(crate) fn handle_auth_status_with_env(
                         provider, section
                     ))
                 })?;
-            vec![compute_status_row(known, sources, env_lookup)]
+            vec![compute_status_row(
+                known,
+                sources,
+                env_lookup,
+                credentials_map.as_ref(),
+            )]
         }
         None => KNOWN_PROVIDERS
             .iter()
             .copied()
-            .map(|p| compute_status_row(p, sources, env_lookup))
+            .map(|p| compute_status_row(p, sources, env_lookup, credentials_map.as_ref()))
             .collect(),
     };
     if args.json {
@@ -1275,6 +1285,7 @@ fn compute_status_row(
     provider: KnownProvider,
     sources: &SeparatedSources,
     env_lookup: &dyn Fn(&str) -> Option<String>,
+    credentials_map: Option<&std::collections::HashMap<String, String>>,
 ) -> StatusRow {
     let tiers: [(Option<&squeezy_core::TierSource>, TierLabel); 3] = [
         // Highest precedence first: repo (per-machine local), then
@@ -1305,9 +1316,14 @@ fn compute_status_row(
         .unwrap_or(false);
     // Check if the provider key is available through credentials.json so
     // `auth status` can distinguish "env-backed" from "file-backed" entries.
-    // We re-use the same env_var name the resolution chain uses.
-    let credentials_file_set =
-        squeezy_llm::resolve_api_key_from_credentials_file(provider.env).is_some();
+    // We re-use the same env_var name the resolution chain uses. Callers
+    // pass a pre-loaded map to amortize the disk read across all rows;
+    // when `None` is supplied we still resolve correctly by going to disk
+    // (used by tests that exercise `compute_status_row` directly).
+    let credentials_file_set = match credentials_map {
+        Some(map) => squeezy_llm::lookup_api_key_in_credentials_map(map, provider.env).is_some(),
+        None => squeezy_llm::resolve_api_key_from_credentials_file(provider.env).is_some(),
+    };
     StatusRow {
         provider: provider.cli,
         section: provider.section,
@@ -1321,6 +1337,18 @@ fn compute_status_row(
     }
 }
 
+/// Render the `auth status` table.
+///
+/// On Windows the source cell is annotated `[file-backed]` for rows
+/// where the credential lives on disk (inline TOML or
+/// `credentials.json`) rather than in a credential manager. macOS
+/// (Keychain) and Linux (Secret Service) users with inline keys also
+/// have file-backed credentials, but get no annotation: the platform-
+/// gated marker is intended as an "ACL hardening reminder" specific
+/// to Windows, where there is no first-class OS keyring fallback yet.
+/// When DPAPI / Windows Credential Manager storage lands the
+/// annotation should reflect the actual storage backend rather than
+/// the OS family.
 fn print_status_table(rows: &[StatusRow]) {
     if rows.is_empty() {
         println!("No providers to report.");

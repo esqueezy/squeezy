@@ -80,8 +80,9 @@ pub use contribution::{
 };
 pub use credentials::{
     ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
-    delete_api_key, fallback_env_var, resolve_api_key, resolve_api_key_from_credentials_file,
-    resolve_api_key_with_inline, resolve_api_key_with_inline_optional, static_api_key_source,
+    delete_api_key, fallback_env_var, load_credentials_file_map, lookup_api_key_in_credentials_map,
+    resolve_api_key, resolve_api_key_from_credentials_file, resolve_api_key_with_inline,
+    resolve_api_key_with_inline_optional, static_api_key_source,
 };
 pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
@@ -101,7 +102,8 @@ pub use oauth::{
     DEFAULT_POLICY_MODELS, DevicePollOutcome, GITHUB_COPILOT_AUTH_FILE_NAME,
     GitHubCopilotDeviceCodeResponse, GitHubCopilotLoginHooks, GitHubCopilotLoginOutcome,
     GitHubCopilotOAuthSource, GitHubCopilotProvider, GitHubCopilotUrls,
-    OPENAI_CODEX_AUTH_FILE_NAME, OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS,
+    OPENAI_CODEX_AUTH_FILE_NAME, OPENAI_CODEX_CALLBACK_PORT,
+    OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS, OPENAI_CODEX_REDIRECT_URI,
     OpenAiCodexLoginOutcome, OpenAiCodexOAuthSource, OpenAiCodexProvider,
     PersistedGitHubCopilotTokens, PersistedTokens, PkceCodes, PolicyEnablementOutcome,
     TokenResponse, anthropic_default_storage_path as oauth_anthropic_default_storage_path,

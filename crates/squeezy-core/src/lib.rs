@@ -11050,10 +11050,14 @@ fn provider_u64_setting_any(
 ) -> Option<String> {
     provider_keys.iter().find_map(|provider| {
         let settings = providers.get(*provider)?;
+        // Per-provider env-var override surfaces only `stream_idle_timeout_ms`
+        // for now; `pool_idle_timeout_ms` and `max_retry_delay_ms` are
+        // configured via TOML and consumed directly by
+        // `provider_transport_settings`, so no arm is needed here. Add new
+        // arms here when a corresponding `SQUEEZY_*` override path is wired
+        // up (parallel to `SQUEEZY_STREAM_IDLE_TIMEOUT_MS`).
         let value = match key {
             "stream_idle_timeout_ms" => settings.stream_idle_timeout_ms,
-            "pool_idle_timeout_ms" => settings.pool_idle_timeout_ms,
-            "max_retry_delay_ms" => settings.max_retry_delay_ms,
             _ => None,
         }?;
         Some(value.to_string())

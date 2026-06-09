@@ -219,8 +219,54 @@ pub fn credentials_file_path() -> Option<PathBuf> {
 /// `read_credentials_file_for`: it may emit a one-shot `tracing::warn!`
 /// when the file exists but has broad permissions on Unix, or on
 /// Windows to note that ACL inspection is unavailable.
+///
+/// Each call re-reads the credentials file from disk. Call sites that
+/// resolve many env vars in a single user-facing operation (e.g.
+/// `auth status` walking every known provider) should use
+/// [`load_credentials_file_map`] once and feed the cached map into
+/// [`lookup_api_key_in_credentials_map`] to avoid redundant disk
+/// reads.
 pub fn resolve_api_key_from_credentials_file(env_var: &str) -> Option<String> {
     read_credentials_file_for(env_var)
+}
+
+/// Load `~/.squeezy/credentials.json` (or the path overridden by
+/// `SQUEEZY_CREDENTIALS_FILE`) once and return the parsed
+/// `{ env_var → value }` map. Returns `None` when the file is
+/// missing, has overly broad permissions on Unix, or fails to parse.
+///
+/// Pair with [`lookup_api_key_in_credentials_map`] to evaluate many
+/// env vars against the same on-disk snapshot without re-reading the
+/// file. Caching is intentionally per-invocation: callers that need
+/// to honor a mid-process `SQUEEZY_CREDENTIALS_FILE` change must
+/// reload the map.
+pub fn load_credentials_file_map() -> Option<HashMap<String, String>> {
+    let path = credentials_file_path()?;
+    read_credentials_file(&path)
+}
+
+/// Resolve `env_var` (or its `fallback_env_var` alias) against a map
+/// previously loaded via [`load_credentials_file_map`]. Mirrors the
+/// resolution rules used by [`resolve_api_key_from_credentials_file`]
+/// but reads from the supplied map instead of touching the
+/// filesystem, so a single load can serve any number of env-var
+/// lookups.
+pub fn lookup_api_key_in_credentials_map(
+    map: &HashMap<String, String>,
+    env_var: &str,
+) -> Option<String> {
+    if let Some(value) = map.get(env_var)
+        && !value.trim().is_empty()
+    {
+        return Some(value.clone());
+    }
+    if let Some(fallback) = fallback_env_var(env_var)
+        && let Some(value) = map.get(&fallback)
+        && !value.trim().is_empty()
+    {
+        return Some(value.clone());
+    }
+    None
 }
 
 /// Read the credentials file and return the value mapped to either
