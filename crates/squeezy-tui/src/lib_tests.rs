@@ -8261,6 +8261,293 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
     assert!(next.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 — clean-exit transcript mirror (`finish_fullscreen`).
+//
+// These assert the exact byte ORDER the clean-exit shutdown mandates against a
+// captured stream: `LeaveAlternateScreen` lands BEFORE the mirrored history, the
+// scrollback purge (`\x1b[3J`) never appears, the resume/exit hint follows the
+// mirror, the emergency `Drop` path writes no mirror at all, and the finding-1
+// height fix emits every wrapped row rather than clipping overflow. The
+// byte-emitting half is `emit_finish_fullscreen`; the driver-level
+// `clean_exit_mirror` drives a settled session through `finish_fullscreen` end
+// to end against the `for_capture_test` `Capture` seam.
+// ---------------------------------------------------------------------------
+
+/// `\x1b[?1049l` — crossterm's `LeaveAlternateScreen`. The clean-exit sequence
+/// must emit it before any mirrored normal-buffer text so the mirror lands in
+/// real scrollback rather than the alternate screen.
+const LEAVE_ALT_SCREEN: &str = "\x1b[?1049l";
+
+/// Build the collapsed transcript mirror buffer the clean-exit path emits for
+/// `app` at `width`, the same `inline_history_lines_for_flush` →
+/// `render_lines_to_owned_buffer` pipeline `finish_fullscreen` runs internally.
+fn mirror_buffer_for(app: &TuiApp, width: u16) -> Buffer {
+    let lines = inline_history_lines_for_flush(app, width, true, 0, app.transcript.len());
+    render_lines_to_owned_buffer(&lines, width)
+}
+
+#[test]
+fn finish_fullscreen_leaves_alt_screen_before_mirror_rows() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("find getFoo"));
+    app.push_transcript_item(TranscriptItem::assistant("No definition found."));
+
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(&mut bytes, &mirror, width, None).expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // The leave sequence must be present and precede the mirrored response text.
+    let leave_pos = ansi
+        .find(LEAVE_ALT_SCREEN)
+        .expect("clean exit must leave the alternate screen");
+    let mirror_pos = ansi
+        .find("No definition found.")
+        .expect("clean exit must mirror the transcript into scrollback");
+    assert!(
+        leave_pos < mirror_pos,
+        "LeaveAlternateScreen (offset {leave_pos}) must precede the first mirror row \
+         (offset {mirror_pos}) so the mirror lands in real scrollback, not the alt screen",
+    );
+    // The very first CRLF row-terminator likewise comes after the leave: every
+    // mirrored row is a normal-buffer write.
+    let first_crlf = ansi.find("\r\n").expect("mirror rows are CRLF terminated");
+    assert!(
+        leave_pos < first_crlf,
+        "LeaveAlternateScreen (offset {leave_pos}) must precede the first CRLF mirror \
+         row terminator (offset {first_crlf})",
+    );
+}
+
+#[test]
+fn finish_fullscreen_normal_exit_does_not_purge_scrollback() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("durable history line"));
+
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(&mut bytes, &mirror, width, None).expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // The scrollback-wipe `\x1b[3J` is reserved for `/clear`; a normal exit must
+    // never emit it, or it would destroy the user's pre-launch scrollback.
+    assert!(
+        !ansi.contains("\x1b[3J"),
+        "normal clean exit must never purge scrollback (\\x1b[3J)",
+    );
+    assert!(
+        !ansi.contains(CLEAR_SCROLLBACK_AND_VISIBLE),
+        "normal clean exit must not emit the /clear scrollback-wipe sequence",
+    );
+}
+
+#[test]
+fn finish_fullscreen_emits_exit_hint_after_the_mirror() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("the mirrored answer"));
+
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+    let hint = "Resume: squeezy sessions resume abc123";
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(&mut bytes, &mirror, width, Some(hint)).expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    let mirror_pos = ansi
+        .find("the mirrored answer")
+        .expect("mirror row present");
+    let hint_pos = ansi.find(hint).expect("exit/resume hint present");
+    assert!(
+        mirror_pos < hint_pos,
+        "the resume hint (offset {hint_pos}) must follow the mirrored transcript \
+         (offset {mirror_pos})",
+    );
+    // And the leave precedes everything: leave -> mirror -> hint.
+    let leave_pos = ansi.find(LEAVE_ALT_SCREEN).expect("leave alt screen");
+    assert!(
+        leave_pos < mirror_pos,
+        "LeaveAlternateScreen must precede the mirror, which precedes the hint",
+    );
+}
+
+#[test]
+fn emergency_drop_teardown_emits_no_transcript_mirror() {
+    // The emergency (`Drop`) teardown restores terminal state only: it must never
+    // mirror transcript content. Distinct from the clean-exit path, which owns
+    // the mirror. We assert no CRLF-mirrored text rides along the teardown bytes.
+    let mut bytes = Vec::new();
+    emit_terminal_emergency_teardown(&mut bytes, /* alt_screen_active = */ true)
+        .expect("emit emergency teardown");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // It leaves the alt screen (still in it) but writes no normal-buffer history:
+    // there are no CRLF row terminators (the mirror's row separator) at all.
+    assert!(
+        ansi.contains(LEAVE_ALT_SCREEN),
+        "emergency teardown still leaves the alternate screen when in it",
+    );
+    assert!(
+        !ansi.contains("\r\n"),
+        "emergency teardown is mirror-free: no CRLF transcript rows, got {ansi:?}",
+    );
+    assert!(
+        !ansi.contains("\x1b[3J"),
+        "emergency teardown must never purge scrollback",
+    );
+
+    // Full lifecycle proof through the real `Drop`: build a fullscreen guard on a
+    // capture sink with a settled transcript reachable to the renderer, drop it,
+    // and confirm no transcript text was mirrored by the emergency path.
+    let (guard, sink) = TerminalGuard::for_capture_test(/* inline_repro = */ false, 80, 24);
+    drop(guard);
+    let drop_ansi = sink_to_string(&sink);
+    assert!(
+        drop_ansi.contains(LEAVE_ALT_SCREEN),
+        "dropping a fullscreen guard leaves the alternate screen",
+    );
+    assert!(
+        !drop_ansi.contains("\x1b[3J"),
+        "Drop must not purge the user's pre-launch scrollback",
+    );
+}
+
+/// Finding-1 height fix: `visual_line_count`'s `chars().count().div_ceil(width)`
+/// estimate UNDER-counts a logical line that (a) word-wraps a too-long word and
+/// (b) contains wide CJK glyphs measured as one column but rendered as two. The
+/// clean-exit mirror sizes its buffer with `render_lines_to_owned_buffer` (a
+/// width-correct upper bound), so EVERY wrapped row is emitted; the old estimate
+/// would clip the overflow rows and truncate mirrored history.
+#[test]
+fn finish_fullscreen_mirror_height_covers_wrapped_rows_not_visual_estimate() {
+    // Width 10. The line forces both pathologies:
+    //   * a 22-char unbreakable word ("aaaa…") that word-wraps across rows, and
+    //   * eight wide CJK glyphs (好, 2 columns each = 16 display cols) that the
+    //     char-count estimate sees as 8 columns.
+    let width = 10u16;
+    let long_word = "a".repeat(22);
+    let cjk = "好".repeat(8);
+    let content = format!("{long_word} {cjk}");
+    let line = Line::from(vec![Span::raw(content.clone())]);
+    let lines = vec![line.clone()];
+
+    // The under-counting estimate the OLD mirror height used.
+    let estimate = visual_line_count(&lines, width) as usize;
+
+    // Ground truth: render the same word-wrapping `Paragraph` into a generously
+    // tall buffer and count the rows that actually carry glyphs.
+    let tall = {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 64));
+        render_lines_to_buffer(&mut buf, lines.clone());
+        buffer_used_height(&buf) as usize
+    };
+    assert!(
+        tall > estimate,
+        "test fixture must actually exceed the char-count estimate \
+         (wrapped rows {tall} vs visual_line_count {estimate})",
+    );
+
+    // The mirror buffer the clean-exit path builds must be tall enough to hold
+    // every wrapped row — never the under-counting estimate.
+    let mirror = render_lines_to_owned_buffer(&lines, width);
+    assert_eq!(
+        mirror.area.height as usize, tall,
+        "mirror buffer height must equal the true wrapped-row count, not the estimate",
+    );
+    assert!(
+        (mirror.area.height as usize) > estimate,
+        "mirror height {} must exceed the under-counting visual_line_count {estimate}",
+        mirror.area.height,
+    );
+
+    // Emit the mirror and prove NO row was truncated: every glyph of the original
+    // content survives across the wrapped rows. Strip the styling escapes, drop
+    // CRLFs, and the de-wrapped text must contain the long word and all CJK.
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(&mut bytes, &mirror, width, None).expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+    let visible: String = strip_ansi(&ansi)
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n')
+        .collect();
+    assert!(
+        visible.contains(&long_word),
+        "the wrapped long word must survive every row, none clipped: {visible:?}",
+    );
+    assert!(
+        visible.contains(&cjk),
+        "every wide CJK glyph must survive the wrap, none clipped: {visible:?}",
+    );
+}
+
+/// Driver-level clean-exit test: drive a settled session through the real
+/// `finish_fullscreen` against the `for_capture_test` `Capture` seam, then assert
+/// on the captured byte stream that `LeaveAlternateScreen` precedes the mirrored
+/// response text — the end-to-end form of the byte-order contract.
+#[test]
+fn clean_exit_mirror() {
+    // A settled session: a user turn and a committed assistant response.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("summarize the change"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Renamed the helper and updated its callers.",
+    ));
+
+    // Fullscreen guard on a capture sink at a deterministic size; its injected
+    // `FixedSize` feeds `finish_fullscreen`'s width with no real TTY.
+    let (mut guard, sink) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ false, 100, 40);
+    guard.set_exit_hint(Some("Resume: squeezy sessions resume deadbeef".to_string()));
+    guard
+        .finish_fullscreen(&app)
+        .expect("clean exit mirrors the settled transcript");
+
+    let ansi = sink_to_string(&sink);
+
+    let leave_pos = ansi
+        .find(LEAVE_ALT_SCREEN)
+        .expect("clean exit must leave the alternate screen");
+    let response_pos = ansi
+        .find("Renamed the helper and updated its callers.")
+        .expect("clean exit must mirror the committed assistant response");
+    assert!(
+        leave_pos < response_pos,
+        "LeaveAlternateScreen (offset {leave_pos}) must precede the mirrored response \
+         text (offset {response_pos}) so the mirror lands in real scrollback",
+    );
+    // The mirror landed in real scrollback, not the alt screen, and the resume
+    // hint persisted after it.
+    let hint_pos = ansi
+        .find("squeezy sessions resume deadbeef")
+        .expect("resume hint persisted after the mirror");
+    assert!(
+        response_pos < hint_pos,
+        "the resume hint must follow the mirrored response",
+    );
+    // A clean exit never purges the user's pre-launch scrollback.
+    assert!(
+        !ansi.contains("\x1b[3J"),
+        "clean exit must not purge scrollback (\\x1b[3J)",
+    );
+
+    // Idempotence: a second `finish_fullscreen` short-circuits (alt screen already
+    // left) and emits nothing further.
+    let len_before = sink.lock().expect("sink lock").len();
+    guard
+        .finish_fullscreen(&app)
+        .expect("second finish_fullscreen is a no-op");
+    let len_after = sink.lock().expect("sink lock").len();
+    assert_eq!(
+        len_before, len_after,
+        "a second clean exit must short-circuit and emit no further bytes",
+    );
+}
+
 #[test]
 fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
     let mut app = test_app(SessionMode::Build);

@@ -1,5 +1,6 @@
 use super::*;
 use crate::termsim::scenario::Scenario;
+use std::sync::Arc;
 
 /// The full matrix gate: every scenario × surface × backend passes the
 /// §8.5 invariants.
@@ -153,4 +154,120 @@ fn fullscreen_main_view_survives_resize_storms_without_stacking() {
             )
         });
     }
+}
+
+/// A `LlmProvider` that never streams: the scenario drives the transcript
+/// directly via `AssistantDelta`, so the provider only has to exist and name
+/// itself. Mirrors `driver::StubProvider` (which is private to that module).
+struct MirrorStubProvider;
+
+impl squeezy_llm::LlmProvider for MirrorStubProvider {
+    fn name(&self) -> &'static str {
+        "termsim-stub"
+    }
+
+    fn stream_response(
+        &self,
+        _request: squeezy_llm::LlmRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> squeezy_llm::LlmStream {
+        Box::pin(futures_util::stream::empty())
+    }
+}
+
+/// Drive a settled session through the real clean-exit path
+/// (`TerminalGuard::finish_fullscreen`) and assert, on the captured byte stream,
+/// that `LeaveAlternateScreen` precedes the mirrored response text — so the
+/// collapsed transcript lands in real scrollback, not the alternate screen.
+///
+/// This is the term-matrix scenario form of the Phase 2 byte-order contract: it
+/// replays the shipped `single_turn` scenario (a streamed delta that settles
+/// into a committed assistant turn) through the same headless `TuiHarness` the
+/// matrix uses, then hands the settled `TuiApp` to a fullscreen guard wired to a
+/// `TerminalWriter::Capture` sink and runs the production `finish_fullscreen`.
+#[test]
+fn clean_exit_mirror() {
+    let scenario = scenario_named("single_turn");
+
+    // The committed response tail is the concrete needle we assert survives into
+    // scrollback; the scenario derives it from its own script, so it can't drift.
+    let tail = scenario
+        .latest_response_tail()
+        .expect("single_turn commits an assistant response tail");
+    assert!(!tail.is_empty(), "needle must be non-empty (non-vacuous)");
+
+    let (w, h) = scenario.initial_size;
+    let config = squeezy_core::AppConfig {
+        model: "termsim-model".to_string(),
+        workspace_root: std::env::temp_dir().join(format!(
+            "squeezy_termsim_clean_exit_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )),
+        ..squeezy_core::AppConfig::default()
+    };
+    let _ = std::fs::create_dir_all(&config.workspace_root);
+    let provider: Arc<dyn squeezy_llm::LlmProvider> = Arc::new(MirrorStubProvider);
+    let mut harness = crate::testing::TuiHarness::new(
+        config,
+        squeezy_core::SessionMode::Build,
+        provider,
+        w,
+        h,
+        None,
+    )
+    .expect("termsim harness builds with stub provider");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("termsim tokio runtime");
+    // Drive the scenario to a settled, committed transcript (the AssistantDelta +
+    // SettleTurn steps land and flush the assistant turn into history).
+    runtime
+        .block_on(harness.drive_scenario(&scenario.steps))
+        .expect("drive_scenario settles the single_turn session");
+
+    // Sanity: the settled session actually holds the committed response, so the
+    // mirror assertion below is non-vacuous.
+    let settled_text = harness.last_assistant_text();
+    assert!(
+        settled_text.contains(&tail),
+        "settled session must hold the committed response tail {tail:?}; got {settled_text:?}",
+    );
+
+    // Clean exit: a fullscreen guard on a capture sink, pointed at the settled
+    // app, run through the production `finish_fullscreen`. The injected
+    // `FixedSize` feeds the mirror width with no real TTY.
+    let (mut guard, sink) =
+        crate::TerminalGuard::for_capture_test(/* inline_repro = */ false, w, h);
+    guard.set_exit_hint(Some("Resume: squeezy sessions resume cafef00d".to_string()));
+    guard
+        .finish_fullscreen(harness.app_mut())
+        .expect("clean exit mirrors the settled transcript");
+
+    let ansi = {
+        let bytes = sink.lock().expect("capture sink lock").clone();
+        String::from_utf8(bytes).expect("captured ANSI is valid utf8")
+    };
+
+    // The defining contract: LeaveAlternateScreen precedes the mirrored response.
+    let leave_pos = ansi
+        .find("\x1b[?1049l")
+        .expect("clean exit must leave the alternate screen");
+    let response_pos = ansi
+        .find(&tail)
+        .expect("clean exit must mirror the committed assistant response into scrollback");
+    assert!(
+        leave_pos < response_pos,
+        "LeaveAlternateScreen (offset {leave_pos}) must precede the mirrored response \
+         {tail:?} (offset {response_pos}) so the mirror lands in real scrollback",
+    );
+    // A clean exit never purges the user's pre-launch scrollback.
+    assert!(
+        !ansi.contains("\x1b[3J"),
+        "clean exit must not purge scrollback (\\x1b[3J)",
+    );
 }

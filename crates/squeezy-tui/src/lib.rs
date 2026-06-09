@@ -155,6 +155,10 @@ const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const PROMPT_MIN_HEIGHT: u16 = 4;
 const PROMPT_MAX_HEIGHT: u16 = 30;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
+/// Column width used to wrap the clean-exit transcript mirror when the real
+/// terminal size is unavailable (piped stdout, detached TTY). 80 is the
+/// universal terminal default.
+const MIRROR_FALLBACK_WIDTH: u16 = 80;
 // The slash-command roster grew well past 30 entries, so a 5-row
 // window forced users to scroll for almost any non-top-5 command.
 // 10 fits comfortably in a standard 24-row terminal alongside the
@@ -243,12 +247,16 @@ const TITLE_NOTIFICATION_GLYPH: &str = "●";
 const MAX_INPUT_EVENTS_PER_POLL: usize = 128;
 const MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL: usize = 4096;
 
-// The transcript-overlay alt-screen sequences no longer have a production
-// caller: the fullscreen renderer enters the alternate screen once in `enter`
-// and renders the overlay as a state on the same terminal (no per-overlay
-// swap). These free functions are retained under `#[cfg(test)]` because byte
-// tests still assert the exact alt-screen / mouse-mode sequences they emit, and
-// the Phase 2 exit mirror may reuse them.
+// `leave_transcript_overlay_screen` is the production clean-exit alt-leave path:
+// `finish_fullscreen` calls it to disable alternate-scroll + mouse reporting and
+// leave the alternate screen (optionally restoring main-screen mouse capture)
+// before mirroring the transcript into native scrollback. Its
+// `enter_transcript_overlay_screen` / `set_transcript_overlay_mouse_mode`
+// siblings have no production caller after Phase 1 (the fullscreen renderer
+// enters the alternate screen once in `enter` and renders the overlay as a state
+// on the same terminal, with no per-overlay swap); they stay under `#[cfg(test)]`
+// only because byte tests still assert the exact alt-screen / mouse-mode
+// sequences they emit.
 #[cfg(test)]
 fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
     execute!(
@@ -261,7 +269,6 @@ fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
     )
 }
 
-#[cfg(test)]
 fn leave_transcript_overlay_screen<W: Write>(
     writer: &mut W,
     restore_mouse_capture: bool,
@@ -1026,6 +1033,14 @@ async fn run_inner_with_terminal(
         .finish_session(squeezy_store::SessionStatus::Completed)
         .await;
     agent.flush_telemetry().await;
+
+    // Clean, successful exit: leave the alternate screen, mirror the collapsed
+    // transcript into native scrollback, write the resume hint, and restore
+    // terminal modes. Best-effort — a teardown IO error must not mask a
+    // completed session, and `Drop` still runs the idempotent emergency teardown
+    // (which sees `alt_screen_active == false` here and won't leave the alternate
+    // screen a second time). `Drop` stays emergency-only and never mirrors.
+    let _ = terminal.finish_fullscreen(&app);
 
     Ok((StartupRunOutcome::Finished, None))
 }
@@ -18435,6 +18450,72 @@ fn emit_terminal_emergency_teardown<W: Write>(
     )
 }
 
+/// Emit the clean-exit (`TerminalGuard::finish_fullscreen`) byte sequence into
+/// `writer`, in the exact shutdown order Phase 2 mandates:
+///
+///   1. Disable mouse reporting (`DISABLE_MOUSE_MODES`) and alternate-scroll —
+///      BEFORE leaving the alternate screen, matching the
+///      `leave_transcript_overlay_screen` / `emit_terminal_emergency_teardown`
+///      ordering.
+///   2. `LeaveAlternateScreen` ONLY — restoring the pre-launch normal buffer
+///      with the user's pre-launch scrollback intact. Deliberately NEVER emits
+///      `\x1b[3J` (the scrollback purge is reserved for `/clear`), so closing
+///      squeezy can't wipe the terminal's prior history. Every subsequent write
+///      lands in the normal buffer and becomes native scrollback — which is the
+///      whole reason the mirror is written here, after the leave.
+///   3. The collapsed transcript mirror, row by row, each terminated by `\r\n`
+///      (CRLF, because raw mode is still on — a bare `\n` would not return the
+///      column and would stair-step the mirror).
+///   4. The exit/resume hint, if any: a blank `\r\n` separator, the hint, then
+///      `\r\n`. Plain normal-buffer text, so it persists in scrollback.
+///   5. The mode restores that mirror `emit_terminal_enter_setup` / the
+///      emergency teardown — keyboard enhancement flags off, bracketed paste
+///      off, focus reporting off, alternate-scroll off, mouse off, and the title
+///      reset `\x1b]0;\x07`. (`LeaveAlternateScreen` is NOT re-emitted; step 2
+///      already did it.) The hardware cursor (`show_cursor`) and `raw mode`
+///      (`disable_raw_mode`) are restored by the caller, since those are
+///      ratatui/crossterm calls rather than bytes, and raw mode must stay on
+///      through the CRLF writes above.
+///
+/// Factored out so a `Capture`-backed test can assert the exact stream:
+/// `LeaveAlternateScreen` precedes the first CRLF mirror row, no `\x1b[3J`
+/// appears, the hint follows the rows, and the mode restores follow the hint.
+fn emit_finish_fullscreen<W: Write>(
+    writer: &mut W,
+    mirror_rows: &Buffer,
+    width: u16,
+    exit_hint: Option<&str>,
+) -> io::Result<()> {
+    // 1 + 2: alternate-scroll + mouse off, then leave the alternate screen.
+    // `restore_mouse_capture = false`: on a clean exit the TUI is shutting down,
+    // so leave mouse reporting disabled rather than re-arming click capture.
+    leave_transcript_overlay_screen(writer, false)?;
+    // 3: the collapsed transcript mirror as plain CRLF normal-buffer rows.
+    for y in 0..mirror_rows.area.height {
+        writer.write_all(b"\r")?;
+        emit_buffer_row_styled(writer, mirror_rows, y, width)?;
+        writer.write_all(b"\r\n")?;
+    }
+    // 4: the resume/exit hint, set off by a blank line, persisted in scrollback.
+    if let Some(hint) = exit_hint {
+        writer.write_all(b"\r\n")?;
+        writer.write_all(hint.as_bytes())?;
+        writer.write_all(b"\r\n")?;
+    }
+    // 5: restore terminal modes (no second `LeaveAlternateScreen`, no `\x1b[3J`).
+    execute!(
+        writer,
+        PopKeyboardEnhancementFlags,
+        Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+        DisableModifyOtherKeys,
+        DisableBracketedPaste,
+        DisableFocusChange,
+        DisableAlternateScroll,
+        Print(DISABLE_MOUSE_MODES),
+        Print("\x1b]0;\x07")
+    )
+}
+
 impl TerminalGuard {
     fn enter(synchronized_output: TuiSynchronizedOutput) -> Result<Self> {
         let synchronized_output = resolve_synchronized_output(synchronized_output);
@@ -18520,6 +18601,67 @@ impl TerminalGuard {
 
     fn set_exit_hint(&mut self, exit_hint: Option<String>) {
         self.exit_hint = exit_hint;
+    }
+
+    /// Clean, successful shutdown of the fullscreen renderer: leave the alternate
+    /// screen and mirror the session's collapsed transcript into the user's real
+    /// terminal scrollback, then restore terminal modes — so closing squeezy
+    /// leaves a durable, self-describing record (the collapsed history plus a
+    /// `squeezy sessions resume …` pointer) instead of a blank prompt.
+    ///
+    /// Called once, on the normal main-loop exit, BEFORE the guard drops; `Drop`
+    /// stays the emergency-only fallback for panics/signals and never mirrors.
+    /// The two paths share the `alt_screen_active` idempotence flag, so the
+    /// alternate screen is left EXACTLY once:
+    ///   * On a clean exit this runs first, performs the full shutdown, and
+    ///     clears the flag; `Drop` then sees `alt_screen_active == false` and
+    ///     skips its own `LeaveAlternateScreen`, re-emitting only the idempotent
+    ///     mode restores.
+    ///   * In the inline-repro path `alt_screen_active` is already `false` (it
+    ///     never entered the alternate screen and its history is already in
+    ///     native scrollback), so this short-circuits and emits nothing.
+    ///   * A second call short-circuits the same way.
+    ///
+    /// Best-effort: the IO `Result` exists so a `Capture` test can assert the
+    /// byte order and so the method composes; the caller discards it with
+    /// `let _ =` so a teardown IO error never masks a completed session (and
+    /// `Drop`'s idempotent emergency teardown still runs).
+    fn finish_fullscreen(&mut self, app: &TuiApp) -> io::Result<()> {
+        // Idempotence gate: nothing to mirror if the alternate screen was never
+        // entered (inline-repro) or has already been left (prior call / Drop).
+        if !self.alt_screen_active {
+            return Ok(());
+        }
+        // Width from the live terminal, with a conservative 80-column fallback
+        // when the size is unavailable (piped stdout / detached TTY). Reusing
+        // `size_source` keeps this testable with no real TTY, like `paint_main`.
+        let width = match self.size_source.size() {
+            Ok((w, _)) if w > 0 => w,
+            _ => MIRROR_FALLBACK_WIDTH,
+        };
+        // Collapsed-by-default mirror over the WHOLE transcript, opened by the
+        // startup/session card, built through the same inline line pipeline the
+        // append-only path used — so the mirrored rows match what the user saw.
+        let lines = inline_history_lines_for_flush(app, width, true, 0, app.transcript.len());
+        let mirror = render_lines_to_owned_buffer(&lines, width);
+
+        let exit_hint = self.exit_hint.clone();
+        let backend = self.term().backend_mut();
+        // Emit the whole clean-exit sequence through the shared free helper:
+        // mouse/alt-scroll off, `LeaveAlternateScreen` (never `\x1b[3J`), the
+        // CRLF mirror rows, the resume hint, and the mode restores.
+        emit_finish_fullscreen(backend, &mirror, width, exit_hint.as_deref())?;
+        // The alternate screen has been left; record it so `Drop` won't leave it
+        // again. Set BEFORE the trailing fallible calls so an error here still
+        // prevents a double-leave.
+        self.alt_screen_active = false;
+        // Raw mode is the very last thing disabled — after every CRLF write above
+        // — so bare-`\n` stair-stepping can't occur mid-mirror. Then show the
+        // hardware cursor `enter` hid, and flush so everything is emitted before
+        // the guard drops.
+        let _ = disable_raw_mode();
+        let _ = self.term().show_cursor();
+        self.term().backend_mut().flush()
     }
 
     /// Paint a single centered status line, flushed before the first real
@@ -18841,13 +18983,94 @@ fn render_footer_to_buffer(
 }
 
 /// Render finished transcript lines into an owned buffer wrapped to `width`,
-/// reusing the same `Paragraph` wrap the old scrollback flush used so on-screen
-/// wrapping matches `visual_line_count`.
+/// reusing the same `Paragraph`/`Wrap { trim: false }` the renderer uses.
+///
+/// The buffer height is a width-correct UPPER BOUND on the wrapped row count —
+/// not `visual_line_count`'s `chars().count().div_ceil(width)`. That estimate
+/// under-counts two ways and would let `render_lines_to_buffer` (which renders
+/// the same word-wrapping `Paragraph`) silently CLIP overflow rows, truncating
+/// mirrored history:
+///   1. Word-wrap reflow (`WordWrapper`, `trim: false`) breaks on word
+///      boundaries, so a word that will not fit leaves the tail of a row blank
+///      and pushes to the next — a logical line of N chars can occupy MORE rows
+///      than `ceil(N/width)`.
+///   2. Wide / CJK glyphs render two columns but `chars().count()` measures them
+///      as one, so a wide-glyph-heavy line wraps to more rows than the char
+///      count predicts.
+///
+/// `wrapped_row_upper_bound` accounts for both (display columns via
+/// `term_display_width`, plus one row of slack per whitespace-delimited word for
+/// the word-boundary reflow), so the buffer can never be too short. Trailing
+/// all-blank rows from the over-allocation are dropped by `buffer_used_height`
+/// so the mirror emits no spurious empty lines.
 fn render_lines_to_owned_buffer(lines: &[Line<'static>], width: u16) -> Buffer {
-    let height = visual_line_count(lines, width).max(1);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width.max(1), height));
+    let width = width.max(1);
+    let height = wrapped_row_upper_bound(lines, width).max(1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
     render_lines_to_buffer(&mut buffer, lines.to_vec());
+    let used = buffer_used_height(&buffer).max(1);
+    if used < buffer.area.height {
+        buffer.resize(Rect::new(0, 0, width, used));
+    }
     buffer
+}
+
+/// A width-correct UPPER BOUND on the number of rows ratatui's
+/// `Paragraph`/`Wrap { trim: false }` wraps `lines` into at `width` columns.
+///
+/// Per logical line: count display columns with [`term_display_width`] (so wide
+/// / CJK glyphs count as 2), take `ceil(cols / width)`, then add one row of
+/// slack for every whitespace-delimited word. The word slack covers the
+/// `WordWrapper` reflow where a word that does not fit the current row is
+/// pushed whole onto the next, leaving a partially-filled row the column
+/// estimate alone would miss. This is a guaranteed over-count (never a clip);
+/// the surplus rows are trimmed by [`buffer_used_height`] after rendering.
+fn wrapped_row_upper_bound(lines: &[Line<'_>], width: u16) -> u16 {
+    let content_width = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let mut cols = 0usize;
+            let mut words = 0usize;
+            let mut in_word = false;
+            let mut buf = [0u8; 4];
+            for span in &line.spans {
+                for ch in span.content.chars() {
+                    let g = ch.encode_utf8(&mut buf);
+                    cols += term_display_width(g).max(1) as usize;
+                    if ch.is_whitespace() {
+                        in_word = false;
+                    } else if !in_word {
+                        in_word = true;
+                        words += 1;
+                    }
+                }
+            }
+            cols.div_ceil(content_width).max(1) + words
+        })
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
+
+/// Height of `buf` counting only up to its last non-blank row (a blank row is
+/// all-space cells with default background and no modifiers), so trailing rows
+/// from an over-allocated buffer are dropped. Returns 0 when the buffer is
+/// entirely blank.
+fn buffer_used_height(buf: &Buffer) -> u16 {
+    let area = buf.area;
+    for y in (0..area.height).rev() {
+        let blank = (0..area.width).all(|x| {
+            buf.cell((x, y))
+                .map(|c| {
+                    c.symbol() == " " && c.bg == Color::Reset && c.modifier == Modifier::empty()
+                })
+                .unwrap_or(true)
+        });
+        if !blank {
+            return y + 1;
+        }
+    }
+    0
 }
 
 /// Emit a buffer's rows as plain styled text lines (`\r\n` separated).
