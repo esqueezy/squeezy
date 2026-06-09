@@ -5,6 +5,8 @@
 //! else.
 
 use std::sync::Mutex;
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShellProgram {
@@ -39,6 +41,8 @@ struct CachedShellBase {
 }
 
 static SHELL_BASE_CACHE: Mutex<Option<CachedShellBase>> = Mutex::new(None);
+#[cfg(windows)]
+static WINDOWS_SHELL_BINARY: OnceLock<String> = OnceLock::new();
 
 impl ShellProgram {
     /// Resolve the shell program + arguments to run `command`.
