@@ -3082,7 +3082,9 @@ async fn statusline_save_closes_picker_and_paints_detail_row() {
 #[test]
 fn statusline_picker_tab_toggles_scope() {
     // Open the picker and verify the default scope is user. Tab should
-    // switch to project. A second Tab should switch back to user.
+    // switch to project. A second Tab should switch back to user. Finally,
+    // Enter should hand the active scope through KeyOutcome::Save so a
+    // future rename of SaveScope::Project is caught by this test alone.
     use crate::status_line_setup;
     let mut state = status_line_setup::StatusLineSetupState::new(None, true);
     assert_eq!(
@@ -3100,6 +3102,18 @@ fn statusline_picker_tab_toggles_scope() {
         status_line_setup::SaveScope::Project,
         "after one Tab scope should be Project"
     );
+    // Enter at project scope must hand the project scope through Save.
+    let save_outcome = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        matches!(
+            save_outcome,
+            status_line_setup::KeyOutcome::Save {
+                scope: status_line_setup::SaveScope::Project,
+                ..
+            }
+        ),
+        "Enter at project scope should yield Save {{ scope: Project, .. }}"
+    );
     let outcome2 = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert!(matches!(outcome2, status_line_setup::KeyOutcome::Continue));
     assert_eq!(
@@ -3111,14 +3125,19 @@ fn statusline_picker_tab_toggles_scope() {
 
 #[tokio::test]
 async fn statusline_picker_project_scope_save_writes_project_note() {
-    // Open the picker, Tab to project scope, then save. The transcript
-    // summary must mention the project note about user-level override.
+    // Open the picker, Tab to project scope, Space-toggle the "Use theme
+    // colors" row off, then save. The transcript summary must explain the
+    // actual precedence (project beats user; the per-machine repo tier still
+    // overrides project) and must NOT tell the user that their user-level
+    // setting overrides project. The project squeezy.toml must persist both
+    // the list and the toggled-off color flag, and the user settings file
+    // must NOT be touched by a project-scope save.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("statusline_project_scope");
     let settings_path = dir.join("settings.toml");
     let _guard = ScopedSettingsPath::new(settings_path.clone());
-    app.set_settings_path_override(Some(settings_path));
+    app.set_settings_path_override(Some(settings_path.clone()));
     // Override workspace_root so find_project_settings_path can locate a
     // squeezy.toml inside the temp dir.
     let project_settings = dir.join("squeezy.toml");
@@ -3149,6 +3168,17 @@ async fn statusline_picker_project_scope_save_writes_project_note() {
         "scope should be Project after Tab"
     );
 
+    // Cursor starts on row 0 ("Use theme colors"). Space toggles it off so
+    // the persisted color flag exercises a non-default value rather than
+    // just round-tripping the constructor's `true`.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .expect("toggle use_colors");
+
     // Enter saves.
     handle_key(
         &mut app,
@@ -3166,7 +3196,20 @@ async fn statusline_picker_project_scope_save_writes_project_note() {
     );
     assert!(
         content.contains("Note:"),
-        "project-scope save should include user-override note; got: {content}"
+        "project-scope save should include precedence note; got: {content}"
+    );
+    // The note must describe Squeezy's actual precedence (project beats
+    // user; per-machine repo tier overrides project), and must not claim
+    // that ~/.squeezy/settings.toml takes precedence over the project tier.
+    assert!(
+        content.contains("`~/.squeezy/projects/<repo-id>/settings.toml`"),
+        "note should call out the per-machine repo tier as the only override; got: {content}"
+    );
+    assert!(
+        !content.contains("~/.squeezy/settings.toml) takes precedence")
+            && !content.contains("user settings (~/.squeezy/settings.toml) takes precedence")
+            && !content.contains("user settings takes precedence"),
+        "note must not claim the user tier overrides project; got: {content}"
     );
     let saved = std::fs::read_to_string(&project_settings).expect("project settings written");
     assert!(
@@ -3174,8 +3217,71 @@ async fn statusline_picker_project_scope_save_writes_project_note() {
         "project settings should persist the status line list; got: {saved}"
     );
     assert!(
-        saved.contains("status_line_use_colors = true"),
-        "project settings should persist color preference; got: {saved}"
+        saved.contains("status_line_use_colors = false"),
+        "project settings should persist the toggled-off color flag; got: {saved}"
+    );
+    // A project-scope save must not write the user tier.
+    let user_untouched = std::fs::read_to_string(&settings_path)
+        .map(|s| !s.contains("status_line"))
+        .unwrap_or(true);
+    assert!(
+        user_untouched,
+        "project-scope save must not write status_line into the user settings file"
+    );
+}
+
+#[tokio::test]
+async fn statusline_project_scope_save_walks_up_to_ancestor_squeezy_toml() {
+    // When the user runs Squeezy inside a subdirectory of a repo whose
+    // squeezy.toml lives at the repo root, a project-scope save must write
+    // to that ancestor file, not create a new squeezy.toml in the
+    // workspace_root subdirectory.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let parent = temp_workspace("statusline_project_scope_walk_up");
+    let settings_path = parent.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path));
+    let ancestor_project_settings = parent.join("squeezy.toml");
+    std::fs::write(&ancestor_project_settings, "").expect("create ancestor squeezy.toml");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).expect("create child dir");
+    app.workspace_root = child.clone();
+
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("tab scope");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+
+    let ancestor =
+        std::fs::read_to_string(&ancestor_project_settings).expect("ancestor settings written");
+    assert!(
+        ancestor.contains("status_line = ["),
+        "ancestor squeezy.toml should have been the save target; got: {ancestor}"
+    );
+    let child_candidate = child.join("squeezy.toml");
+    assert!(
+        !child_candidate.exists(),
+        "project-scope save must not create a new squeezy.toml inside workspace_root when an \
+         ancestor squeezy.toml exists"
     );
 }
 
@@ -5201,6 +5307,10 @@ async fn slash_help_lists_topics() {
     let content = last_message_content(&app).expect("help transcript");
     assert!(content.contains("Available `/help` topics"), "{content}");
     assert!(content.contains("`providers`"), "{content}");
+    assert!(
+        app.turn_rx.is_none(),
+        "locally answered /help must not start a model turn"
+    );
 }
 
 #[tokio::test]
@@ -5215,6 +5325,10 @@ async fn slash_help_config_renders_citations_and_config() {
     assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
     assert!(content.contains("[model]"), "{content}");
     assert!(!content.contains("--api-key"), "{content}");
+    assert!(
+        app.turn_rx.is_none(),
+        "locally answered /help must not start a model turn"
+    );
 }
 
 #[tokio::test]
@@ -5237,6 +5351,10 @@ async fn inline_slash_help_dispatches_from_prompt_body() {
     assert!(
         content.contains("docs/external/PROVIDERS.md"),
         "inline /help should dispatch from its position and render local answer: {content}"
+    );
+    assert!(
+        app.turn_rx.is_none(),
+        "locally answered inline /help must not start a model turn"
     );
 }
 

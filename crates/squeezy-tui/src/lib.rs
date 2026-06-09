@@ -3466,17 +3466,15 @@ fn save_status_line(
 ) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    let (target_path, scope_target) = match scope {
+    let scope_target = match scope {
         status_line_setup::SaveScope::User => {
             let p = app.user_settings_path();
-            let s = SettingsScope::user(&p);
-            (p, s)
+            SettingsScope::user(&p)
         }
         status_line_setup::SaveScope::Project => {
             let p = squeezy_core::find_project_settings_path(&app.workspace_root)
                 .unwrap_or_else(|| app.workspace_root.join(squeezy_core::PROJECT_SETTINGS_FILE));
-            let s = SettingsScope::project(&p);
-            (p, s)
+            SettingsScope::project(&p)
         }
     };
     let slug_list: Vec<String> = items.iter().map(|i| i.slug().to_string()).collect();
@@ -3503,28 +3501,31 @@ fn save_status_line(
             agent.replace_config(cfg);
             app.status_line_items = Some(items);
             app.status_line_use_colors = use_colors;
-            app.status = format!("status line saved to {}", target_path.display());
+            let target_display = scope_target.path.display();
+            app.status = format!("status line saved to {target_display}");
+            // Squeezy's settings tiers merge in the order defaults → user →
+            // project → repo, with later tiers overriding earlier ones (see
+            // squeezy_core::load_settings_from_paths and TuiSettings::merge).
+            // So a project-scope save already wins over the user tier on
+            // restart; the only thing that would override it is a per-machine
+            // entry in ~/.squeezy/projects/<repo-id>/settings.toml.
             let project_note = if matches!(scope, status_line_setup::SaveScope::Project) {
-                "\n\nNote: a `status_line` entry in your user settings (~/.squeezy/settings.toml) \
-                 takes precedence over this project setting on restart. Remove it there if you \
-                 want the project layout to apply to your sessions."
+                "\n\nNote: this project layout takes precedence over user settings on restart. \
+                 A per-machine entry in `~/.squeezy/projects/<repo-id>/settings.toml` would \
+                 still override it."
             } else {
                 ""
             };
             let summary = if slug_list.is_empty() {
                 format!(
-                    "status line cleared (colors {}); written to {}{}",
+                    "status line cleared (colors {}); written to {target_display}{project_note}",
                     if use_colors { "on" } else { "off" },
-                    target_path.display(),
-                    project_note,
                 )
             } else {
                 format!(
-                    "status line saved: {} (colors {}); written to {}{}",
+                    "status line saved: {} (colors {}); written to {target_display}{project_note}",
                     slug_list.join(", "),
                     if use_colors { "on" } else { "off" },
-                    target_path.display(),
-                    project_note,
                 )
             };
             app.push_transcript_item(TranscriptItem::system(summary));

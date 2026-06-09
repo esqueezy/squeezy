@@ -126,7 +126,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     // for topics without local coverage.
     slash_args_caps(
         "/help",
-        "show local Squeezy help topics (falls back to model for unknown topics)",
+        "local help; falls back to model for unknown topics",
         true,
         "[topic|/slash-command]",
         &[PermissionCapability::Network],

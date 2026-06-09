@@ -267,11 +267,15 @@ pub(crate) fn render(
     app: &TuiApp,
 ) {
     frame.render_widget(Clear, area);
+    // Surface the active save scope in the block title so a user who Tabs
+    // into project scope and presses Enter sees the destination tier at the
+    // moment of confirmation, not only in the bottom help row.
+    let title = format!(" Configure Status Line — save: {} ", state.scope.label());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::render::theme::secondary()))
-        .title(" Configure Status Line ");
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
