@@ -29,10 +29,21 @@ fn with_session_env<R>(
     let _guard = ENV_LOCK.lock().expect("env lock");
     let previous_home = env::var_os("HOME");
     let previous_xdg = env::var_os("XDG_STATE_HOME");
+    #[cfg(windows)]
+    let previous_userprofile = env::var_os("USERPROFILE");
+    #[cfg(windows)]
+    let previous_appdata = env::var_os("APPDATA");
     unsafe {
         match home {
             Some(path) => env::set_var("HOME", path),
-            None => env::remove_var("HOME"),
+            None => {
+                env::remove_var("HOME");
+                #[cfg(windows)]
+                {
+                    env::remove_var("USERPROFILE");
+                    env::remove_var("APPDATA");
+                }
+            }
         }
         match xdg_state_home {
             Some(path) => env::set_var("XDG_STATE_HOME", path),
@@ -48,6 +59,17 @@ fn with_session_env<R>(
         match previous_xdg {
             Some(value) => env::set_var("XDG_STATE_HOME", value),
             None => env::remove_var("XDG_STATE_HOME"),
+        }
+        #[cfg(windows)]
+        {
+            match previous_userprofile {
+                Some(value) => env::set_var("USERPROFILE", value),
+                None => env::remove_var("USERPROFILE"),
+            }
+            match previous_appdata {
+                Some(value) => env::set_var("APPDATA", value),
+                None => env::remove_var("APPDATA"),
+            }
         }
     }
     result
