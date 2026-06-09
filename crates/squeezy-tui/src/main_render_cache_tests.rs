@@ -39,6 +39,7 @@ fn key_at(session: u64, width: u16) -> MainRenderKey {
         pending_hash: 0,
         turn_divider_hash: 0,
         shortcut_hash: 0,
+        tail_anim_phase: 0,
         include_startup_card: false,
     }
 }

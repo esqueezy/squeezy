@@ -10560,8 +10560,9 @@ fn pending_assistant_uses_static_moon_marker() {
 
     let lines = transcript_lines_for_render(&app, Some(80), false);
 
-    // The assistant reply marker is a static full moon (never timer-animated
-    // or input-driven); the working-line star carries the motion instead.
+    // The assistant reply marker glyph is a fixed crescent moon (the
+    // working-line star carries the shape motion); its color is the
+    // tick-pulsed Running tint via `TurnVisualState::color`.
     assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
         lines[0].spans[1].style.fg,
@@ -21512,6 +21513,83 @@ fn main_render_app() -> TuiApp {
     app
 }
 
+/// Clear every entry's settle-fold so the assembled-render cache is exercised
+/// rather than bypassed. The settle-fold bypass deliberately routes around the
+/// cache (see `transcript_lines_and_entry_offsets`), so a freshly-pushed
+/// reasoning/plan/tool entry would otherwise make a cached-vs-uncached test
+/// trivially pass via the bypass instead of through the cache.
+fn clear_all_settles(app: &mut TuiApp) {
+    for entry in &mut app.transcript {
+        entry.settle = None;
+    }
+}
+
+/// A richer NON-subagent fixture that exercises the segmentation loop's
+/// edge branches the plain `main_render_app` never hits: a render-time
+/// coalesced tool run (its non-lead members take the suppressed `continue`),
+/// a suppressed reasoning pair (the second reasoning entry takes its own
+/// suppressed `continue`), and a non-empty pending-assistant tail painted with
+/// the live moon span. Coalescing is forced on so the run actually folds.
+fn main_render_app_rich() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.coalesce_tool_runs = true;
+    app.show_reasoning_usage = true;
+    app.push_transcript_item(TranscriptItem::user(
+        "search the tree and summarise the matches",
+    ));
+    // Two adjacent reasoning entries -> lead + one suppressed member.
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
+        squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "rsn-rich-1".to_string(),
+            summary: vec!["Plan: grep the tree, then read the hottest hits.".to_string()],
+            encrypted_content: None,
+        },
+    ));
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
+        squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "rsn-rich-2".to_string(),
+            summary: vec!["Refine: prioritise src/ over tests/.".to_string()],
+            encrypted_content: None,
+        },
+    ));
+    // Three adjacent same-tool same-status results -> a render-time coalesced
+    // run (lead + two suppressed members).
+    app.push_tool_result(sample_tool_result("grep", "src/a.rs:1: fn one("));
+    app.push_tool_result(sample_tool_result("grep", "src/b.rs:2: fn two("));
+    app.push_tool_result(sample_tool_result("grep", "src/c.rs:3: fn three("));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Found three matches across the source tree; the hottest is src/a.rs.",
+    ));
+    // A live pending-assistant tail (the trailing moon span + text) on a
+    // Running turn, so `pending_assistant_display_content` is `Some` and the
+    // tail's tick-pulsed moon is painted.
+    app.pending_assistant
+        .push_delta("Streaming the next part of the answer");
+    app.turn_visual = TurnVisualState::Running;
+    clear_all_settles(&mut app);
+    app
+}
+
+/// A subagent-view fixture so the conversation-title head-chrome branch of the
+/// segmentation loop (the `active_conversation_title` path, mutually exclusive
+/// with the pending tail) is covered by the cached-vs-uncached sweep.
+fn main_render_app_subagent() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(
+        7,
+        "delegate".to_string(),
+        "Audit the auth module".to_string(),
+    );
+    app.subagent_pane.active = ConversationSource::Subagent(7);
+    app.note_subagent_activity(
+        7,
+        "delegate".to_string(),
+        "read src/auth.rs and flagged a weak hash".to_string(),
+    );
+    clear_all_settles(&mut app);
+    app
+}
+
 // Hit/miss is asserted via `contains_main_key` (presence of this app's exact
 // key in the process-wide LRU), which is race-free because every `TuiApp` mints
 // a private `render_cache_session`. The global hit/miss stat counters are NOT
@@ -21572,23 +21650,161 @@ fn main_render_cached_matches_uncached_byte_for_byte() {
     // The painted rows + entry offsets from the cached path must equal the raw
     // builder's output for the same state — across several widths and the
     // startup-card toggle. This is the load-bearing correctness proof.
+    //
+    // The fixtures together drive every segmentation edge branch that a plain
+    // four-message transcript skips: `main_render_app_rich` carries a
+    // render-time coalesced tool run (suppressed members) + a suppressed
+    // reasoning pair + a live pending-assistant tail, and
+    // `main_render_app_subagent` carries the conversation-title head-chrome
+    // path. Each app mints a private `render_cache_session`, so sweeping all
+    // three in one test cannot cross-pollute the process-wide LRU.
     let _theme = lock_main_render_theme();
-    let app = main_render_app();
-    for &width in &[20u16, 40, 60, 80, 120] {
-        for &card in &[false, true] {
-            let cached = transcript_lines_and_entry_offsets(&app, Some(width), card);
-            let uncached = transcript_lines_and_entry_offsets_uncached(&app, Some(width), card);
-            assert_eq!(
-                rows_fingerprint(&cached.0),
-                rows_fingerprint(&uncached.0),
-                "cached rows must match uncached at width {width}, card {card}"
-            );
-            assert_eq!(
-                cached.1, uncached.1,
-                "cached entry offsets must match uncached at width {width}, card {card}"
-            );
+    let fixtures: [(&str, TuiApp); 3] = [
+        ("plain", main_render_app()),
+        ("rich", main_render_app_rich()),
+        ("subagent", main_render_app_subagent()),
+    ];
+    for (label, app) in &fixtures {
+        for &width in &[20u16, 40, 60, 80, 120] {
+            for &card in &[false, true] {
+                let cached = transcript_lines_and_entry_offsets(app, Some(width), card);
+                let uncached = transcript_lines_and_entry_offsets_uncached(app, Some(width), card);
+                assert_eq!(
+                    rows_fingerprint(&cached.0),
+                    rows_fingerprint(&uncached.0),
+                    "[{label}] cached rows must match uncached at width {width}, card {card}"
+                );
+                assert_eq!(
+                    cached.1, uncached.1,
+                    "[{label}] cached entry offsets must match uncached at width {width}, card {card}"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn main_render_rich_fixture_exercises_segmentation_edges() {
+    // Pin that the rich fixture actually drives the suppressed-segment branches
+    // the byte-for-byte sweep is meant to cover, so a future fixture edit that
+    // silently stopped coalescing/suppressing wouldn't quietly narrow coverage.
+    let app = main_render_app_rich();
+    let entries = active_transcript_entries(&app);
+    // Two adjacent reasoning entries -> a lead + one suppressed member.
+    let reasoning_runs: Vec<_> = (0..entries.len())
+        .filter_map(|i| reasoning_run_info(entries, i))
+        .collect();
+    assert!(
+        reasoning_runs.contains(&ReasoningRun::Suppressed),
+        "rich fixture must contain a suppressed reasoning member: {reasoning_runs:?}"
+    );
+    // Three adjacent same-tool same-status results -> a coalesced run with
+    // suppressed members.
+    let tool_runs: Vec<_> = (0..entries.len())
+        .filter_map(|i| tool_run_info(entries, i, app.coalesce_tool_runs))
+        .collect();
+    assert!(
+        tool_runs
+            .iter()
+            .any(|run| matches!(run, ToolRun::Lead { extras } if *extras >= 1)),
+        "rich fixture must contain a coalesced tool-run lead: {tool_runs:?}"
+    );
+    assert!(
+        tool_runs.contains(&ToolRun::Suppressed),
+        "rich fixture must contain a suppressed tool-run member: {tool_runs:?}"
+    );
+    // A live pending-assistant tail is shown.
+    assert!(
+        pending_assistant_display_content(&app).is_some(),
+        "rich fixture must show a pending-assistant tail"
+    );
+    // No settle-fold remains, so the cache is actually exercised (not bypassed).
+    assert!(
+        entries.iter().all(|entry| entry.settle.is_none()),
+        "rich fixture must clear settles so the cache path is taken"
+    );
+}
+
+/// The fg color of the first crescent-moon ("☽") span in `rows`, used to pin
+/// the animated pending-tail tint.
+fn first_moon_color(rows: &[Line<'static>]) -> Option<Color> {
+    rows.iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "☽")
+        .map(|span| span.style.fg)
+        .unwrap_or(None)
+}
+
+#[test]
+fn main_render_cache_pending_tail_moon_pulses_across_tick() {
+    // Regression for the MainRenderKey-omits-animation-tick freeze: while a
+    // turn is Running and a pending-assistant tail is shown, the tail's moon is
+    // tinted by `TurnVisualState::Running.color(tick)`, which alternates
+    // between two tints every 4 ticks (the `tick % 8 < 4` branch).
+    // `main_render_key` folds that color bucket (gated on the
+    // has-animating-tail predicate) so a cache hit on stable pending text can't
+    // freeze the pulse. Advance the tick across the bucket boundary and assert
+    // the cached moon color actually changes.
+    let _theme = lock_main_render_theme();
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("go"));
+    app.pending_assistant
+        .push_delta("streaming a stable answer tail");
+    app.turn_visual = TurnVisualState::Running;
+    let width = 60u16;
+
+    // tick 0 -> 0 % 8 == 0 (< 4) -> the "secondary" tint.
+    app.animation_tick = 0;
+    let phase_low = app.turn_visual.color(0);
+    let rows_low = transcript_lines_and_entry_offsets(&app, Some(width), false).0;
+    assert_eq!(
+        first_moon_color(&rows_low),
+        Some(phase_low),
+        "pending-tail moon must paint the tick-0 Running tint"
+    );
+
+    // tick 4 -> 4 % 8 == 4 (>= 4) -> the "accent" tint. A different mod-8 phase,
+    // so the gated key dimension changes and the cached row is rebuilt.
+    app.animation_tick = 4;
+    let phase_high = app.turn_visual.color(4);
+    assert_ne!(
+        phase_low, phase_high,
+        "precondition: the Running tint differs across a mod-8 boundary"
+    );
+    let rows_high = transcript_lines_and_entry_offsets(&app, Some(width), false).0;
+    assert_eq!(
+        first_moon_color(&rows_high),
+        Some(phase_high),
+        "cache must not freeze the pending-tail moon across a tick boundary"
+    );
+
+    // A within-bucket advance (4 -> 5, both in `% 8 >= 4`) keeps the SAME tint
+    // and stays a cache hit: the gate folds only the two-state color bucket, so
+    // within-bucket frames are not forced to miss.
+    app.animation_tick = 5;
+    let key_phase_5 = main_render_key(&app, width, false);
+    assert!(
+        main_render_cache::contains_main_key(&key_phase_5),
+        "tick 5 shares tick 4's color bucket, so its key is already cached"
+    );
+}
+
+#[test]
+fn main_render_key_idle_tail_phase_is_stable_across_ticks() {
+    // The has-animating-tail gate: when NO pending tail is showing (or the turn
+    // is not Running), the folded phase is held at a constant 0 so a bare tick
+    // advance never invalidates the idle key.
+    let _theme = lock_main_render_theme();
+    let mut app = main_render_app(); // settled transcript, no pending tail
+    let width = 60u16;
+    app.animation_tick = 0;
+    let key_a = main_render_key(&app, width, false);
+    app.animation_tick = 4; // crosses the Running color-bucket boundary
+    let key_b = main_render_key(&app, width, false);
+    assert_eq!(
+        key_a, key_b,
+        "an idle transcript with no animating tail must key identically across ticks"
+    );
 }
 
 #[test]

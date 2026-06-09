@@ -132,6 +132,18 @@ fn row_included(kind: RowKind, include_tool_output: bool, include_reasoning: boo
 /// `kinds` is indexed in lock-step with `rows`; a row past the end of `kinds` is
 /// treated as [`RowKind::Normal`] (always searched), so a short/empty `kinds`
 /// degrades to "search everything" rather than dropping rows.
+/// Offset-stable case fold: one source char in, exactly one lowercase char out.
+///
+/// `char::to_lowercase` can expand a char to several chars (e.g. 'İ' U+0130 ->
+/// "i\u{307}"), which would desync the char offsets the search column math
+/// relies on. This takes the FIRST char of the lowercase expansion, which is
+/// always defined and keeps the 1:1 char-to-column mapping while still folding
+/// non-ASCII case (unlike a bare `to_ascii_lowercase`). For the overwhelming
+/// 1:1 majority of chars this is identical to `to_lowercase`.
+fn simple_lower(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
 pub(crate) fn find(
     rows: &[Line<'static>],
     kinds: &[RowKind],
@@ -166,23 +178,24 @@ pub(crate) fn find(
         // offsets (not byte offsets) and the case-insensitive scan compares
         // char-for-char with `needle`.
         let hay: Vec<char> = cleaned.chars().flat_map(char::to_lowercase).collect();
-        // `char::to_lowercase` can expand one char into several (e.g. some
-        // ligatures), which would desync char offsets from the original cleaned
-        // text. Guard against that: only the offset-stable common case (1:1
-        // lowering) is used for column math; otherwise fall back to a per-char
-        // simple lowercase that preserves the 1:1 mapping.
+        // `char::to_lowercase` can expand one char into several (e.g. 'İ'
+        // U+0130 -> "i\u{307}"), which would desync char offsets from the
+        // original cleaned text and corrupt the reported column ranges. Guard
+        // against that: the offset-stable common case (1:1 lowering for every
+        // char in the line) is used directly; otherwise fall back to an
+        // offset-preserving simple fold — `simple_lower`, which maps each
+        // source char to exactly one lowercase char (the first char of its
+        // expansion). That keeps the char-for-char 1:1 mapping the column math
+        // needs WHILE preserving Unicode case-insensitivity (e.g. "É" still
+        // matches "é"), rather than the old ASCII-only downgrade that silently
+        // dropped non-ASCII folding for the whole line. The needle is folded
+        // the same way so hay/needle stay comparable.
         let (hay, needle) = if hay.len() == cleaned.chars().count() {
             (hay, needle.clone())
         } else {
             (
-                cleaned
-                    .chars()
-                    .map(|c| c.to_ascii_lowercase())
-                    .collect::<Vec<char>>(),
-                query
-                    .chars()
-                    .map(|c| c.to_ascii_lowercase())
-                    .collect::<Vec<char>>(),
+                cleaned.chars().map(simple_lower).collect::<Vec<char>>(),
+                query.chars().map(simple_lower).collect::<Vec<char>>(),
             )
         };
 

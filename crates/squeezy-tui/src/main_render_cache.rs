@@ -41,7 +41,8 @@
 //! transcript shortcut rebind, and the startup-card toggle. When any of those
 //! change the key changes and the entry is recomputed. The painted output is
 //! therefore byte-for-byte identical with and without the cache for the same
-//! state (proven by `main_render_cache_tests::cached_render_matches_uncached`).
+//! state (proven by
+//! `lib_tests::main_render_cached_matches_uncached_byte_for_byte`).
 //!
 //! ## Settle-fold bypass
 //!
@@ -50,8 +51,10 @@
 //! absolute `Instant`, not `animation_tick`). Rather than fold the wall clock
 //! into the key — which would force a miss on literally every frame and pollute
 //! the LRU with single-use entries during the fold — the caller bypasses the
-//! cache entirely while any visible entry is settling. This matches
-//! `settle_folded_entry_lines`' existing "outside the per-entry cache" contract.
+//! cache entirely while ANY active-conversation entry is settling (the cheap
+//! `entry.settle.is_some()` scan runs over the whole active transcript, not a
+//! visible subset). This matches `settle_folded_entry_lines`' existing "outside
+//! the per-entry cache" contract.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -121,6 +124,15 @@ pub(crate) struct MainRenderKey {
     pub(crate) turn_divider_hash: u64,
     /// Transcript shortcut rebind (a `[tui.keymap]` change restyles hints).
     pub(crate) shortcut_hash: u64,
+    /// Animation phase of the pending-assistant tail's moon span, folded ONLY
+    /// while a Running turn is actually showing that tail (see
+    /// `main_render_key`). The tail's crescent is tinted by
+    /// `TurnVisualState::Running.color(tick)`, which alternates every 4 ticks
+    /// (mod 8). Without this dimension a cache hit on momentarily-stable pending
+    /// text would freeze the moon's pulse. Held at a constant `0` on every
+    /// non-animating frame so idle/settled transcripts still hit regardless of
+    /// the live tick.
+    pub(crate) tail_anim_phase: u64,
     /// Main-only input: the startup card flips the leading lines.
     pub(crate) include_startup_card: bool,
 }
@@ -137,10 +149,10 @@ static ENTRY_WRAP_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Snapshot of the four cache counters: `(main_hits, main_misses,
 /// entry_wrap_hits, entry_wrap_misses)`.
 ///
-/// The render path bumps these on every lookup; the later Phase 8
-/// instrumentation step surfaces them in a debug HUD / trace line, so this is
-/// wired but not yet consumed in production.
-#[allow(dead_code)]
+/// The render path bumps these on every lookup; `draw_app` reads this snapshot
+/// before and after each painted frame to derive that frame's cache hit/miss
+/// deltas for the render-budget metrics (surfaced when `show_render_metrics` is
+/// on as the per-frame HUD / trace line).
 pub(crate) fn cache_stats() -> (u64, u64, u64, u64) {
     (
         MAIN_HITS.load(Ordering::Relaxed),

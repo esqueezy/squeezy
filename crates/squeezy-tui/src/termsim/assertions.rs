@@ -139,6 +139,42 @@ pub(crate) fn latest_response_present(grid: &Grid, expected_tail: &str) -> Resul
     ))
 }
 
+/// A run of fullwidth glyphs (`expected_run`, e.g. a CJK string) must survive a
+/// reflow contiguously and in order in `viewport ∪ scrollback`.
+///
+/// Unlike [`latest_response_present`], which only pins the scenario's short
+/// ASCII tail word, this keys on the WIDE run itself — the class of cell the
+/// ASCII tail can never exercise. The grid reconstruction stores each wide
+/// glyph's trailing cell as a single blank spacer (`你 好 世 界` — see
+/// `backend_alacritty.rs`'s `WIDE_CHAR_SPACER` handling), so the painted run is
+/// the glyphs interleaved with spaces. We strip the inter-cell ASCII spaces
+/// before matching, so the check pins survival AND order AND contiguity
+/// (a dropped, reordered, or wrap-stranded glyph all break the contiguous run)
+/// without being brittle to the spacer reconstruction. An empty `expected_run`
+/// passes vacuously.
+pub(crate) fn wide_run_present(grid: &Grid, expected_run: &str) -> Result<(), String> {
+    if expected_run.is_empty() {
+        return Ok(());
+    }
+    // Collapse every row to just its non-space glyphs, joined across rows, so a
+    // run that reflowed onto one row OR wrapped across rows still reads as the
+    // contiguous run (the spacer cells and any wrap whitespace fall away).
+    let despaced: String = grid
+        .scrollback
+        .iter()
+        .chain(grid.viewport.iter())
+        .flat_map(|row| row.chars())
+        .filter(|c| *c != ' ')
+        .collect();
+    if despaced.contains(expected_run) {
+        return Ok(());
+    }
+    Err(format!(
+        "wide glyph run {expected_run:?} not found contiguously in viewport+scrollback \
+         after reflow (despaced grid: {despaced:?})",
+    ))
+}
+
 /// The cursor row must stay within `[0, h)`, never orphaned above the viewport
 /// top or below the live region. `mark.h` is the terminal height in effect for
 /// the frame the grid was read from.

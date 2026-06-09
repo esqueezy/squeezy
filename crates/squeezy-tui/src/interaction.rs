@@ -211,9 +211,10 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 // ===========================================================================
 
 /// A second/third press on the *same target key* within this window is treated
-/// as a double/triple click. The card-affordance recognizer's own window; the
-/// main-text selection path keeps a separate (same-valued) `MULTI_CLICK_MS` in
-/// `lib.rs` until it is migrated onto the recognizer in a later phase.
+/// as a double/triple click. The single source of truth for the multi-click
+/// window: the card-affordance recognizer (here) and the main-text selection
+/// path (`handle_main_selection_press` in `lib.rs`, still cell-keyed) both read
+/// this constant, so the two recognizers can never drift to different windows.
 pub(crate) const MULTI_CLICK_MS: u128 = 400;
 
 /// A hovered target must stay hovered (same key) for at least this long before

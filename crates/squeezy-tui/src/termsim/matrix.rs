@@ -70,6 +70,14 @@ fn assert_fullscreen_invariants(scenario: &Scenario, run: &ScenarioRun) {
 
     assertions::latest_response_present(&grid, &run.latest_response_tail)
         .unwrap_or_else(|e| panic!("[{}] fullscreen: {e}", scenario.name));
+
+    // For a scenario that commits a wide-glyph run, the run itself (not just the
+    // ASCII tail) must survive the reflow contiguously on the fullscreen grid —
+    // the wide-cell class the ASCII needle can't exercise end-to-end.
+    if let Some(run_needle) = scenario.wide_run_needle() {
+        assertions::wide_run_present(&grid, &run_needle)
+            .unwrap_or_else(|e| panic!("[{}] fullscreen: {e}", scenario.name));
+    }
 }
 
 /// Replay the captured inline stream through one backend and assert the
@@ -87,6 +95,13 @@ fn assert_emulator_invariants(
     // Cursor must stay within the final frame's height. The last recorded mark
     // carries the size in effect for the final paint; fall back to the
     // fullscreen frame height when a scenario somehow recorded no marks.
+    //
+    // Load-bearing only on the alacritty leg, whose `logical_cursor_row` is the
+    // PRE-clamp row that genuinely surfaces the below-wrap drift. The fixed-grid
+    // vt100 leg is a vacuous pass here by construction (it has no scrollback and
+    // reports the already-clamped row as the logical row — see
+    // `backend_vt100::grid_from_term`), so this never fails for vt100; it runs
+    // uniformly so every leg reads the same field.
     let final_mark = run.log.frames.last().copied().unwrap_or(FrameMark {
         byte_offset: run.log.bytes.len(),
         w: run.final_frame.width,
@@ -111,6 +126,15 @@ fn assert_emulator_invariants(
     if emulator.profile().reflows {
         assertions::latest_response_present(&grid, &run.latest_response_tail)
             .unwrap_or_else(|e| panic!("[{} / {backend_name}] inline replay: {e}", scenario.name));
+
+        // On a reflow-capable leg, a committed wide-glyph run must reflow
+        // through the rewrap intact — survival, order, and contiguity — the
+        // bug class this scenario exists to guard.
+        if let Some(run_needle) = scenario.wide_run_needle() {
+            assertions::wide_run_present(&grid, &run_needle).unwrap_or_else(|e| {
+                panic!("[{} / {backend_name}] inline replay: {e}", scenario.name)
+            });
+        }
     }
 }
 

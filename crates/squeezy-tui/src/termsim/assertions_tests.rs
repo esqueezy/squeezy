@@ -51,6 +51,31 @@ fn latest_response_found_in_viewport_or_scrollback() {
 }
 
 #[test]
+fn wide_run_present_strips_spacers_and_pins_contiguity() {
+    // The grid stores each wide glyph's trailing cell as a blank spacer, so a
+    // healthy run reads as "你 好 世 界". Despacing must recover the contiguous
+    // run.
+    let g = grid_with_viewport(&["   ☽ 你 好 世 界 你 好 世 界"]);
+    assert!(wide_run_present(&g, "你好世界你好世界").is_ok());
+    // Empty needle passes vacuously.
+    assert!(wide_run_present(&g, "").is_ok());
+    // A glyph dropped from the run breaks contiguity -> fail.
+    let dropped = grid_with_viewport(&["   ☽ 你 好 界 你 好 世 界"]);
+    assert!(wide_run_present(&dropped, "你好世界你好世界").is_err());
+    // A reordered run breaks contiguity -> fail.
+    let reordered = grid_with_viewport(&["   ☽ 好 你 世 界 你 好 世 界"]);
+    assert!(wide_run_present(&reordered, "你好世界你好世界").is_err());
+}
+
+#[test]
+fn wide_run_present_recovers_run_split_across_wrapped_rows() {
+    // A narrow reflow can wrap the run across rows; despacing across the joined
+    // rows must still recover the contiguous run.
+    let g = grid_with_viewport(&["你 好 世", "界 你 好 世 界"]);
+    assert!(wide_run_present(&g, "你好世界你好世界").is_ok());
+}
+
+#[test]
 fn latest_response_found_via_joined_rows_across_wrap_boundary() {
     // A reflow split the logical line "the final answer" across two viewport
     // rows: "the final" then "answer". No single row contains the wrapped

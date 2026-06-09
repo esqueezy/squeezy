@@ -102,6 +102,44 @@ fn uppercase_query_matches_lowercase_content() {
     assert_eq!(found, vec![m(0, 4..9)]);
 }
 
+// ---- find: non-1:1 Unicode lowercasing fallback ---------------------------
+//
+// `char::to_lowercase('İ')` (U+0130) expands to two chars ("i\u{307}"), which
+// trips `find`'s offset-stability guard and routes the line through the
+// `simple_lower` fallback instead of the flattened-lowercase fast path. These
+// pin that the fallback (a) keeps char offsets 1:1 so the reported column is
+// correct, and (b) STILL folds non-ASCII case — the previous ASCII-only
+// downgrade would have silently failed (b).
+
+#[test]
+fn non_1to1_lowercasing_char_keeps_offsets_stable() {
+    // "İstanbul café": the leading U+0130 forces the fallback path. "café"
+    // begins at char index 9 (İ s t a n b u l ␠ c …), so the reported column
+    // must be 9..13 — an offset desync would shift or drop the range.
+    let r = rows(&["İstanbul café"]);
+    let found = find(&r, &[], "café", true, true);
+    assert_eq!(found, vec![m(0, 9..13)]);
+}
+
+#[test]
+fn non_1to1_fallback_still_folds_non_ascii_case() {
+    // Same fallback-triggering line, but an UPPERCASE non-ASCII query. The
+    // fallback must fold "CAFÉ" -> "café" (Unicode case-insensitive), not
+    // degrade to ASCII-only — which would have left "É" unmatched.
+    let r = rows(&["İstanbul CAFÉ here"]);
+    let found = find(&r, &[], "café", true, true);
+    assert_eq!(found, vec![m(0, 9..13)]);
+}
+
+#[test]
+fn non_1to1_lowercasing_char_is_itself_matchable() {
+    // The expanding char folds to the first char of its lowercase expansion
+    // ('İ' -> 'i'), so a plain "i" query finds it at its own column.
+    let r = rows(&["İ and i"]);
+    let found = find(&r, &[], "i", true, true);
+    assert_eq!(found, vec![m(0, 0..1), m(0, 6..7)]);
+}
+
 // ---- find: multi-span projection ------------------------------------------
 
 #[test]

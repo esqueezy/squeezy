@@ -2379,10 +2379,6 @@ fn main_scrollbar_from_bottom_from_mouse(app: &TuiApp, column: u16, row: u16) ->
 // highlight + clean-text bridges. lib.rs owns the `TuiApp` field, the per-frame
 // text-area cache, the gesture/key dispatch, and the clipboard delivery.
 
-/// A second/third left press at the same cell within this many milliseconds is
-/// treated as a double/triple click (word / row select).
-const MULTI_CLICK_MS: u128 = 400;
-
 /// The painted wrapped rows of the MAIN transcript surface this frame — the
 /// exact `Vec<Line>` `render_transcript` drew, so a `selection::Pos` row indexes
 /// them faithfully. Rebuilt from the cached width + startup-card flag.
@@ -2646,7 +2642,9 @@ fn handle_main_selection_press(
     let now = std::time::Instant::now();
     let multiplicity = match app.last_click {
         Some((at, c, r, count))
-            if c == column && r == row && now.duration_since(at).as_millis() <= MULTI_CLICK_MS =>
+            if c == column
+                && r == row
+                && now.duration_since(at).as_millis() <= interaction::MULTI_CLICK_MS =>
         {
             (count + 1).min(3)
         }
@@ -4580,8 +4578,9 @@ fn sync_queue_ids(app: &mut TuiApp) {
 }
 
 /// Resolve a stable queue item id to its current Vec index, or `None` if the
-/// id is no longer present (already drained or deleted). Mirrors
-/// `Focus::resolve_index` — identity is the id, position is derived.
+/// id is no longer present (already drained or deleted). Identity is the stable
+/// id; the position is derived on demand, so a concurrent front-drain or
+/// reorder can never stale a held index.
 fn queue_index_for_id(app: &TuiApp, id: u64) -> Option<usize> {
     app.prompt_queue_ids.iter().position(|qid| *qid == id)
 }
@@ -12682,11 +12681,12 @@ fn transcript_lines_for_render(
 ///
 /// - `width == None`: the logical-line (unwrapped) path is rare (off-frame
 ///   copy/export at logical granularity) and not worth a key dimension.
-/// - any visible entry is mid settle-fold (`entry.settle == Some(..)`): that
-///   entry renders a per-frame eased height driven by an absolute clock, not
-///   `animation_tick`, so caching would serve a stale fold height. The bypass
-///   keeps the fold animation smooth and is the documented exception to the
-///   per-entry cache contract.
+/// - any active-conversation entry is mid settle-fold (`entry.settle ==
+///   Some(..)`; the scan covers the whole active transcript, not just the
+///   visible window): that entry renders a per-frame eased height driven by an
+///   absolute clock, not `animation_tick`, so caching would serve a stale fold
+///   height. The bypass keeps the fold animation smooth and is the documented
+///   exception to the per-entry cache contract.
 ///
 /// On the cached path the returned `Vec`s are cloned out of the shared `Arc`
 /// once, matching the existing owned-`Vec` API. Selection/search highlight is
@@ -12761,6 +12761,7 @@ fn main_render_key(
     }
 
     main_render_cache::MainRenderKey {
+        tail_anim_phase: main_render_tail_anim_phase(app),
         render_cache_session: app.render_cache_session,
         width,
         selected_entry: active_selected_entry(app),
@@ -12776,6 +12777,35 @@ fn main_render_key(
             key_hint(app, keymap::Action::ToggleTranscriptOverlay).as_str(),
         ),
         include_startup_card,
+    }
+}
+
+/// The animation phase folded into [`main_render_cache::MainRenderKey`] for the
+/// pending-assistant tail's moon span.
+///
+/// The tail's crescent is painted by `turn_coin_span`, tinted with
+/// `TurnVisualState::Running.color(tick)` — which alternates between two tints
+/// every 4 ticks (the `tick % 8 < 4` branch). When a Running turn is showing
+/// that tail the color genuinely changes, so the key must move with it or a
+/// cache hit on momentarily-stable pending text would freeze the pulse. Gated
+/// behind the has-animating-tail predicate: a tail is only animating while
+/// `turn_visual == Running` AND a pending-assistant tail is actually shown
+/// (no active subagent view, non-empty display content). On every other frame
+/// — idle, settled, or a non-Running outcome whose moon color is static — the
+/// value is held at a constant `0` so the cache still hits regardless of the
+/// live `animation_tick`. Only the two-state color *bucket* is folded (not the
+/// raw tick), so a Running tail churns through at most two keys — flipping
+/// exactly when the tint flips — rather than minting a fresh key every tick.
+fn main_render_tail_anim_phase(app: &TuiApp) -> u64 {
+    let has_animating_tail = app.turn_visual == TurnVisualState::Running
+        && active_subagent_record(app).is_none()
+        && pending_assistant_display_content(app).is_some();
+    if has_animating_tail {
+        // Mirror the exact branch `TurnVisualState::Running.color` keys on, so
+        // the folded value flips iff the painted tint flips.
+        u64::from(app.animation_tick % 8 < 4)
+    } else {
+        0
     }
 }
 
@@ -18275,9 +18305,13 @@ struct TurnDividerSnapshot {
 
 fn turn_coin_span(app: &TuiApp) -> Span<'static> {
     // A crescent moon marking the assistant's reply — softer than a full disc
-    // and on-theme with the prompt's moon bullets. Static (never input-driven
-    // or timer-animated; the working-line star carries motion), and tinted by
-    // outcome: green when the turn succeeded, red when it failed.
+    // and on-theme with the prompt's moon bullets. The glyph itself never
+    // changes (the working-line star carries the shape motion); the color is
+    // tinted by outcome — green when the turn succeeded, red when it failed —
+    // and, while the turn is still Running, gently pulses every 4 ticks via
+    // `TurnVisualState::color(tick)`. That pulse is what `main_render_key`
+    // folds in through `main_render_tail_anim_phase` so a cache hit cannot
+    // freeze it.
     Span::styled(
         "☽",
         Style::default()
@@ -20762,9 +20796,10 @@ pub(crate) struct TuiApp {
     /// the card-affordance path, keying multiplicity on the target key rather
     /// than the screen cell. NOTE: this does NOT yet replace the main-transcript
     /// selection path — `handle_main_selection_press` still owns its own
-    /// cell-keyed multi-click counter (`last_click` + `MULTI_CLICK_MS`); the two
-    /// recognizers coexist, both using a 400ms window, until the main-selection
-    /// path is migrated onto the recognizer in a later phase.
+    /// cell-keyed multi-click counter (`last_click`); both paths now read the
+    /// single `interaction::MULTI_CLICK_MS` window, so they can never drift,
+    /// until the main-selection path is migrated onto the recognizer in a later
+    /// phase.
     pub(crate) gestures: interaction::Recognizer,
     /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
     /// `<workspace>/.squeezy/prompts/`. Consulted by

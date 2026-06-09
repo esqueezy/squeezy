@@ -76,6 +76,37 @@ impl Scenario {
             _ => None,
         })
     }
+
+    /// The longest contiguous run of fullwidth (≥2-column) glyphs in the last
+    /// `AssistantDelta`, if any — the wide-glyph needle the reflow matrix
+    /// checks survives a resize storm. Derived from the script so it can't drift
+    /// from what the driver injects. `None` for scenarios that commit no wide
+    /// run (the ASCII-only ones).
+    pub(crate) fn wide_run_needle(&self) -> Option<String> {
+        let text = self.steps.iter().rev().find_map(|step| match step {
+            Step::AssistantDelta(text) => Some(text.as_str()),
+            _ => None,
+        })?;
+        // Walk the chars, tracking the longest maximal run of wide glyphs.
+        let is_wide = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) >= 2;
+        let mut best = String::new();
+        let mut current = String::new();
+        for c in text.chars() {
+            if is_wide(c) {
+                current.push(c);
+            } else {
+                if current.chars().count() > best.chars().count() {
+                    best = std::mem::take(&mut current);
+                } else {
+                    current.clear();
+                }
+            }
+        }
+        if current.chars().count() > best.chars().count() {
+            best = current;
+        }
+        (!best.is_empty()).then_some(best)
+    }
 }
 
 /// The scenarios to ship first (§8.E), smallest blast radius first.
@@ -151,11 +182,15 @@ pub(crate) fn shipped_scenarios() -> Vec<Scenario> {
         },
         // 4b. A run of fullwidth CJK glyphs straddling the wrap column,
         //     oscillating width like the drag storm. Exercises a wide-glyph-at-
-        //     wrap-boundary reflow end-to-end through BOTH emulator legs — the
-        //     class the ASCII storms can't surface. The ASCII tail keeps the
-        //     latest-response needle reflow-safe while the wide run stresses the
-        //     reflow (each glyph occupies two columns, so the run wraps at the
-        //     narrow widths and unwraps at the wide ones).
+        //     wrap-boundary reflow end-to-end — the class the ASCII storms can't
+        //     surface. The ASCII tail keeps the latest-response needle
+        //     reflow-safe while the wide run stresses the reflow (each glyph
+        //     occupies two columns, so the run wraps at the narrow widths and
+        //     unwraps at the wide ones). The matrix asserts BOTH needles: the
+        //     ASCII tail via `latest_response_present` AND the wide run itself
+        //     via `wide_run_present` (keyed on `Scenario::wide_run_needle`), so
+        //     a dropped / reordered / wrap-stranded CJK cell fails the gate
+        //     rather than passing on the ASCII tail alone.
         Scenario {
             name: "wide_glyph_reflow",
             initial_size: (60, 40),
@@ -212,3 +247,7 @@ pub(crate) fn shipped_scenarios() -> Vec<Scenario> {
         },
     ]
 }
+
+#[cfg(test)]
+#[path = "scenario_tests.rs"]
+mod tests;
