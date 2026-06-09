@@ -51,7 +51,7 @@ use squeezy_core::{
     detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
-use squeezy_skills::PromptTemplateCatalog;
+use squeezy_skills::{HelpStatus, PromptTemplateCatalog, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::{
     ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, PreparedFeedback,
@@ -2555,9 +2555,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 app.status_line_setup = None;
                 app.status = "/statusline cancelled".to_string();
             }
-            status_line_setup::KeyOutcome::Save { items, use_colors } => {
+            status_line_setup::KeyOutcome::Save {
+                items,
+                use_colors,
+                scope,
+            } => {
                 app.status_line_setup = None;
-                save_status_line(app, agent, items, use_colors);
+                save_status_line(app, agent, items, use_colors, scope);
             }
         }
         return Ok(false);
@@ -3458,18 +3462,28 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
 }
 
 /// Persist the picker's selection to `[tui].status_line` /
-/// `[tui].status_line_use_colors` in the user-scope settings file and
-/// apply it in-memory immediately.
+/// `[tui].status_line_use_colors` in the chosen scope (user or project
+/// settings file) and apply it in-memory immediately.
 fn save_status_line(
     app: &mut TuiApp,
     agent: &mut Agent,
     items: Vec<status::StatusLineItem>,
     use_colors: bool,
+    scope: status_line_setup::SaveScope,
 ) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    let target_path = app.user_settings_path();
-    let scope_target = SettingsScope::user(&target_path);
+    let scope_target = match scope {
+        status_line_setup::SaveScope::User => {
+            let p = app.user_settings_path();
+            SettingsScope::user(&p)
+        }
+        status_line_setup::SaveScope::Project => {
+            let p = squeezy_core::find_project_settings_path(&app.workspace_root)
+                .unwrap_or_else(|| app.workspace_root.join(squeezy_core::PROJECT_SETTINGS_FILE));
+            SettingsScope::project(&p)
+        }
+    };
     let slug_list: Vec<String> = items.iter().map(|i| i.slug().to_string()).collect();
     let edits = [
         SettingsEdit {
@@ -3494,19 +3508,31 @@ fn save_status_line(
             agent.replace_config(cfg);
             app.status_line_items = Some(items);
             app.status_line_use_colors = use_colors;
-            app.status = format!("status line saved to {}", target_path.display());
+            let target_display = scope_target.path.display();
+            app.status = format!("status line saved to {target_display}");
+            // Squeezy's settings tiers merge in the order defaults → user →
+            // project → repo, with later tiers overriding earlier ones (see
+            // squeezy_core::load_settings_from_paths and TuiSettings::merge).
+            // So a project-scope save already wins over the user tier on
+            // restart; the only thing that would override it is a per-machine
+            // entry in ~/.squeezy/projects/<repo-id>/settings.toml.
+            let project_note = if matches!(scope, status_line_setup::SaveScope::Project) {
+                "\n\nNote: this project layout takes precedence over user settings on restart. \
+                 A per-machine entry in `~/.squeezy/projects/<repo-id>/settings.toml` would \
+                 still override it."
+            } else {
+                ""
+            };
             let summary = if slug_list.is_empty() {
                 format!(
-                    "status line cleared (colors {}); written to {}",
+                    "status line cleared (colors {}); written to {target_display}{project_note}",
                     if use_colors { "on" } else { "off" },
-                    target_path.display(),
                 )
             } else {
                 format!(
-                    "status line saved: {} (colors {}); written to {}",
+                    "status line saved: {} (colors {}); written to {target_display}{project_note}",
                     slug_list.join(", "),
                     if use_colors { "on" } else { "off" },
-                    target_path.display(),
                 )
             };
             app.push_transcript_item(TranscriptItem::system(summary));
@@ -3522,12 +3548,12 @@ fn save_status_line(
 /// Whether the transcript should show a styled banner for this slash
 /// command's invocation. Commands that open their own UI overlay
 /// (`/config`, `/statusline`, …) are silenced — the overlay is the
-/// affordance. Commands that route through `start_user_turn` and
-/// already produce a user-message bubble (`/help`) are also silenced
-/// to avoid duplication. `/tool-verbosity` reports when called bare but
-/// silently applies a value when given an arg — echo only the second form.
-/// Unrecognized commands are not echoed: they fall through to be sent as
-/// regular user prompts.
+/// affordance. `/help` is silenced: for answered topics it pushes a system
+/// transcript card directly; for unknown topics the `start_user_turn` fallback
+/// produces a user-message bubble — echo in either case would duplicate output.
+/// `/tool-verbosity` reports when called bare but silently applies a value when
+/// given an arg — echo only the second form. Unrecognized commands are not
+/// echoed: they fall through to be sent as regular user prompts.
 fn should_echo_slash_command(command: &str, rest: &str) -> bool {
     if !SLASH_COMMANDS.iter().any(|spec| spec.name == command) {
         return false;
@@ -4916,6 +4942,25 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
     } else {
         format!("/help {}", rest.trim())
     };
+    // Attempt to answer locally from the bundled skills knowledge base before
+    // sending the turn to the model. Pass the redacted config inspect so the
+    // local answer can include relevant config sections, matching the quality
+    // of the agent-level `resolve_help_turn` path.
+    //
+    // `answer_for_input` always returns `Some` for `/help`-prefixed input
+    // (parse_help_command always matches). A `None` result or `Unsupported`
+    // status means the topic isn't covered locally; both fall through to the
+    // model turn so the agent's doc-help subagent can handle broader questions.
+    let config_inspect = agent.config_snapshot().inspect_redacted();
+    let help = SqueezyHelp::new(config_inspect);
+    if let Some(answer) = help.answer_for_input(&prompt)
+        && answer.status == HelpStatus::Answered
+    {
+        app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
+        app.status = format!("help: {}", answer.topic);
+        return;
+    }
+    // Topic not covered locally — fall back to a model turn (network).
     start_user_turn(app, agent, prompt);
 }
 

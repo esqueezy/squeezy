@@ -126,7 +126,12 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     // Unknown topics can escalate to a DocHelp subagent, but that path is
     // uncommon; the command is not labelled as network-capable so it doesn't
     // look riskier or costlier than it is in practice.
-    slash_args("/help", "show local Squeezy help topics", true, "[topic]"),
+    slash_args(
+        "/help",
+        "local help; unknown topics can use the model",
+        true,
+        "[topic|/slash-command]",
+    ),
     slash_args_caps(
         "/config",
         "open config (or pass a section name)",

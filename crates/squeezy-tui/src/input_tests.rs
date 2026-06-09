@@ -49,6 +49,7 @@ fn slash_commands_declare_expected_capabilities() {
     // Anchors the audited capability mapping so future edits to the catalog
     // stay deliberate rather than accidentally silent.
     // `/help` is answered locally for curated topics; no capability badge.
+    // Unknown topics can still fall back to the model, but the common path is local.
     assert_eq!(find_command("/help").capabilities, &[]);
     assert_eq!(
         find_command("/compact").capabilities,
