@@ -741,6 +741,27 @@ struct SessionReportArgs {
 const WORKER_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn main() -> squeezy_core::Result<()> {
+    // `block_on` drives the root future on the calling thread, and `run()`
+    // performs deep synchronous work for some commands (notably `doctor`).
+    // The OS main thread defaults to a ~1 MiB stack on Windows (vs 8 MiB on
+    // Unix), which that depth overflows. Run the runtime on a dedicated thread
+    // sized like the worker threads so the root future has the same generous
+    // stack on every platform. Panics are re-raised so abort/backtrace
+    // behavior is unchanged.
+    let worker = std::thread::Builder::new()
+        .name("squeezy-main".to_string())
+        .stack_size(WORKER_THREAD_STACK_SIZE)
+        .spawn(run_blocking)
+        .map_err(|err| {
+            SqueezyError::Config(format!("failed to spawn main runtime thread: {err}"))
+        })?;
+    match worker.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run_blocking() -> squeezy_core::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
