@@ -35,6 +35,11 @@ updates:
       benchmark-cargo-dependencies:
         patterns:
           - "*"
+    # Transitive workspace deps (fancy-regex, lru) are pinned in the root
+    # Cargo.toml / deny.toml; bumping them via the benchmark lockfile breaks CI.
+    ignore:
+      - dependency-name: fancy-regex
+      - dependency-name: lru
     open-pull-requests-limit: 3
 
   - package-ecosystem: github-actions
