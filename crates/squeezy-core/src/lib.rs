@@ -7617,6 +7617,14 @@ fn default_sensitive_path_patterns() -> Vec<String> {
         // PSReadLine\ConsoleHost_history.txt; %APPDATA% resolves to Roaming.
         "AppData/Roaming/Microsoft/Windows/PowerShell/**",
         ".nuget/credentials",
+        // XDG and cloud CLI credential locations not covered above.
+        // Added as part of the Linux-hardening pass.
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
     ]
     .into_iter()
     .map(str::to_string)
@@ -10372,7 +10380,7 @@ pub fn user_settings_template() -> &'static str {
 # read_roots = []                  # extra absolute directories shell may read
 # write_roots = []                 # extra absolute directories shell may read/write
 # protected_metadata_names = [".git", ".squeezy", ".agents"]
-# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
+# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*", ".password-store/**", ".config/sops/**", ".config/1Password/**", ".azure/**", ".config/gcloud/**", ".config/kube/**"]
 
 [hardening]
 # disable_core_dumps = true

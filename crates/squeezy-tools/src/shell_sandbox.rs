@@ -412,6 +412,20 @@ pub struct ShellSandboxDoctor {
     pub available: bool,
     /// Human-readable explanation for the doctor row.
     pub detail: String,
+    /// Linux-specific: whether unprivileged user namespaces are available
+    /// (required for `unshare(CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWNET)`).
+    /// Always `None` on non-Linux platforms.
+    pub linux_user_namespaces: Option<bool>,
+    /// Linux-specific: Landlock ABI version exposed by the kernel,
+    /// or `0` when Landlock is absent. Always `None` on non-Linux platforms.
+    pub linux_landlock_abi: Option<i32>,
+    /// Linux-specific: whether the seccomp BPF filter compiles successfully on
+    /// this architecture. Always `None` on non-Linux platforms.
+    pub linux_seccomp_available: Option<bool>,
+    /// Linux-specific: whether `squeezy ask` is unavailable inside the sandboxed
+    /// shell child because the seccomp profile denies AF_UNIX `socket(2)`.
+    /// Always `None` on non-Linux platforms.
+    pub linux_ask_socket_blocked: Option<bool>,
 }
 
 /// Probe the active shell-sandbox backend for `doctor`.
@@ -429,6 +443,10 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
                 "/usr/bin/sandbox-exec not found; required mode denies, best_effort degrades"
                     .to_string()
             },
+            linux_user_namespaces: None,
+            linux_landlock_abi: None,
+            linux_seccomp_available: None,
+            linux_ask_socket_blocked: None,
         }
     }
     #[cfg(target_os = "linux")]
@@ -442,7 +460,7 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             .map(|v| v.trim().to_string());
         let userns_ns_present = std::path::Path::new("/proc/self/ns/user").exists();
         let knob_str = userns_knob.as_deref().unwrap_or("absent");
-
+        let seccomp_ok = linux_seccomp::build_shell_filter().is_ok();
         let detail = match (userns, landlock) {
             (true, true) => format!(
                 "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock ABI {abi} + seccomp available; \
@@ -468,6 +486,12 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             backend: "linux-direct-syscalls",
             available: userns && landlock,
             detail,
+            linux_user_namespaces: Some(userns),
+            linux_landlock_abi: Some(abi),
+            linux_seccomp_available: Some(seccomp_ok),
+            // AF_UNIX is blocked by the seccomp filter only when the sandbox
+            // actually runs: unshare must succeed AND the filter must compile.
+            linux_ask_socket_blocked: Some(userns && seccomp_ok),
         }
     }
     #[cfg(target_os = "windows")]
@@ -477,6 +501,10 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             available: true,
             detail: "restricted-token tier enforces filesystem writes with no admin; the elevated tier (sensitive-read deny + WFP network egress control) is opt-in via `squeezy doctor --sandbox-setup` (one UAC prompt)"
                 .to_string(),
+            linux_user_namespaces: None,
+            linux_landlock_abi: None,
+            linux_seccomp_available: None,
+            linux_ask_socket_blocked: None,
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -485,6 +513,10 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             backend: "none",
             available: false,
             detail: "no OS shell-sandbox backend is available for this platform".to_string(),
+            linux_user_namespaces: None,
+            linux_landlock_abi: None,
+            linux_seccomp_available: None,
+            linux_ask_socket_blocked: None,
         }
     }
 }
@@ -847,11 +879,16 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                 selected_shell: None,
             });
         }
-        let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
         if required {
-            return Err(reason.to_string());
+            return Err(
+                "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles"
+                    .to_string(),
+            );
         }
-        fallback_reason = Some(reason.to_string());
+        fallback_reason = Some(
+            "macos sandbox-exec unavailable; running without OS sandbox because mode is best_effort"
+                .to_string(),
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -864,16 +901,18 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
         if !linux_unshare_available {
             if required {
                 return Err(format!(
-                    "required shell sandbox unavailable: linux unshare(CLONE_NEWUSER|CLONE_NEWNS{}) failed",
+                    "required shell sandbox unavailable: linux unshare(CLONE_NEWUSER|CLONE_NEWNS{}) not permitted on this host",
                     if network == "denied" {
-                        " |CLONE_NEWNET"
+                        "|CLONE_NEWNET"
                     } else {
                         ""
                     }
                 ));
             }
-            fallback_reason =
-                Some("required shell sandbox unavailable: linux unshare failed".to_string());
+            fallback_reason = Some(
+                "linux unshare unavailable; running without OS sandbox because mode is best_effort"
+                    .to_string(),
+            );
         } else {
             // In required mode, verify that every user-configured root
             // actually exists at plan time. Optional default roots are
@@ -1522,13 +1561,13 @@ const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
 #[cfg(target_os = "linux")]
-fn linux_landlock_supported() -> bool {
+pub(crate) fn linux_landlock_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| linux_landlock_abi_version() > 0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn linux_landlock_supported() -> bool {
+pub(crate) fn linux_landlock_supported() -> bool {
     false
 }
 

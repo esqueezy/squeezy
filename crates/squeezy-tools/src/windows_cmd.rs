@@ -37,13 +37,12 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     // are already flagged by the POSIX destructive-verb list in
     // `destructive_shell_segment_reason`.
     let is_remove_item = command_name == "remove-item" || command_name == "ri";
-    if is_remove_item {
-        if (powershell_has_recurse_flag(&tokens) && powershell_has_force_flag(&tokens))
+    if is_remove_item
+        && ((powershell_has_recurse_flag(&tokens) && powershell_has_force_flag(&tokens))
             || lower.contains("-confirm:$false")
-            || lower.contains("-confirm=false")
-        {
-            return true;
-        }
+            || lower.contains("-confirm=false"))
+    {
+        return true;
     }
     if command_name == "invoke-expression" || command_name == "iex" {
         return true;

@@ -152,6 +152,8 @@ use specs::{
 };
 pub use squeezy_graph::LanguageReport;
 
+#[cfg(target_os = "macos")]
+use shell_sandbox::macos_sandbox_exec_supported;
 #[cfg(all(test, target_os = "macos"))]
 use shell_sandbox::macos_shell_sandbox_profile;
 #[cfg(test)]
@@ -164,6 +166,8 @@ use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
     prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
+#[cfg(target_os = "linux")]
+use shell_sandbox::{linux_landlock_supported, linux_unshare_supported};
 
 /// Provision the Windows elevated sandbox tier (one-time, prompts for UAC):
 /// creates the hidden local sandbox users and installs the persistent WFP
@@ -2451,6 +2455,87 @@ impl ToolRegistry {
                     "sandbox_network".to_string(),
                     self.shell_sandbox.network.as_str().to_string(),
                 );
+                // Surface the active OS sandbox backend and filesystem posture at
+                // approval time so the TUI can show isolation level before spawn.
+                // Uses the same probe functions the planner calls so the displayed
+                // backend matches the one the planner will actually select.
+                #[cfg(target_os = "linux")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    let will_use_direct_syscalls = linux_unshare_supported()
+                        && !matches!(
+                            self.shell_sandbox.mode,
+                            ShellSandboxMode::Off | ShellSandboxMode::External
+                        );
+                    if will_use_direct_syscalls {
+                        let fs = if linux_landlock_supported() {
+                            "enforced"
+                        } else {
+                            "best_effort_unavailable"
+                        };
+                        ("linux-direct-syscalls", fs)
+                    } else {
+                        ("none", "not_enforced")
+                    }
+                };
+                #[cfg(target_os = "macos")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    if macos_sandbox_exec_supported()
+                        && !matches!(
+                            self.shell_sandbox.mode,
+                            ShellSandboxMode::Off | ShellSandboxMode::External
+                        )
+                    {
+                        ("macos-sandbox-exec", "enforced")
+                    } else {
+                        ("none", "not_enforced")
+                    }
+                };
+                #[cfg(target_os = "windows")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    if matches!(
+                        self.shell_sandbox.mode,
+                        ShellSandboxMode::Off | ShellSandboxMode::External
+                    ) {
+                        ("none", "not_enforced")
+                    } else {
+                        match self.shell_sandbox.windows_sandbox_level {
+                            squeezy_core::WindowsSandboxLevel::Disabled => {
+                                ("windows-job-object", "best_effort_unavailable")
+                            }
+                            squeezy_core::WindowsSandboxLevel::RestrictedToken => {
+                                ("windows-restricted-token", "enforced_writes_only")
+                            }
+                            squeezy_core::WindowsSandboxLevel::Elevated
+                                if squeezy_win_sandbox::elevated_setup_is_complete(
+                                    &win_sandbox_spec::win_state_dir(),
+                                ) =>
+                            {
+                                ("windows-elevated", "enforced")
+                            }
+                            squeezy_core::WindowsSandboxLevel::Elevated => {
+                                ("windows-restricted-token", "enforced_writes_only")
+                            }
+                        }
+                    }
+                };
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                let (sandbox_backend, sandbox_filesystem) = ("none", "not_enforced");
+                metadata.insert("sandbox_backend".to_string(), sandbox_backend.to_string());
+                metadata.insert(
+                    "sandbox_filesystem".to_string(),
+                    sandbox_filesystem.to_string(),
+                );
+                // On linux-direct-syscalls the seccomp filter denies AF_UNIX
+                // socket(2), so squeezy ask cannot connect from inside the child.
+                // Only emit this hint when the direct-syscalls backend will
+                // actually be used (i.e. unshare is available and sandbox is on).
+                #[cfg(target_os = "linux")]
+                if sandbox_backend == "linux-direct-syscalls" {
+                    metadata.insert(
+                        "ask_socket_unavailable".to_string(),
+                        "squeezy ask is unavailable inside this shell child because the seccomp profile blocks AF_UNIX socket(2)".to_string(),
+                    );
+                }
                 metadata.insert(
                     "sandbox_read_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.read_roots),

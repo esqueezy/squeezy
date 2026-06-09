@@ -6212,3 +6212,54 @@ fn sanitize_repo_settings_name_strips_special_chars() {
     assert_eq!(sanitize_repo_settings_name("my_project"), "my_project");
     assert_eq!(sanitize_repo_settings_name("CamelCase"), "camelcase");
 }
+
+// ── sensitive-path defaults ────────────────────────────────────────────────
+
+/// Validate that the default sensitive-path patterns cover the XDG and cloud
+/// CLI credential locations added in the Linux-hardening pass, in addition to
+/// the pre-existing baseline patterns.
+#[test]
+fn default_sensitive_paths_include_xdg_and_cloud_creds() {
+    let config = ShellSandboxConfig::default();
+    let patterns = &config.sensitive_path_patterns;
+
+    for expected in [".ssh/**", ".aws/**", ".kube/**", ".gnupg/**"] {
+        assert!(
+            patterns.iter().any(|p| p == expected),
+            "default patterns should contain {expected:?}; got: {patterns:?}"
+        );
+    }
+
+    for expected in [
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
+    ] {
+        assert!(
+            patterns.iter().any(|p| p == expected),
+            "default patterns should contain {expected:?}; got: {patterns:?}"
+        );
+    }
+}
+
+#[test]
+fn user_settings_template_lists_hardened_sensitive_path_defaults() {
+    let template = user_settings_template();
+
+    for expected in [
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
+    ] {
+        assert!(
+            template.contains(expected),
+            "user settings template should mention default sensitive path {expected:?}"
+        );
+    }
+}

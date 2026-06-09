@@ -167,6 +167,32 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(binary) = permission.metadata.get("binary") {
         lines.push(dim(format!("binary {binary}")));
     }
+    // Show sandbox posture so the user can see isolation level at approval time.
+    let backend = permission
+        .metadata
+        .get("sandbox_backend")
+        .map(String::as_str);
+    let mode = permission.metadata.get("sandbox").map(String::as_str);
+    let network = permission
+        .metadata
+        .get("sandbox_network")
+        .map(String::as_str);
+    let filesystem = permission
+        .metadata
+        .get("sandbox_filesystem")
+        .map(String::as_str);
+    if let (Some(b), Some(m)) = (backend, mode)
+        && b != "none"
+    {
+        let mut posture = format!("sandbox {b}  mode {m}");
+        if let Some(fs) = filesystem {
+            posture.push_str(&format!("  filesystem {fs}"));
+        }
+        if let Some(net) = network {
+            posture.push_str(&format!("  network-policy {net}"));
+        }
+        lines.push(dim(posture));
+    }
     // Show Windows sandbox posture when approval remains the boundary for
     // reads/network or for all filesystem access.
     let windows_posture = permission
@@ -198,6 +224,11 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+    }
+    // On linux-direct-syscalls the seccomp filter blocks AF_UNIX, so
+    // `squeezy ask` cannot be used from inside this sandboxed shell child.
+    if let Some(hint) = permission.metadata.get("ask_socket_unavailable") {
+        lines.push(dim(format!("note: {hint}")));
     }
 }
 
