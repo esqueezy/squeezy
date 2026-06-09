@@ -123,7 +123,13 @@ pub(crate) enum Action {
     /// Delete the given queue item (by stable item id).
     QueueDelete(u64),
     /// Begin a reorder drag of the given queue item (by stable item id).
+    /// The press on a queue-item row arms a drag; the live move + drop are
+    /// driven from the gesture recognizer's `DragState` in `handle_mouse`.
     QueueReorderBegin(u64),
+    /// Undo the most recent queue mutation (delete or reorder). The mouse
+    /// twin of the keyboard undo verb; both pop one entry off the queue's
+    /// bounded undo stack and reverse it exactly.
+    QueueUndo,
     /// Jump the transcript to the latest (tail) row.
     JumpToLatest,
     /// Jump the scrollbar thumb to the clicked gutter row.

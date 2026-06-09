@@ -19782,3 +19782,421 @@ async fn esc_clears_a_keyboard_seeded_selection() {
         app.status
     );
 }
+
+// ===========================================================================
+// Prompt-queue direct manipulation (Phase 7B follow-up): stable ids, mouse +
+// keyboard delete/reorder, bounded undo, focus-cursor clamping.
+// ===========================================================================
+
+/// Build an app whose prompt queue holds `items` (each stamped with a stable
+/// id via the production enqueue path) and an open reorder overlay focused on
+/// item 0. Mirrors how `queue_input_behind_running_turn` populates the queue.
+fn queue_app(items: &[&str]) -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    for item in items {
+        app.prompt_queue.push_back((*item).to_string());
+        enqueue_queue_id(&mut app);
+    }
+    app.prompt_queue_overlay = Some(prompt_queue::PromptQueueState::new());
+    app
+}
+
+fn queue_texts(app: &TuiApp) -> Vec<String> {
+    app.prompt_queue.iter().cloned().collect()
+}
+
+fn queue_id_at(app: &TuiApp, index: usize) -> u64 {
+    *app.prompt_queue_ids.get(index).expect("id in range")
+}
+
+#[test]
+fn enqueue_stamps_unique_monotonic_ids() {
+    let app = queue_app(&["a", "b", "c"]);
+    assert_eq!(app.prompt_queue_ids.len(), 3);
+    let ids: Vec<u64> = app.prompt_queue_ids.iter().copied().collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+    assert_eq!(app.next_queue_id, 3);
+}
+
+#[test]
+fn delete_by_id_removes_right_item_and_keeps_others() {
+    let mut app = queue_app(&["a", "b", "c"]);
+    let id_b = queue_id_at(&app, 1);
+    assert!(queue_delete_by_id(&mut app, id_b));
+    assert_eq!(queue_texts(&app), vec!["a", "c"]);
+    // Surviving items keep their original ids.
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert!(app.status.contains("deleted"));
+}
+
+#[test]
+fn delete_does_not_shift_other_items_hit_identity() {
+    // Deleting the FIRST item must not change the id (hit-target identity) of
+    // the remaining items — the whole point of id-keyed targets.
+    let mut app = queue_app(&["a", "b", "c"]);
+    let id_a = queue_id_at(&app, 0);
+    let id_b = queue_id_at(&app, 1);
+    let id_c = queue_id_at(&app, 2);
+    assert!(queue_delete_by_id(&mut app, id_a));
+    assert_eq!(queue_index_for_id(&app, id_b), Some(0));
+    assert_eq!(queue_index_for_id(&app, id_c), Some(1));
+    // The deleted id is gone, not reassigned.
+    assert_eq!(queue_index_for_id(&app, id_a), None);
+}
+
+#[test]
+fn delete_unknown_id_is_noop() {
+    let mut app = queue_app(&["a", "b"]);
+    assert!(!queue_delete_by_id(&mut app, 999));
+    assert_eq!(queue_texts(&app), vec!["a", "b"]);
+}
+
+#[test]
+fn move_indices_reorders_both_queue_and_ids() {
+    let mut app = queue_app(&["a", "b", "c", "d"]);
+    // Move "a" (id 0) from front to the end.
+    queue_move_indices(&mut app, 0, 3);
+    assert_eq!(queue_texts(&app), vec!["b", "c", "d", "a"]);
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3, 0]
+    );
+    // Move it back to the front.
+    queue_move_indices(&mut app, 3, 0);
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c", "d"]);
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    // Move a middle item up by one.
+    queue_move_indices(&mut app, 2, 1);
+    assert_eq!(queue_texts(&app), vec!["a", "c", "b", "d"]);
+}
+
+#[test]
+fn undo_restores_exact_order_after_delete() {
+    let mut app = queue_app(&["a", "b", "c"]);
+    let id_b = queue_id_at(&app, 1);
+    queue_delete_by_id(&mut app, id_b);
+    assert_eq!(queue_texts(&app), vec!["a", "c"]);
+    assert!(queue_undo(&mut app));
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c"]);
+    // The restored item carries its original id back at its old position.
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(app.status.contains("undid delete"));
+}
+
+#[test]
+fn undo_restores_exact_order_after_reorder() {
+    let mut app = queue_app(&["a", "b", "c", "d"]);
+    queue_move_indices(&mut app, 0, 3);
+    push_queue_undo(&mut app, QueueMutation::Reordered { from: 0, to: 3 });
+    assert_eq!(queue_texts(&app), vec!["b", "c", "d", "a"]);
+    assert!(queue_undo(&mut app));
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c", "d"]);
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    assert!(app.status.contains("undid reorder"));
+}
+
+#[test]
+fn undo_on_empty_stack_reports_nothing_to_undo() {
+    let mut app = queue_app(&["a"]);
+    assert!(!queue_undo(&mut app));
+    assert_eq!(app.status, "nothing to undo");
+    assert_eq!(queue_texts(&app), vec!["a"]);
+}
+
+#[test]
+fn undo_stack_is_bounded() {
+    let mut app = queue_app(&["x"]);
+    for _ in 0..(QUEUE_UNDO_CAP + 10) {
+        push_queue_undo(&mut app, QueueMutation::Reordered { from: 0, to: 0 });
+    }
+    assert_eq!(app.prompt_queue_undo.len(), QUEUE_UNDO_CAP);
+}
+
+#[test]
+fn delete_clamps_focus_cursor() {
+    let mut app = queue_app(&["a", "b", "c"]);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 2; // focus the last item
+    }
+    let id_c = queue_id_at(&app, 2);
+    queue_delete_by_id(&mut app, id_c);
+    // Focus was on the now-removed tail; it clamps to the new last index.
+    assert_eq!(app.prompt_queue_overlay.as_ref().unwrap().selected, 1);
+}
+
+#[test]
+fn emptying_queue_parks_focus_at_zero() {
+    let mut app = queue_app(&["a"]);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    let id_a = queue_id_at(&app, 0);
+    queue_delete_by_id(&mut app, id_a);
+    assert!(app.prompt_queue.is_empty());
+    assert_eq!(app.prompt_queue_overlay.as_ref().unwrap().selected, 0);
+    // A further undo restores the single item without panicking.
+    assert!(queue_undo(&mut app));
+    assert_eq!(queue_texts(&app), vec!["a"]);
+}
+
+#[test]
+fn single_item_reorder_is_noop_without_panic() {
+    let mut app = queue_app(&["only"]);
+    // Moving the sole item to itself does nothing and never panics.
+    queue_move_indices(&mut app, 0, 0);
+    assert_eq!(queue_texts(&app), vec!["only"]);
+}
+
+#[tokio::test]
+async fn keyboard_delete_matches_mouse_delete_result() {
+    // Keyboard path: Delete on the focused item.
+    let mut kb = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = kb.prompt_queue_overlay.as_mut() {
+        state.selected = 1; // focus "b"
+    }
+    handle_key(
+        &mut kb,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("delete key");
+
+    // Mouse path: delete the same item by id.
+    let mut ms = queue_app(&["a", "b", "c"]);
+    let id_b = queue_id_at(&ms, 1);
+    queue_delete_by_id(&mut ms, id_b);
+
+    assert_eq!(queue_texts(&kb), queue_texts(&ms));
+    assert_eq!(queue_texts(&kb), vec!["a", "c"]);
+}
+
+#[tokio::test]
+async fn keyboard_reorder_matches_mouse_reorder_result() {
+    // Keyboard path: Shift+Down moves the focused item down one slot.
+    let mut kb = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // focus item 0 ("a")
+    handle_key(
+        &mut kb,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift down");
+
+    // Mouse-equivalent: move id of "a" from index 0 to index 1.
+    let mut ms = queue_app(&["a", "b", "c"]);
+    queue_move_indices(&mut ms, 0, 1);
+
+    assert_eq!(queue_texts(&kb), queue_texts(&ms));
+    assert_eq!(queue_texts(&kb), vec!["b", "a", "c"]);
+    // The keyboard reorder is undoable and reverses exactly.
+    assert!(queue_undo(&mut kb));
+    assert_eq!(queue_texts(&kb), vec!["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn keyboard_undo_key_reverses_last_mutation() {
+    let mut app = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // Delete the focused first item via the keyboard.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("delete");
+    assert_eq!(queue_texts(&app), vec!["b", "c"]);
+    // `u` undoes it while the overlay is focused.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("undo key");
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c"]);
+    assert!(app.status.contains("undid"));
+}
+
+#[tokio::test]
+async fn undo_key_falls_through_to_composer_when_overlay_closed() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(app.prompt_queue_overlay.is_none());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("u typed");
+    // With no overlay, `u` is ordinary composer input.
+    assert_eq!(app.input, "u");
+}
+
+#[tokio::test]
+async fn integration_click_delete_affordance_removes_item() {
+    // Render the real app with an open overlay so `render_input` registers the
+    // per-item delete/reorder hit targets, then click the delete zone.
+    let mut app = queue_app(&["alpha", "beta", "gamma"]);
+    let width = 100u16;
+    let height = 20u16;
+    let _ = render_to_string(&app, width, height);
+
+    // Find the registered delete target for "beta" (id 1) and click its rect.
+    let id_beta = queue_id_at(&app, 1);
+    let hit_rect = {
+        let registry = app.clickables.borrow();
+        // Probe every cell for the QueueDelete action on the beta id.
+        let mut found = None;
+        'outer: for y in 0..height {
+            for x in 0..width {
+                if let Some((key, action)) = registry.hit_test(x, y)
+                    && key == interaction::TargetKey::QueueItem(id_beta)
+                    && action == interaction::Action::QueueDelete(id_beta)
+                {
+                    found = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        found
+    };
+    let (col, row) = hit_rect.expect("delete affordance for beta must be registered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(queue_texts(&app), vec!["alpha", "gamma"]);
+    assert!(app.status.contains("deleted"));
+}
+
+#[tokio::test]
+async fn integration_mouse_drag_reorders_then_undo_restores() {
+    let mut app = queue_app(&["alpha", "beta", "gamma"]);
+    let width = 100u16;
+    let height = 20u16;
+    let _ = render_to_string(&app, width, height);
+
+    let id_alpha = queue_id_at(&app, 0);
+    let id_gamma = queue_id_at(&app, 2);
+
+    // Locate the reorder handle rect for alpha and the row of gamma.
+    let cell_for =
+        |action: interaction::Action, key: interaction::TargetKey| -> Option<(u16, u16)> {
+            let registry = app.clickables.borrow();
+            for y in 0..height {
+                for x in 0..width {
+                    if let Some((k, a)) = registry.hit_test(x, y)
+                        && k == key
+                        && a == action
+                    {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        };
+    let (alpha_col, alpha_row) = cell_for(
+        interaction::Action::QueueReorderBegin(id_alpha),
+        interaction::TargetKey::QueueItem(id_alpha),
+    )
+    .expect("alpha reorder handle registered");
+    let (gamma_col, gamma_row) = cell_for(
+        interaction::Action::QueueReorderBegin(id_gamma),
+        interaction::TargetKey::QueueItem(id_gamma),
+    )
+    .expect("gamma reorder handle registered");
+
+    // Press on alpha's handle to arm the drag.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: alpha_col,
+            row: alpha_row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.prompt_queue_drag.is_some(),
+        "press arms the reorder drag"
+    );
+
+    // Drag over gamma's row (live move).
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: gamma_col,
+            row: gamma_row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    // Release to finalize.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: gamma_col,
+            row: gamma_row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(app.prompt_queue_drag.is_none(), "release clears the drag");
+    assert_eq!(queue_texts(&app), vec!["beta", "gamma", "alpha"]);
+
+    // The whole-gesture move is a single undoable step.
+    assert!(queue_undo(&mut app));
+    assert_eq!(queue_texts(&app), vec!["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn sync_queue_ids_heals_front_drain() {
+    // Simulate an external front-drain (a queued prompt ran) without touching
+    // the id sidecar, then verify sync re-aligns to the surviving tail.
+    let mut app = queue_app(&["a", "b", "c"]);
+    let id_b = queue_id_at(&app, 1);
+    let id_c = queue_id_at(&app, 2);
+    app.prompt_queue.pop_front(); // drop "a"
+    sync_queue_ids(&mut app);
+    assert_eq!(app.prompt_queue_ids.len(), 2);
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![id_b, id_c]
+    );
+}
+
+#[test]
+fn sync_queue_ids_heals_back_enqueue() {
+    // Simulate an external back-enqueue without stamping an id.
+    let mut app = queue_app(&["a", "b"]);
+    app.prompt_queue.push_back("c".to_string());
+    sync_queue_ids(&mut app);
+    assert_eq!(app.prompt_queue_ids.len(), 3);
+    // The new tail got a fresh, unique id.
+    let ids: Vec<u64> = app.prompt_queue_ids.iter().copied().collect();
+    assert_eq!(ids[0..2], [0, 1]);
+    assert_eq!(ids[2], 2);
+}

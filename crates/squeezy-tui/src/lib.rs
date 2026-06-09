@@ -2133,6 +2133,26 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         return active_transcript_scroll(app) != before;
     }
 
+    // Prompt-queue reorder overlay: per-item delete + drag-reorder. Gated on
+    // the overlay being open — a state none of the other arms consult — so it
+    // can never interfere with the scrollbar drag (own state:
+    // `main_scrollbar_cache`) or the text-selection drag (own state:
+    // `app.selection`). It runs BEFORE the card-affordance / selection arms so
+    // a press inside the overlay never doubles as a transcript selection.
+    //
+    // A press on a `QueueItem` row arms the gesture recognizer and dispatches
+    // its action: the trailing delete zone fires `QueueDelete` immediately; the
+    // body fires `QueueReorderBegin`, which records the dragged id. A held drag
+    // moves the item live to the row under the pointer (translated id→position,
+    // never raw `mouse.row`); release records the whole-gesture reorder for
+    // undo. The recognizer's `DragState` is the drag authority, disjoint from
+    // the scrollbar and selection authorities.
+    if app.prompt_queue_overlay.is_some()
+        && let Some(consumed) = handle_queue_overlay_mouse(app, mouse)
+    {
+        return consumed;
+    }
+
     // Main-view transcript-card affordances: a caret click toggles the entry's
     // fold, a header click focuses it, a double-click on the caret expands a
     // collapsed card. Hit-tested in ABSOLUTE screen coordinates (the main text
@@ -4230,6 +4250,17 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             open_focused_entry_in_detail(app);
             true
         }
+        // Prompt-queue undo. Binds to bare `u`, claimed modally by the open
+        // reorder overlay. Outside the overlay it MUST fall through so the
+        // composer keeps `u` — hence the `is_none` short-circuit returning
+        // `false` (not consumed) rather than swallowing the key.
+        keymap::Action::QueueUndo => {
+            if app.prompt_queue_overlay.is_none() {
+                return false;
+            }
+            queue_undo(app);
+            true
+        }
     }
 }
 
@@ -4432,6 +4463,170 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
     true
 }
 
+/// Largest number of queue mutations kept on the undo stack. Small on
+/// purpose: the queue is short-lived and one-line, so a deep history would
+/// be more confusing than useful. Oldest entries fall off the front.
+const QUEUE_UNDO_CAP: usize = 32;
+
+/// A reversible queue mutation, recorded on `TuiApp::prompt_queue_undo` so a
+/// later undo can restore the exact prior order and contents. Positions are
+/// the Vec indices at the moment the op was applied; `undo` re-inserts /
+/// re-moves against the live queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QueueMutation {
+    /// An item was deleted. Undo re-inserts `text` at `index` (clamped) with
+    /// its original `id` so its hit-target identity is restored too.
+    Deleted { index: usize, id: u64, text: String },
+    /// An item moved from `from` to `to`. Undo moves it back `to`→`from`.
+    Reordered { from: usize, to: usize },
+}
+
+/// In-flight mouse drag-reorder. Records which item id is being dragged and
+/// the index it started at, so the drop can be recorded as a `Reordered`
+/// mutation spanning the whole gesture (not each intermediate hop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueDrag {
+    pub(crate) id: u64,
+    pub(crate) from: usize,
+}
+
+/// Re-establish the `prompt_queue_ids.len() == prompt_queue.len()` invariant.
+///
+/// The overlay manipulators (delete / reorder / undo) keep both deques in
+/// perfect lockstep directly. This helper is the safety net for the two
+/// mutation shapes that happen *outside* the overlay: a front-drain
+/// (`pop_front` as a queued prompt runs) and a back-enqueue (`push_back` as
+/// the user queues new input). It models exactly those two shapes — drop ids
+/// from the front when the queue shrank, stamp fresh ids on the back when it
+/// grew — so an existing item's id is never silently reassigned. Called at
+/// the top of every overlay manipulation and once per queue render.
+fn sync_queue_ids(app: &mut TuiApp) {
+    let want = app.prompt_queue.len();
+    // Queue shrank from the front (drain): drop the matching number of
+    // leading ids so the surviving items keep their ids aligned to the tail.
+    while app.prompt_queue_ids.len() > want {
+        app.prompt_queue_ids.pop_front();
+    }
+    // Queue grew at the back (enqueue): stamp fresh monotonic ids.
+    while app.prompt_queue_ids.len() < want {
+        let id = app.next_queue_id;
+        app.next_queue_id += 1;
+        app.prompt_queue_ids.push_back(id);
+    }
+}
+
+/// Resolve a stable queue item id to its current Vec index, or `None` if the
+/// id is no longer present (already drained or deleted). Mirrors
+/// `Focus::resolve_index` — identity is the id, position is derived.
+fn queue_index_for_id(app: &TuiApp, id: u64) -> Option<usize> {
+    app.prompt_queue_ids.iter().position(|qid| *qid == id)
+}
+
+/// Stamp a fresh stable id for the prompt just `push_back`ed onto the queue.
+/// Call immediately after each enqueue so the id sidecar stays aligned.
+fn enqueue_queue_id(app: &mut TuiApp) {
+    let id = app.next_queue_id;
+    app.next_queue_id += 1;
+    app.prompt_queue_ids.push_back(id);
+}
+
+/// Record a mutation on the bounded undo stack, dropping the oldest entry
+/// once `QUEUE_UNDO_CAP` is exceeded.
+fn push_queue_undo(app: &mut TuiApp, mutation: QueueMutation) {
+    app.prompt_queue_undo.push(mutation);
+    if app.prompt_queue_undo.len() > QUEUE_UNDO_CAP {
+        app.prompt_queue_undo.remove(0);
+    }
+}
+
+/// Delete the queue item with `id`. Records the removal (text + former
+/// position + id) on the undo stack, clamps the overlay focus cursor, and
+/// sets a status message. No-op (returns false) if the id is gone.
+fn queue_delete_by_id(app: &mut TuiApp, id: u64) -> bool {
+    sync_queue_ids(app);
+    let Some(index) = queue_index_for_id(app, id) else {
+        return false;
+    };
+    let text = app
+        .prompt_queue
+        .remove(index)
+        .expect("index from resolve is in range");
+    app.prompt_queue_ids
+        .remove(index)
+        .expect("ids stay in lockstep with the queue");
+    push_queue_undo(
+        app,
+        QueueMutation::Deleted {
+            index,
+            id,
+            text: text.clone(),
+        },
+    );
+    clamp_queue_focus(app);
+    app.auto_drain_queue = false;
+    app.status = format!("deleted queued prompt ({} left)", app.prompt_queue.len());
+    app.needs_redraw = true;
+    true
+}
+
+/// Move the item at `from` to `to` in BOTH the queue and its id sidecar,
+/// keeping them in lockstep. Pure index shuffle; records no undo (callers
+/// decide whether the move is an undoable op or a step of an undo itself).
+fn queue_move_indices(app: &mut TuiApp, from: usize, to: usize) {
+    if from == to || from >= app.prompt_queue.len() || to >= app.prompt_queue.len() {
+        return;
+    }
+    if let Some(text) = app.prompt_queue.remove(from) {
+        app.prompt_queue.insert(to, text);
+    }
+    if let Some(id) = app.prompt_queue_ids.remove(from) {
+        app.prompt_queue_ids.insert(to, id);
+    }
+}
+
+/// Undo the most recent queue mutation, reversing it exactly. A deleted item
+/// returns to its former position (with its original id); a reorder moves the
+/// item back from `to` to `from`. Sets a status message; safe on an empty
+/// stack ("nothing to undo"). Returns true if anything was undone.
+fn queue_undo(app: &mut TuiApp) -> bool {
+    sync_queue_ids(app);
+    let Some(mutation) = app.prompt_queue_undo.pop() else {
+        app.status = "nothing to undo".to_string();
+        app.needs_redraw = true;
+        return false;
+    };
+    match mutation {
+        QueueMutation::Deleted { index, id, text } => {
+            let at = index.min(app.prompt_queue.len());
+            app.prompt_queue.insert(at, text);
+            app.prompt_queue_ids.insert(at, id);
+            app.next_queue_id = app.next_queue_id.max(id + 1);
+            app.status = "undid delete".to_string();
+        }
+        QueueMutation::Reordered { from, to } => {
+            // Reverse: the item now sits at `to`; move it back to `from`.
+            queue_move_indices(app, to, from);
+            app.status = "undid reorder".to_string();
+        }
+    }
+    clamp_queue_focus(app);
+    app.needs_redraw = true;
+    true
+}
+
+/// Clamp the overlay focus cursor into range after the queue shrank or
+/// shifted. Safe on an empty queue (cursor parks at 0).
+fn clamp_queue_focus(app: &mut TuiApp) {
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        let len = app.prompt_queue.len();
+        if len == 0 {
+            state.selected = 0;
+        } else if state.selected >= len {
+            state.selected = len - 1;
+        }
+    }
+}
+
 /// Toggle the prompt-queue reorder overlay. Hard-coded as a chord
 /// (`Ctrl+X` then `Q`) rather than a rebindable keymap action because
 /// single-Ctrl-letter defaults collide with terminal flow control
@@ -4446,10 +4641,20 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
     app.prompt_queue_overlay = if app.prompt_queue_overlay.is_some() {
         None
     } else {
+        // Keep the id sidecar aligned to the live queue the moment the
+        // overlay opens, so the very first hit-target frame is id-stable.
+        sync_queue_ids(app);
         Some(prompt_queue::PromptQueueState::new())
     };
+    if app.prompt_queue_overlay.is_none() {
+        // Closing also abandons any in-flight reorder drag.
+        app.prompt_queue_drag = None;
+    }
     app.status = if app.prompt_queue_overlay.is_some() {
-        format!("prompt queue ({} queued)", app.prompt_queue.len())
+        format!(
+            "prompt queue ({} queued) · ↑↓ focus · Shift+↑↓ move · Del remove · u undo · Enter close",
+            app.prompt_queue.len()
+        )
     } else {
         "prompt queue closed".to_string()
     };
@@ -4523,15 +4728,35 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 open_focused_entry_in_detail(app);
             }
         }
-        // Queue delete/reorder, scrollbar-jump, and jump-to-latest are not yet
-        // registered as targets by the render paths; their handlers land with
-        // the affordances that register them. Until then these arms are inert
-        // (no panic), so the registry vocabulary is complete without forcing a
-        // half-wired button into the UI.
-        interaction::Action::QueueDelete(_)
-        | interaction::Action::QueueReorderBegin(_)
-        | interaction::Action::ScrollbarJump
-        | interaction::Action::JumpToLatest => {}
+        // The per-item delete affordance in the reorder overlay. Removes the
+        // item with this stable id (never a Vec position, so a concurrent
+        // reorder can't make it delete the wrong row) and records the removal
+        // for undo.
+        interaction::Action::QueueDelete(id) => {
+            queue_delete_by_id(app, id);
+        }
+        // The drag-handle press arms a reorder drag. The live move + drop are
+        // driven from the gesture recognizer in `handle_mouse` (DragStart /
+        // DragExtend / DragEnd); this arm just records which id is in flight
+        // and seeds the overlay focus onto it so a keyboard finish stays on
+        // the same item.
+        interaction::Action::QueueReorderBegin(id) => {
+            sync_queue_ids(app);
+            if let Some(from) = queue_index_for_id(app, id) {
+                app.prompt_queue_drag = Some(QueueDrag { id, from });
+                if let Some(state) = app.prompt_queue_overlay.as_mut() {
+                    state.selected = from;
+                }
+            }
+        }
+        // Undo the last queue mutation (mouse twin of the keyboard verb).
+        interaction::Action::QueueUndo => {
+            queue_undo(app);
+        }
+        // Scrollbar-jump and jump-to-latest are not yet registered as targets
+        // by the render paths; their handlers land with the affordances that
+        // register them. Until then these arms are inert (no panic).
+        interaction::Action::ScrollbarJump | interaction::Action::JumpToLatest => {}
     }
 }
 
@@ -5381,6 +5606,7 @@ fn expand_prompt_template_or_fallthrough(
     agent.record_prompt_template_telemetry(source.as_str(), arg_count, queued);
     if queued {
         app.prompt_queue.push_back(expanded);
+        enqueue_queue_id(app);
         app.status = format!("queued ({})", app.prompt_queue.len());
         return true;
     }
@@ -5883,6 +6109,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.cancel = None;
                 app.clear_prompt_attachments();
                 app.prompt_queue.clear();
+                app.prompt_queue_ids.clear();
+                app.prompt_queue_undo.clear();
+                app.prompt_queue_drag = None;
                 app.prompt_queue_overlay = None;
                 app.auto_drain_queue = false;
                 app.transcript_overlay = None;
@@ -7336,18 +7565,198 @@ fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
     }
 }
 
+/// Handle a key while the prompt-queue reorder overlay is open.
+///
+/// The overlay keeps the established "consume keys before the global keymap"
+/// pattern: it owns Up/Down (focus), Shift+Up/Down (reorder), and Delete via
+/// `PromptQueueState::dispatch`, exactly as before. The new wrinkle is that
+/// each manipulation must also keep the id sidecar aligned and record an undo
+/// step. Rather than re-implement the cursor/swap/delete logic, we let
+/// `dispatch` mutate the queue, then *reconcile*: diff the queue before/after
+/// to recognise the single op that happened (delete or adjacent swap) and
+/// mirror it onto the ids + undo stack. This reuses the pure-state dispatcher
+/// (so its semantics and tests stay the single source of truth) while making
+/// the mutation id-stable and undoable.
+///
+/// `QueueUndo` (bare `u`) is handled earlier by `dispatch_keymap_action`; it
+/// never reaches here. Esc/Enter close the overlay.
 fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    let Some(state) = app.prompt_queue_overlay.as_mut() else {
+    if app.prompt_queue_overlay.is_none() {
         return false;
-    };
-    match state.dispatch(&mut app.prompt_queue, key) {
-        prompt_queue::QueueDispatch::Handled => true,
+    }
+    sync_queue_ids(app);
+    let before: Vec<String> = app.prompt_queue.iter().cloned().collect();
+    let mut state = app
+        .prompt_queue_overlay
+        .take()
+        .expect("checked is_some above");
+    let outcome = state.dispatch(&mut app.prompt_queue, key);
+    app.prompt_queue_overlay = Some(state);
+    match outcome {
         prompt_queue::QueueDispatch::Close => {
             app.prompt_queue_overlay = None;
+            app.prompt_queue_drag = None;
             app.status = "prompt queue closed".to_string();
-            true
         }
-        prompt_queue::QueueDispatch::Ignored => true, // stay modal
+        prompt_queue::QueueDispatch::Handled => {
+            reconcile_queue_after_dispatch(app, &before);
+        }
+        // Stay modal: swallow the key so stray input can't leak into the
+        // composer while the overlay owns the surface.
+        prompt_queue::QueueDispatch::Ignored => {}
+    }
+    true
+}
+
+/// After `PromptQueueState::dispatch` mutated `prompt_queue`, mirror the one
+/// op it performed onto the id sidecar + undo stack. `before` is the queue's
+/// contents prior to the dispatch. Recognises exactly the two mutating ops the
+/// dispatcher can do — a single delete (length shrank by one) or an adjacent
+/// swap (same length, two neighbours transposed) — and leaves the ids
+/// untouched for a pure cursor move.
+fn reconcile_queue_after_dispatch(app: &mut TuiApp, before: &[String]) {
+    let after_len = app.prompt_queue.len();
+    if after_len + 1 == before.len() {
+        // A delete: find the single index whose item is gone. Walk both
+        // sequences in step; the first mismatch is the removed slot (or the
+        // tail if every kept item matched).
+        let index = (0..after_len)
+            .find(|&i| app.prompt_queue[i] != before[i])
+            .unwrap_or(before.len() - 1);
+        let next_id = app.next_queue_id;
+        let id = app.prompt_queue_ids.remove(index).unwrap_or(next_id);
+        push_queue_undo(
+            app,
+            QueueMutation::Deleted {
+                index,
+                id,
+                text: before[index].clone(),
+            },
+        );
+        app.auto_drain_queue = false;
+        app.status = format!("deleted queued prompt ({after_len} left)");
+        app.needs_redraw = true;
+    } else if after_len == before.len() {
+        // Either a pure cursor move (queue unchanged) or an adjacent swap.
+        let first_diff = (0..after_len).find(|&i| app.prompt_queue[i] != before[i]);
+        if let Some(i) = first_diff
+            && i + 1 < after_len
+            && app.prompt_queue[i] == before[i + 1]
+            && app.prompt_queue[i + 1] == before[i]
+        {
+            // Adjacent swap of i and i+1: mirror on the ids, record undo.
+            app.prompt_queue_ids.swap(i, i + 1);
+            push_queue_undo(app, QueueMutation::Reordered { from: i, to: i + 1 });
+            app.status = "moved queued prompt".to_string();
+            app.needs_redraw = true;
+        }
+        // else: cursor-only move — nothing to mirror.
+    }
+    clamp_queue_focus(app);
+}
+
+/// Handle a mouse event while the prompt-queue reorder overlay is open.
+///
+/// Returns `Some(consumed)` when the event belongs to the overlay (so the
+/// caller stops), or `None` to fall through to the transcript arms (e.g. a
+/// wheel scroll, or a press outside any queue affordance). The recognizer's
+/// `DragState` is the sole drag authority here, disjoint from the scrollbar
+/// and text-selection drags.
+fn handle_queue_overlay_mouse(
+    app: &mut TuiApp,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<bool> {
+    use crossterm::event::MouseButton;
+    let now = std::time::Instant::now();
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let hit = app.click_target_at(mouse.column, mouse.row);
+            // Only claim presses that land on a queue item; a press elsewhere
+            // (e.g. the indicator strip, handled by the footer arm, or empty
+            // space) falls through.
+            match hit {
+                Some((interaction::TargetKey::QueueItem(_), action)) => {
+                    app.gestures.recognize(interaction::Phase::Press, hit, now);
+                    // Delete fires on the press; reorder arms a drag.
+                    dispatch_click_action(app, action);
+                    Some(true)
+                }
+                _ => None,
+            }
+        }
+        // Drag/Release are only queue gestures while a reorder drag is armed;
+        // otherwise fall through (a held drag with no queue drag is a
+        // text-selection / scrollbar gesture the later arms own).
+        MouseEventKind::Drag(MouseButton::Left) if app.prompt_queue_drag.is_some() => {
+            let hit = app.click_target_at(mouse.column, mouse.row);
+            app.gestures.recognize(interaction::Phase::Drag, hit, now);
+            queue_drag_move_to(app, hit);
+            Some(true)
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.prompt_queue_drag.is_some() => {
+            let hit = app.click_target_at(mouse.column, mouse.row);
+            app.gestures
+                .recognize(interaction::Phase::Release, hit, now);
+            finalize_queue_drag(app);
+            Some(true)
+        }
+        // Wheel / move / other buttons are not queue gestures.
+        _ => None,
+    }
+}
+
+/// During a reorder drag, move the dragged item live to the row currently
+/// under the pointer. The destination is derived from the hovered
+/// `QueueItem` id (id→position), never from the raw pointer row, so a resize
+/// mid-drag re-resolves cleanly. Intermediate hops are NOT pushed to the undo
+/// stack; only the whole-gesture move is recorded on release.
+fn queue_drag_move_to(
+    app: &mut TuiApp,
+    hit: Option<(interaction::TargetKey, interaction::Action)>,
+) {
+    let Some(drag) = app.prompt_queue_drag else {
+        return;
+    };
+    let Some((interaction::TargetKey::QueueItem(over_id), _)) = hit else {
+        return;
+    };
+    sync_queue_ids(app);
+    let (Some(from), Some(to)) = (
+        queue_index_for_id(app, drag.id),
+        queue_index_for_id(app, over_id),
+    ) else {
+        return;
+    };
+    if from == to {
+        return;
+    }
+    queue_move_indices(app, from, to);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = to;
+    }
+    app.status = "moving queued prompt".to_string();
+    app.needs_redraw = true;
+}
+
+/// Finalize a reorder drag on release: record the whole-gesture move (start
+/// position → final position) on the undo stack, then clear the drag state.
+fn finalize_queue_drag(app: &mut TuiApp) {
+    let Some(drag) = app.prompt_queue_drag.take() else {
+        return;
+    };
+    sync_queue_ids(app);
+    if let Some(to) = queue_index_for_id(app, drag.id)
+        && to != drag.from
+    {
+        push_queue_undo(
+            app,
+            QueueMutation::Reordered {
+                from: drag.from,
+                to,
+            },
+        );
+        app.status = "moved queued prompt".to_string();
+        app.needs_redraw = true;
     }
 }
 
@@ -7362,6 +7771,7 @@ fn queue_input_behind_running_turn(app: &mut TuiApp, input: String) {
         return;
     }
     app.prompt_queue.push_back(input.clone());
+    enqueue_queue_id(app);
     clear_input(app);
     push_input_history(app, input);
     app.input_history_index = None;
@@ -7375,6 +7785,8 @@ async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
         let Some(next) = app.prompt_queue.pop_front() else {
             return;
         };
+        // Keep the id sidecar aligned to the front-drain.
+        app.prompt_queue_ids.pop_front();
         let remaining = app.prompt_queue.len();
         app.status = if remaining == 0 {
             "running queued prompt".to_string()
@@ -17598,16 +18010,108 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             );
         }
     }
+    // Record where the queue overlay block starts in `lines` so the per-item
+    // delete/drag hit targets can be registered at their true screen rows
+    // (after the paragraph scroll is known). The header is the first overlay
+    // line; item rows follow, windowed exactly as `render_lines` windows them.
+    let queue_overlay_base = if queue_open { Some(lines.len()) } else { None };
     lines.extend(queue_overlay_lines);
     lines.extend(overlay_lines);
     lines.extend(mention_lines);
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
+    if let Some(base) = queue_overlay_base {
+        register_queue_item_targets(app, area, base, scroll);
+    }
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(crate::render::theme::foreground()))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+/// Number of overlay item rows shown at once. Mirrors `prompt_queue`'s private
+/// `WINDOW`; kept in sync so the registered hit rows line up with the painted
+/// rows exactly.
+const QUEUE_OVERLAY_WINDOW: usize = 5;
+/// Width of the trailing delete affordance (`[x]`) on each item row.
+const QUEUE_DELETE_AFFORDANCE_WIDTH: u16 = 3;
+
+/// Compute the `(start, count)` slice of queued items the overlay shows, given
+/// the focus cursor. Mirrors the windowing in `prompt_queue::render_lines` so
+/// the registered hit rects match the painted rows one-for-one.
+fn queue_overlay_window(selected: usize, total: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let window = QUEUE_OVERLAY_WINDOW.min(total);
+    let half = QUEUE_OVERLAY_WINDOW / 2;
+    let start = selected
+        .saturating_sub(half)
+        .min(total.saturating_sub(window));
+    (start, window)
+}
+
+/// Register the per-item mouse affordances for the open reorder overlay: a
+/// trailing delete zone (`QueueDelete`) and the rest of the row as a
+/// drag/reorder handle (`QueueReorderBegin`). Rects are recomputed every frame
+/// from the live geometry; identity is the stable item id, never a remembered
+/// coordinate, so a delete/reorder mid-gesture can't shift the hit target.
+fn register_queue_item_targets(app: &TuiApp, area: Rect, overlay_base: usize, scroll: u16) {
+    let Some(state) = app.prompt_queue_overlay.as_ref() else {
+        return;
+    };
+    let total = app.prompt_queue.len();
+    if total == 0 {
+        return;
+    }
+    let (start, count) = queue_overlay_window(state.selected, total);
+    let bottom = area.y.saturating_add(area.height);
+    for rel in 0..count {
+        let item_index = start + rel;
+        let Some(&id) = app.prompt_queue_ids.get(item_index) else {
+            continue;
+        };
+        // `lines` layout: overlay_base is the header; item rows start at +1.
+        let line_index = overlay_base + 1 + rel;
+        if (line_index as u16) < scroll {
+            continue;
+        }
+        let row = area.y.saturating_add(line_index as u16 - scroll);
+        if row >= bottom {
+            continue;
+        }
+        let delete_w = QUEUE_DELETE_AFFORDANCE_WIDTH.min(area.width);
+        let handle_w = area.width.saturating_sub(delete_w);
+        // Drag/reorder handle: the body of the row (everything left of the
+        // delete zone). Registered first so the later delete zone wins the
+        // overlap test on its own cells.
+        if handle_w > 0 {
+            app.register_click(
+                Rect {
+                    x: area.x,
+                    y: row,
+                    width: handle_w,
+                    height: 1,
+                },
+                interaction::TargetKey::QueueItem(id),
+                interaction::Action::QueueReorderBegin(id),
+            );
+        }
+        // Delete affordance: the trailing cells of the row.
+        if delete_w > 0 {
+            app.register_click(
+                Rect {
+                    x: area.x.saturating_add(handle_w),
+                    y: row,
+                    width: delete_w,
+                    height: 1,
+                },
+                interaction::TargetKey::QueueItem(id),
+                interaction::Action::QueueDelete(id),
+            );
+        }
+    }
 }
 
 fn overlay_picker_lines(app: &TuiApp) -> Vec<Line<'static>> {
@@ -19317,6 +19821,24 @@ pub(crate) struct TuiApp {
     /// FIFO of prompts the user typed while a turn was running. Drained
     /// one-at-a-time as each turn completes; preserved on cancel.
     pub(crate) prompt_queue: VecDeque<String>,
+    /// Stable per-item ids, one per `prompt_queue` slot, kept in lockstep
+    /// with it (front id ↔ front prompt). The direct-manipulation registry
+    /// (delete / reorder / undo) addresses items by these ids, NOT by Vec
+    /// position, so a mutation mid-gesture never shifts the hit target. The
+    /// id rides alongside the slot, so `swap`/`remove` carry it with the
+    /// item. `sync_queue_ids` re-establishes the 1:1 invariant after any
+    /// front-drain / back-enqueue done outside the overlay manipulators.
+    pub(crate) prompt_queue_ids: VecDeque<u64>,
+    /// Monotonic source for `prompt_queue_ids`. Never reused, so an id
+    /// uniquely names one queued prompt for its whole lifetime.
+    pub(crate) next_queue_id: u64,
+    /// Bounded undo stack for queue mutations (delete / reorder). Each push
+    /// records enough to reverse the op exactly; `QUEUE_UNDO_CAP` caps it.
+    pub(crate) prompt_queue_undo: Vec<QueueMutation>,
+    /// Id of the queue item currently being drag-reordered by the mouse,
+    /// plus its position when the drag started (for the undo record). `None`
+    /// when no reorder drag is in flight.
+    pub(crate) prompt_queue_drag: Option<QueueDrag>,
     /// Open reorder overlay state. `None` when the overlay is closed;
     /// the queue itself lives on `prompt_queue` regardless.
     pub(crate) prompt_queue_overlay: Option<prompt_queue::PromptQueueState>,
@@ -19709,6 +20231,10 @@ impl TuiApp {
             pending_diff: None,
             pending_diff_started_at: None,
             prompt_queue: VecDeque::new(),
+            prompt_queue_ids: VecDeque::new(),
+            next_queue_id: 0,
+            prompt_queue_undo: Vec::new(),
+            prompt_queue_drag: None,
             prompt_queue_overlay: None,
             auto_drain_queue: false,
             pending_chord: None,

@@ -104,6 +104,35 @@ fn invalid_entries_surface_in_diagnostics() {
 }
 
 #[test]
+fn queue_undo_action_round_trips_and_defaults_to_u() {
+    // Slug round-trips and is registered in `ALL` (so `/keymap` lists it and
+    // an override can target it).
+    assert_eq!(Action::from_slug("queue_undo"), Some(Action::QueueUndo));
+    assert!(Action::ALL.contains(&Action::QueueUndo));
+    // Default binding is bare `u`.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::QueueUndo),
+        KeyBinding::new(KeyCode::Char('u'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('u'), KeyModifiers::NONE),
+        Some(Action::QueueUndo),
+    );
+}
+
+#[test]
+fn all_actions_have_unique_slugs() {
+    // A duplicate slug would let one action silently shadow another in the
+    // `[tui.keymap]` table; guard against it as new verbs land.
+    let mut slugs: Vec<&str> = Action::ALL.iter().map(|a| a.slug()).collect();
+    slugs.sort_unstable();
+    let before = slugs.len();
+    slugs.dedup();
+    assert_eq!(before, slugs.len(), "duplicate action slug detected");
+}
+
+#[test]
 fn keymap_report_includes_overrides_and_warnings() {
     let mut overrides = BTreeMap::new();
     overrides.insert("transcript_overlay".to_string(), "Ctrl+o".to_string());

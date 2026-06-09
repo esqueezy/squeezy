@@ -108,6 +108,16 @@ pub(crate) enum Action {
     /// (`Ctrl+Enter` default). Paired with the mouse "open in detail"
     /// affordance; both drive `open_focused_entry_in_detail`.
     OpenFocusedInDetail,
+    /// Undo the most recent prompt-queue mutation — delete or reorder
+    /// (`u` default). The keyboard twin of the mouse undo affordance. Only
+    /// fires while the queue reorder overlay is open; outside it the key
+    /// falls through so `u` keeps its normal composer meaning. The other
+    /// queue verbs (focus move, item reorder, delete) are consumed inside the
+    /// overlay's own modal key handler via `PromptQueueState::dispatch`
+    /// (Up/Down, Shift+Up/Down, Delete), keeping the overlay's
+    /// before-the-global-keymap consumption pattern; undo is the one genuinely
+    /// new verb, so it earns a rebindable action.
+    QueueUndo,
 }
 
 impl Action {
@@ -141,6 +151,7 @@ impl Action {
             Self::FocusNextEntry => "focus_next_entry",
             Self::ToggleFocusedFold => "toggle_focused_fold",
             Self::OpenFocusedInDetail => "open_focused_in_detail",
+            Self::QueueUndo => "queue_undo",
         }
     }
 
@@ -173,6 +184,7 @@ impl Action {
         Action::FocusNextEntry,
         Action::ToggleFocusedFold,
         Action::OpenFocusedInDetail,
+        Action::QueueUndo,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -230,6 +242,11 @@ impl Action {
             Self::FocusNextEntry => KeyBinding::new(KeyCode::Down, KeyModifiers::CONTROL),
             Self::ToggleFocusedFold => KeyBinding::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             Self::OpenFocusedInDetail => KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            // Prompt-queue undo. Binds to bare `u`, claimed modally by the open
+            // reorder overlay; `dispatch_keymap_action` gates it on the overlay
+            // being open, so outside the overlay `u` keeps its composer meaning.
+            // Bare `u` is safe to bind here precisely because of that gate.
+            Self::QueueUndo => KeyBinding::new(KeyCode::Char('u'), KeyModifiers::NONE),
         }
     }
 }
