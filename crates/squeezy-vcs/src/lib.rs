@@ -1795,6 +1795,11 @@ impl CheckpointStore {
             index += 2;
         }
         for path in changed_raw_paths {
+            // Raw-path tracking still lists rename sources even though git
+            // name-status already collapsed the pair into one Renamed row.
+            if from_for_new.values().any(|source| source == path) {
+                continue;
+            }
             statuses.entry(path.clone()).or_insert_with(|| {
                 if before_raw.contains_key(path) && !after_raw.contains_key(path) {
                     DiffFileStatus::Deleted
