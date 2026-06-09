@@ -4836,8 +4836,11 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
     let profile_field = &models.fields[2]; // profile
 
     // Env-override fields might be set in the test environment; clear them so
-    // the test asserts the tier precedence, not env precedence.
-    // SAFETY: tests run single-threaded by default for this module.
+    // the test asserts the tier precedence, not env precedence. Hold the
+    // shared env mutex to serialize against any other test in this module
+    // that mutates the same vars.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutations are guarded by TEST_ENV_MUTEX above.
     unsafe {
         std::env::remove_var("SQUEEZY_PROVIDER");
         std::env::remove_var("SQUEEZY_MODEL");
@@ -4856,6 +4859,7 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
         resolve_field_source(&sources, profile_field),
         config_schema::FieldSource::Default
     );
+    drop(_env_guard);
 }
 
 #[test]
@@ -4874,10 +4878,14 @@ fn resolve_field_source_returns_env_when_env_var_set() {
         Some("SQUEEZY_PROVIDER"),
         "provider field should declare env_override; precondition for this test"
     );
-    // SAFETY: tests run single-threaded by default for this module.
+    // Hold the shared env mutex while we mutate process env so we don't
+    // race with any other test that touches SQUEEZY_PROVIDER.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutations are guarded by TEST_ENV_MUTEX above.
     unsafe { std::env::set_var("SQUEEZY_PROVIDER", "anthropic") };
     let resolved = resolve_field_source(&sources, provider_field);
     unsafe { std::env::remove_var("SQUEEZY_PROVIDER") };
+    drop(_env_guard);
     assert_eq!(resolved, config_schema::FieldSource::Env);
 }
 
@@ -6264,20 +6272,18 @@ fn session_metrics_merge_turn_folds_model_ledger() {
     assert_eq!(bucket.main.estimated_usd_micros, Some(84));
 }
 
-// ── Windows path-handling tests ───────────────────────────────────────────────
+// ── path and settings tests ──────────────────────────────────────────────────
+
+static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn expand_home_path_tilde_alone_uses_home_var() {
-    // Directly test the inner logic: when the path is "~" it should expand
-    // to whatever HOME resolves to. We check that the result is at least
-    // not the literal "~" when a home dir is available.
     let path = PathBuf::from("~");
     let expanded = expand_home_path(path.clone());
-    if home_dir_path().is_some() {
-        assert_ne!(expanded, path, "tilde should expand when home dir is known");
-        assert!(expanded.is_absolute(), "expanded tilde should be absolute");
+    if let Some(home) = home_dir_path() {
+        assert_eq!(expanded, home);
     } else {
-        assert_eq!(expanded, path, "tilde must survive unexpanded when no home");
+        assert_eq!(expanded, path);
     }
 }
 
@@ -6286,85 +6292,64 @@ fn expand_home_path_tilde_prefix_joins_suffix() {
     let path = PathBuf::from("~/.squeezy/keybindings.toml");
     let expanded = expand_home_path(path.clone());
     if let Some(home) = home_dir_path() {
-        let expected = home.join(".squeezy/keybindings.toml");
-        assert_eq!(expanded, expected);
+        assert_eq!(expanded, home.join(".squeezy/keybindings.toml"));
     } else {
         assert_eq!(expanded, path);
     }
 }
 
 #[test]
-fn expand_home_path_absolute_is_unchanged() {
+fn expand_home_path_absolute_and_relative_paths_are_unchanged() {
     #[cfg(unix)]
-    let path = PathBuf::from("/usr/local/bin/squeezy");
+    let abs = PathBuf::from("/usr/local/bin/squeezy");
     #[cfg(not(unix))]
-    let path = PathBuf::from("C:/Program Files/squeezy/squeezy.exe");
-    assert_eq!(expand_home_path(path.clone()), path);
+    let abs = PathBuf::from("C:/Program Files/squeezy/squeezy.exe");
+    assert_eq!(expand_home_path(abs.clone()), abs);
+
+    let rel = PathBuf::from("relative/path/settings.toml");
+    assert_eq!(expand_home_path(rel.clone()), rel);
 }
 
 #[test]
-fn expand_home_path_no_tilde_relative_unchanged() {
-    let path = PathBuf::from("relative/path/settings.toml");
-    assert_eq!(expand_home_path(path.clone()), path);
+fn expand_home_path_leaves_named_user_tilde_literal() {
+    let named = PathBuf::from("~alice/sessions");
+    assert_eq!(expand_home_path(named.clone()), named);
+    let bare_named = PathBuf::from("~root");
+    assert_eq!(expand_home_path(bare_named.clone()), bare_named);
 }
 
 #[test]
-fn repo_settings_id_is_deterministic() {
+fn repo_settings_id_is_deterministic_and_well_formed() {
     let tmp = std::env::temp_dir();
     let id1 = repo_settings_id(&tmp);
     let id2 = repo_settings_id(&tmp);
-    assert_eq!(id1, id2, "same path must yield the same id");
-}
-
-#[test]
-fn repo_settings_id_format_matches_name_hash_pattern() {
-    let tmp = std::env::temp_dir();
-    let id = repo_settings_id(&tmp);
-    // Format is `<name>-<16-hex-digit-hash>`.
-    let (_, hash) = id.rsplit_once('-').expect("id must contain a hyphen");
-    assert_eq!(hash.len(), 16, "hash portion must be 16 hex digits");
-    assert!(
-        hash.chars().all(|c| c.is_ascii_hexdigit()),
-        "hash must be lowercase hex"
-    );
+    assert_eq!(id1, id2);
+    let (_, hash) = id1.rsplit_once('-').expect("id must contain a hyphen");
+    assert_eq!(hash.len(), 16);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 #[cfg(windows)]
 #[test]
 fn repo_settings_id_windows_drive_letter_case_stable() {
-    use std::path::PathBuf;
-    // Simulate two spellings of the same Windows path that differ only in
-    // drive-letter casing. After the lowercase normalisation both should
-    // hash to the same value.
     let lower = PathBuf::from("c:\\users\\me\\project");
     let upper = PathBuf::from("C:\\users\\me\\project");
-    // Both paths don't exist, so canonicalize falls through; the display
-    // strings are `c:\...` and `C:\...`.  After lowercasing the hash input
-    // they should produce equal IDs.
-    assert_eq!(
-        repo_settings_id(&lower),
-        repo_settings_id(&upper),
-        "drive-letter casing must not affect the repo settings id on Windows"
-    );
+    assert_eq!(repo_settings_id(&lower), repo_settings_id(&upper));
 }
 
 #[test]
 fn toml_path_round_trip_forward_slashes() {
-    // TOML accepts forward slashes in string values on all platforms.
-    // Verify that a PathBuf round-trips through display() → PathBuf::from().
     #[cfg(unix)]
     let raw = "/home/user/squeezy/sessions";
     #[cfg(not(unix))]
     let raw = "C:/Users/user/squeezy/sessions";
     let path = PathBuf::from(raw);
     let display = path.display().to_string();
-    let round_tripped = PathBuf::from(&display);
-    assert_eq!(path, round_tripped);
+    assert_eq!(path, PathBuf::from(&display));
 }
 
 #[test]
 fn sanitize_repo_settings_name_strips_special_chars() {
-    // Trailing hyphen from `!` is trimmed by trim_matches('-').
     assert_eq!(sanitize_repo_settings_name("My Project!"), "my-project");
     assert_eq!(sanitize_repo_settings_name("!foo!"), "foo");
     assert_eq!(sanitize_repo_settings_name("squeezy"), "squeezy");
@@ -6372,24 +6357,15 @@ fn sanitize_repo_settings_name_strips_special_chars() {
     assert_eq!(sanitize_repo_settings_name("CamelCase"), "camelcase");
 }
 
-// ── sensitive-path defaults ────────────────────────────────────────────────
-
-/// Validate that the default sensitive-path patterns cover the XDG and cloud
-/// CLI credential locations added in the Linux-hardening pass, in addition to
-/// the pre-existing baseline patterns.
 #[test]
 fn default_sensitive_paths_include_xdg_and_cloud_creds() {
     let config = ShellSandboxConfig::default();
     let patterns = &config.sensitive_path_patterns;
-
-    for expected in [".ssh/**", ".aws/**", ".kube/**", ".gnupg/**"] {
-        assert!(
-            patterns.iter().any(|p| p == expected),
-            "default patterns should contain {expected:?}; got: {patterns:?}"
-        );
-    }
-
     for expected in [
+        ".ssh/**",
+        ".aws/**",
+        ".kube/**",
+        ".gnupg/**",
         ".password-store/**",
         ".config/sops/**",
         ".config/1Password/**",
@@ -6399,7 +6375,7 @@ fn default_sensitive_paths_include_xdg_and_cloud_creds() {
     ] {
         assert!(
             patterns.iter().any(|p| p == expected),
-            "default patterns should contain {expected:?}; got: {patterns:?}"
+            "missing {expected:?}"
         );
     }
 }
@@ -6407,7 +6383,6 @@ fn default_sensitive_paths_include_xdg_and_cloud_creds() {
 #[test]
 fn user_settings_template_lists_hardened_sensitive_path_defaults() {
     let template = user_settings_template();
-
     for expected in [
         ".password-store/**",
         ".config/sops/**",
@@ -6416,9 +6391,201 @@ fn user_settings_template_lists_hardened_sensitive_path_defaults() {
         ".config/gcloud/**",
         ".config/kube/**",
     ] {
+        assert!(template.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[test]
+fn resolved_config_paths_returns_absolute_user_settings_when_home_set() {
+    if std::env::var_os("HOME").is_some() {
+        let paths = resolved_config_paths();
+        assert!(paths.user_settings.is_absolute());
+        assert!(paths.home_set);
+        assert!(paths.home.is_some());
+    }
+}
+
+#[test]
+fn resolved_config_paths_home_field_matches_env() {
+    let paths = resolved_config_paths();
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    assert_eq!(paths.home, env_home);
+    assert_eq!(paths.home_set, env_home.is_some());
+}
+
+#[test]
+fn session_log_dir_env_tilde_is_expanded() {
+    let config =
+        AppConfig::from_settings_and_env_vars(SettingsFile::default(), |name| match name {
+            "SQUEEZY_SESSION_DIR" => Some("~/sessions".to_string()),
+            _ => None,
+        });
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        assert_eq!(config.session_logs.log_dir, Some(home.join("sessions")));
+    }
+}
+
+#[test]
+fn default_squeezy_skills_dir_is_absolute_when_home_or_data_dir_available() {
+    if std::env::var_os("HOME").is_some() || dirs::data_dir().is_some() {
+        assert!(default_squeezy_skills_dir().is_absolute());
+        assert!(default_agent_compat_skills_dir().is_absolute());
+    }
+}
+
+#[test]
+fn check_settings_file_permissions_does_not_panic() {
+    let _ = check_settings_file_permissions();
+}
+
+#[test]
+fn config_warning_emitted_for_squeezy_session_dir_with_tilde() {
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "~/sessions") };
+    let result = AppConfig::from_env_and_settings();
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    drop(_env_guard);
+
+    let config = result.expect("from_env_and_settings should succeed");
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .any(|w| w.source == "SQUEEZY_SESSION_DIR" && w.field.contains("starts with '~'"))
+    );
+}
+
+#[test]
+fn no_session_dir_warning_when_value_is_absolute_or_unset() {
+    for value in [Some("/var/log/squeezy"), None] {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        match value {
+            Some(v) => unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", v) },
+            None => unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") },
+        }
+        let result = AppConfig::from_env_and_settings();
+        unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+        drop(_env_guard);
+        let config = result.expect("from_env_and_settings should succeed");
         assert!(
-            template.contains(expected),
-            "user settings template should mention default sensitive path {expected:?}"
+            !config
+                .config_warnings
+                .iter()
+                .any(|w| w.source == "SQUEEZY_SESSION_DIR")
         );
     }
+}
+
+#[test]
+fn config_warning_for_session_dir_user_tilde_does_not_promise_expansion() {
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "~alice/sessions") };
+    let result = AppConfig::from_env_and_settings();
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    drop(_env_guard);
+    let config = result.expect("from_env_and_settings should succeed");
+    let warning = config
+        .config_warnings
+        .iter()
+        .find(|w| w.source == "SQUEEZY_SESSION_DIR")
+        .expect("expected warning");
+    assert!(warning.field.contains("does not expand"));
+    assert!(
+        !warning
+            .field
+            .contains("expands it against HOME automatically")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn home_unset_warning_fires_on_unix_without_home_or_settings_path() {
+    let user_path = PathBuf::from("/etc/squeezy/settings.toml");
+    let warning = home_unset_warning(false, false, &user_path).expect("warning");
+    assert_eq!(warning.source, "environment");
+    assert!(warning.field.contains("HOME is not set"));
+    assert!(warning.field.contains(&user_path.display().to_string()));
+    assert!(warning.field.contains("dirs::config_dir()"));
+}
+
+#[cfg(unix)]
+#[test]
+fn home_unset_warning_suppressed_by_settings_path_escape_hatch() {
+    let user_path = PathBuf::from("/etc/squeezy/settings.toml");
+    assert!(home_unset_warning(false, true, &user_path).is_none());
+    assert!(home_unset_warning(true, false, &user_path).is_none());
+    assert!(home_unset_warning(true, true, &user_path).is_none());
+}
+
+#[test]
+fn squeezy_skills_dir_for_home_helpers_cover_fallbacks() {
+    let data = PathBuf::from("/var/lib/data");
+    assert_eq!(
+        squeezy_skills_dir_for_home(None, Some(data.clone())),
+        data.join("squeezy").join("skills")
+    );
+    assert_eq!(
+        agent_compat_skills_dir_for_home(None, Some(data.clone())),
+        data.join("agents").join("skills")
+    );
+    let home = PathBuf::from("/home/alice");
+    assert_eq!(
+        squeezy_skills_dir_for_home(Some(home.clone()), Some(data.clone())),
+        home.join(DEFAULT_SQUEEZY_SKILLS_DIR)
+    );
+    assert_eq!(
+        agent_compat_skills_dir_for_home(Some(home), Some(data)),
+        PathBuf::from("/home/alice").join(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+    );
+    assert_eq!(
+        squeezy_skills_dir_for_home(None, None),
+        PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR)
+    );
+    assert_eq!(
+        agent_compat_skills_dir_for_home(None, None),
+        PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_settings_file_permissions_detects_group_writable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp =
+        std::env::temp_dir().join(format!("squeezy-perm-gw-test-{}.toml", std::process::id()));
+    std::fs::write(&tmp, b"[model]\n").unwrap();
+    let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+    perms.set_mode(0o620);
+    std::fs::set_permissions(&tmp, perms).unwrap();
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", tmp.to_str().unwrap()) };
+    let issues = check_settings_file_permissions();
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_file(&tmp);
+    assert!(!issues.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_settings_file_permissions_follows_symlink_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("squeezy-symlink-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("real-settings.toml");
+    let link = dir.join("settings.toml");
+    std::fs::write(&target, b"[model]\n").unwrap();
+    let mut perms = std::fs::metadata(&target).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&target, perms).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", link.to_str().unwrap()) };
+    let issues = check_settings_file_permissions();
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!issues.is_empty());
+    assert_eq!(issues[0].path, link);
 }
