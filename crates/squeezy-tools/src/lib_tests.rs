@@ -287,6 +287,35 @@ fn plan_parallel_batches_serializes_unsafe_calls_between_safe_runs() {
 }
 
 #[test]
+fn shell_permission_metadata_populates_filesystem_posture_for_approval_prompt() {
+    // Regression test: the approval prompt's `filesystem` warn-line arms
+    // (squeezy-tui::approval::append_shell) only render when this key is
+    // populated at permission-request time. Mode = Off → plan is direct,
+    // so `filesystem` is "not_enforced" — deterministic across platforms.
+    let root = temp_workspace("permission_filesystem_posture");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "filesystem-posture".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "echo hello",
+            "description": "trivial echo"
+        }),
+    });
+
+    assert!(
+        request.metadata.contains_key("filesystem"),
+        "permission_request must populate the `filesystem` metadata key so the \
+         approval prompt's posture warn-line can render: keys = {:?}",
+        request.metadata.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(request.metadata["filesystem"], "not_enforced");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     let root = temp_workspace("permission_metadata");
     let registry = registry_with_shell_sandbox_off(&root);
@@ -11278,6 +11307,9 @@ fn sensitive_path_matcher_ignores_substring_false_positives() {
 
 #[test]
 fn sensitive_path_matcher_catches_quoted_and_expanded_bypasses() {
+    // Honour the file-wide ENV_MUTEX so this test serialises with the
+    // newer USERPROFILE / APPDATA tests that mutate sibling vars.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
     assert!(shell_command_references_sensitive_path("cat .env", &patterns).is_some());
     assert!(shell_command_references_sensitive_path("cat ./.env.production", &patterns).is_some());

@@ -82,6 +82,20 @@ fn flags_net_user_delete() {
 }
 
 #[test]
+fn ri_substring_does_not_false_positive_inside_benign_tokens() {
+    // `Invoke-WebRequest -Uri ... -Recurse -Force` lowercases to a stream
+    // that contains the bytes `ri -recurse -force` immediately after `-u`,
+    // which the previous substring matcher tripped on. The token-based
+    // `ri` arm refuses to match unless `ri` is the first whitespace-
+    // separated token.
+    assert!(!is_destructive_windows_segment(
+        "Invoke-WebRequest -Uri https://example.com/api -Recurse -Force"
+    ));
+    // A bare `ri` without recursion/force flags still classifies safe.
+    assert!(!is_destructive_windows_segment("ri foo.txt"));
+}
+
+#[test]
 fn does_not_flag_safe_takeown() {
     // /r is required for our match; single-file takeown is less dangerous
     assert!(!is_destructive_windows_segment("takeown /f somefile.txt"));

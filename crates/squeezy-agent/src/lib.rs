@@ -15284,7 +15284,18 @@ pub(crate) fn mode_permission_verdict(
     // denial-message display, avoiding a redundant fs::canonicalize syscall.
     // On Windows this also normalises drive-letter case, UNC prefixes, and
     // junction targets before either comparison or display.
-    let active_plan_canon = active_plan_path.and_then(plan_mode::canonicalize_active_plan_path);
+    //
+    // Gate the canonicalize on the only branches that consume the result:
+    // Plan-mode + Edit (used by `plan_edit_allowed` and the denial display).
+    // Read / Search / Network / Mcp / Shell / Git / Compiler permission
+    // decisions (the high-volume path on every Plan-mode turn) skip the
+    // syscall entirely.
+    let active_plan_canon =
+        if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
+            active_plan_path.and_then(plan_mode::canonicalize_active_plan_path)
+        } else {
+            None
+        };
     let plan_edit_allowed = matches!(
         (mode, request.capability),
         (SessionMode::Plan, PermissionCapability::Edit)
@@ -15394,7 +15405,9 @@ pub(crate) fn mode_permission_verdict(
 /// capability is a compile-time prompt to decide whether plan mode admits it.
 /// `plan_edit_allowed` is computed by
 /// `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites and by
-/// `plan_mode::is_active_plan_path` at runtime (issue 2).
+/// `mode_permission_verdict`'s pre-canonicalized pair
+/// (`plan_mode::canonicalize_active_plan_path` +
+/// `plan_mode::is_active_plan_path_with_canon`) at runtime (issue 2).
 fn mode_refuses_capability(
     mode: SessionMode,
     capability: PermissionCapability,

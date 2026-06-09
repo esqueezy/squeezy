@@ -2415,6 +2415,19 @@ impl ToolRegistry {
                     "sandbox_write_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.write_roots),
                 );
+                // Surface the active filesystem-isolation posture (e.g.
+                // "enforced", "enforced_writes_only", "best_effort_unavailable")
+                // so the approval prompt can warn when the active backend
+                // does not actually isolate filesystem reads or writes.
+                // `prepare_shell_sandbox_plan` is synchronous and cheap
+                // (cached probes, no per-spawn restricted-token preparation
+                // here); errors mirror what the execute path will raise, so
+                // skip the key and let the execute path surface the failure.
+                if let Ok(plan) =
+                    prepare_shell_sandbox_plan(command, &analysis, &self.root, &self.shell_sandbox)
+                {
+                    metadata.insert("filesystem".to_string(), plan.filesystem.to_string());
+                }
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
                 }

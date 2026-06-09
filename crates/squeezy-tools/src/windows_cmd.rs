@@ -22,11 +22,6 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         "remove-item -r -force",
         "remove-item -force -recurse",
         "remove-item -force -r",
-        // Abbreviation "ri" is a built-in alias for Remove-Item.
-        "ri -recurse -force",
-        "ri -force -recurse",
-        "ri -r -force",
-        "ri -force -r",
         // Policy / user / storage management.
         "set-executionpolicy",
         "new-localuser",
@@ -47,13 +42,26 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         }
     }
 
-    // cmd.exe destructive commands. Tokenise to avoid matching substrings
-    // inside paths.
+    // Tokenised matches for both the PowerShell `ri` alias (whose two-byte
+    // name needs token boundaries to avoid false positives inside benign
+    // tokens like `-Uri`) and the cmd.exe destructive commands.
     let tokens: Vec<&str> = segment.split_whitespace().collect();
     let first = tokens.first().copied().unwrap_or("").to_ascii_lowercase();
     let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
 
     match first.as_str() {
+        // Abbreviation "ri" is a built-in alias for Remove-Item. Match it
+        // as a standalone command rather than as a substring so benign
+        // commands ending in `ri` (e.g. `Invoke-WebRequest -Uri -Recurse
+        // -Force …`, which lowercases to `... -uri -recurse -force ...`)
+        // do not falsely trip the recursive-force shape.
+        "ri" => {
+            let has_recurse = flag_matches("-recurse") || flag_matches("-r");
+            let has_force = flag_matches("-force");
+            if has_recurse && has_force {
+                return true;
+            }
+        }
         "del" | "erase" => {
             return flag_matches("/s") || (flag_matches("/q") && flag_matches("/f"));
         }
