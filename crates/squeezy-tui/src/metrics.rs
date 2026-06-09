@@ -6,10 +6,10 @@
 //! *painted* frame in `TerminalGuard::draw_app`, capturing:
 //!
 //! - **render time** — wall time to build AND emit the frame (the full
-//!   `draw`/`paint_main` call, measured at the single `draw_app` chokepoint).
+//!   `draw` call, measured at the single `draw_app` chokepoint).
 //! - **bytes emitted** — every byte handed to the terminal writer this frame,
-//!   counted by an `Arc<AtomicU64>` the writer bumps on each `write` (so it
-//!   covers both the fullscreen ratatui path and the inline escape hatch).
+//!   counted by an `Arc<AtomicU64>` the writer bumps on each `write` (over the
+//!   fullscreen ratatui path).
 //! - **rows built** — the wrapped transcript rows materialized for the main
 //!   view this frame (stamped by `render_transcript`).
 //! - **cache hit / miss** — a delta of the process-wide cache counters

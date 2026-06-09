@@ -10,7 +10,7 @@ use std::{
 
 use crossterm::{
     Command,
-    cursor::{Hide, MoveTo, MoveToColumn, MoveToPreviousLine},
+    cursor::{Hide, MoveTo},
     event::{
         self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -22,13 +22,13 @@ use crossterm::{
         SetBackgroundColor, SetColors, SetForegroundColor,
     },
     terminal::{
-        Clear, ClearType, DisableLineWrap, EnableLineWrap, EnterAlternateScreen,
-        LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size as terminal_size,
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode, size as terminal_size,
     },
 };
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
-    backend::{CrosstermBackend, IntoCrossterm, TestBackend},
+    backend::{CrosstermBackend, IntoCrossterm},
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -106,8 +106,6 @@ mod status_line_setup;
 mod streaming;
 mod streaming_patch;
 mod terminal_writer;
-#[cfg(feature = "term-matrix")]
-mod termsim;
 mod toast;
 mod transcript_surface;
 pub use render::markdown::render_markdown;
@@ -164,7 +162,6 @@ const TOOL_CALL_MAX_LINES: usize = 5;
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const PROMPT_MIN_HEIGHT: u16 = 4;
 const PROMPT_MAX_HEIGHT: u16 = 30;
-const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 /// Column width used to wrap the clean-exit transcript mirror when the real
 /// terminal size is unavailable (piped stdout, detached TTY). 80 is the
 /// universal terminal default.
@@ -219,27 +216,9 @@ const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
 /// requires holding `Shift` on most emulators — the standard tradeoff
 /// when a TUI takes over mouse input.
 const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
-/// Enable button-motion reporting (1002) in addition to basic click
-/// reporting. This is only used while the transcript overlay is in its
-/// explicit scrollbar-drag mode; native unmodified text selection needs
-/// mouse reporting disabled, so drag capture cannot be the overlay default.
-#[cfg(test)]
-const ENABLE_MOUSE_DRAG_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 // The matching disable sequence (1000l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
-const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
-/// Startup variant of [`CLEAR_SCROLLBACK_AND_VISIBLE`]: resets the scroll
-/// region (`ESC[r`) and SGR (`ESC[0m`), homes the cursor, and clears the
-/// *visible* screen (`ESC[2J`) — but deliberately OMITS the `ESC[3J`
-/// scrollback purge. Inline mode's whole premise is that the conversation
-/// lives in the terminal's native scrollback; nuking scrollback on launch
-/// throws away whatever the user had in their terminal before starting
-/// Squeezy. Strict xterm.js (the VS Code integrated terminal) honours
-/// `ESC[3J` literally, so the old sequence wiped real history there
-/// (cf. openai/codex#14277). The explicit `/clear` command and the Drop
-/// teardown still use the scrollback-purging form, matching `clear(1)`.
-const RESET_AND_CLEAR_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
 const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
 /// DEC private mode 2026 — Begin Synchronized Update. Capable terminals
 /// buffer subsequent output and flip the cell grid atomically when they
@@ -260,25 +239,9 @@ const MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL: usize = 4096;
 // `leave_transcript_overlay_screen` is the production clean-exit alt-leave path:
 // `finish_fullscreen` calls it to disable alternate-scroll + mouse reporting and
 // leave the alternate screen (optionally restoring main-screen mouse capture)
-// before mirroring the transcript into native scrollback. Its
-// `enter_transcript_overlay_screen` / `set_transcript_overlay_mouse_mode`
-// siblings have no production caller after Phase 1 (the fullscreen renderer
-// enters the alternate screen once in `enter` and renders the overlay as a state
-// on the same terminal, with no per-overlay swap); they stay under `#[cfg(test)]`
-// only because byte tests still assert the exact alt-screen / mouse-mode
-// sequences they emit.
-#[cfg(test)]
-fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
-    execute!(
-        writer,
-        EnterAlternateScreen,
-        Print(DISABLE_MOUSE_MODES),
-        EnableAlternateScroll,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )
-}
-
+// before mirroring the transcript into native scrollback. The fullscreen
+// renderer enters the alternate screen once in `enter` and renders the overlay
+// as a state on the same terminal, with no per-overlay swap.
 fn leave_transcript_overlay_screen<W: Write>(
     writer: &mut W,
     restore_mouse_capture: bool,
@@ -290,21 +253,6 @@ fn leave_transcript_overlay_screen<W: Write>(
         LeaveAlternateScreen
     )?;
     if restore_mouse_capture {
-        execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn set_transcript_overlay_mouse_mode<W: Write>(
-    writer: &mut W,
-    scrollbar_drag: bool,
-    restore_main_mouse_capture: bool,
-) -> io::Result<()> {
-    execute!(writer, Print(DISABLE_MOUSE_MODES))?;
-    if scrollbar_drag {
-        execute!(writer, Print(ENABLE_MOUSE_DRAG_CAPTURE))?;
-    } else if restore_main_mouse_capture {
         execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
     }
     Ok(())
@@ -9819,137 +9767,6 @@ fn render_metrics_hud(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(Paragraph::new(text).block(block), rect);
 }
 
-fn render_inline(
-    frame: &mut Frame<'_>,
-    app: &TuiApp,
-    flushed_turn_divider_generation: Option<u64>,
-) {
-    app.begin_frame_clickables();
-    let area = frame.area();
-    if app.transcript_overlay.is_some() {
-        render_transcript_overlay_surface(frame, area, app);
-        return;
-    }
-    if let Some(state) = &app.status_line_setup {
-        status_line_setup::render(frame, area, state, app);
-        return;
-    }
-    if let Some(state) = &app.config_screen {
-        config_screen::render(frame, area, state);
-        return;
-    }
-    let input_height = input_panel_height(app, area.width);
-    let approval_height = approval_menu_height(app, area.width);
-    let plan_indicator_height = plan_mode_indicator_height(app);
-    let show_completed_turn_divider =
-        should_show_live_completed_turn_divider(app, flushed_turn_divider_generation);
-    let task_height =
-        should_show_task_panel(app, show_completed_turn_divider).then_some(task_panel_height(app));
-    let status_height = 2;
-    let subagent_height = subagent_pane_height(app);
-    // Just-finished work nodes that are still folding render here in the live
-    // region (held back from scrollback) above the streaming answer, then flush
-    // collapsed once their 600ms settle finishes.
-    let mut live_lines = live_settling_lines(app, area.width);
-    live_lines.extend(pending_assistant_lines(app));
-    let live_visual_height = visual_line_count(&live_lines, area.width);
-    let live_gap = if live_visual_height > 0 { 1 } else { 0 };
-    // Cap the approval block so the options can never be clipped behind the
-    // status line on a short terminal (see the matching note in `render`).
-    let approval_height = if app.pending_approval.is_some() {
-        let reserve = input_height
-            .saturating_add(status_height)
-            .saturating_add(plan_indicator_height)
-            .saturating_add(task_height.unwrap_or(0));
-        approval_height.min(area.height.saturating_sub(reserve))
-    } else {
-        approval_height
-    };
-    let required_height = task_height
-        .unwrap_or(0)
-        .saturating_add(input_height)
-        .saturating_add(approval_height)
-        .saturating_add(plan_indicator_height)
-        .saturating_add(status_height)
-        .saturating_add(subagent_height)
-        .saturating_add(live_gap);
-    let attachment_height =
-        attachment_panel_height(app, area.height.saturating_sub(required_height));
-    let reserved_height = required_height.saturating_add(attachment_height);
-    let live_height = live_visual_height.min(area.height.saturating_sub(reserved_height));
-
-    let mut constraints = Vec::new();
-    if live_height > 0 {
-        constraints.push(Constraint::Length(live_height));
-    }
-    if live_gap > 0 && live_height > 0 {
-        constraints.push(Constraint::Length(live_gap));
-    }
-    if let Some(h) = task_height {
-        constraints.push(Constraint::Length(h));
-    }
-    if attachment_height > 0 {
-        constraints.push(Constraint::Length(attachment_height));
-    }
-    if plan_indicator_height > 0 {
-        constraints.push(Constraint::Length(plan_indicator_height));
-    }
-    constraints.push(Constraint::Length(input_height));
-    if approval_height > 0 {
-        constraints.push(Constraint::Length(approval_height));
-    }
-    constraints.push(Constraint::Length(status_height));
-    if subagent_height > 0 {
-        constraints.push(Constraint::Length(subagent_height));
-    }
-    constraints.push(Constraint::Min(0));
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-    let mut index = 0;
-    if live_height > 0 {
-        let scroll = scroll::to_u16_clamped(transcript_scroll_offset(
-            live_lines.len(),
-            live_height as usize,
-            0,
-        ));
-        let paragraph = Paragraph::new(live_lines)
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, chunks[index]);
-        index += 1;
-    }
-    if live_gap > 0 && live_height > 0 {
-        index += 1;
-    }
-    if task_height.is_some() {
-        render_task_state(frame, chunks[index], app, show_completed_turn_divider);
-        index += 1;
-    }
-    if attachment_height > 0 {
-        render_attachments(frame, chunks[index], app);
-        index += 1;
-    }
-    if plan_indicator_height > 0 {
-        render_plan_mode_indicator(frame, chunks[index], app);
-        index += 1;
-    }
-    render_input(frame, chunks[index], app);
-    index += 1;
-    if approval_height > 0 {
-        render_approval(frame, chunks[index], app);
-        index += 1;
-    }
-    render_status(frame, chunks[index], app);
-    index += 1;
-    if subagent_height > 0 {
-        render_subagent_pane(frame, chunks[index], app);
-    }
-    render_toast_overlay(frame, area, app);
-}
-
 fn should_show_live_completed_turn_divider(app: &TuiApp, flushed_generation: Option<u64>) -> bool {
     let Some(snapshot) = live_turn_divider_snapshot(app) else {
         return false;
@@ -10278,11 +10095,6 @@ fn live_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
     })
 }
 
-fn pending_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
-    app.pending_turn_divider
-        .or_else(|| live_turn_divider_snapshot(app))
-}
-
 fn overlay_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
     if active_subagent_record(app).is_some() {
         return None;
@@ -10301,71 +10113,6 @@ fn transcript_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot>
         return None;
     }
     app.pending_turn_divider
-}
-
-fn turn_divider_snapshot_for_flush(
-    app: &TuiApp,
-    transcript_flushed_to: usize,
-    flushed_generation: Option<u64>,
-) -> Option<TurnDividerSnapshot> {
-    let snapshot = pending_turn_divider_snapshot(app)?;
-    if snapshot.transcript_len > transcript_flushed_to {
-        return None;
-    }
-    if flushed_generation == Some(snapshot.generation) {
-        return None;
-    }
-    Some(snapshot)
-}
-
-#[cfg(test)]
-fn turn_divider_lines_for_flush(
-    app: &TuiApp,
-    width: u16,
-    transcript_flushed_to: usize,
-    flushed_generation: Option<u64>,
-) -> Vec<Line<'static>> {
-    turn_divider_snapshot_for_flush(app, transcript_flushed_to, flushed_generation)
-        .map(|snapshot| vec![turn_divider_line(snapshot, width)])
-        .unwrap_or_default()
-}
-
-fn inline_history_lines_for_flush_with_turn_divider(
-    app: &TuiApp,
-    width: u16,
-    include_startup_card: bool,
-    transcript_from: usize,
-    transcript_to: usize,
-    flushed_generation: Option<u64>,
-) -> (Vec<Line<'static>>, Option<u64>) {
-    let Some(snapshot) = turn_divider_snapshot_for_flush(app, transcript_to, flushed_generation)
-    else {
-        return (
-            inline_history_lines_for_flush(
-                app,
-                width,
-                include_startup_card,
-                transcript_from,
-                transcript_to,
-            ),
-            None,
-        );
-    };
-
-    let boundary = snapshot
-        .transcript_len
-        .clamp(transcript_from, transcript_to);
-    let mut lines =
-        inline_history_lines_for_flush(app, width, include_startup_card, transcript_from, boundary);
-    lines.push(turn_divider_line(snapshot, width));
-    lines.extend(inline_history_lines_for_flush(
-        app,
-        width,
-        false,
-        boundary,
-        transcript_to,
-    ));
-    (lines, Some(snapshot.generation))
 }
 
 fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
@@ -13346,11 +13093,6 @@ pub(crate) fn format_plan_mode_indicator_line() -> Line<'static> {
 fn render_plan_mode_indicator(frame: &mut Frame<'_>, area: Rect, _app: &TuiApp) {
     let paragraph = Paragraph::new(format_plan_mode_indicator_line());
     frame.render_widget(paragraph, area);
-}
-
-fn transcript_scroll_offset(line_count: usize, area_height: usize, from_bottom: usize) -> usize {
-    let max_scroll = line_count.saturating_sub(area_height);
-    max_scroll.saturating_sub(from_bottom)
 }
 
 fn transcript_visual_line_count(app: &TuiApp, width: u16, include_startup_card: bool) -> u16 {
@@ -20568,20 +20310,13 @@ pub(crate) struct TuiApp {
     pending_turn_divider: Option<TurnDividerSnapshot>,
     turn_divider_generation: u64,
     /// Set when a terminal resize event arrives so the next draw is forced.
-    /// The append-only renderer responds by dropping its footer baseline and
-    /// repainting the footer at the new geometry; the terminal reflows the
-    /// already-committed scrollback itself.
+    /// The fullscreen renderer redraws every cell from model state on the next
+    /// frame; ratatui autoresizes the alternate screen cleanly.
     pub(crate) pending_resize: bool,
-    /// Screen row where the append-only footer currently starts (its top). The
-    /// footer's click rects are registered footer-relative (origin 0), so mouse
-    /// hit-testing subtracts this to map absolute terminal rows into the footer.
-    ///
-    /// Inline-repro-only render-coordinate state: it is mutated solely from the
-    /// `SQUEEZY_INLINE_REPRO` paint path (`paint_main_inner`, reached only when
-    /// `inline_repro` is set) and read only by that path's click mapping. The
-    /// fullscreen renderer registers absolute click rects, so it leaves this at
-    /// 0. Do not refactor for the fullscreen path — Phase 10 deletes the inline
-    /// path (and this field with it).
+    /// Origin row for footer-relative click-rect mapping. The fullscreen
+    /// renderer registers absolute click rects and never offsets the hit-test,
+    /// so this stays 0 for the whole session; the guarded click arms subtract it
+    /// (a no-op at 0). Retained so the hit-test math reads uniformly.
     pub(crate) footer_origin: u16,
     /// Set by `/clear` after the app transcript has been reset. The next
     /// terminal draw purges the visible screen and scrollback before any
@@ -20884,7 +20619,7 @@ impl TuiApp {
     }
 
     /// Clear the hit-test registry at the start of each frame.
-    /// Called from `render` / `render_inline` before any widget draws.
+    /// Called from `render` before any widget draws.
     pub(crate) fn begin_frame_clickables(&self) {
         self.clickables.borrow_mut().begin_frame();
     }
@@ -22520,47 +22255,15 @@ fn exit_hint(session_id: Option<&str>) -> Option<String> {
     })
 }
 
-/// Mutable bookkeeping the append-only renderer ([`paint_main_inner`]) threads
-/// across frames: which history has flushed to native scrollback, the last
-/// flushed turn-divider generation, and whether a footer is currently on
-/// screen (so the next frame's `FromCursorDown` clear knows to erase it).
-///
-/// A standalone struct so the production guard ([`TerminalGuard`]) and the
-/// term-matrix capture harness (`testing::capture`) share one shape and one
-/// emitter — the capture path can never re-implement (and so never drift
-/// from) the production flush/footer logic. `pub(crate)` so the capture module
-/// can construct and own one.
-///
-/// `startup_flushed` / `transcript_flushed_len` / `turn_divider_flushed_generation`
-/// track the scrollback flush; `footer_painted` is whether a footer is on
-/// screen at the parked cursor and must be erased before the next repaint. It
-/// is false only right after the screen was cleared (startup, `/clear`); it
-/// stays true across a Ctrl+T overlay round-trip, since `LeaveAlternateScreen`
-/// restores the main buffer with the old footer (which must then be erased).
-#[derive(Default)]
-pub(crate) struct PaintBookkeeping {
-    pub(crate) startup_flushed: bool,
-    pub(crate) transcript_flushed_len: usize,
-    pub(crate) turn_divider_flushed_generation: Option<u64>,
-    pub(crate) footer_painted: bool,
-}
-
 struct TerminalGuard {
     /// `Option` so we can drop and rebuild the ratatui `Terminal`, and
-    /// so `Drop` can `take` it for emergency teardown.
-    /// Fullscreen terminal (`Viewport::Fullscreen`), or inline
-    /// (`Viewport::Inline(N)`) only under `SQUEEZY_INLINE_REPRO`.
-    /// Always `Some` after `enter`.
+    /// so `Drop` can `take` it for emergency teardown. Always the
+    /// fullscreen alt-screen terminal (`Viewport::Fullscreen`), `Some`
+    /// after `enter`.
     terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
-    /// Resolved once in `enter` from `SQUEEZY_INLINE_REPRO`. When true the
-    /// guard runs the legacy append-only inline `paint_main` path (an escape
-    /// hatch for reproducing the inline renderer); when false it runs the
-    /// default fullscreen alt-screen renderer.
-    inline_repro: bool,
     /// True after `enter` emits `EnterAlternateScreen`; cleared by `Drop`
     /// (and by Phase 2's `finish_fullscreen`). Idempotence guard so the
-    /// alt-screen is left exactly once. False in the inline-repro path,
-    /// which never enters the alternate screen.
+    /// alt-screen is left exactly once.
     alt_screen_active: bool,
     /// Whether mouse capture is enabled for the main screen. Defaults on in
     /// fullscreen (alt-screen norm) unless `SQUEEZY_MOUSE_CAPTURE=0`. When on,
@@ -22574,12 +22277,6 @@ struct TerminalGuard {
     #[allow(dead_code)]
     mouse_capture: bool,
     exit_hint: Option<String>,
-    /// Inline-repro (`SQUEEZY_INLINE_REPRO`) append-only paint bookkeeping.
-    /// Unused on the default fullscreen path; kept so the escape-hatch
-    /// `paint_main` path still compiles. Shared verbatim with the term-matrix
-    /// capture harness via [`paint_main_inner`], so the two paths can never
-    /// diverge on what history has flushed or whether a footer is on screen.
-    book: PaintBookkeeping,
     /// Resolved DEC 2026 synchronized-output flag. Computed once at
     /// startup from the user's [`TuiSynchronizedOutput`] policy plus
     /// terminal-capability detection; consulted around every frame
@@ -22587,8 +22284,8 @@ struct TerminalGuard {
     synchronized_output: bool,
     /// Source of the current terminal dimensions. Production uses
     /// [`crate::size_source::RealSize`] (delegates to `crossterm::terminal::size`);
-    /// tests inject a [`crate::size_source::FixedSize`] so the inline-repro
-    /// `paint_main` path can be driven at a deterministic size with no real TTY.
+    /// tests inject a [`crate::size_source::FixedSize`] so the clean-exit mirror
+    /// width can be driven at a deterministic size with no real TTY.
     size_source: Box<dyn crate::size_source::SizeSource>,
     /// Shared per-frame byte counter installed into the terminal writer. The
     /// writer bumps it on every write; `draw_app` resets it at frame begin and
@@ -22622,20 +22319,6 @@ where
         .unwrap_or(true)
 }
 
-/// Resolve the inline-repro escape hatch from the environment.
-/// `SQUEEZY_INLINE_REPRO=1` (or any non-empty, non-`0` value) selects the legacy
-/// append-only inline renderer; default OFF means the product fullscreen
-/// alt-screen path. Injected `env_get` keeps it testable without process-env
-/// mutation.
-fn resolve_inline_repro<F>(env_get: F) -> bool
-where
-    F: Fn(&str) -> Option<std::ffi::OsString>,
-{
-    env_get("SQUEEZY_INLINE_REPRO")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
-}
-
 /// Resolve the initial state of the hidden render-budget HUD from the
 /// environment. `SQUEEZY_RENDER_METRICS=1` (or any non-empty, non-`0` value)
 /// shows the HUD and enables the per-frame trace line from the first frame;
@@ -22652,59 +22335,34 @@ where
 }
 
 /// Emit the terminal startup setup sequence into `writer`: the keyboard
-/// enhancement flags, then either the fullscreen alt-screen entry (the product
-/// path) or the inline-repro entry (escape hatch), and finally mouse capture
+/// enhancement flags, the fullscreen alt-screen entry, and finally mouse capture
 /// when enabled. This is the byte-emitting half of [`TerminalGuard::enter`],
 /// factored out so a test can drive the exact same sequence into a
-/// [`TerminalWriter::Capture`] sink with no real TTY (and no `enable_raw_mode`),
-/// the same single-source pattern as [`paint_main_inner`].
+/// [`TerminalWriter::Capture`] sink with no real TTY (and no `enable_raw_mode`).
 ///
-/// * Fullscreen (`inline_repro == false`): `EnterAlternateScreen` plus
-///   alternate-scroll, clear, home, bracketed paste, focus reporting, and a
-///   hidden hardware cursor.
-/// * Inline-repro (`inline_repro == true`): never enters the alternate screen;
-///   resets + clears the visible buffer in the normal buffer instead.
-fn emit_terminal_enter_setup<W: Write>(
-    writer: &mut W,
-    inline_repro: bool,
-    mouse_capture: bool,
-) -> io::Result<()> {
+/// Enters the alternate screen plus alternate-scroll, clear, home, bracketed
+/// paste, focus reporting, and a hidden hardware cursor (the caret is a rendered
+/// glyph; Drop shows it again).
+fn emit_terminal_enter_setup<W: Write>(writer: &mut W, mouse_capture: bool) -> io::Result<()> {
     let _ = execute!(
         writer,
         DisableModifyOtherKeys,
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
     );
-    if inline_repro {
-        // Inline viewport: the TUI pins itself to the bottom rows and flushes
-        // finished output up into the terminal's own scrollback.
-        execute!(
-            writer,
-            Print(RESET_AND_CLEAR_VISIBLE),
-            Print(DISABLE_MOUSE_MODES),
-            DisableAlternateScroll,
-            EnableBracketedPaste,
-            EnableFocusChange,
-            // Append-only renders the caret as a glyph (`┃`) inside the footer,
-            // so keep the hardware cursor hidden for the whole session; Drop
-            // restores it via `show_cursor`.
-            Hide
-        )?;
-    } else {
-        // Fullscreen: enter the alternate screen, clear it, home the cursor,
-        // and enable bracketed paste / focus reporting. The hardware cursor
-        // stays hidden (the caret is a rendered glyph); Drop shows it again.
-        execute!(
-            writer,
-            EnterAlternateScreen,
-            Print(DISABLE_MOUSE_MODES),
-            EnableAlternateScroll,
-            Clear(ClearType::All),
-            MoveTo(0, 0),
-            EnableBracketedPaste,
-            EnableFocusChange,
-            Hide
-        )?;
-    }
+    // Fullscreen: enter the alternate screen, clear it, home the cursor,
+    // and enable bracketed paste / focus reporting. The hardware cursor
+    // stays hidden (the caret is a rendered glyph); Drop shows it again.
+    execute!(
+        writer,
+        EnterAlternateScreen,
+        Print(DISABLE_MOUSE_MODES),
+        EnableAlternateScroll,
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        EnableBracketedPaste,
+        EnableFocusChange,
+        Hide
+    )?;
     if mouse_capture {
         execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
     }
@@ -22726,8 +22384,8 @@ fn emit_terminal_emergency_teardown<W: Write>(
     writer: &mut W,
     alt_screen_active: bool,
 ) -> io::Result<()> {
-    // Leave the alternate screen iff we are still in it. The inline-repro path
-    // never entered alt-screen, so this is skipped there.
+    // Leave the alternate screen iff we are still in it (a clean exit or a
+    // prior teardown may already have left it).
     if alt_screen_active {
         execute!(
             writer,
@@ -22912,16 +22570,11 @@ impl TerminalGuard {
         // are the escape hatch. Only the literal `SQUEEZY_MOUSE_CAPTURE=0`
         // disables it; any other value (including empty) leaves it on.
         let mouse_capture = resolve_mouse_capture(|key| std::env::var_os(key));
-        // `SQUEEZY_INLINE_REPRO=1` selects the legacy append-only inline
-        // renderer (an escape hatch for reproducing inline behaviour). Default
-        // OFF: the product path is the fullscreen alt-screen renderer.
-        let inline_repro = resolve_inline_repro(|key| std::env::var_os(key));
-        // Emit the whole startup setup sequence (keyboard flags, alt-screen /
-        // inline entry, bracketed paste / focus, mouse capture) through the
-        // shared free helper so a test can drive the exact same bytes into a
-        // `Capture` writer with no real TTY — the same single-source pattern as
-        // `paint_main_inner` / the term-matrix capture harness.
-        emit_terminal_enter_setup(&mut writer, inline_repro, mouse_capture)
+        // Emit the whole startup setup sequence (keyboard flags, alt-screen
+        // entry, bracketed paste / focus, mouse capture) through the shared free
+        // helper so a test can drive the exact same bytes into a `Capture`
+        // writer with no real TTY.
+        emit_terminal_enter_setup(&mut writer, mouse_capture)
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         // Crash safety (Phase 9): install the panic hook now that the terminal is
         // in raw mode / the alternate screen, and publish the alt-screen state so
@@ -22930,24 +22583,21 @@ impl TerminalGuard {
         // unchanged; these only cover the paths where `Drop` cannot run (a panic
         // message printing pre-unwind, or a SIGTERM/SIGHUP killing the process).
         // The panic hook is restored on the clean exit in `finish_fullscreen`.
-        signal_teardown::set_alt_screen_active(!inline_repro);
+        signal_teardown::set_alt_screen_active(true);
         signal_teardown::install_panic_hook();
         let backend = CrosstermBackend::new(writer);
-        let viewport = if inline_repro {
-            Viewport::Inline(INLINE_VIEWPORT_HEIGHT)
-        } else {
-            Viewport::Fullscreen
-        };
-        let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
             terminal: Some(terminal),
-            inline_repro,
-            // Inline-repro never enters the alternate screen.
-            alt_screen_active: !inline_repro,
+            alt_screen_active: true,
             mouse_capture,
             exit_hint: None,
-            book: PaintBookkeeping::default(),
             synchronized_output,
             size_source: Box::new(crate::size_source::RealSize),
             byte_counter,
@@ -22956,21 +22606,17 @@ impl TerminalGuard {
 
     /// Build a guard wired to a headless [`TerminalWriter::Capture`] backend at a
     /// deterministic `(w, h)` (via [`crate::size_source::FixedSize`]), so
-    /// [`Self::draw_app`] routing — and the bytes each branch emits — can be
-    /// asserted with no real TTY. Returns the guard plus the shared sink the
-    /// caller reads the emitted ANSI from.
+    /// [`Self::draw_app`] and the clean-exit mirror — and the bytes each emits —
+    /// can be asserted with no real TTY. Returns the guard plus the shared sink
+    /// the caller reads the emitted ANSI from.
     ///
-    /// Uses a fixed-area viewport so the fullscreen `render()` branch never hits
-    /// ratatui's autoresize (which queries the real terminal); the append-only
-    /// `paint_main` branch reads its size from the injected `FixedSize`. No
-    /// startup setup bytes are emitted — the enter sequence is covered directly
-    /// against [`emit_terminal_enter_setup`].
+    /// Uses a fixed-area viewport so the fullscreen `render()` never hits
+    /// ratatui's autoresize (which queries the real terminal); the clean-exit
+    /// mirror reads its width from the injected `FixedSize`. No startup setup
+    /// bytes are emitted — the enter sequence is covered directly against
+    /// [`emit_terminal_enter_setup`].
     #[cfg(test)]
-    fn for_capture_test(
-        inline_repro: bool,
-        w: u16,
-        h: u16,
-    ) -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
+    fn for_capture_test(w: u16, h: u16) -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
         let sink: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let byte_counter: metrics::ByteCounter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut writer = TerminalWriter::capture(sink.clone());
@@ -22981,11 +22627,9 @@ impl TerminalGuard {
             .expect("capture terminal builds with a fixed viewport");
         let guard = Self {
             terminal: Some(terminal),
-            inline_repro,
-            alt_screen_active: !inline_repro,
+            alt_screen_active: true,
             mouse_capture: true,
             exit_hint: None,
-            book: PaintBookkeeping::default(),
             synchronized_output: false,
             size_source: Box::new(crate::size_source::FixedSize(w, h)),
             byte_counter,
@@ -23020,32 +22664,29 @@ impl TerminalGuard {
     ///     clears the flag; `Drop` then sees `alt_screen_active == false` and
     ///     skips its own `LeaveAlternateScreen`, re-emitting only the idempotent
     ///     mode restores.
-    ///   * In the inline-repro path `alt_screen_active` is already `false` (it
-    ///     never entered the alternate screen and its history is already in
-    ///     native scrollback), so this short-circuits and emits nothing.
-    ///   * A second call short-circuits the same way.
+    ///   * A second call short-circuits the same way (the flag is already clear).
     ///
     /// Best-effort: the IO `Result` exists so a `Capture` test can assert the
     /// byte order and so the method composes; the caller discards it with
     /// `let _ =` so a teardown IO error never masks a completed session (and
     /// `Drop`'s idempotent emergency teardown still runs).
     fn finish_fullscreen(&mut self, app: &TuiApp) -> io::Result<()> {
-        // Idempotence gate: nothing to mirror if the alternate screen was never
-        // entered (inline-repro) or has already been left (prior call / Drop).
+        // Idempotence gate: nothing to mirror if the alternate screen has already
+        // been left (prior call / Drop).
         if !self.alt_screen_active {
             return Ok(());
         }
         // Width from the live terminal, with a conservative 80-column fallback
         // when the size is unavailable (piped stdout / detached TTY). Reusing
-        // `size_source` keeps this testable with no real TTY, like `paint_main`.
+        // `size_source` keeps this testable with no real TTY.
         let width = match self.size_source.size() {
             Ok((w, _)) if w > 0 => w,
             _ => MIRROR_FALLBACK_WIDTH,
         };
         // Collapsed-by-default mirror over the WHOLE transcript, opened by the
-        // startup/session card, built through the same inline line pipeline the
-        // append-only path used — so the mirrored rows match what the user saw.
-        let lines = inline_history_lines_for_flush(app, width, true, 0, app.transcript.len());
+        // startup/session card, built through the same fullscreen line pipeline
+        // `render()` draws — so the mirrored rows match what the user saw.
+        let lines = transcript_lines_for_render(app, Some(width), true);
         let mirror = render_lines_to_owned_buffer(&lines, width);
 
         let exit_hint = self.exit_hint.clone();
@@ -23105,14 +22746,12 @@ impl TerminalGuard {
     ///
     /// Best-effort throughout: every emit is `let _ =` so a flaky terminal cannot
     /// abort the suspend mid-restore (which would leave a corrupted screen). A
-    /// no-op when not in the alternate screen (inline-repro), where Ctrl+Z needs
-    /// no special handling — the inline path lives in the normal buffer already.
+    /// no-op when the alternate screen has already been left (a Ctrl+Z racing a
+    /// clean exit), where there is nothing to restore.
     #[cfg(unix)]
     fn suspend_and_resume(&mut self, app: &mut TuiApp) {
-        // Inline-repro never enters the alternate screen and renders into the
-        // normal buffer, so the shell already sees a sane terminal on Ctrl+Z.
-        // Let the default SIGTSTP-equivalent path (a plain stop) handle it; we
-        // only manage the alt-screen lifecycle here.
+        // Nothing to manage if the alternate screen has already been left (a
+        // Ctrl+Z arriving after the clean-exit path already tore down).
         if !self.alt_screen_active {
             return;
         }
@@ -23142,10 +22781,9 @@ impl TerminalGuard {
         //    force a full repaint from model state on the next frame.
         let _ = enable_raw_mode();
         {
-            let inline_repro = self.inline_repro;
             let mouse_capture = self.mouse_capture;
             let backend = self.term().backend_mut();
-            let _ = emit_terminal_enter_setup(backend, inline_repro, mouse_capture);
+            let _ = emit_terminal_enter_setup(backend, mouse_capture);
             let _ = backend.flush();
         }
         self.alt_screen_active = true;
@@ -23205,14 +22843,12 @@ impl TerminalGuard {
         self.apply_terminal_title(app)?;
         if app.pending_resize {
             // Ratatui autoresizes the fullscreen terminal cleanly on the next
-            // `draw` (no inline `append_lines` stranding), so just clear the
-            // flag. The inline-repro `paint_main` likewise re-reads the size
-            // every frame, so the flag is a no-op nudge on both paths.
+            // `draw`, so just clear the flag.
             app.pending_resize = false;
         }
         // ---- Frame-budget instrumentation: begin ----
-        // This whole method is the single per-frame chokepoint for both paint
-        // paths, so it is the one place to bracket render time, byte count,
+        // This whole method is the single per-frame chokepoint for the paint, so
+        // it is the one place to bracket render time, byte count,
         // rows built, cache hit/miss, and the longest entry wrap. Sample the
         // per-frame accumulators at frame begin so the deltas below isolate
         // THIS frame's work from every prior frame's.
@@ -23255,25 +22891,14 @@ impl TerminalGuard {
         paint
     }
 
-    /// Paint exactly one frame: route to the fullscreen `render()` or the
-    /// inline `paint_main` path. Factored out of [`Self::draw_app`] so the
-    /// instrumentation there brackets the whole paint without duplicating the
-    /// routing in both the timed and untimed positions.
+    /// Paint exactly one frame through the fullscreen `render()` path. Factored
+    /// out of [`Self::draw_app`] so the instrumentation there brackets the whole
+    /// paint without duplicating it in both the timed and untimed positions.
     ///
-    /// On the fullscreen path the `Terminal::draw` call is wrapped in DEC 2026
-    /// synchronized-output brackets when [`Self::synchronized_output`] is set,
-    /// so a capable terminal commits the frame's cells atomically (no partial
-    /// repaint / tearing). The inline path emits its own brackets inside
-    /// [`paint_main_inner`].
+    /// The `Terminal::draw` call is wrapped in DEC 2026 synchronized-output
+    /// brackets when [`Self::synchronized_output`] is set, so a capable terminal
+    /// commits the frame's cells atomically (no partial repaint / tearing).
     fn paint_one_frame(&mut self, app: &mut TuiApp) -> Result<()> {
-        if self.inline_repro {
-            // Legacy append-only inline path (escape hatch).
-            if app.terminal_clear_pending {
-                self.clear_scrollback_and_visible()?;
-                app.terminal_clear_pending = false;
-            }
-            return self.paint_main(app);
-        }
         // Fullscreen: one full-frame draw. `render` dispatches main view vs.
         // transcript-overlay / config / status-line surfaces purely from `app`
         // state, so Ctrl+T / config / status-line render on this same terminal
@@ -23294,9 +22919,8 @@ impl TerminalGuard {
     /// terminal could commit the cells before it saw the begin) and END
     /// written-and-flushed AFTER `draw` returns. We write begin/end directly to
     /// the backend and flush each, so the bracket reliably surrounds the whole
-    /// committed frame. END is best-effort on the close side (mirroring
-    /// `paint_main_inner`) so a stray begin can never be left open: it is
-    /// emitted whether or not the inner draw succeeded.
+    /// committed frame. END is best-effort on the close side so a stray begin can
+    /// never be left open: it is emitted whether or not the inner draw succeeded.
     fn draw_fullscreen_synchronized(&mut self, app: &mut TuiApp) -> Result<()> {
         let synchronized = self.synchronized_output;
         if synchronized {
@@ -23322,55 +22946,6 @@ impl TerminalGuard {
         drawn
     }
 
-    /// Append-only main-view paint, in the cargo / indicatif model. Every
-    /// finished transcript line is committed to the terminal's native scrollback
-    /// as plain `\r\n` text, so the terminal owns the entire history — its
-    /// scrollback AND its reflow on resize. Nothing the user has seen can be lost
-    /// or stranded. The footer (everything `render_inline` draws) is PRINTED as a
-    /// contiguous block right below the latest history line, and erased each frame
-    /// with a `FromCursorDown` clear anchored to a cursor parked at the footer's
-    /// top row. Because the footer is printed (not absolute-positioned), the
-    /// terminal reflows it together with that parked cursor on resize, so the
-    /// clear always lands on it: a width drag can't strand a divider per width,
-    /// and a shrink simply scrolls older history into recoverable scrollback.
-    ///
-    /// This path never calls `Terminal::draw`/`insert_before`, so ratatui's
-    /// inline autoresize (`append_lines`) never fires. The footer floats just
-    /// below the conversation (it sits at the bottom once history fills the
-    /// screen), like cargo's progress bar or the Claude Code composer. The whole
-    /// compound op is wrapped in one DEC 2026 synchronized update.
-    ///
-    /// Thin wrapper: it resolves the live terminal size and synchronized-output
-    /// flag, then defers every byte of emission and all flush/footer
-    /// bookkeeping to the free [`paint_main_inner`]. The term-matrix capture
-    /// harness drives that same `paint_main_inner` against an injected
-    /// `FixedSize` and a capture backend, so the captured ANSI stream is
-    /// byte-for-byte what this production path emits — there is no re-inlined
-    /// copy to drift.
-    fn paint_main(&mut self, app: &mut TuiApp) -> Result<()> {
-        // Read the size through the injectable `SizeSource` (production:
-        // `RealSize` -> `crossterm::terminal::size`; tests: `FixedSize`) so the
-        // append-only paint can be driven at a deterministic size with no TTY.
-        let (w, h) = self
-            .size_source
-            .size()
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        if w == 0 || h == 0 {
-            return Ok(());
-        }
-        let synchronized = self.synchronized_output;
-        // Split the borrows so `book` and the terminal backend are disjoint:
-        // `term()` would borrow all of `self`, colliding with `&mut self.book`.
-        let book = &mut self.book;
-        let backend = self
-            .terminal
-            .as_mut()
-            .expect("primary terminal lost — unreachable after `enter`")
-            .backend_mut();
-        paint_main_inner(app, backend, w, h, book, synchronized)
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))
-    }
-
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
         let elapsed_ms = prompt_elapsed_ms(app);
         let desired = terminal_title_for(app.terminal_title_state, &app.directory, elapsed_ms);
@@ -23387,181 +22962,6 @@ impl TerminalGuard {
         app.last_terminal_title = desired;
         Ok(())
     }
-
-    /// Handle `/clear`: purge the terminal's scrollback and visible screen,
-    /// then reset the append-only flush bookkeeping so the next paint re-emits
-    /// the whole transcript from the top onto the freshly cleared screen.
-    /// Emits `CLEAR_SCROLLBACK_AND_VISIBLE` (the scrollback-purging `\x1b[3J`
-    /// form, matching `clear(1)`), which is reserved for this command — the
-    /// normal exit/leave path never purges scrollback. Only reached on the main
-    /// path; the overlay short-circuits earlier, so no overlay guard is needed.
-    fn clear_scrollback_and_visible(&mut self) -> Result<()> {
-        // `/clear` keeps the scrollback-purging form (`\x1b[3J`), matching
-        // `clear(1)`. Append-only then resets the flush bookkeeping and drops
-        // the footer baseline so the next frame re-emits history from the top
-        // onto the freshly cleared screen. Only reached on the main path
-        // (overlay short-circuits earlier), so no overlay guard is needed.
-        {
-            let backend = self.term().backend_mut();
-            execute!(backend, Print(CLEAR_SCROLLBACK_AND_VISIBLE))
-                .and_then(|()| backend.flush())
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        }
-        self.book.startup_flushed = false;
-        self.book.transcript_flushed_len = 0;
-        self.book.turn_divider_flushed_generation = None;
-        // Fresh screen: next paint re-flushes history from the top and clears
-        // the footer region before painting it absolutely.
-        self.book.footer_painted = false;
-        Ok(())
-    }
-}
-
-/// One append-only main-view frame, emitted byte-for-byte into `backend` —
-/// the single source of truth for the cargo / indicatif paint, shared by the
-/// production [`TerminalGuard::paint_main`] and the term-matrix capture harness
-/// (`testing::capture`).
-///
-/// Every finished transcript line is committed to the terminal's native
-/// scrollback as plain `\r\n` text, so the terminal owns the entire history —
-/// its scrollback AND its reflow on resize. Nothing the user has seen can be
-/// lost or stranded. The footer (everything `render_inline` draws) is PRINTED
-/// as a contiguous block right below the latest history line, and erased each
-/// frame with a `FromCursorDown` clear anchored to a cursor parked at the
-/// footer's top row. Because the footer is printed (not absolute-positioned),
-/// the terminal reflows it together with that parked cursor on resize, so the
-/// clear always lands on it: a width drag can't strand a divider per width, and
-/// a shrink simply scrolls older history into recoverable scrollback.
-///
-/// This path never calls `Terminal::draw`/`insert_before`, so ratatui's inline
-/// autoresize (`append_lines`) never fires. The whole compound op is wrapped in
-/// one DEC 2026 synchronized update when `synchronized` is set.
-///
-/// `(w, h)` is the terminal size the frame is painted at — the production path
-/// passes the live `terminal_size()`; the capture path passes its injected
-/// `FixedSize` so a scripted `Resize` actually changes what the paint reads.
-/// `book` advances the flush/footer bookkeeping in place; `app.footer_origin`
-/// is updated so click mapping points at the parked footer.
-pub(crate) fn paint_main_inner(
-    app: &mut TuiApp,
-    backend: &mut impl io::Write,
-    w: u16,
-    h: u16,
-    book: &mut PaintBookkeeping,
-    synchronized: bool,
-) -> io::Result<()> {
-    // Render the footer + history TWO columns narrower than the terminal so an
-    // ambiguous-width glyph the terminal draws wider than unicode-width measured
-    // (☽ ◐ ● ✷ are 2 cols in VS Code, 1 to unicode-width) can't overflow the
-    // last column.
-    let content_w = w.saturating_sub(2).max(1);
-
-    // Advance the scrollback-flush bookkeeping and collect the finished
-    // transcript lines to commit this frame (empty when nothing new settled).
-    // This was the old `prepare_history` body, folded in so the bookkeeping
-    // lives in `book` and the whole frame is single-sourced.
-    let flush_to = settling_flush_boundary(app);
-    let (history_lines, flushed_divider_generation) =
-        inline_history_lines_for_flush_with_turn_divider(
-            app,
-            content_w,
-            !book.startup_flushed,
-            book.transcript_flushed_len,
-            flush_to,
-            book.turn_divider_flushed_generation,
-        );
-    if let Some(generation) = flushed_divider_generation {
-        book.turn_divider_flushed_generation = Some(generation);
-    }
-    book.startup_flushed = true;
-    book.transcript_flushed_len = flush_to;
-
-    let divider_gen = book.turn_divider_flushed_generation;
-    let footer =
-        render_footer_to_buffer(app, content_w, INLINE_VIEWPORT_HEIGHT.min(h), divider_gen);
-    let footer_h = capped_footer_height(footer_content_height(&footer), h);
-    let history = (!history_lines.is_empty())
-        .then(|| render_lines_to_owned_buffer(&history_lines, content_w));
-
-    // Whether a footer is currently on screen at the parked cursor and must be
-    // erased before repainting. False only when the screen was just cleared:
-    // the first paint after startup or `/clear` (both home the cursor and clear
-    // the screen). It stays TRUE across a Ctrl+T overlay round-trip —
-    // `LeaveAlternateScreen` restores the main buffer with the old footer and
-    // its parked cursor, so that footer must be erased.
-    let had_footer = book.footer_painted;
-
-    let body = (|| -> io::Result<()> {
-        if synchronized {
-            backend.write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())?;
-        }
-        // 1. Erase the previous footer. The cursor is parked at its top row;
-        //    the terminal reflows that cursor with the footer on resize, so
-        //    this clear erases it wherever the reflow moved it.
-        if had_footer {
-            execute!(backend, Clear(ClearType::FromCursorDown))?;
-        }
-        // 2. Commit new finished history as plain `\r\n` lines. The terminal
-        //    appends them above the (now-erased) footer position and scrolls
-        //    older lines into native scrollback — they are never lost.
-        if let Some(hist) = history.as_ref() {
-            for y in 0..hist.area.height {
-                backend.write_all(b"\r")?;
-                emit_buffer_row_styled(backend, hist, y, content_w)?;
-                backend.write_all(b"\r\n")?;
-            }
-        }
-        // 3. Print the footer as a contiguous block. Autowrap off so one buffer
-        //    row maps to one physical row (making the cursor-up park below
-        //    exact); no trailing newline so printing the last row can't scroll
-        //    the footer. Clear-to-EOL per row wipes any stale tail.
-        execute!(backend, DisableLineWrap)?;
-        for y in 0..footer_h {
-            backend.write_all(b"\r")?;
-            emit_buffer_row_styled(backend, &footer, y, content_w)?;
-            execute!(backend, Clear(ClearType::UntilNewLine))?;
-            if y + 1 < footer_h {
-                backend.write_all(b"\r\n")?;
-            }
-        }
-        execute!(backend, EnableLineWrap)?;
-        // 4. Park the cursor back at the footer's TOP row so the next frame's
-        //    erase (and the terminal's reflow tracking) is anchored there.
-        if footer_h > 1 {
-            execute!(backend, MoveToPreviousLine(footer_h - 1))?;
-        } else {
-            execute!(backend, MoveToColumn(0))?;
-        }
-        Ok(())
-    })();
-    // Restore autowrap and close the synchronized update even on error.
-    let _ = execute!(backend, EnableLineWrap);
-    if synchronized {
-        let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
-    }
-    let flushed = backend.flush();
-
-    book.footer_painted = true;
-    // Click mapping: once history fills the screen (the normal interactive
-    // case) the footer sits on the bottom `footer_h` rows. Before that it
-    // floats higher, but a pristine startup screen has no clickable history.
-    app.footer_origin = h.saturating_sub(footer_h);
-    body.and(flushed)
-}
-
-/// Lay out the live "footer" (everything `render_inline` draws) into an
-/// off-screen buffer via a throwaway in-memory terminal. `render_inline` is
-/// unchanged; the caller decides where the buffer lands on the real screen.
-fn render_footer_to_buffer(
-    app: &TuiApp,
-    width: u16,
-    height: u16,
-    divider_gen: Option<u64>,
-) -> Buffer {
-    let mut terminal = Terminal::new(TestBackend::new(width.max(1), height.max(1)))
-        .expect("in-memory footer terminal never fails to construct");
-    let _ = terminal.draw(|frame| render_inline(frame, app, divider_gen));
-    terminal.backend().buffer().clone()
 }
 
 /// Render finished transcript lines into an owned buffer wrapped to `width`,
@@ -23616,55 +23016,6 @@ fn buffer_used_height(buf: &Buffer) -> u16 {
         }
     }
     0
-}
-
-/// Emit a buffer's rows as plain styled text lines (`\r\n` separated).
-/// Test-only helper retained to exercise the styled-row emitter and its
-/// trailing-newline / wide-grapheme handling; production prints the footer as a
-/// contiguous block and commits history row-by-row.
-#[cfg(test)]
-fn emit_buffer_as_lines<W: io::Write>(
-    out: &mut W,
-    buf: &Buffer,
-    trailing_newline: bool,
-) -> io::Result<()> {
-    let area = buf.area;
-    for y in 0..area.height {
-        emit_buffer_row_styled(out, buf, y, area.width)?;
-        if trailing_newline || y + 1 < area.height {
-            out.write_all(b"\r\n")?;
-        }
-    }
-    Ok(())
-}
-
-/// Clamp the footer's content height so it never fills the whole terminal:
-/// capped at `term_height - 1` (and at least 1). Keeping it below the full
-/// height guarantees `footer_origin = term_height - footer_height >= 1`, so the
-/// cursor parked at the footer top is never on row 0. If it were, the next
-/// frame's relative `FromCursorDown` clear would wipe the entire visible screen
-/// from home, destroying the append-only history band (and forcing every line
-/// through scrollback). One reserved row keeps that band alive.
-fn capped_footer_height(content_height: u16, term_height: u16) -> u16 {
-    content_height.clamp(1, term_height.saturating_sub(1).max(1))
-}
-
-/// Height of a footer buffer counting only up to its last non-blank row, so the
-/// trailing `Min(0)` filler is dropped and the footer is bottom-anchored at its
-/// TRUE content height — leaving the rest of the screen for native scrollback.
-fn footer_content_height(buf: &Buffer) -> u16 {
-    let area = buf.area;
-    for y in (0..area.height).rev() {
-        let blank = (0..area.width).all(|x| {
-            buf.cell((x, y))
-                .map(|c| c.symbol() == " " && c.bg == Color::Reset)
-                .unwrap_or(true)
-        });
-        if !blank {
-            return y + 1;
-        }
-    }
-    1
 }
 
 /// True for the decorative glyphs squeezy uses that some terminals (notably VS
@@ -23880,168 +23231,6 @@ impl Drop for TerminalGuard {
         }
         let _ = terminal.show_cursor();
     }
-}
-
-/// Render `lines` into an existing buffer with the same word-wrapping
-/// `Paragraph`/`Wrap { trim: false }` the renderer uses. Test-only ground-truth
-/// helper: the mirror sizing path now drives `Paragraph::line_count` directly in
-/// [`render_lines_to_owned_buffer`], but the mirror-height test still renders into
-/// a deliberately oversized buffer here and counts the rows that carry glyphs.
-#[cfg(test)]
-fn render_lines_to_buffer(buffer: &mut Buffer, lines: Vec<Line<'static>>) {
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .render(buffer.area, buffer);
-}
-
-/// Index of the first transcript entry still animating its settle-fold. Those
-/// trailing nodes are held in the live region until the fold finishes, so the
-/// inline scrollback flush stops here. Returns `transcript.len()` when nothing
-/// is settling (the whole transcript is flushable).
-fn settling_flush_boundary(app: &TuiApp) -> usize {
-    app.transcript
-        .iter()
-        .position(|entry| entry.settle.is_some())
-        .unwrap_or(app.transcript.len())
-}
-
-/// The still-settling tail rendered for the inline live region: each held node
-/// folds in place there, then flushes to scrollback collapsed once its fold
-/// finishes. Empty when nothing is settling.
-fn live_settling_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let boundary = settling_flush_boundary(app);
-    if boundary >= app.transcript.len() {
-        return Vec::new();
-    }
-    inline_history_lines_for_flush(app, width, false, boundary, app.transcript.len())
-}
-
-fn inline_history_lines_for_flush(
-    app: &TuiApp,
-    width: u16,
-    include_startup_card: bool,
-    transcript_from: usize,
-    transcript_to: usize,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    if include_startup_card {
-        lines.extend(startup_card_lines(app, width));
-        lines.push(Line::from(""));
-    }
-    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
-    let shortcut = shortcut.as_str();
-    // Seed the rail-connector state from the entry just before this flush so a
-    // `│` threads across the incremental scrollback flushes, not just within one.
-    let mut prev_work = transcript_from > 0
-        && app
-            .transcript
-            .get(transcript_from - 1)
-            .is_some_and(|prev| is_rail_work_node(&prev.kind));
-    for (index, item) in app
-        .transcript
-        .iter()
-        .enumerate()
-        .take(transcript_to)
-        .skip(transcript_from)
-    {
-        // A finished work node mid settle-fold renders folded in the live
-        // region (it is held back from the scrollback flush until the fold
-        // finishes), then flushes collapsed. Checked before run-coalescing so
-        // each settling node folds standalone.
-        if let Some(settle) = item.settle {
-            let mut block = settle_folded_entry_lines(
-                item,
-                false,
-                app.tool_output_verbosity,
-                message_outcome(&app.transcript, index),
-                Some(width),
-                app.show_reasoning_usage,
-                settle,
-                shortcut,
-            );
-            push_rail_work_block(
-                &mut lines,
-                &mut block,
-                &mut prev_work,
-                rail_chrome(&item.kind, false),
-            );
-            continue;
-        }
-        match reasoning_run_info(&app.transcript, index) {
-            Some(ReasoningRun::Suppressed) => continue,
-            Some(ReasoningRun::Lead { extras }) => {
-                if app.show_reasoning_usage
-                    && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
-                {
-                    let mut block = reasoning_block_lines_with_extras(
-                        &snapshot.display_text,
-                        item.collapsed,
-                        false,
-                        extras,
-                        shortcut,
-                    );
-                    push_rail_work_block(
-                        &mut lines,
-                        &mut block,
-                        &mut prev_work,
-                        rail_chrome(&item.kind, false),
-                    );
-                }
-                continue;
-            }
-            None => {}
-        }
-        match tool_run_info(&app.transcript, index, app.coalesce_tool_runs) {
-            Some(ToolRun::Suppressed) => continue,
-            Some(ToolRun::Lead { extras }) => {
-                let members = collect_tool_run_members(&app.transcript, index, extras);
-                let mut block = format_grouped_tool_result_entry(
-                    &members,
-                    item.collapsed,
-                    false,
-                    ToolDetailMode::Preview(app.tool_output_verbosity),
-                    Some(width),
-                    ToolCardSurface::Tinted,
-                    shortcut,
-                );
-                push_rail_work_block(
-                    &mut lines,
-                    &mut block,
-                    &mut prev_work,
-                    rail_chrome(&item.kind, false),
-                );
-                continue;
-            }
-            None => {}
-        }
-        let mut block = format_transcript_entry_with_width(
-            item,
-            false,
-            app.tool_output_verbosity,
-            message_outcome(&app.transcript, index),
-            Some(width),
-            app.show_reasoning_usage,
-            shortcut,
-        );
-        if is_rail_work_node(&item.kind) {
-            push_rail_work_block(
-                &mut lines,
-                &mut block,
-                &mut prev_work,
-                rail_chrome(&item.kind, false),
-            );
-        } else {
-            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
-            // connector threads the gutter down into the conclusion, whose own
-            // marker sits in the gutter column.
-            if prev_work {
-                lines.push(rail::connector_line(rail::dim()));
-            }
-            lines.append(&mut block);
-            prev_work = false;
-        }
-    }
-    wrap_transcript_overlay_rows(&lines, width)
 }
 
 #[cfg(test)]

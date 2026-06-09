@@ -2968,9 +2968,8 @@ async fn slash_statusline_opens_picker() {
 }
 
 #[tokio::test]
-async fn statusline_picker_renders_in_inline_mode() {
-    // Inline is the default terminal mode; the overlay must be visible
-    // there, not just in AlternateScreen.
+async fn statusline_picker_renders_in_fullscreen() {
+    // The picker overlay must be visible in the fullscreen render path.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/statusline".to_string());
@@ -2981,10 +2980,10 @@ async fn statusline_picker_renders_in_inline_mode() {
     )
     .await
     .expect("handle key");
-    let rendered = render_inline_to_string(&app, 80, 24);
+    let rendered = render_to_string(&app, 80, 24);
     assert!(
         rendered.contains("Configure Status Line"),
-        "inline render should show the picker; got:\n{rendered}"
+        "fullscreen render should show the picker; got:\n{rendered}"
     );
 }
 
@@ -5622,174 +5621,6 @@ async fn slash_clear_without_session_log_still_wipes_the_transcript() {
     );
 }
 
-/// True if `bytes` contains a DECSTBM set-scroll-region sequence
-/// (`ESC [ <digits/;> r`) — the scroll-region primitive the append-only
-/// renderer must never emit for history.
-fn ansi_contains_set_scroll_region(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
-            let mut j = i + 2;
-            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b'r' {
-                return true;
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
-#[test]
-fn hard_terminal_clear_reflushes_fresh_transcript_from_top() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::system("Conversation cleared."));
-
-    // After a hard `/clear`, the append-only renderer resets its flush
-    // bookkeeping (startup_flushed=false, transcript_flushed_len=0) inside
-    // `clear_scrollback_and_visible`, so the next frame re-emits the whole
-    // fresh transcript — startup card included — onto the cleared screen.
-    let startup_flushed = false;
-    let transcript_flushed_len = 0usize;
-    let lines = inline_history_lines_for_flush(
-        &app,
-        80,
-        !startup_flushed,
-        transcript_flushed_len,
-        app.transcript.len(),
-    );
-    let rendered = lines_to_plain_text(&lines);
-    assert!(rendered.contains("Conversation cleared."), "{rendered}");
-    assert!(rendered.contains("Squeezy v"), "{rendered}");
-}
-
-#[test]
-fn append_only_history_emits_plain_newline_terminated_text() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::system("Conversation cleared."));
-
-    // The append-only renderer commits finished history to native scrollback as
-    // ordinary styled text lines (the terminal owns scroll + reflow), never via
-    // ratatui's `insert_before` scroll-region machinery.
-    let lines = inline_history_lines_for_flush(&app, 80, true, 0, app.transcript.len());
-    let buffer = render_lines_to_owned_buffer(&lines, 80);
-    let mut out: Vec<u8> = Vec::new();
-    emit_buffer_as_lines(&mut out, &buffer, true).expect("emit history lines");
-
-    // Text content is verified on the plain rendering (the emitted bytes
-    // interleave SGR codes between glyphs, so substring checks must ignore them).
-    let plain = lines_to_plain_text(&lines);
-    assert!(plain.contains("Squeezy v"), "{plain}");
-    assert!(plain.contains("Conversation cleared."), "{plain}");
-    assert!(
-        out.ends_with(b"\r\n"),
-        "history lines are newline-terminated so the terminal scrolls them into scrollback",
-    );
-    // No reverse-index (ESC M) and no DECSTBM set-scroll-region (ESC [ ... r):
-    // those are exactly the scroll-region primitives append-only avoids.
-    assert!(
-        !out.windows(2).any(|w| w == b"\x1bM"),
-        "history must not use reverse-index scrolling",
-    );
-    assert!(
-        !ansi_contains_set_scroll_region(&out),
-        "history must not set a DECSTBM scroll region",
-    );
-}
-
-#[test]
-fn emit_buffer_as_lines_respects_trailing_newline() {
-    let mut buf = Buffer::empty(Rect::new(0, 0, 3, 2));
-    buf.set_string(0, 0, "ab", Style::default());
-    buf.set_string(0, 1, "cd", Style::default());
-
-    // History uses a trailing newline (so the footer starts on a fresh row);
-    // the footer's final row must NOT, or it would scroll one extra row and
-    // push the footer off the bottom.
-    let mut with = Vec::new();
-    emit_buffer_as_lines(&mut with, &buf, true).expect("emit");
-    assert!(
-        with.ends_with(b"\r\n"),
-        "trailing_newline=true ends with CRLF"
-    );
-
-    let mut without = Vec::new();
-    emit_buffer_as_lines(&mut without, &buf, false).expect("emit");
-    assert!(
-        !without.ends_with(b"\r\n"),
-        "trailing_newline=false must not end with CRLF",
-    );
-    let text = String::from_utf8_lossy(&without);
-    assert!(text.contains("ab") && text.contains("cd"), "{text}");
-}
-
-#[test]
-fn emit_buffer_as_lines_skips_wide_grapheme_continuation_cells() {
-    // A wide grapheme (好) occupies two buffer cells; ratatui blanks the second
-    // (continuation) cell. Emission must print the glyph once and skip the
-    // continuation — otherwise the line serializes as `好 x` and every column
-    // after it shifts. Regression test for the CJK/wide-emoji handling.
-    let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
-    buf.set_string(0, 0, "好x", Style::default());
-    let mut out = Vec::new();
-    emit_buffer_as_lines(&mut out, &buf, false).expect("emit");
-    let text = String::from_utf8_lossy(&out);
-    assert!(
-        text.contains("好x"),
-        "wide glyph then next cell, no gap: {text:?}"
-    );
-    assert!(
-        !text.contains("好 x"),
-        "the blanked continuation cell must not be emitted: {text:?}",
-    );
-}
-
-#[test]
-fn idle_footer_repaint_produces_no_diff() {
-    // The common idle/no-change frame must emit zero cells: rendering the same
-    // footer twice yields an empty buffer diff, so the cell-diff paint path is a
-    // no-op and the footer never flickers when nothing changed.
-    let app = test_app(SessionMode::Build);
-    let a = render_footer_to_buffer(&app, 80, 18, None);
-    let b = render_footer_to_buffer(&app, 80, 18, None);
-    assert!(
-        a.diff(&b).is_empty(),
-        "an unchanged footer must produce no cell diff",
-    );
-}
-
-#[test]
-fn capped_footer_height_reserves_one_row_for_history() {
-    // The footer must never fill the whole terminal: capping at term_height-1
-    // keeps footer_origin >= 1 so the parked cursor is never on row 0 (where the
-    // next frame's relative FromCursorDown clear would wipe the whole screen and
-    // destroy the append-only history band).
-    assert_eq!(capped_footer_height(3, 50), 3, "short footer kept as-is");
-    assert_eq!(
-        capped_footer_height(50, 50),
-        49,
-        "footer as tall as the terminal is capped to leave one history row"
-    );
-    assert_eq!(
-        capped_footer_height(99, 20),
-        19,
-        "an over-tall footer is capped to term_height - 1"
-    );
-    assert_eq!(capped_footer_height(0, 50), 1, "footer is at least one row");
-    // Degenerate tiny terminals must not underflow or report zero height.
-    assert_eq!(capped_footer_height(5, 1), 1);
-    assert_eq!(capped_footer_height(5, 0), 1);
-    // For every plausible terminal height, footer_origin = h - cap stays >= 1.
-    for h in 2..=120u16 {
-        let cap = capped_footer_height(h, h);
-        assert!(h - cap >= 1, "footer_origin must stay >= 1 at height {h}");
-    }
-}
-
 #[test]
 fn term_display_width_is_two_for_wide_rendered_glyphs() {
     // The VS Code wide-moon fix: these glyphs measure 1 cell in unicode-width
@@ -6141,9 +5972,7 @@ fn width_audit_ambiguous_width_char_stays_narrow() {
     // An East-Asian-ambiguous codepoint (U+00A7 SECTION SIGN). squeezy uses the
     // crate's default (narrow = 1) and does NOT treat ambiguous as wide; nor is
     // it in `is_wide_rendered_glyph`. Pin width 1 so any move to a CJK-wide
-    // policy is deliberate. Cross-reference: the emulator's own
-    // `ambiguous_glyph_width` policy lives in `termsim/types.rs` and is the
-    // place to change if ambiguous-wide handling is ever wanted.
+    // policy is deliberate.
     let ambiguous = "§"; // U+00A7
     assert_eq!(
         ambiguous.width(),
@@ -6195,44 +6024,6 @@ fn width_audit_mirror_keeps_wide_moon_at_exact_fit_and_drops_it_when_overflowing
     assert!(
         text2.contains('●'),
         "a wide moon whose 2nd column lands on the last column fits and is kept: {text2:?}"
-    );
-}
-
-#[test]
-fn footer_content_height_empty_buffer_is_one() {
-    // An all-blank buffer has no content rows; the footer still occupies at
-    // least one row so it anchors to the bottom.
-    let buf = Buffer::empty(Rect::new(0, 0, 10, 5));
-    assert_eq!(footer_content_height(&buf), 1);
-}
-
-#[test]
-fn footer_content_height_counts_through_last_nonblank_row() {
-    // Content on the very last row means the whole area height is content.
-    let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
-    buf.set_string(0, 4, "x", Style::default());
-    assert_eq!(footer_content_height(&buf), buf.area.height);
-}
-
-#[test]
-fn footer_content_height_ignores_trailing_blank_rows() {
-    // Content only on row 0 with blank filler below: height is 1, so the
-    // trailing Min(0) filler is dropped and scrollback keeps the rest.
-    let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
-    buf.set_string(0, 0, "header", Style::default());
-    assert_eq!(footer_content_height(&buf), 1);
-}
-
-#[test]
-fn footer_content_height_treats_colored_background_as_content() {
-    // A row of only spaces but with a non-Reset background is NOT blank — it is
-    // a painted bar (e.g. a highlighted composer row), so it counts as content.
-    let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
-    buf.set_string(0, 2, "    ", Style::default().bg(Color::Blue));
-    assert_eq!(
-        footer_content_height(&buf),
-        3,
-        "a space-only row with bg != Reset must count as non-blank",
     );
 }
 
@@ -8244,8 +8035,7 @@ fn approval_options_stay_visible_on_short_terminal() {
     set_input(&mut app, "approve?".to_string());
 
     // Heights where the full block overflows; pre-fix the option rows were
-    // clipped behind the status line. All three options must stay painted in
-    // both render paths.
+    // clipped behind the status line. All three options must stay painted.
     for height in [12u16, 16, 20] {
         let out = render_to_string(&app, 80, height);
         assert!(out.contains("Approve"), "render h={height}:\n{out}");
@@ -8254,14 +8044,6 @@ fn approval_options_stay_visible_on_short_terminal() {
             "render h={height}:\n{out}"
         );
         assert!(out.contains("Deny"), "render h={height}:\n{out}");
-
-        let inline = render_inline_to_string(&app, 80, height);
-        assert!(inline.contains("Approve"), "inline h={height}:\n{inline}");
-        assert!(
-            inline.contains("Always approve this command in this repo"),
-            "inline h={height}:\n{inline}"
-        );
-        assert!(inline.contains("Deny"), "inline h={height}:\n{inline}");
     }
 }
 
@@ -8593,68 +8375,6 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
 }
 
 #[test]
-fn transcript_overlay_screen_keeps_native_selection_available() {
-    let mut bytes = Vec::new();
-    enter_transcript_overlay_screen(&mut bytes).expect("enter transcript overlay screen");
-    let ansi = String::from_utf8(bytes).expect("ansi");
-
-    assert!(ansi.contains("\x1b[?1049h"), "must enter alt screen");
-    assert!(
-        ansi.contains("\x1b[?1007h"),
-        "must enable alternate-scroll mode for wheel-to-key fallback"
-    );
-    assert!(
-        ansi.contains(DISABLE_MOUSE_MODES),
-        "must clear inline mouse capture before opening the transcript"
-    );
-    assert!(
-        !ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
-        "full transcript must leave native terminal text selection available"
-    );
-    assert!(
-        !ansi.contains(ENABLE_MOUSE_DRAG_CAPTURE),
-        "full transcript must not capture drag events by default"
-    );
-}
-
-#[test]
-fn transcript_overlay_mouse_mode_enables_scrollbar_drag_reporting() {
-    let mut bytes = Vec::new();
-    set_transcript_overlay_mouse_mode(&mut bytes, true, false)
-        .expect("enable transcript overlay mouse mode");
-    let ansi = String::from_utf8(bytes).expect("ansi");
-
-    assert!(
-        ansi.starts_with(DISABLE_MOUSE_MODES),
-        "must reset stale mouse modes before enabling drag reporting"
-    );
-    assert!(
-        ansi.contains(ENABLE_MOUSE_DRAG_CAPTURE),
-        "scrollbar mode must enable button-drag reporting"
-    );
-    assert!(
-        ansi.contains("\x1b[?1002h"),
-        "scrollbar mode must report drag events, not just clicks"
-    );
-}
-
-#[test]
-fn transcript_overlay_mouse_mode_can_restore_main_click_capture() {
-    let mut bytes = Vec::new();
-    set_transcript_overlay_mouse_mode(&mut bytes, false, true).expect("restore main mouse capture");
-    let ansi = String::from_utf8(bytes).expect("ansi");
-
-    assert!(
-        ansi.starts_with(DISABLE_MOUSE_MODES),
-        "must leave overlay drag mode before restoring main mouse capture"
-    );
-    assert!(
-        ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
-        "main click capture should be restored when it was enabled before the overlay"
-    );
-}
-
-#[test]
 fn transcript_overlay_screen_exit_restores_inline_mouse_setting() {
     let mut without_restore = Vec::new();
     leave_transcript_overlay_screen(&mut without_restore, false)
@@ -8695,16 +8415,10 @@ fn modify_other_keys_reset_uses_xterm_sequence() {
 //
 // These exercise the byte-emitting seams the production guard now delegates to
 // (`emit_terminal_enter_setup`, `emit_terminal_emergency_teardown`), the env
-// policy resolvers (`resolve_mouse_capture` / `resolve_inline_repro`), and the
-// `draw_app` renderer routing — all against a headless `TerminalWriter::Capture`
-// sink with a deterministic `FixedSize`, so there is no real TTY and no PTY.
+// policy resolver (`resolve_mouse_capture`), and the `draw_app` renderer
+// routing — all against a headless `TerminalWriter::Capture` sink with a
+// deterministic `FixedSize`, so there is no real TTY and no PTY.
 // ---------------------------------------------------------------------------
-
-/// `\x1b[?7l` — crossterm's `DisableLineWrap`. The append-only `paint_main`
-/// frame brackets the footer print with `DisableLineWrap`/`EnableLineWrap`; the
-/// fullscreen `render()` draw never toggles autowrap. This single byte sequence
-/// is therefore an unambiguous "this was the inline paint path" marker.
-const DISABLE_LINE_WRAP: &str = "\x1b[?7l";
 
 /// True when a row carries a live composer horizon: a `☽` followed (after
 /// optional spaces) by one of the horizon dash glyphs. Mirrors the term-matrix
@@ -8783,10 +8497,8 @@ fn strip_ansi(ansi: &str) -> String {
 #[test]
 fn fullscreen_enter_emits_alt_screen_enter_sequence() {
     let mut bytes = Vec::new();
-    emit_terminal_enter_setup(
-        &mut bytes, /* inline_repro = */ false, /* mouse_capture = */ true,
-    )
-    .expect("emit fullscreen enter setup");
+    emit_terminal_enter_setup(&mut bytes, /* mouse_capture = */ true)
+        .expect("emit fullscreen enter setup");
     let ansi = String::from_utf8(bytes).expect("ansi");
 
     // The defining contract: fullscreen enters the alternate screen.
@@ -8805,21 +8517,13 @@ fn fullscreen_enter_emits_alt_screen_enter_sequence() {
         ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
         "fullscreen enter must enable mouse click capture by default"
     );
-    // The inline-repro reset/clear of the NORMAL buffer must NOT appear: the
-    // fullscreen path owns the alternate buffer, never the normal one.
-    assert!(
-        !ansi.contains(RESET_AND_CLEAR_VISIBLE),
-        "fullscreen enter must not reset/clear the normal buffer"
-    );
 }
 
 #[test]
 fn fullscreen_enter_respects_mouse_capture_disabled() {
     let mut bytes = Vec::new();
-    emit_terminal_enter_setup(
-        &mut bytes, /* inline_repro = */ false, /* mouse_capture = */ false,
-    )
-    .expect("emit fullscreen enter setup, mouse off");
+    emit_terminal_enter_setup(&mut bytes, /* mouse_capture = */ false)
+        .expect("emit fullscreen enter setup, mouse off");
     let ansi = String::from_utf8(bytes).expect("ansi");
 
     assert!(
@@ -8829,25 +8533,6 @@ fn fullscreen_enter_respects_mouse_capture_disabled() {
     assert!(
         !ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
         "SQUEEZY_MOUSE_CAPTURE=0 must suppress mouse click capture"
-    );
-}
-
-#[test]
-fn inline_repro_enter_does_not_enter_alt_screen() {
-    let mut bytes = Vec::new();
-    emit_terminal_enter_setup(
-        &mut bytes, /* inline_repro = */ true, /* mouse_capture = */ true,
-    )
-    .expect("emit inline-repro enter setup");
-    let ansi = String::from_utf8(bytes).expect("ansi");
-
-    assert!(
-        !ansi.contains("\x1b[?1049h"),
-        "inline-repro escape hatch must never enter the alternate screen"
-    );
-    assert!(
-        ansi.contains(RESET_AND_CLEAR_VISIBLE),
-        "inline-repro resets and clears the normal buffer instead"
     );
 }
 
@@ -8878,77 +8563,24 @@ fn mouse_capture_defaults_on_unless_disabled() {
     );
 }
 
-#[test]
-fn inline_repro_defaults_off_unless_enabled() {
-    assert!(
-        !resolve_inline_repro(|_| None),
-        "inline-repro defaults off when SQUEEZY_INLINE_REPRO is unset"
-    );
-    assert!(
-        resolve_inline_repro(
-            |key| (key == "SQUEEZY_INLINE_REPRO").then(|| std::ffi::OsString::from("1"))
-        ),
-        "SQUEEZY_INLINE_REPRO=1 selects the inline escape hatch"
-    );
-    assert!(
-        !resolve_inline_repro(
-            |key| (key == "SQUEEZY_INLINE_REPRO").then(|| std::ffi::OsString::from("0"))
-        ),
-        "SQUEEZY_INLINE_REPRO=0 stays on the fullscreen path"
-    );
-    assert!(
-        !resolve_inline_repro(|key| (key == "SQUEEZY_INLINE_REPRO").then(std::ffi::OsString::new)),
-        "an empty SQUEEZY_INLINE_REPRO value stays on the fullscreen path"
-    );
-}
-
 #[tokio::test]
-async fn draw_app_routes_main_view_through_render_not_paint_main() {
+async fn draw_app_routes_main_view_through_render() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
 
-    // Fullscreen (inline_repro = false): draw_app must drive the fullscreen
-    // `render()` path, not the append-only `paint_main`.
-    let (mut guard, sink) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    // draw_app drives the fullscreen `render()` path — the single renderer.
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
     guard.draw_app(&mut app).expect("fullscreen draw_app");
     let ansi = sink_to_string(&sink);
 
-    // Positive signal: the fullscreen frame rendered the main view, which pins
-    // the composer horizon (`☽` + dashes) at the bottom. ratatui interleaves SGR
-    // escapes between the moon coin and the dashes, so match on the de-escaped
-    // glyph stream.
+    // The fullscreen frame rendered the main view, which pins the composer
+    // horizon (`☽` + dashes) at the bottom. ratatui interleaves SGR escapes
+    // between the moon coin and the dashes, so match on the de-escaped glyph
+    // stream.
     let plain = strip_ansi(&ansi);
     assert!(
         row_is_composer_horizon(&plain),
         "fullscreen render() must draw the composer horizon main view"
-    );
-    // Negative signal: the append-only paint brackets its footer with
-    // DisableLineWrap; the fullscreen draw never does. Its absence proves we did
-    // not fall through to paint_main.
-    assert!(
-        !ansi.contains(DISABLE_LINE_WRAP),
-        "fullscreen draw_app must not run the append-only paint_main path"
-    );
-}
-
-#[tokio::test]
-async fn draw_app_routes_inline_repro_through_paint_main() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
-
-    // Inline-repro: draw_app must drive the append-only paint_main path. Its
-    // size now comes from the injected FixedSize, so this is deterministic with
-    // no real TTY.
-    let (mut guard, sink) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ true, 120, 40);
-    guard.draw_app(&mut app).expect("inline-repro draw_app");
-    let ansi = sink_to_string(&sink);
-
-    // The append-only footer paint is the only path that toggles autowrap.
-    assert!(
-        ansi.contains(DISABLE_LINE_WRAP),
-        "inline-repro draw_app must run the append-only paint_main path"
     );
 }
 
@@ -8968,8 +8600,7 @@ async fn fullscreen_draw_app_brackets_frame_in_synchronized_output_when_enabled(
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
 
-    let (mut guard, sink) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
     guard.set_synchronized_output(true);
     guard.draw_app(&mut app).expect("fullscreen draw_app");
     let ansi = sink_to_string(&sink);
@@ -9003,8 +8634,7 @@ async fn fullscreen_draw_app_emits_no_synchronized_brackets_when_disabled() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
 
-    let (mut guard, sink) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
     guard.draw_app(&mut app).expect("fullscreen draw_app");
     let ansi = sink_to_string(&sink);
 
@@ -9028,8 +8658,7 @@ async fn draw_app_stamps_render_metrics_for_a_painted_frame() {
     let before = app.render_metrics.get();
     assert_eq!(before.frame, 0, "a fresh app has stamped no frames yet");
 
-    let (mut guard, _sink) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    let (mut guard, _sink) = TerminalGuard::for_capture_test(120, 40);
     guard.draw_app(&mut app).expect("fullscreen draw_app");
 
     let m = app.render_metrics.get();
@@ -9058,8 +8687,7 @@ async fn render_metrics_hud_paints_only_when_toggled_on() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::assistant("hello"));
 
-    let (mut guard, sink) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
     guard.draw_app(&mut app).expect("draw without HUD");
     let plain_off = strip_ansi(&sink_to_string(&sink));
     assert!(
@@ -9070,8 +8698,7 @@ async fn render_metrics_hud_paints_only_when_toggled_on() {
     app.toggle_render_metrics();
     assert!(app.show_render_metrics, "toggle turns the HUD on");
     // Fresh sink for the second frame so we inspect only the toggled-on paint.
-    let (mut guard2, sink2) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    let (mut guard2, sink2) = TerminalGuard::for_capture_test(120, 40);
     guard2.draw_app(&mut app).expect("draw with HUD");
     let plain_on = strip_ansi(&sink_to_string(&sink2));
     assert!(
@@ -9148,10 +8775,6 @@ fn emergency_teardown_leaves_alt_screen_and_restores_modes_without_mirror() {
         !ansi.contains("\x1b[3J"),
         "emergency teardown must never purge scrollback (\\x1b[3J)"
     );
-    assert!(
-        !ansi.contains(CLEAR_SCROLLBACK_AND_VISIBLE),
-        "emergency teardown must not emit the /clear scrollback-wipe sequence"
-    );
 }
 
 /// Phase 9 SIGTSTP (Ctrl+Z) suspend/resume — byte contract.
@@ -9199,12 +8822,8 @@ fn suspend_restores_terminal_then_resume_reenters_and_clears() {
 
     // Step 3 — resume re-enter: the same enter-setup bytes (fullscreen, mouse on).
     let mut resume_bytes = Vec::new();
-    emit_terminal_enter_setup(
-        &mut resume_bytes,
-        /* inline_repro = */ false,
-        /* mouse_capture = */ true,
-    )
-    .expect("emit resume re-enter");
+    emit_terminal_enter_setup(&mut resume_bytes, /* mouse_capture = */ true)
+        .expect("emit resume re-enter");
     let resume = String::from_utf8(resume_bytes).expect("ansi");
 
     // Re-enters the alternate screen and clears it (blank on re-entry).
@@ -9351,26 +8970,27 @@ async fn explicit_idle_exit_requests_teardown_that_leaves_fullscreen() {
 }
 
 #[test]
-fn emergency_teardown_skips_leave_alt_screen_for_inline_repro() {
-    // The inline-repro path never entered the alternate screen, so teardown must
-    // not emit LeaveAlternateScreen for it (alt_screen_active = false).
+fn emergency_teardown_skips_leave_alt_screen_when_not_active() {
+    // When the guard never entered the alternate screen (alt_screen_active =
+    // false), teardown must not emit a spurious LeaveAlternateScreen — but it
+    // still restores terminal modes.
     let mut bytes = Vec::new();
     emit_terminal_emergency_teardown(&mut bytes, /* alt_screen_active = */ false)
-        .expect("emit emergency teardown, inline-repro");
+        .expect("emit emergency teardown, alt screen inactive");
     let ansi = String::from_utf8(bytes).expect("ansi");
 
     assert!(
         !ansi.contains("\x1b[?1049l"),
-        "inline-repro teardown must not leave an alternate screen it never entered"
+        "teardown must not leave an alternate screen it never entered"
     );
     // Modes are still restored.
     assert!(
         ansi.contains(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
-        "inline-repro teardown still restores keyboard enhancement flags"
+        "teardown still restores keyboard enhancement flags"
     );
     assert!(
         ansi.contains(DISABLE_MOUSE_MODES),
-        "inline-repro teardown still disables mouse modes"
+        "teardown still disables mouse modes"
     );
 }
 
@@ -9380,7 +9000,7 @@ fn dropping_fullscreen_guard_emits_leave_alt_screen_and_no_mirror() {
     // sink, then drop it and inspect the teardown bytes. Proves the production
     // `Drop` (which delegates to `emit_terminal_emergency_teardown`) leaves the
     // alternate screen exactly once and writes no transcript mirror.
-    let (guard, sink) = TerminalGuard::for_capture_test(/* inline_repro = */ false, 80, 24);
+    let (guard, sink) = TerminalGuard::for_capture_test(80, 24);
     drop(guard);
     let ansi = sink_to_string(&sink);
 
@@ -9401,21 +9021,20 @@ fn dropping_fullscreen_guard_emits_leave_alt_screen_and_no_mirror() {
 }
 
 #[test]
-fn inline_history_flush_contains_startup_and_new_transcript() {
+fn exit_mirror_lines_contain_startup_card_and_transcript() {
+    // The clean-exit mirror is built from the same fullscreen line pipeline
+    // `render()` draws (`transcript_lines_for_render(.., include_startup_card)`),
+    // so the mirrored rows carry the startup card and the whole transcript.
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("find getFoo"));
     app.push_transcript_item(TranscriptItem::assistant("No definition found."));
 
-    let len = app.transcript.len();
-    let first = inline_history_lines_for_flush(&app, 100, true, 0, len);
-    let rendered = lines_to_plain_text(&first);
+    let lines = transcript_lines_for_render(&app, Some(100), true);
+    let rendered = lines_to_plain_text(&lines);
 
     assert!(rendered.contains("Squeezy v0.1.0"), "{rendered}");
     assert!(rendered.contains("find getFoo"), "{rendered}");
     assert!(rendered.contains("☽ No definition found."), "{rendered}");
-
-    let next = inline_history_lines_for_flush(&app, 100, false, len, len);
-    assert!(next.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -9437,10 +9056,10 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
 const LEAVE_ALT_SCREEN: &str = "\x1b[?1049l";
 
 /// Build the collapsed transcript mirror buffer the clean-exit path emits for
-/// `app` at `width`, the same `inline_history_lines_for_flush` →
+/// `app` at `width`, the same `transcript_lines_for_render` →
 /// `render_lines_to_owned_buffer` pipeline `finish_fullscreen` runs internally.
 fn mirror_buffer_for(app: &TuiApp, width: u16) -> Buffer {
-    let lines = inline_history_lines_for_flush(app, width, true, 0, app.transcript.len());
+    let lines = transcript_lines_for_render(app, Some(width), true);
     render_lines_to_owned_buffer(&lines, width)
 }
 
@@ -9496,10 +9115,6 @@ fn finish_fullscreen_normal_exit_does_not_purge_scrollback() {
     assert!(
         !ansi.contains("\x1b[3J"),
         "normal clean exit must never purge scrollback (\\x1b[3J)",
-    );
-    assert!(
-        !ansi.contains(CLEAR_SCROLLBACK_AND_VISIBLE),
-        "normal clean exit must not emit the /clear scrollback-wipe sequence",
     );
 }
 
@@ -9561,7 +9176,7 @@ fn emergency_drop_teardown_emits_no_transcript_mirror() {
     // Full lifecycle proof through the real `Drop`: build a fullscreen guard on a
     // capture sink with a settled transcript reachable to the renderer, drop it,
     // and confirm no transcript text was mirrored by the emergency path.
-    let (guard, sink) = TerminalGuard::for_capture_test(/* inline_repro = */ false, 80, 24);
+    let (guard, sink) = TerminalGuard::for_capture_test(80, 24);
     drop(guard);
     let drop_ansi = sink_to_string(&sink);
     assert!(
@@ -9601,7 +9216,9 @@ fn finish_fullscreen_mirror_height_covers_wrapped_rows_not_visual_estimate() {
     // tall buffer and count the rows that actually carry glyphs.
     let tall = {
         let mut buf = Buffer::empty(Rect::new(0, 0, width, 64));
-        render_lines_to_buffer(&mut buf, lines.clone());
+        Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .render(buf.area, &mut buf);
         buffer_used_height(&buf) as usize
     };
     assert!(
@@ -9658,8 +9275,7 @@ fn clean_exit_mirror() {
 
     // Fullscreen guard on a capture sink at a deterministic size; its injected
     // `FixedSize` feeds `finish_fullscreen`'s width with no real TTY.
-    let (mut guard, sink) =
-        TerminalGuard::for_capture_test(/* inline_repro = */ false, 100, 40);
+    let (mut guard, sink) = TerminalGuard::for_capture_test(100, 40);
     guard.set_exit_hint(Some("Resume: squeezy sessions resume deadbeef".to_string()));
     guard
         .finish_fullscreen(&app)
@@ -9707,7 +9323,7 @@ fn clean_exit_mirror() {
 }
 
 #[test]
-fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
+fn transcript_render_wraps_long_shell_cards_on_the_rail() {
     let mut app = test_app(SessionMode::Build);
     let command = concat!(
         "echo \"=== .mcp.json ===\"; cat .mcp.json; echo; ",
@@ -9734,9 +9350,8 @@ fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
     app.finalize_settles_for_test();
 
     let width = 72usize;
-    let flushed =
-        inline_history_lines_for_flush(&app, width as u16, false, 0, app.transcript.len());
-    let rendered = lines_to_plain_text(&flushed);
+    let lines = transcript_lines_for_render(&app, Some(width as u16), false);
+    let rendered = lines_to_plain_text(&lines);
 
     assert!(rendered.contains("├─✔ Ran echo"), "{rendered}");
     assert!(
@@ -9750,7 +9365,7 @@ fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
 }
 
 #[test]
-fn inline_history_flush_wraps_representative_rail_nodes_to_width() {
+fn transcript_render_wraps_representative_rail_nodes_to_width() {
     let mut app = test_app(SessionMode::Build);
     app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
         squeezy_core::ReasoningPayload::OpenAi {
@@ -9788,9 +9403,8 @@ fn inline_history_flush_wraps_representative_rail_nodes_to_width() {
     app.finalize_settles_for_test();
 
     let width = 54usize;
-    let flushed =
-        inline_history_lines_for_flush(&app, width as u16, false, 0, app.transcript.len());
-    let rendered = lines_to_plain_text(&flushed);
+    let lines = transcript_lines_for_render(&app, Some(width as u16), false);
+    let rendered = lines_to_plain_text(&lines);
 
     assert!(rendered.contains("reasoning"), "{rendered}");
     assert!(rendered.contains("configuration warning"), "{rendered}");
@@ -9812,151 +9426,35 @@ fn inline_history_flush_wraps_representative_rail_nodes_to_width() {
 }
 
 #[test]
-fn settling_node_is_held_from_flush_and_folds_in_live_region() {
-    let mut app = test_app(SessionMode::Build);
-    // A success tool result arms a settle-fold (it rests collapsed).
-    app.push_tool_result(sample_tool_result("grep", "match-1\nmatch-2"));
-    assert!(app.transcript[0].settle.is_some(), "a success tool folds");
-
-    // The scrollback flush stops before the settling node — it is held back.
-    let boundary = settling_flush_boundary(&app);
-    assert_eq!(boundary, 0);
-    let flushed = inline_history_lines_for_flush(&app, 100, false, 0, boundary);
-    assert!(flushed.is_empty(), "settling node must not flush yet");
-
-    // Meanwhile it renders folding on the rail in the live region.
-    let live = lines_to_plain_text(&live_settling_lines(&app, 100));
-    assert!(live.contains("grep"), "{live}");
-    assert!(
-        live.contains("├─") || live.contains("╰─"),
-        "rail gutter: {live}"
-    );
-
-    // Once the fold finishes the node becomes flushable and leaves the live region.
-    app.finalize_settles_for_test();
-    assert_eq!(settling_flush_boundary(&app), app.transcript.len());
-    assert!(live_settling_lines(&app, 100).is_empty());
-}
-
-#[test]
-fn turn_divider_flush_waits_for_settling_tail_and_dedupes() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "match-1\nmatch-2"));
-    complete_turn_for_test(&mut app, TurnVisualState::Cancelled, Duration::from_secs(5));
-    assert!(app.transcript[0].settle.is_some(), "a success tool folds");
-
-    let boundary = settling_flush_boundary(&app);
-    assert_eq!(boundary, 0);
-    assert!(
-        turn_divider_lines_for_flush(&app, 100, boundary, None).is_empty(),
-        "divider must wait until the settling transcript tail can flush"
-    );
-
-    app.finalize_settles_for_test();
-    let len = app.transcript.len();
-    let first = lines_to_plain_text(&turn_divider_lines_for_flush(&app, 100, len, None));
-    assert!(first.contains("╰─☽ Cancelled after 5s"), "{first}");
-    assert!(
-        turn_divider_lines_for_flush(&app, 100, len, Some(app.turn_divider_generation)).is_empty(),
-        "divider flush is a one-shot; the terminal guard tracks the persisted row"
-    );
-}
-
-#[test]
-fn cancelled_turn_scrollback_persists_closing_moon_after_warn_tail() {
+fn cancelled_turn_render_persists_closing_moon_after_warn_tail() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("What is the architecture?"));
     app.push_note("mcp status 0/1 ready 0 tools 1 failed".to_string());
     app.push_warn("turn cancelled".to_string());
     complete_turn_for_test(&mut app, TurnVisualState::Cancelled, Duration::from_secs(5));
 
-    let len = app.transcript.len();
-    let mut lines = inline_history_lines_for_flush(&app, 100, false, 0, len);
-    lines.extend(turn_divider_lines_for_flush(&app, 100, len, None));
-    let rendered = lines_to_plain_text(&lines);
+    // The full fullscreen frame composes the transcript surface (warn tail) and
+    // the completed-turn footer (the closing moon) the user actually sees.
+    let rendered = render_to_string(&app, 100, 18);
 
     assert!(rendered.contains("turn cancelled"), "{rendered}");
     assert!(
         rendered.contains("╰─☽ Cancelled after 5s"),
-        "scrollback must persist the cyan closed moon as the turn terminator: {rendered}"
+        "the rendered frame must persist the cyan closed moon as the turn terminator: {rendered}"
     );
+    // The warn tail must thread into the closing moon — the rail node row must
+    // not be the last non-blank rail glyph (no dangling `│` connector).
+    let warn_line = rendered
+        .lines()
+        .position(|l| l.contains("turn cancelled"))
+        .expect("warn tail row present");
+    let moon_line = rendered
+        .lines()
+        .position(|l| l.contains("╰─☽ Cancelled after 5s"))
+        .expect("closing moon row present");
     assert!(
-        !rendered.trim_end().ends_with('│'),
-        "a cancelled turn must not leave the rail ending on a dangling connector: {rendered}"
-    );
-}
-
-#[test]
-fn turn_divider_flush_survives_queued_prompt_auto_start_for_all_outcomes() {
-    for (visual, expected, color, expect_closing_moon) in [
-        (
-            TurnVisualState::Succeeded,
-            "─ Worked for 3s",
-            crate::render::theme::green(),
-            false,
-        ),
-        (
-            TurnVisualState::Failed,
-            "╰─☽ Failed after 3s",
-            crate::render::theme::red(),
-            true,
-        ),
-        (
-            TurnVisualState::Cancelled,
-            "╰─☽ Cancelled after 3s",
-            crate::render::theme::cyan(),
-            true,
-        ),
-    ] {
-        let mut app = test_app(SessionMode::Build);
-        app.push_transcript_item(TranscriptItem::user("first"));
-        complete_turn_for_test(&mut app, visual, Duration::from_secs(3));
-
-        // Queued prompt auto-drain starts the next turn before the next draw,
-        // which clears the live footer duration. The persisted snapshot must
-        // still be available for scrollback flush.
-        app.note_turn_started();
-        assert!(app.last_turn_duration.is_none());
-
-        let len = app.transcript.len();
-        let lines = turn_divider_lines_for_flush(&app, 100, len, None);
-        let rendered = lines_to_plain_text(&lines);
-        assert!(rendered.contains(expected), "{rendered}");
-        assert_eq!(lines[0].spans[2].style.fg, Some(color));
-        assert_eq!(rendered.contains("╰─☽"), expect_closing_moon, "{rendered}");
-    }
-}
-
-#[test]
-fn turn_divider_flush_inserts_before_queued_prompt_started_before_draw() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first prompt"));
-    complete_turn_for_test(&mut app, TurnVisualState::Succeeded, Duration::from_secs(4));
-
-    app.note_turn_started();
-    app.push_transcript_item(TranscriptItem::user("queued prompt"));
-
-    let len = app.transcript.len();
-    let (lines, generation) =
-        inline_history_lines_for_flush_with_turn_divider(&app, 100, false, 0, len, None);
-    assert_eq!(generation, Some(app.turn_divider_generation));
-
-    let rendered_lines = lines
-        .iter()
-        .map(rendered_line_text)
-        .collect::<Vec<String>>();
-    let divider_index = rendered_lines
-        .iter()
-        .position(|line| line.contains("─ Worked for 4s"))
-        .expect("divider should render");
-    let queued_prompt_index = rendered_lines
-        .iter()
-        .position(|line| line.contains("queued prompt"))
-        .expect("queued prompt should render");
-    assert!(
-        divider_index < queued_prompt_index,
-        "the completed turn must close before the queued prompt starts:\n{}",
-        rendered_lines.join("\n")
+        moon_line > warn_line,
+        "the closing moon must follow the warn tail, threading the rail:\n{rendered}"
     );
 }
 
@@ -10068,21 +9566,6 @@ fn transcript_overlay_inserts_pending_turn_divider_before_queued_prompt() {
         "overlay must show the completed-turn footer before the queued prompt:\n{}",
         rendered_lines.join("\n")
     );
-}
-
-#[test]
-fn inline_live_viewport_excludes_flushed_history() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("old prompt"));
-    app.push_transcript_item(TranscriptItem::assistant("old answer"));
-    set_input(&mut app, "new prompt".to_string());
-
-    let output = render_inline_to_string(&app, 100, 12);
-
-    assert!(!output.contains("Squeezy v"), "{output}");
-    assert!(!output.contains("old prompt"), "{output}");
-    assert!(!output.contains("old answer"), "{output}");
-    assert!(output.contains("new prompt┃"), "{output}");
 }
 
 #[test]
@@ -10645,53 +10128,6 @@ fn completed_turn_shows_worked_duration_divider() {
     assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::green()));
     assert!(!output.contains("Working ("), "{output}");
     assert!(!output.contains("• Done"), "{output}");
-}
-
-#[test]
-fn inline_view_hides_completed_divider_after_scrollback_flush() {
-    for (visual, label) in [
-        (TurnVisualState::Succeeded, "Worked for 8s"),
-        (TurnVisualState::Cancelled, "Cancelled after 8s"),
-        (TurnVisualState::Failed, "Failed after 8s"),
-    ] {
-        let mut app = test_app(SessionMode::Build);
-        app.push_transcript_item(TranscriptItem::user("why?"));
-        app.push_transcript_item(TranscriptItem::assistant("Because."));
-        complete_turn_for_test(&mut app, visual, Duration::from_secs(8));
-
-        let before_flush = render_inline_to_string(&app, 120, 10);
-        assert!(
-            before_flush.contains(label),
-            "unflushed inline view should still close the completed turn: {before_flush}"
-        );
-
-        let len = app.transcript.len();
-        let (scrollback_lines, flushed_generation) =
-            inline_history_lines_for_flush_with_turn_divider(&app, 120, false, 0, len, None);
-        assert_eq!(flushed_generation, Some(app.turn_divider_generation));
-        let scrollback = lines_to_plain_text(&scrollback_lines);
-        assert!(
-            scrollback.contains(label),
-            "scrollback must own the completed divider after flush: {scrollback}"
-        );
-
-        let after_flush = render_inline_to_string_with_flushed_turn_divider(
-            &app,
-            120,
-            10,
-            app.turn_divider_generation,
-        );
-        assert!(
-            !after_flush.contains(label),
-            "once scrollback owns the divider, the live viewport must not duplicate it: {after_flush}"
-        );
-        let combined = format!("{scrollback}\n{after_flush}");
-        assert_eq!(
-            combined.matches(label).count(),
-            1,
-            "completed turn should have exactly one closing divider: {combined}"
-        );
-    }
 }
 
 #[test]
@@ -13160,9 +12596,11 @@ fn scrolled_indicator_appears_only_when_scrolled_up() {
 
 #[test]
 fn transcript_scroll_offset_defaults_to_bottom() {
-    assert_eq!(transcript_scroll_offset(20, 10, 0), 10);
-    assert_eq!(transcript_scroll_offset(20, 10, 8), 2);
-    assert_eq!(transcript_scroll_offset(20, 10, usize::MAX), 0);
+    // `scroll_offset_for_from_bottom(from_bottom, total_rows, viewport_h)` =
+    // total_rows - viewport_h - from_bottom, saturating.
+    assert_eq!(scroll_offset_for_from_bottom(0, 20, 10), 10);
+    assert_eq!(scroll_offset_for_from_bottom(8, 20, 10), 2);
+    assert_eq!(scroll_offset_for_from_bottom(usize::MAX, 20, 10), 0);
 }
 
 #[test]
@@ -14547,34 +13985,6 @@ fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal.draw(|frame| render(frame, app)).expect("draw");
-    let buffer = terminal.backend().buffer();
-    let mut output = String::new();
-    for y in 0..height {
-        for x in 0..width {
-            output.push_str(buffer[(x, y)].symbol());
-        }
-        output.push('\n');
-    }
-    output
-}
-
-fn render_inline_to_string(app: &TuiApp, width: u16, height: u16) -> String {
-    render_inline_to_string_with_flushed_turn_divider(app, width, height, 0)
-}
-
-fn render_inline_to_string_with_flushed_turn_divider(
-    app: &TuiApp,
-    width: u16,
-    height: u16,
-    flushed_turn_divider_generation: u64,
-) -> String {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("terminal");
-    let flushed_generation =
-        (flushed_turn_divider_generation != 0).then_some(flushed_turn_divider_generation);
-    terminal
-        .draw(|frame| render_inline(frame, app, flushed_generation))
-        .expect("draw");
     let buffer = terminal.backend().buffer();
     let mut output = String::new();
     for y in 0..height {
@@ -19235,9 +18645,9 @@ fn rail_chrome_lights_special_nodes() {
 }
 
 /// Fixture: a full turn (reasoning → tool → subagent breadcrumbs → a failed
-/// tool → answer) rendered on the inline Quiet Rail. Guards the combined
-/// look — every work node threads the rail, the failure's stderr is not
-/// duplicated, and the answer leaves the rail set off by a blank line.
+/// tool → answer) rendered on the Quiet Rail. Guards the combined look — every
+/// work node threads the rail, the failure's stderr is not duplicated, and the
+/// answer leaves the rail set off by a blank line.
 #[test]
 fn rail_gallery_renders_a_full_turn() {
     let mut app = test_app(SessionMode::Build);
@@ -19274,8 +18684,7 @@ fn rail_gallery_renders_a_full_turn() {
     ));
     app.finalize_settles_for_test();
 
-    let len = app.transcript.len();
-    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 96, true, 0, len));
+    let scrollback = lines_to_plain_text(&transcript_lines_for_render(&app, Some(96), true));
 
     // Every work node threads the rail.
     assert!(scrollback.contains("├─▸ reasoning · Plan:"), "{scrollback}");
@@ -19337,8 +18746,7 @@ fn routing_note_threads_the_rail_as_a_dim_dot() {
     app.push_note("routed `sonnet` → `haiku` (llm_judge)".to_string());
     app.push_transcript_item(TranscriptItem::assistant("Hey!"));
     app.finalize_settles_for_test();
-    let len = app.transcript.len();
-    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 70, false, 0, len));
+    let scrollback = lines_to_plain_text(&transcript_lines_for_render(&app, Some(70), false));
     // The note threads the gutter as `├─◦` (one note pipeline) — never the old
     // off-rail `• Noted` line that severed the coin→answer gutter.
     assert!(
@@ -19356,8 +18764,7 @@ fn warning_threads_the_rail_as_a_warn_node() {
     app.push_warn("config key `foo` ignored (unknown)".to_string());
     app.push_transcript_item(TranscriptItem::assistant("Done."));
     app.finalize_settles_for_test();
-    let len = app.transcript.len();
-    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 70, false, 0, len));
+    let scrollback = lines_to_plain_text(&transcript_lines_for_render(&app, Some(70), false));
     // A warning threads the gutter (├─⚠) instead of floating off-rail.
     assert!(
         scrollback.contains("├─⚠ config key `foo` ignored (unknown)"),

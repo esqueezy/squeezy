@@ -2,10 +2,10 @@
 //!
 //! Today the TUI reads the terminal dimensions by calling
 //! `crossterm::terminal::size()` directly at a couple of render-path
-//! sites (see `transcript_overlay_max_scroll` and the append-only
-//! `paint_main`). That couples those code paths to a real terminal,
-//! which makes them awkward to exercise from headless tests and from
-//! `squeezy-eval` scenarios driving a `TestBackend`.
+//! sites (see `transcript_overlay_max_scroll` and the clean-exit
+//! mirror in `finish_fullscreen`). That couples those code paths to a
+//! real terminal, which makes them awkward to exercise from headless
+//! tests and from `squeezy-eval` scenarios driving a `TestBackend`.
 //!
 //! This module introduces a small trait, [`SizeSource`], whose single
 //! method returns the current terminal size, plus a production
@@ -20,11 +20,11 @@
 //! Every method speaks the same tuple crossterm does:
 //! `(columns, rows)` — i.e. `(width, height)`. The two existing call
 //! sites already bind it that way (in `transcript_overlay_max_scroll`
-//! and `TerminalGuard::paint_main` respectively):
+//! and `TerminalGuard::finish_fullscreen` respectively):
 //!
 //! ```ignore
 //! let (width, height) = terminal_size().ok()?;          // transcript_overlay_max_scroll
-//! let (w, h)          = terminal_size().map_err(..)?;    // paint_main
+//! let (w, _h)         = terminal_size().map_err(..)?;    // finish_fullscreen mirror width
 //! ```
 //!
 //! Implementations and the [`FixedSize`] test helper preserve that
