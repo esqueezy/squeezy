@@ -11,7 +11,8 @@ use squeezy_llm::{
 };
 use squeezy_parse::smoke_all_languages;
 use squeezy_store::{
-    SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
+    STALE_RUNNING_SESSION_THRESHOLD_MS, SessionQuery, SessionStatus, SessionStore, SqueezyStore,
+    cache_diagnostics, ensure_repo_profile, prune_cache_backups,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use tokio_util::sync::CancellationToken;
@@ -240,6 +241,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         checks.push(skills_roots_check(config));
         checks.push(hook_shell_check(config));
         checks.push(session_store_check(config));
+        checks.extend(session_paths_checks(config));
         checks.push(state_store_check(config));
         checks.push(cache_check(config, args.prune_cache));
     }
@@ -400,6 +402,164 @@ fn key_source_label(source: KeySource, env_name: &str) -> String {
             .unwrap_or_else(|| "fallback env var".to_string()),
         KeySource::JsonEnv => "SQUEEZY_CREDENTIALS_JSON".to_string(),
     }
+}
+
+/// Report resolved session-related paths and whether XDG variables are honored.
+/// Shows the workspace session root, global index path, static memory path, and
+/// warns when `HOME` is unset, XDG is invalid, or the active index directory is
+/// read-only.
+fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let store = SessionStore::open(config);
+    let session_root = store.root().display().to_string();
+
+    let index_path = SessionStore::global_index_path();
+    let memory_path = SessionStore::memory_path();
+    let xdg_state_home = env::var_os("XDG_STATE_HOME");
+    let xdg_honored = xdg_state_home
+        .as_ref()
+        .is_some_and(|xdg| PathBuf::from(xdg).is_absolute());
+    let xdg_invalid = xdg_state_home.as_ref().is_some_and(|xdg| {
+        let path = PathBuf::from(xdg);
+        !path.is_absolute()
+    });
+
+    // Warn when HOME is unset; an absolute XDG_STATE_HOME can still carry the
+    // global index, but the memory file remains HOME-based.
+    if env::var_os("HOME").is_none() {
+        let detail = if index_path.is_some() {
+            "HOME is not set; memory file is unavailable; global index uses XDG_STATE_HOME"
+                .to_string()
+        } else {
+            "HOME is not set; global session index and memory file are unavailable".to_string()
+        };
+        checks.push(Check {
+            name: "session_home".to_string(),
+            status: Status::Warn,
+            detail,
+        });
+    }
+
+    if xdg_invalid {
+        let raw = xdg_state_home
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        checks.push(Check {
+            name: "session_xdg_state_home".to_string(),
+            status: Status::Warn,
+            detail: format!("XDG_STATE_HOME={raw} is not absolute; falling back to HOME"),
+        });
+    }
+
+    // Check that the directory that will hold the global index is writable. This
+    // uses the resolved index path (XDG or legacy) rather than HOME so the check
+    // is accurate when XDG_STATE_HOME redirects to a different location.
+    let index_dir_readonly = index_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .is_some_and(|dir| {
+            fs::metadata(dir)
+                .map(|m| m.permissions().readonly())
+                .unwrap_or(false)
+        });
+    if index_dir_readonly {
+        let dir = index_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        checks.push(Check {
+            name: "session_home".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "global index directory {dir} appears read-only; index writes will fail"
+            ),
+        });
+    }
+
+    let index_detail = match &index_path {
+        Some(p) => {
+            if xdg_honored {
+                format!("global_index={} (XDG_STATE_HOME honored)", p.display())
+            } else {
+                format!("global_index={}", p.display())
+            }
+        }
+        None => "global_index=unavailable (HOME unset)".to_string(),
+    };
+    let memory_detail = match &memory_path {
+        Some(p) => format!("memory={}", p.display()),
+        None => "memory=unavailable (HOME unset)".to_string(),
+    };
+
+    // Warn if the legacy path still exists after an XDG migration — it continues
+    // to be merged on every startup until it is manually removed.
+    let legacy_present = xdg_honored
+        && SessionStore::legacy_global_index_path()
+            .is_some_and(|lp| lp.exists() && index_path.as_ref().is_some_and(|ip| *ip != lp));
+    if legacy_present {
+        let lp = SessionStore::legacy_global_index_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        checks.push(Check {
+            name: "session_legacy_index".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "legacy global index still present at {lp}; \
+                 it will continue to be merged on every startup until removed"
+            ),
+        });
+    }
+
+    let stale_running = if !index_dir_readonly {
+        let stale_count = count_stale_running_sessions(&store);
+        if stale_count > 0 {
+            Some(stale_count)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut detail = format!("session_root={session_root}  {index_detail}  {memory_detail}");
+    let mut status = Status::Ok;
+    if let Some(count) = stale_running {
+        detail.push_str(&format!(
+            "; {count} stale running session(s) (started >{}h ago); \
+             run `squeezy sessions list` to review",
+            STALE_RUNNING_SESSION_THRESHOLD_MS / (3600 * 1000)
+        ));
+        status = Status::Warn;
+    }
+
+    checks.push(Check {
+        name: "session_paths".to_string(),
+        status,
+        detail,
+    });
+    checks
+}
+
+/// Count sessions whose status is `Running` but whose last-event timestamp
+/// is older than [`STALE_RUNNING_SESSION_THRESHOLD_MS`]. Returns 0 if the
+/// session list cannot be read.
+fn count_stale_running_sessions(store: &SessionStore) -> usize {
+    let Ok(sessions) = store.list(&SessionQuery::default()) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    sessions
+        .iter()
+        .filter(|s| {
+            s.status == SessionStatus::Running
+                && now.saturating_sub(s.started_at_ms) > STALE_RUNNING_SESSION_THRESHOLD_MS
+        })
+        .count()
 }
 
 fn session_store_check(config: &AppConfig) -> Check {
