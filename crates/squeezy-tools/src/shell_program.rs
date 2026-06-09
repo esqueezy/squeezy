@@ -162,6 +162,14 @@ impl ShellProgram {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn for_windows_restricted_command(command: &str) -> Self {
+        if let Ok(custom) = std::env::var("SQUEEZY_SHELL") {
+            return Self::resolve_override(&custom, command);
+        }
+        Self::windows_cmd(command)
+    }
+
     fn unix_sh(command: &str) -> Self {
         Self {
             program: "sh".to_string(),
@@ -283,6 +291,20 @@ impl ShellProgram {
                 ],
                 display_name,
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_cmd(command: &str) -> Self {
+        Self {
+            program: "cmd.exe".to_string(),
+            args: vec![
+                "/D".to_string(),
+                "/S".to_string(),
+                "/C".to_string(),
+                command.to_string(),
+            ],
+            display_name: "cmd.exe".to_string(),
         }
     }
 

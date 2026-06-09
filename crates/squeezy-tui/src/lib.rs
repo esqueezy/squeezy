@@ -3689,6 +3689,7 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         | DispatchCommand::Keymap
         | DispatchCommand::Cheap
         | DispatchCommand::Parent => SlashArgShape::None,
+        DispatchCommand::CheckpointsDoctor => SlashArgShape::FixedSubcommand,
         DispatchCommand::Attach { .. } => SlashArgShape::Path,
         DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
             slash_option_shape(prompt.as_ref(), SlashArgShape::FreeText)
@@ -4572,6 +4573,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         }
         DispatchCommand::Checkpoints => {
             start_local_checkpoint_job(app, agent, "checkpoint_list", serde_json::json!({}))
+        }
+        DispatchCommand::CheckpointsDoctor => {
+            start_local_checkpoint_job(app, agent, "checkpoint_doctor", serde_json::json!({}))
         }
         DispatchCommand::Undo => {
             start_local_checkpoint_job(app, agent, "checkpoint_undo", serde_json::json!({}))

@@ -17,9 +17,10 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 - `group_id` — the agent turn that produced the write. Every record
   emitted while handling one user turn shares this value.
 - `tool_name`, `call_id`, `status`, `before_tree`, `after_tree`, per-file
-  `before_sha256` / `after_sha256`, POSIX file type, Git mode, symlink
-  targets when the tree entry is a symlink, and Unix hardlink peer paths when a
-  changed regular file belongs to a link group.
+  Git blob hashes (`before_sha256` / `after_sha256`), raw worktree byte hashes
+  (`before_worktree_sha256` / `after_worktree_sha256`), POSIX file type, Git
+  mode, symlink targets when the tree entry is a symlink, and Unix hardlink
+  peer paths when a changed regular file belongs to a link group.
 - `files`, `skipped_files`, `summary`, `coverage_warnings`, and
   `created_at_ms`.
 
@@ -34,6 +35,16 @@ targets; the sha256 and file-type gates are identical in all cases.
 `checkpoint_undo` targets `Latest`; `checkpoint_revert` requires exactly one
 of `group_id` or `checkpoint_id`. Both tool surfaces preflight the full set of
 paths that rollback can mutate, including the source side of a reversed rename.
+
+Rollback safety is checked against the raw worktree byte hash when the
+checkpoint recorded one. Git blob hashes remain in the record for object
+integrity and display diagnostics, but they are not used as the only safety
+gate because `.gitattributes`, CRLF conversion, and clean filters can make a
+Git blob differ from the bytes a Windows editor actually left on disk.
+Checkpoints created before this change have no
+`before_worktree_sha256` / `after_worktree_sha256` field and continue to
+use the Git blob hash as their only safety gate; run a fresh checkpoint
+through the agent to get raw-byte safety.
 
 ## Why `Group(group_id)` Is Load-Bearing
 
@@ -106,10 +117,32 @@ Large-file discovery is Git-driven: the shadow repo asks `git ls-files -z
 metadata checks. This avoids recursive per-path `git check-ignore` calls on
 large Linux workspaces.
 
+Rollback attempts are journaled even when only some paths are restored.
+`BestEffort` mode converts per-file filesystem errors into structured
+conflicts and continues with later files. `Atomic` mode preflights
+read-only attributes and write-handle availability before mutating, so
+many obvious conflicts surface before any byte is touched. The probe
+opens each planned-write target with the OS's default share mode, so an
+exclusive-share editor lock (e.g. a legacy editor that opens with
+`dwShareMode = 0`, or an antivirus scanner) can still slip past the
+preflight and produce a per-file conflict during the actual rollback,
+which is then journaled as an applied-with-conflicts row. This matters
+on Windows, where read-only attributes, editor locks, antivirus
+scanners, and sync tools can reject one write/delete while other paths
+are still safe.
+
+`checkpoint_doctor` (also reachable from `/checkpoints doctor`) performs a
+no-op shadow snapshot and reports the normalized workspace/shadow paths, Git
+path mode, relevant shadow Git config, discovered `.gitattributes`, lock-file
+writability, protected-ref create/delete capability, and a temporary CRLF
+checkpoint/mutate/rollback smoke result. The smoke workspace is created outside
+the user's project and removed after the report.
+
 ## What This Document Is Not
 
 This is not a user manual. The agent-visible tools (`checkpoint_list`,
-`checkpoint_show`, `checkpoint_undo`, `checkpoint_revert`) are
+`checkpoint_doctor`, `checkpoint_show`, `checkpoint_undo`,
+`checkpoint_revert`) are
 documented in their own specs under `crates/squeezy-tools/src/`. This
 file records *why* the `group_id` axis exists so a future refactor
 does not pare it down to `Latest` + `Checkpoint(id)` on the grounds

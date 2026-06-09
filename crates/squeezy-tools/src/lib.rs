@@ -139,9 +139,9 @@ use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
 use shell_program::ShellProgram;
 use specs::{
-    apply_patch_spec, checkpoint_list_spec, checkpoint_revert_spec, checkpoint_show_spec,
-    checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
-    downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, impact_spec,
+    apply_patch_spec, checkpoint_doctor_spec, checkpoint_list_spec, checkpoint_revert_spec,
+    checkpoint_show_spec, checkpoint_undo_spec, decl_search_spec, definition_search_spec,
+    diff_context_spec, downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, impact_spec,
     inheritance_hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
     mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
@@ -825,6 +825,7 @@ pub fn human_label_for_call(name: &str, args: &Value) -> String {
         },
         "read_tool_output" => "expanding earlier tool output".to_string(),
         "diff_context" => "gathering diff context".to_string(),
+        "checkpoint_doctor" => "checking checkpoint health".to_string(),
         "checkpoint_list" => "listing checkpoints".to_string(),
         "checkpoint_show" => "inspecting a checkpoint".to_string(),
         "checkpoint_undo" => "undoing to a checkpoint".to_string(),
@@ -2028,6 +2029,7 @@ impl ToolRegistry {
         specs.push(checkpoint_list_spec());
         if self.checkpoints.is_some() {
             specs.extend([
+                checkpoint_doctor_spec(),
                 checkpoint_revert_spec(),
                 checkpoint_show_spec(),
                 checkpoint_undo_spec(),
@@ -2273,11 +2275,11 @@ impl ToolRegistry {
             "read_slice" if self.read_slice_targets_ignored_policy(&call.arguments) => {
                 PermissionScope::IgnoredSearch
             }
-            "checkpoint_list" | "checkpoint_show" | "decl_search" | "definition_search"
-            | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "plan_patch"
-            | "read_file" | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
-            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill"
-            | "observations" => PermissionScope::Read,
+            "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show" | "decl_search"
+            | "definition_search" | "diff_context" | "downstream_flow" | "glob" | "grep"
+            | "hierarchy" | "plan_patch" | "read_file" | "read_slice" | "read_tool_output"
+            | "reference_search" | "repo_map" | "symbol_context" | "upstream_flow"
+            | "list_skills" | "load_skill" | "observations" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
@@ -2775,7 +2777,8 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
             ),
-            "checkpoint_list"
+            "checkpoint_doctor"
+            | "checkpoint_list"
             | "checkpoint_show"
             | "diff_context"
             | "downstream_flow"
@@ -2953,6 +2956,7 @@ impl ToolRegistry {
             return format!("mcp server={:?} tool={:?}", tool.server, tool.raw_name);
         }
         match call.name.as_str() {
+            "checkpoint_doctor" => "checkpoint_doctor".to_string(),
             "checkpoint_list" => "checkpoint_list".to_string(),
             "checkpoint_show" => {
                 let args =
@@ -3334,6 +3338,7 @@ impl ToolRegistry {
         } else {
             match call.name.as_str() {
                 "apply_patch" => self.execute_apply_patch(&call, &group_id).await,
+                "checkpoint_doctor" => self.execute_checkpoint_doctor(&call).await,
                 "checkpoint_list" => self.execute_checkpoint_list(&call).await,
                 "checkpoint_show" => self.execute_checkpoint_show(&call).await,
                 "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,

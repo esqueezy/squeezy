@@ -13,6 +13,10 @@ pub(crate) struct CheckpointListArgs {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointDoctorArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointUndoArgs {
     mode: Option<RollbackMode>,
 }
@@ -102,6 +106,30 @@ impl ToolRegistry {
         }
     }
 
+    pub(crate) async fn execute_checkpoint_doctor(&self, call: &ToolCall) -> ToolResult {
+        if let Err(err) = serde_json::from_value::<CheckpointDoctorArgs>(call.arguments.clone()) {
+            return tool_arg_error(call, err);
+        }
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.doctor() {
+            Ok(report) => {
+                let ok = report.protected_ref_roundtrip
+                    && report.checkpoints_dir_writable
+                    && report.warnings.is_empty();
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({ "ok": ok, "doctor": report }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
+        }
+    }
+
     pub(crate) async fn execute_checkpoint_undo(&self, call: &ToolCall) -> ToolResult {
         let args = match serde_json::from_value::<CheckpointUndoArgs>(call.arguments.clone()) {
             Ok(args) => args,
@@ -137,6 +165,7 @@ impl ToolRegistry {
                         None,
                     );
                 }
+                let message = rollback_message(&result);
                 make_result(
                     call,
                     if result.conflicts.is_empty() && !result.skipped && result.applied {
@@ -144,7 +173,10 @@ impl ToolRegistry {
                     } else {
                         ToolStatus::Stale
                     },
-                    json!({ "rollback": result }),
+                    json!({
+                        "rollback": result,
+                        "message": message,
+                    }),
                     ToolCostHint::default(),
                     None,
                 )
@@ -177,6 +209,7 @@ impl ToolRegistry {
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
+                let message = rollback_message(&result);
                 make_result(
                     call,
                     if result.conflicts.is_empty() && !result.skipped && result.applied {
@@ -184,7 +217,10 @@ impl ToolRegistry {
                     } else {
                         ToolStatus::Stale
                     },
-                    json!({ "rollback": result }),
+                    json!({
+                        "rollback": result,
+                        "message": message,
+                    }),
                     ToolCostHint::default(),
                     None,
                 )
@@ -224,5 +260,24 @@ impl ToolRegistry {
             }
             Err(err) => Some(tool_error(call, err)),
         }
+    }
+}
+
+fn rollback_message(result: &squeezy_vcs::RollbackResult) -> Option<&'static str> {
+    if result.conflicts.is_empty() {
+        return None;
+    }
+    if result.conflicts.iter().any(|conflict| conflict.retryable) {
+        Some(
+            "rollback hit retryable filesystem conflicts; close editors or terminals holding the files, pause OneDrive/Defender sync if needed, then retry /undo or inspect affected paths with checkpoint_show",
+        )
+    } else if result.conflicts.iter().any(|conflict| {
+        conflict.reason_code == Some(squeezy_vcs::RollbackConflictReason::GitFilterOrEolMismatch)
+    }) {
+        Some(
+            "rollback detected a Git filter/eol hash-basis mismatch; compare checkpoint blob hashes with current worktree byte hashes before retrying",
+        )
+    } else {
+        Some("rollback conflicts left current file content untouched")
     }
 }

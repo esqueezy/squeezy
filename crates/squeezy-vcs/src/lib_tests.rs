@@ -445,9 +445,137 @@ fn checkpoint_rollback_reports_conflicts_without_overwriting_user_changes() {
         .expect("rollback latest");
 
     assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(
+        rollback.conflicts[0].reason_code,
+        Some(RollbackConflictReason::WorktreeChanged)
+    );
+    assert_eq!(
+        rollback.conflicts[0].expected_hash_basis.as_deref(),
+        Some("checkpoint worktree byte hash")
+    );
+    assert_eq!(
+        rollback.conflicts[0].current_hash_basis.as_deref(),
+        Some("current worktree byte hash")
+    );
     assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user\n");
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_rollback_restores_raw_crlf_worktree_bytes_despite_gitattributes() {
+    let root = temp_repo("checkpoint_crlf_gitattributes");
+    fs::write(root.join(".gitattributes"), "*.txt text eol=lf\n").expect("write attributes");
+    fs::write(root.join("a.txt"), b"before\r\n").expect("write crlf before");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), b"agent\r\n").expect("agent edit crlf");
+    let record = store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    let file = &record.files[0];
+    assert_ne!(
+        file.after_sha256, file.after_worktree_sha256,
+        "Git blob hash should be normalized while the worktree hash keeps CRLF bytes"
+    );
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback latest");
+
+    assert!(rollback.applied);
+    assert!(rollback.conflicts.is_empty());
+    assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"before\r\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_capture_skips_symlinked_workspace_entries() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("checkpoint_skip_symlinks");
+    let outside = temp_repo("checkpoint_skip_symlinks_outside");
+    fs::write(root.join("real.txt"), "real\n").expect("write real file");
+    fs::write(outside.join("outside.txt"), "outside\n").expect("write outside file");
+    fs::create_dir(outside.join("dir")).expect("create outside dir");
+    fs::write(outside.join("dir").join("nested.txt"), "nested\n").expect("write nested file");
+    symlink(outside.join("outside.txt"), root.join("linked.txt")).expect("symlink file");
+    symlink(outside.join("dir"), root.join("linked-dir")).expect("symlink dir");
+
+    let mut entries = Vec::new();
+    collect_workspace_file_entries(&root, &root, &mut entries).expect("collect workspace files");
+    let paths = entries
+        .iter()
+        .map(|entry| entry.rel.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, vec!["real.txt"]);
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_conflicts_on_symlink_replacement_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("checkpoint_rollback_symlink_replacement");
+    let outside = temp_repo("checkpoint_rollback_symlink_outside");
+    fs::write(root.join("a.txt"), "before\n").expect("write a");
+    fs::write(outside.join("target.txt"), "agent\n").expect("write outside target");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), "agent\n").expect("agent edit");
+    store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::remove_file(root.join("a.txt")).expect("remove a");
+    symlink(outside.join("target.txt"), root.join("a.txt")).expect("replace with symlink");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback latest");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(
+        rollback.conflicts[0].reason_code,
+        Some(RollbackConflictReason::ReparsePoint)
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("target.txt")).unwrap(),
+        "agent\n"
+    );
+    assert_eq!(
+        fs::read_link(root.join("a.txt")).expect("a remains symlink"),
+        outside.join("target.txt")
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
 }
 
 #[test]
@@ -1408,6 +1536,9 @@ fn shadow_repo_open_cleans_stale_orphan_dirs() {
     fs::write(stale_dir.join("payload"), b"old").expect("write orphan payload");
     let stale_lock = checkpoints_dir.join("crashed-process.lock");
     fs::write(&stale_lock, b"99999\n").expect("write stale lock");
+    let raw_blobs = checkpoints_dir.join("raw-blobs");
+    fs::create_dir_all(raw_blobs.join("aa")).expect("create raw blobs dir");
+    fs::write(raw_blobs.join("aa").join("payload"), b"raw").expect("write raw blob");
     let recent_dir = checkpoints_dir.join("recent-scratch");
     fs::create_dir_all(&recent_dir).expect("create recent orphan dir");
 
@@ -1443,6 +1574,10 @@ fn shadow_repo_open_cleans_stale_orphan_dirs() {
     assert!(
         checkpoints_dir.join("git").exists(),
         "shadow `git/` directory must survive cleanup"
+    );
+    assert!(
+        raw_blobs.exists(),
+        "raw worktree byte blobs are checkpoint data and must survive cleanup"
     );
     drop(store);
 

@@ -53,7 +53,7 @@ pub(crate) fn spawn(
                 root.display(),
                 &write_sid
             );
-            acl::add_allow_ace(root, &write_sid)?;
+            acl::add_allow_ace_recursive(root, &write_sid)?;
 
             // Deny write on read-only carve-outs beneath this root.
             for ro_sub in &wr.read_only_subpaths {
@@ -61,7 +61,7 @@ pub(crate) fn spawn(
                     "restricted spawn: add_deny_write_ace on '{}' (read-only subpath)",
                     ro_sub.display()
                 );
-                acl::add_deny_write_ace(ro_sub, &write_sid)?;
+                acl::add_deny_write_ace_recursive(ro_sub, &write_sid)?;
             }
 
             // Deny write on protected metadata names joined under this root.
@@ -72,7 +72,7 @@ pub(crate) fn spawn(
                         "restricted spawn: add_deny_write_ace on '{}' (protected metadata)",
                         meta_path.display()
                     );
-                    acl::add_deny_write_ace(&meta_path, &write_sid)?;
+                    acl::add_deny_write_ace_recursive(&meta_path, &write_sid)?;
                 }
             }
 
@@ -83,7 +83,7 @@ pub(crate) fn spawn(
                     "restricted spawn: add_deny_write_ace on state_dir '{}' (inside writable root)",
                     state_dir.display()
                 );
-                acl::add_deny_write_ace(state_dir, &write_sid)?;
+                acl::add_deny_write_ace_recursive(state_dir, &write_sid)?;
             }
 
             all_cap_sids.push(write_sid);

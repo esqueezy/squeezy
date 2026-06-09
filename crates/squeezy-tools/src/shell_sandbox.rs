@@ -863,7 +863,7 @@ fn windows_restricted_plan(
     required: bool,
     fallback_reason: Option<String>,
 ) -> ShellSandboxPlan {
-    let shell = ShellProgram::for_command(command);
+    let shell = ShellProgram::for_windows_restricted_command(command);
     let selected_shell = Some(shell.display_name.clone());
     ShellSandboxPlan {
         program: shell.program,

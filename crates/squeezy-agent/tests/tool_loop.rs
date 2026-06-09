@@ -162,6 +162,14 @@ impl LlmProvider for DelegateFanoutProvider {
 /// builds. See `docs/internal/TEST_STACK_POSTURE.md` for the project
 /// posture and when to reuse this helper vs. the smaller
 /// `run_high_stack_async_test` in `crates/squeezy-agent/src/lib_tests.rs`.
+///
+/// The Windows MSVC default thread stack is 1 MiB; the full agent +
+/// scripted-provider + tool-registry chain instantiated by these tests
+/// blows past that and crashes with a stack overflow under
+/// `#[tokio::test]`. Sibling tests with the same ingredients (any test
+/// that drives `Agent::start_turn` on top of a `ScriptedProvider`)
+/// should reach for this wrapper if they ever start failing on Windows
+/// CI for the same reason.
 fn run_high_stack_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

@@ -146,6 +146,7 @@ pub enum DispatchCommand {
         path: Option<String>,
     },
     Checkpoints,
+    CheckpointsDoctor,
     Checkpoint {
         id: String,
     },
@@ -219,6 +220,7 @@ impl DispatchCommand {
             Self::SessionExport { .. } => "/session-export",
             Self::SessionExportHtml { .. } => "/session-export-html",
             Self::Checkpoints => "/checkpoints",
+            Self::CheckpointsDoctor => "/checkpoints",
             Self::Checkpoint { .. } => "/checkpoint",
             Self::Undo => "/undo",
             Self::RevertTurn { .. } => "/revert-turn",
@@ -373,7 +375,13 @@ impl DispatchCommand {
                 let path = tokens.next().map(str::to_string);
                 Self::SessionExportHtml { id, path }
             }
-            "/checkpoints" => Self::Checkpoints,
+            "/checkpoints" => {
+                if rest.eq_ignore_ascii_case("doctor") {
+                    Self::CheckpointsDoctor
+                } else {
+                    Self::Checkpoints
+                }
+            }
             "/checkpoint" => Self::Checkpoint {
                 id: require_id(head, rest, "<checkpoint_id>")?,
             },
