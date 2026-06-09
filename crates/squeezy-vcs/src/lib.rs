@@ -2281,7 +2281,7 @@ fn restore_regular_file_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> 
     {
         // No POSIX mode bits to apply on non-Unix; consume the parameter
         // so `cargo clippy` does not flag it as dead.
-        mode.map(drop);
+        let _ = mode;
     }
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
@@ -2411,11 +2411,6 @@ fn verify_hardlink_group(root: &Path, group: &[String]) -> Result<bool> {
             return Ok(false);
         }
     }
-    Ok(true)
-}
-
-#[cfg(not(unix))]
-fn verify_hardlink_group(_root: &Path, _group: &[String]) -> Result<bool> {
     Ok(true)
 }
 
