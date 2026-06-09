@@ -9758,9 +9758,11 @@ pub fn default_win_sandbox_state_dir() -> PathBuf {
 fn home_squeezy_subpath(name: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".squeezy").join(name))
+        // Share `cached_home_dir()` with `expand_home_path` and the skills
+        // resolvers so a Unix process with `HOME` unset agrees on a single
+        // home directory (via `getpwuid_r`) instead of splitting between
+        // `dirs::config_dir()` and `dirs::home_dir()` across call sites.
+        cached_home_dir().map(|home| home.join(".squeezy").join(name))
     }
     #[cfg(not(unix))]
     {
@@ -9773,13 +9775,29 @@ pub fn repo_settings_id(root: impl AsRef<Path>) -> String {
     let root = root.as_ref();
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let display = canonical.display().to_string();
-    // On Windows, drive-letter casing (e.g. `C:\` vs `c:\`) and UNC
-    // normalisation can vary between callers, producing different hashes
-    // for the same root. Lowercase the whole display string before hashing
-    // so per-repo settings are stable regardless of how the drive letter is
-    // spelled. On non-Windows the string is case-sensitive and unchanged.
+    // On Windows, the same physical path can be spelled in several ways
+    // (`C:\foo` vs `c:\foo`, `C:\foo` vs `C:/foo`, `\\?\C:\foo` vs `C:\foo`).
+    // `fs::canonicalize` unifies these when the path exists on disk, but
+    // falls back to the raw spelling otherwise — which is the common first-
+    // run case for a brand-new repo. Normalize the display string before
+    // hashing so per-repo settings are stable regardless of casing or
+    // separator. On non-Windows the string is case-sensitive and unchanged.
+    //
+    // `str::to_lowercase` uses Rust's Unicode case folding, which agrees
+    // with NTFS case-insensitive comparison for ASCII paths (the
+    // overwhelming majority in practice). Non-ASCII names (e.g. Turkish
+    // dotted/dotless i, certain CJK variants) can in principle disagree
+    // with NTFS's table-driven UPCASE; that gap is accepted as good-enough
+    // rather than carrying a custom case-folding table at runtime.
     #[cfg(windows)]
-    let display = display.to_lowercase();
+    let display = {
+        let normalised = display.replace('/', "\\");
+        let normalised = normalised
+            .strip_prefix("\\\\?\\")
+            .map(str::to_string)
+            .unwrap_or(normalised);
+        normalised.to_lowercase()
+    };
     let name = canonical
         .file_name()
         .and_then(|name| name.to_str())
@@ -9826,7 +9844,7 @@ pub fn default_squeezy_skills_dir() -> PathBuf {
     // skills and settings under the same %APPDATA%\squeezy umbrella.
     #[cfg(unix)]
     {
-        home_dir_path()
+        cached_home_dir()
             .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
     }
@@ -9835,7 +9853,7 @@ pub fn default_squeezy_skills_dir() -> PathBuf {
         if let Some(config) = dirs::config_dir() {
             return config.join("squeezy").join("skills");
         }
-        home_dir_path()
+        cached_home_dir()
             .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
     }
@@ -9848,7 +9866,7 @@ pub fn default_agent_compat_skills_dir() -> PathBuf {
     // a dotdir relative to the home directory.
     #[cfg(unix)]
     {
-        home_dir_path()
+        cached_home_dir()
             .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
     }
@@ -9857,7 +9875,7 @@ pub fn default_agent_compat_skills_dir() -> PathBuf {
         if let Some(data) = dirs::data_dir() {
             return data.join("agents").join("skills");
         }
-        home_dir_path()
+        cached_home_dir()
             .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
     }
@@ -9868,17 +9886,24 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
         return path;
     };
     if path_str == "~" {
-        return home_dir_path().unwrap_or(path);
+        return cached_home_dir().unwrap_or(path);
     }
     if let Some(rest) = path_str.strip_prefix("~/") {
-        return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
+        return cached_home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or(path);
     }
     // On Windows, TOML authors may write `~\subdir` (backslash separator).
     // `PathBuf::to_str` on Windows preserves the separator as `\\` in the
-    // string representation, so we also check for that prefix.
+    // string representation, so we also check for that prefix. The cross-
+    // platform `~/` arm above already covers TOML strings written with
+    // forward slashes (which work fine on Windows), so this arm exists
+    // strictly for Windows-native backslash paths and is not redundant.
     #[cfg(windows)]
     if let Some(rest) = path_str.strip_prefix("~\\") {
-        return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
+        return cached_home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or(path);
     }
     path
 }
@@ -9910,10 +9935,6 @@ pub fn cached_home_dir() -> Option<PathBuf> {
         })
         .as_deref()
         .map(PathBuf::from)
-}
-
-fn home_dir_path() -> Option<PathBuf> {
-    cached_home_dir()
 }
 
 /// Walks up the directory tree from `start` looking for `squeezy.toml`.
@@ -10377,6 +10398,27 @@ pub fn project_settings_template() -> &'static str {
 "#
 }
 
+/// Push a warning when the resolved user-settings path is relative (meaning
+/// neither HOME nor `dirs::config_dir()` resolved a concrete directory). On
+/// Windows this most often means APPDATA and USERPROFILE are both absent,
+/// which causes settings reads/writes to chase the current working directory
+/// instead of a stable per-user location. Shared between the CLI merge path
+/// (`load_default_settings_sources`) and the TUI tier-aware path
+/// (`load_separated_settings_sources`) so the signal surfaces in both.
+fn warn_if_user_path_relative(user_path: &Path, warnings: &mut Vec<ConfigWarning>) {
+    if user_path.is_relative() {
+        warnings.push(ConfigWarning {
+            source: "settings_path".to_string(),
+            field: format!(
+                "user settings path resolved to a relative path ({}) — \
+                 set SQUEEZY_SETTINGS_PATH to an absolute path to ensure \
+                 a stable, per-user config location",
+                user_path.display()
+            ),
+        });
+    }
+}
+
 fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -10392,22 +10434,7 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
         project_path.as_deref(),
         Some(repo_path.as_path()),
     )?;
-    // Warn when the user-settings path is relative (meaning neither HOME nor
-    // dirs::config_dir resolved a concrete directory). On Windows this most
-    // often means APPDATA and USERPROFILE are both absent, which causes
-    // settings reads/writes to chase the current working directory instead of
-    // a stable per-user location.
-    if user_path.is_relative() {
-        warnings.push(ConfigWarning {
-            source: "config".to_string(),
-            field: format!(
-                "user settings path resolved to a relative path ({}) — \
-                 set SQUEEZY_SETTINGS_PATH to an absolute path to ensure \
-                 a stable, per-user config location",
-                user_path.display()
-            ),
-        });
-    }
+    warn_if_user_path_relative(&user_path, &mut warnings);
     Ok((settings, sources, warnings))
 }
 
@@ -10456,6 +10483,11 @@ pub struct SeparatedSources {
     pub user_path_default: PathBuf,
     pub project_path_default: PathBuf,
     pub repo_path_default: PathBuf,
+    /// Non-fatal load-time observations the UI surfaces near the config
+    /// screen header (e.g. the relative-user-path warning). The CLI merge
+    /// path returns warnings out-of-band via `load_default_settings_sources`;
+    /// the TUI loads tiers independently so it carries them inline here.
+    pub warnings: Vec<ConfigWarning>,
 }
 
 /// Loads each tier separately so the UI can compute inheritance per leaf.
@@ -10479,6 +10511,8 @@ pub fn load_separated_settings_sources() -> Result<SeparatedSources> {
     let repo = load_tier_source(&repo_path)?;
     let project_path_default =
         project_path.unwrap_or_else(|| repo_root.join(PROJECT_SETTINGS_FILE));
+    let mut warnings = Vec::new();
+    warn_if_user_path_relative(&user_path, &mut warnings);
     Ok(SeparatedSources {
         user,
         project,
@@ -10486,6 +10520,7 @@ pub fn load_separated_settings_sources() -> Result<SeparatedSources> {
         user_path_default: user_path,
         project_path_default,
         repo_path_default: repo_path,
+        warnings,
     })
 }
 

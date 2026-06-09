@@ -51,6 +51,7 @@ fn synthetic_sources(
         user_path_default: user_default,
         project_path_default: project_default,
         repo_path_default: repo_default,
+        warnings: Vec::new(),
     }
 }
 

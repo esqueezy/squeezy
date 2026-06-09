@@ -4731,6 +4731,7 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
         user_path_default: PathBuf::from("/u.toml"),
         project_path_default: PathBuf::from("/p.toml"),
         repo_path_default: PathBuf::from("/r.toml"),
+        warnings: Vec::new(),
     };
     let models = &config_schema::CONFIG_SECTIONS[0];
     let provider_field = &models.fields[0]; // provider
@@ -4769,6 +4770,7 @@ fn resolve_field_source_returns_env_when_env_var_set() {
         user_path_default: PathBuf::from("/u.toml"),
         project_path_default: PathBuf::from("/p.toml"),
         repo_path_default: PathBuf::from("/r.toml"),
+        warnings: Vec::new(),
     };
     let provider_field = &config_schema::CONFIG_SECTIONS[0].fields[0];
     assert_eq!(
@@ -6016,7 +6018,7 @@ fn expand_home_path_tilde_alone_uses_home_var() {
     // not the literal "~" when a home dir is available.
     let path = PathBuf::from("~");
     let expanded = expand_home_path(path.clone());
-    if home_dir_path().is_some() {
+    if cached_home_dir().is_some() {
         assert_ne!(expanded, path, "tilde should expand when home dir is known");
         assert!(expanded.is_absolute(), "expanded tilde should be absolute");
     } else {
@@ -6028,7 +6030,7 @@ fn expand_home_path_tilde_alone_uses_home_var() {
 fn expand_home_path_tilde_prefix_joins_suffix() {
     let path = PathBuf::from("~/.squeezy/keybindings.toml");
     let expanded = expand_home_path(path.clone());
-    if let Some(home) = home_dir_path() {
+    if let Some(home) = cached_home_dir() {
         let expected = home.join(".squeezy/keybindings.toml");
         assert_eq!(expanded, expected);
     } else {
@@ -6049,6 +6051,23 @@ fn expand_home_path_absolute_is_unchanged() {
 fn expand_home_path_no_tilde_relative_unchanged() {
     let path = PathBuf::from("relative/path/settings.toml");
     assert_eq!(expand_home_path(path.clone()), path);
+}
+
+#[cfg(windows)]
+#[test]
+fn expand_home_path_tilde_backslash_prefix_joins_suffix() {
+    // Windows users (and PowerShell-influenced TOML) may spell home-relative
+    // paths with a backslash separator: `~\.squeezy\keybindings.toml`. The
+    // Windows-only arm in `expand_home_path` must join the suffix against
+    // the resolved home directory just like the cross-platform `~/...` arm.
+    let path = PathBuf::from("~\\.squeezy\\keybindings.toml");
+    let expanded = expand_home_path(path.clone());
+    if let Some(home) = cached_home_dir() {
+        let expected = home.join(".squeezy\\keybindings.toml");
+        assert_eq!(expanded, expected);
+    } else {
+        assert_eq!(expanded, path);
+    }
 }
 
 #[test]
@@ -6091,6 +6110,41 @@ fn repo_settings_id_windows_drive_letter_case_stable() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn repo_settings_id_windows_separator_normalisation_stable() {
+    use std::path::PathBuf;
+    // The same logical Windows path can arrive with either `\` or `/` as
+    // the separator (e.g. a TOML author wrote forward slashes while a
+    // Win32 caller emits backslashes). When the path does not exist on
+    // disk `canonicalize` falls through, so we rely on the in-function
+    // normalisation to unify the spellings before hashing.
+    let backslash = PathBuf::from("C:\\users\\me\\project");
+    let forward = PathBuf::from("C:/users/me/project");
+    assert_eq!(
+        repo_settings_id(&backslash),
+        repo_settings_id(&forward),
+        "separator style must not affect the repo settings id on Windows"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn repo_settings_id_windows_extended_length_prefix_stripped() {
+    use std::path::PathBuf;
+    // The Windows "extended-length" prefix `\\?\` makes the same path read
+    // differently in raw form; when the path does not exist on disk
+    // `canonicalize` cannot unify the spellings for us, so the in-function
+    // normalisation must strip the prefix before hashing.
+    let prefixed = PathBuf::from("\\\\?\\C:\\users\\me\\project");
+    let bare = PathBuf::from("C:\\users\\me\\project");
+    assert_eq!(
+        repo_settings_id(&prefixed),
+        repo_settings_id(&bare),
+        "extended-length prefix must not affect the repo settings id on Windows"
+    );
+}
+
 #[test]
 fn toml_path_round_trip_forward_slashes() {
     // TOML accepts forward slashes in string values on all platforms.
@@ -6103,6 +6157,44 @@ fn toml_path_round_trip_forward_slashes() {
     let display = path.display().to_string();
     let round_tripped = PathBuf::from(&display);
     assert_eq!(path, round_tripped);
+}
+
+#[test]
+fn warn_if_user_path_relative_pushes_settings_path_warning() {
+    // The relative-user-path warning is the single signal users get when
+    // `default_settings_path` falls through to `.squeezy/settings.toml`
+    // (HOME, dirs::config_dir, and APPDATA/USERPROFILE all unresolved).
+    // Pin the source label and the env-var hint so the message stays
+    // actionable across refactors.
+    let mut warnings = Vec::new();
+    warn_if_user_path_relative(Path::new("relative/settings.toml"), &mut warnings);
+    assert_eq!(warnings.len(), 1, "relative path must emit one warning");
+    assert_eq!(warnings[0].source, "settings_path");
+    assert!(
+        warnings[0].field.contains("relative/settings.toml")
+            || warnings[0].field.contains("relative\\settings.toml"),
+        "warning should embed the offending path: {}",
+        warnings[0].field
+    );
+    assert!(
+        warnings[0].field.contains("SQUEEZY_SETTINGS_PATH"),
+        "warning should point users at the env-var fix: {}",
+        warnings[0].field
+    );
+}
+
+#[test]
+fn warn_if_user_path_relative_no_op_for_absolute_path() {
+    let mut warnings = Vec::new();
+    #[cfg(unix)]
+    let absolute = Path::new("/home/me/.squeezy/settings.toml");
+    #[cfg(not(unix))]
+    let absolute = Path::new("C:\\Users\\me\\squeezy\\settings.toml");
+    warn_if_user_path_relative(absolute, &mut warnings);
+    assert!(
+        warnings.is_empty(),
+        "absolute path must not produce a warning"
+    );
 }
 
 #[test]

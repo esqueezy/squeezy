@@ -2161,6 +2161,7 @@ fn empty_sources_for(_cfg: &AppConfig) -> SeparatedSources {
         user_path_default: PathBuf::from(""),
         project_path_default: PathBuf::from(""),
         repo_path_default: PathBuf::from(""),
+        warnings: Vec::new(),
     }
 }
 

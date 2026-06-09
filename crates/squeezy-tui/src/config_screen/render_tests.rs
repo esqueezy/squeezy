@@ -38,6 +38,18 @@ fn home_relative_display_path_uses_component_boundaries_on_unix() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn home_relative_display_path_returns_tilde_for_exact_home() {
+    // When the path is the home directory itself the suffix is empty;
+    // we render it as a bare `~` rather than `~/`.
+    let home = std::path::Path::new("/tmp/squeezy-home");
+    assert_eq!(
+        home_relative_display_path(home, home),
+        Some("~".to_string())
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn home_relative_display_path_matches_windows_home_case_insensitively() {
@@ -54,6 +66,19 @@ fn home_relative_display_path_matches_windows_home_case_insensitively() {
             std::path::Path::new(r"D:\Users\Me\.squeezy\settings.toml"),
             home
         ),
+        None
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn home_relative_display_path_returns_none_when_path_shorter_than_home() {
+    // The Windows component matcher walks home component by component;
+    // when the input path runs out of components before home does, the
+    // match must fail rather than panic.
+    let home = std::path::Path::new(r"C:\Users\Me");
+    assert_eq!(
+        home_relative_display_path(std::path::Path::new(r"C:\Users"), home),
         None
     );
 }
