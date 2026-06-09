@@ -2451,6 +2451,14 @@ impl Agent {
     /// from inside an agent turn. The "manual" group id mirrors how the agent
     /// labels human-driven invocations so checkpoint grouping stays
     /// consistent across both entry points.
+    ///
+    /// Cancellation: this is a directly-awaited (sync) entry point whose
+    /// caller can drop the future to abort, so it issues a fresh
+    /// `CancellationToken` rather than a `mcp_shutdown_child_token()` child.
+    /// `Agent::shutdown` cannot interrupt an in-flight call here; the
+    /// `_in_background` siblings (e.g. `set_mcp_server_enabled_in_background`,
+    /// `restart_mcp_server_in_background`) are the ones that adopt the
+    /// shutdown-rooted token because they outlive their caller.
     pub async fn execute_local_tool(&self, call: ToolCall) -> ToolResult {
         self.tools
             .execute_for_group(call, CancellationToken::new(), "manual".to_string())
@@ -2461,6 +2469,11 @@ impl Agent {
     /// background refresh on each `start_turn`; this helper lets tests
     /// and the eval harness pre-warm the cache so the very first turn
     /// can issue `mcp__*` tool calls without racing the background task.
+    ///
+    /// See [`Agent::execute_local_tool`] for the rationale behind the fresh
+    /// `CancellationToken`: this is a sync entry point whose caller controls
+    /// cancellation by dropping the future, so it does not enrol in the
+    /// shutdown-rooted token tree.
     pub async fn refresh_mcp_tools(&self) -> squeezy_tools::McpRefreshOutcome {
         self.tools.refresh_mcp_tools(CancellationToken::new()).await
     }
@@ -2469,6 +2482,12 @@ impl Agent {
     /// agent. Returns the same refresh outcome `refresh_mcp_tools`
     /// produces so the caller (the `/mcp` config page, eval driver)
     /// can pull the new per-server status.
+    ///
+    /// Cancellation: as with `execute_local_tool` and `refresh_mcp_tools`,
+    /// this is a sync call whose caller owns the lifetime, so we mint a
+    /// fresh token. The `_in_background` sibling spawns into the agent's
+    /// JoinSet and therefore uses `mcp_shutdown_child_token()` so
+    /// `Agent::shutdown` can drain it.
     pub async fn set_mcp_server_enabled(
         &mut self,
         server_name: &str,

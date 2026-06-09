@@ -2414,6 +2414,22 @@ fn with_summary_id(mut event: TelemetryEvent, summary_id: &str) -> TelemetryEven
     event
 }
 
+/// Rolls per-event telemetry into the session summary that callers fold
+/// into the final `summary` event.
+///
+/// `failure_count` is the cumulative counter of "things that meaningfully
+/// failed mid-run", and most failure-shaped events both increment it and
+/// add a per-kind row in `failure_counts`. There is one deliberate
+/// asymmetry: `ShellWindowsDegraded` only ticks the per-kind row, not
+/// `failure_count`, because it is a steady-state platform posture (every
+/// Windows `windows-job-object` run hits it) rather than a runtime
+/// failure. Counting it as a failure would dominate any Windows session's
+/// cumulative failure_count and drown out genuine errors. Per-kind rows
+/// stay separable so dashboards that want platform breakdowns still get
+/// them. `ShellSandboxBestEffortFallback`, by contrast, *is* a runtime
+/// degradation (the configured sandbox couldn't start and we fell back),
+/// so it bumps both. Any future steady-state-degradation event should
+/// mirror the `ShellWindowsDegraded` shape.
 #[derive(Debug, Default)]
 struct SummaryAccumulator {
     provider: Option<ProviderKind>,

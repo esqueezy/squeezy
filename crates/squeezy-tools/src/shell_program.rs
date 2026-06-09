@@ -46,21 +46,26 @@ impl ShellProgram {
     ///   convention (`-NoLogo -NoProfile -Command` for PowerShell variants,
     ///   `/D /S /C` for cmd).
     ///
-    /// The resolved shell binary is cached for the process lifetime and
-    /// invalidated when `SQUEEZY_SHELL` changes. Only the default (no
-    /// override) shell path is cached; override and git-bash paths bypass
-    /// the cache because they involve per-call env-var reads of their own.
-    /// This avoids repeated `which::which` PATH walks on Windows for every
-    /// shell tool call.
+    /// Caching: the cache is consulted only when `SQUEEZY_SHELL` is unset.
+    /// Setting `SQUEEZY_SHELL` temporarily takes a non-cached path (the
+    /// override is resolved per-call), but unsetting it again returns the
+    /// previously cached default. `PATH` changes during the process
+    /// lifetime are not detected; the cached `which::which` result is
+    /// reused for the rest of the process. Override and git-bash paths
+    /// bypass the cache entirely.
     pub(crate) fn for_command(command: &str) -> Self {
         // Try the per-process cache when no override is configured. The
         // SQUEEZY_SHELL override paths are cheap and command-specific, so
-        // they bypass the cache. If the lock is poisoned we fall through to
-        // the uncached resolution path below.
-        if std::env::var_os("SQUEEZY_SHELL").is_none()
-            && let Ok(mut guard) = SHELL_BASE_CACHE.lock()
-        {
-            if let Some(ref cached) = *guard {
+        // they bypass the cache.
+        if std::env::var_os("SQUEEZY_SHELL").is_none() {
+            // Tentative read: hold the lock only long enough to clone the
+            // cached entry. `which::which` (a potentially blocking PATH
+            // walk on Windows) runs outside the critical section so other
+            // tokio futures contending on shell tool calls don't queue
+            // behind a first-time resolution.
+            if let Ok(guard) = SHELL_BASE_CACHE.lock()
+                && let Some(ref cached) = *guard
+            {
                 let mut args = cached.arg_prefix.clone();
                 args.push(command.to_string());
                 return Self {
@@ -68,15 +73,22 @@ impl ShellProgram {
                     args,
                 };
             }
-            // Cache miss: resolve the default shell and store the result.
             let resolved = Self::resolve_default(command);
             // The command is always the last argument; store the prefix.
             let arg_prefix: Vec<String> =
                 resolved.args[..resolved.args.len().saturating_sub(1)].to_vec();
-            *guard = Some(CachedShellBase {
-                program: resolved.program.clone(),
-                arg_prefix,
-            });
+            // Re-acquire the lock to publish. If a concurrent caller
+            // already populated the cache, leave their value in place —
+            // both will be equivalent under the "no SQUEEZY_SHELL, same
+            // PATH" precondition we just used.
+            if let Ok(mut guard) = SHELL_BASE_CACHE.lock()
+                && guard.is_none()
+            {
+                *guard = Some(CachedShellBase {
+                    program: resolved.program.clone(),
+                    arg_prefix,
+                });
+            }
             return resolved;
         }
 
@@ -177,18 +189,6 @@ impl ShellProgram {
                 "/C".to_string(),
                 command.to_string(),
             ],
-        }
-    }
-
-    /// Reset the per-process shell cache. Only available in test builds; call
-    /// this in test setup when the expected default shell may differ between
-    /// tests (e.g. after a PATH change or before testing the
-    /// `pwsh → powershell → cmd.exe` fallback chain).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn reset_shell_cache() {
-        if let Ok(mut guard) = SHELL_BASE_CACHE.lock() {
-            *guard = None;
         }
     }
 
