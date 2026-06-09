@@ -20,7 +20,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use squeezy_core::{FileId, Result, SqueezyError};
 
@@ -227,27 +230,27 @@ impl SqueezyStore {
     }
 
     pub fn set_graph_metadata(&self, metadata: &GraphStoreMetadata) -> Result<()> {
-        self.graph_store()?.set_graph_metadata(metadata)
+        self.with_graph_store(|store| store.set_graph_metadata(metadata))
     }
 
     pub fn graph_metadata(&self) -> Result<Option<GraphStoreMetadata>> {
-        self.graph_store()?.graph_metadata()
+        self.with_graph_store(GraphStore::graph_metadata)
     }
 
     pub fn put_graph_partition<T: Serialize>(&self, file_id: &FileId, partition: &T) -> Result<()> {
-        self.graph_store()?.put_graph_partition(file_id, partition)
+        self.with_graph_store(|store| store.put_graph_partition(file_id, partition))
     }
 
     pub fn graph_partition<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
-        self.graph_store()?.graph_partition(file_id)
+        self.with_graph_store(|store| store.graph_partition(file_id))
     }
 
     pub fn remove_graph_partition(&self, file_id: &FileId) -> Result<()> {
-        self.graph_store()?.remove_graph_partition(file_id)
+        self.with_graph_store(|store| store.remove_graph_partition(file_id))
     }
 
     pub fn clear_graph_partitions(&self) -> Result<()> {
-        self.graph_store()?.clear_graph_partitions()
+        self.with_graph_store(GraphStore::clear_graph_partitions)
     }
 
     /// Apply a coherent set of graph changes (metadata + partition upserts and
@@ -258,7 +261,7 @@ impl SqueezyStore {
     /// independently and pays a fresh fsync, which dominates wall-clock cost
     /// on a cold workspace crawl.
     pub fn apply_graph_batch(&self, batch: &GraphWriteBatch) -> Result<()> {
-        self.graph_store()?.apply_graph_batch(batch)
+        self.with_graph_store(|store| store.apply_graph_batch(batch))
     }
 
     /// Upsert a per-file resolver snapshot into the V2 resolver cache.
@@ -266,36 +269,36 @@ impl SqueezyStore {
     /// stored value so a later open can decide whether the snapshot is
     /// still authoritative.
     pub fn put_resolver_entry<T: Serialize>(&self, file_id: &FileId, entry: &T) -> Result<()> {
-        self.graph_store()?.put_resolver_entry(file_id, entry)
+        self.with_graph_store(|store| store.put_resolver_entry(file_id, entry))
     }
 
     pub fn resolver_entry<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
-        self.graph_store()?.resolver_entry(file_id)
+        self.with_graph_store(|store| store.resolver_entry(file_id))
     }
 
     pub fn resolver_entries_for<T: DeserializeOwned>(
         &self,
         file_ids: &[FileId],
     ) -> Result<Vec<(FileId, T)>> {
-        self.graph_store()?.resolver_entries_for(file_ids)
+        self.with_graph_store(|store| store.resolver_entries_for(file_ids))
     }
 
     pub fn remove_resolver_entry(&self, file_id: &FileId) -> Result<()> {
-        self.graph_store()?.remove_resolver_entry(file_id)
+        self.with_graph_store(|store| store.remove_resolver_entry(file_id))
     }
 
     pub fn clear_resolver_entries(&self) -> Result<()> {
-        self.graph_store()?.clear_resolver_entries()
+        self.with_graph_store(GraphStore::clear_resolver_entries)
     }
 
     /// Replace the persisted file-level import adjacency blob. Stored under
     /// one key so reading on warm-start is a single table get.
     pub fn put_import_graph<T: Serialize>(&self, graph: &T) -> Result<()> {
-        self.graph_store()?.put_import_graph(graph)
+        self.with_graph_store(|store| store.put_import_graph(graph))
     }
 
     pub fn import_graph<T: DeserializeOwned>(&self) -> Result<Option<T>> {
-        self.graph_store()?.import_graph()
+        self.with_graph_store(|store| store.import_graph())
     }
 
     pub fn put_tool_receipt(&self, receipt: &StoredToolReceipt) -> Result<()> {
@@ -619,7 +622,7 @@ impl SqueezyStore {
         let mut cached = self
             .graph_store
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .map_err(|_| SqueezyError::Tool("graph store lock poisoned".to_string()))?;
         if let Some(store) = cached.as_ref() {
             return Ok(Arc::clone(store));
         }
@@ -628,6 +631,11 @@ impl SqueezyStore {
         )?);
         *cached = Some(Arc::clone(&store));
         Ok(store)
+    }
+
+    fn with_graph_store<T>(&self, action: impl FnOnce(&GraphStore) -> Result<T>) -> Result<T> {
+        let store = self.graph_store()?;
+        action(store.as_ref())
     }
 }
 
@@ -1060,6 +1068,8 @@ pub struct CacheDiagnostics {
     pub cache_dir: PathBuf,
     pub state: CacheFileReport,
     pub graph: CacheFileReport,
+    pub state_stats: Option<StateCacheStats>,
+    pub graph_stats: Option<GraphCacheStats>,
     pub backups: Vec<CacheFileReport>,
     pub backup_total_bytes: u64,
 }
@@ -1070,6 +1080,26 @@ pub struct CacheDiagnostics {
 /// callers that previously pattern-matched `Err(io::ErrorKind::…)` on the
 /// old signature would silently miss those failures — hence `#[must_use]`
 /// and [`Self::errored`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateCacheStats {
+    pub schema_version: Option<u64>,
+    pub tool_receipts: usize,
+    pub read_snapshots: usize,
+    pub mcp_tool_cache_entries: usize,
+    pub observations: usize,
+    pub compaction_checkpoints: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphCacheStats {
+    pub schema_version: Option<u64>,
+    pub graph_partitions: usize,
+    pub resolver_entries: usize,
+    pub import_graph_present: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[must_use = "CachePruneReport carries partial failures in `failed_files`; ignore only intentionally"]
 pub struct CachePruneReport {
@@ -1094,12 +1124,16 @@ pub fn cache_diagnostics(
     let cache_dir = cache_dir_path(workspace_root, cache_root);
     let state = cache_file_report(state_path(workspace_root, cache_root));
     let graph = cache_file_report(graph_path(workspace_root, cache_root));
+    let state_stats = state.exists.then(|| state_cache_stats(&state.path));
+    let graph_stats = graph.exists.then(|| graph_cache_stats(&graph.path));
     let backups = cache_backups(&cache_dir)?;
     let backup_total_bytes = backups.iter().map(|file| file.size_bytes).sum();
     Ok(CacheDiagnostics {
         cache_dir,
         state,
         graph,
+        state_stats,
+        graph_stats,
         backups,
         backup_total_bytes,
     })
@@ -1146,6 +1180,86 @@ fn bootstrap_graph_store(path: &Path) -> Result<()> {
     }
     let database = open_database(path)?;
     initialize_graph_schema(&database)
+}
+
+fn state_cache_stats(path: &Path) -> StateCacheStats {
+    match open_database(path) {
+        Ok(database) => StateCacheStats {
+            schema_version: current_schema_version(&database).ok().flatten(),
+            tool_receipts: table_entry_count(&database, TOOL_RECEIPTS).unwrap_or(0),
+            read_snapshots: table_entry_count(&database, READ_SNAPSHOTS).unwrap_or(0),
+            mcp_tool_cache_entries: table_entry_count(&database, MCP_TOOL_CACHE).unwrap_or(0),
+            observations: table_entry_count(&database, OBSERVATIONS).unwrap_or(0),
+            compaction_checkpoints: table_entry_count(&database, COMPACTION_CHECKPOINTS)
+                .unwrap_or(0),
+            error: None,
+        },
+        Err(error) => StateCacheStats {
+            schema_version: None,
+            tool_receipts: 0,
+            read_snapshots: 0,
+            mcp_tool_cache_entries: 0,
+            observations: 0,
+            compaction_checkpoints: 0,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn graph_cache_stats(path: &Path) -> GraphCacheStats {
+    match open_database(path) {
+        Ok(database) => GraphCacheStats {
+            schema_version: current_schema_version(&database).ok().flatten(),
+            graph_partitions: table_entry_count(&database, GRAPH_PARTITIONS).unwrap_or(0),
+            resolver_entries: table_entry_count(&database, RESOLVER_SNAPSHOT_PER_FILE).unwrap_or(0),
+            import_graph_present: table_has_key(
+                &database,
+                RESOLVER_IMPORT_GRAPH,
+                "resolver_import_graph",
+            )
+            .unwrap_or(false),
+            error: None,
+        },
+        Err(error) => GraphCacheStats {
+            schema_version: None,
+            graph_partitions: 0,
+            resolver_entries: 0,
+            import_graph_present: false,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn table_entry_count(
+    database: &Database,
+    definition: TableDefinition<&str, &[u8]>,
+) -> Result<usize> {
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(definition) {
+        Ok(table) => table,
+        Err(_) => return Ok(0),
+    };
+    // redb 4.x exposes a constant-time `len()` on every readable table via
+    // [`ReadableTableMetadata`]. Falling back to iteration would do a full
+    // table scan for what cache diagnostics treat as a one-line summary —
+    // noticeable on graph caches with tens of thousands of partitions.
+    table.len().map(|len| len as usize).map_err(store_error)
+}
+
+fn table_has_key(
+    database: &Database,
+    definition: TableDefinition<&str, &[u8]>,
+    key: &str,
+) -> Result<bool> {
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(definition) {
+        Ok(table) => table,
+        Err(_) => return Ok(false),
+    };
+    table
+        .get(key)
+        .map(|value| value.is_some())
+        .map_err(store_error)
 }
 
 pub fn cache_dir_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {

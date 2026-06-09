@@ -6,8 +6,8 @@ use squeezy_core::AppConfig;
 use squeezy_core::FileId;
 
 use crate::{
-    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphWriteBatch, STATE_FILE_NAME,
-    SqueezyStore, fs_util, graph_path, sessions::ResumeItem, state_path,
+    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphStoreMetadata, GraphWriteBatch,
+    STATE_FILE_NAME, SqueezyStore, fs_util, graph_path, sessions::ResumeItem, state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -228,7 +228,10 @@ fn graph_write_batch_applies_resolver_cache_changes() {
     batch
         .upsert_resolver_entry(&second, &json!({"exports": ["Second"]}))
         .expect("encode second resolver entry");
-    assert_eq!(batch.len(), 2);
+    batch
+        .set_import_graph(&json!({"imports_by_file": {"src/first.rs": ["src/second.rs"]}}))
+        .expect("encode import graph");
+    assert_eq!(batch.len(), 3);
     store
         .apply_graph_batch(&batch)
         .expect("apply resolver batch");
@@ -243,6 +246,14 @@ fn graph_write_batch_applies_resolver_cache_changes() {
         .expect("load second")
         .expect("second present");
     assert_eq!(second_entry["exports"][0], "Second");
+    let import_graph: serde_json::Value = store
+        .import_graph()
+        .expect("load import graph")
+        .expect("import graph present");
+    assert_eq!(
+        import_graph["imports_by_file"]["src/first.rs"][0],
+        "src/second.rs"
+    );
 
     let mut update = GraphWriteBatch::new();
     update.remove_resolver_entry(&first);
@@ -269,7 +280,7 @@ fn graph_write_batch_applies_resolver_cache_changes() {
 
 #[test]
 fn state_open_creates_state_only_store() {
-    let (root, _store) = open_store("state-only");
+    let (root, store) = open_store("state-only");
     assert!(
         state_path(&root, None).exists(),
         "{STATE_FILE_NAME} should be created by SqueezyStore::open"
@@ -277,6 +288,20 @@ fn state_open_creates_state_only_store() {
     assert!(
         !graph_path(&root, None).exists(),
         "{GRAPH_FILE_NAME} should remain unopened until graph persistence is needed"
+    );
+
+    let metadata = GraphStoreMetadata {
+        workspace_root: root.display().to_string(),
+        crawl_options_hash: "crawl".to_string(),
+        language_registry_version: "langs".to_string(),
+        graph_format_version: 1,
+    };
+    store
+        .set_graph_metadata(&metadata)
+        .expect("lazy graph metadata write");
+    assert_eq!(
+        store.graph_metadata().expect("lazy graph metadata read"),
+        Some(metadata)
     );
 }
 

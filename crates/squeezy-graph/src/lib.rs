@@ -563,6 +563,14 @@ impl SemanticGraph {
     }
 
     pub fn from_parsed(files: Vec<ParsedFile>) -> Self {
+        Self::from_parsed_with_resolver_cache(files, None, &[]).0
+    }
+
+    fn from_parsed_with_resolver_cache(
+        files: Vec<ParsedFile>,
+        store: Option<&GraphStore>,
+        records: &[FileRecord],
+    ) -> (Self, ResolverCacheLoadReport) {
         let mut graph = Self::empty();
         graph.reserve_parsed_capacity(&files);
         for file in files {
@@ -571,9 +579,18 @@ impl SemanticGraph {
         graph.rebuild_java_project_facts();
         graph.rebuild_dotnet_project_facts();
         graph.rebuild_kotlin_project_facts();
-        graph.rebuild_semantic_edges();
+        let resolver_cache = load_resolver_cache(store, &mut graph, records).unwrap_or({
+            ResolverCacheLoadReport {
+                entries_loaded: 0,
+                entries_missed: records.len(),
+                import_graph_loaded: false,
+            }
+        });
+        graph.rebuild_semantic_edges_with_cached_resolver(
+            resolver_cache.entries_missed == 0 && resolver_cache.import_graph_loaded,
+        );
         graph.rebuild_indexes();
-        graph
+        (graph, resolver_cache)
     }
 
     fn reserve_parsed_capacity(&mut self, files: &[ParsedFile]) {
@@ -1844,7 +1861,10 @@ impl SemanticGraph {
         }
     }
 
-    fn rebuild_resolution_indexes(&mut self) {
+    pub(crate) fn rebuild_resolution_indexes_with_cached_resolver(
+        &mut self,
+        resolver_loaded: bool,
+    ) {
         self.symbols_by_name.clear();
         self.children_by_parent.clear();
         self.arity_index.clear();
@@ -1887,13 +1907,15 @@ impl SemanticGraph {
             }
         }
 
-        self.rebuild_resolver_slots();
-        self.rebuild_importers_by_file();
+        if !resolver_loaded {
+            self.rebuild_resolver_slots();
+            self.rebuild_importers_by_file();
+        }
     }
 
     /// Populate per-file [`cross_file::ResolverSlot`] entries. Slots are
-    /// persisted by [`GraphManager::persist_resolver_cache`] and restored on
-    /// warm starts by [`Self::apply_warm_resolver_cache`], so the per-language
+    /// persisted by [`GraphManager::extend_resolver_cache_batch`] and restored
+    /// on warm starts by `load_resolver_cache`, so the per-language
     /// flip to the phased resolver can read a ready table immediately instead
     /// of paying a one-time backfill.
     fn rebuild_resolver_slots(&mut self) {
@@ -2227,6 +2249,9 @@ pub struct GraphBuildReport {
     pub persisted_files_loaded: usize,
     pub persisted_files_missed: usize,
     pub persistence_rebuilt: bool,
+    pub resolver_entries_loaded: usize,
+    pub resolver_entries_missed: usize,
+    pub resolver_import_graph_loaded: bool,
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
@@ -2575,25 +2600,11 @@ impl GraphManager {
             }
             store.apply_graph_batch(&batch)?;
         }
-        let mut graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
+        let (graph, resolver_cache) = SemanticGraph::from_parsed_with_resolver_cache(
+            merge_parsed_by_snapshot_order(&snapshot.files, loaded.parsed, parsed_missed),
+            store.as_deref(),
             &snapshot.files,
-            loaded.parsed,
-            parsed_missed,
-        ));
-        // Warm-start: only when every partition was loaded from persistence
-        // (no files were re-parsed). If any file was re-parsed, `from_parsed`
-        // → `rebuild_importers_by_file` produced a fresh, correct importer
-        // index; overwriting it with the persisted snapshot would introduce
-        // stale edges for the changed files. Per-file slot entries are
-        // individually fingerprint-guarded inside `apply_warm_resolver_cache`,
-        // but the global snapshot replacement is not, so skip the whole
-        // warm-start on any re-parse.
-        if loaded.missed_records.is_empty()
-            && let Some(store) = store.as_deref()
-        {
-            let (entries, snap) = load_resolver_cache(store, &snapshot.files);
-            graph.apply_warm_resolver_cache(entries, snap);
-        }
+        );
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
             files_seen: snapshot.files.len(),
@@ -2606,6 +2617,9 @@ impl GraphManager {
             persisted_files_loaded: loaded.loaded_files,
             persisted_files_missed: loaded.missed_records.len(),
             persistence_rebuilt: loaded.rebuilt,
+            resolver_entries_loaded: resolver_cache.entries_loaded,
+            resolver_entries_missed: resolver_cache.entries_missed,
+            resolver_import_graph_loaded: resolver_cache.import_graph_loaded,
             excluded_files: snapshot.coverage.skipped_files,
             excluded_dirs: snapshot.coverage.skipped_dirs,
             excluded_bytes: snapshot.coverage.skipped_bytes,
@@ -2618,7 +2632,7 @@ impl GraphManager {
             freshness_mode: GraphFreshnessMode::Polling,
             freshness_fallback_reason: None,
         };
-        Ok(Self {
+        let manager = Self {
             root,
             crawler,
             parser,
@@ -2635,7 +2649,19 @@ impl GraphManager {
                 backend: "none",
                 fallback_reason: None,
             },
-        })
+        };
+        if let Some(store) = manager.store.as_deref() {
+            // Cold-build commits the partition/metadata batch above with
+            // error propagation; the resolver-cache rows go in a separate,
+            // best-effort batch so an encoding or write failure here cannot
+            // poison the freshly-built graph.
+            let mut batch = GraphWriteBatch::new();
+            manager.extend_resolver_cache_batch(&mut batch);
+            if !batch.is_empty() {
+                let _ = store.apply_graph_batch(&batch);
+            }
+        }
+        Ok(manager)
     }
 
     pub fn graph(&self) -> &SemanticGraph {
@@ -2710,17 +2736,18 @@ impl GraphManager {
         Arc::clone(&self.pending_changed_paths)
     }
 
-    /// Best-effort write of the V2 resolver-cache rows. All per-file entries
-    /// and the single-blob import adjacency graph are accumulated into one
-    /// [`GraphWriteBatch`] and committed in a single redb transaction, so
-    /// large workspaces pay one fsync instead of one per file.
+    /// Extend `batch` with the V2 resolver-cache rows. Per-file entries
+    /// carry the workspace-side fingerprint that future warm-start reads
+    /// will compare against. The single-blob import adjacency is mirrored
+    /// from [`SemanticGraph::importers_by_file`]. Encoding failures are
+    /// swallowed so persistence errors cannot poison the in-memory graph.
     ///
-    /// The workspace-side fingerprint (modified-time + size) embedded in each
-    /// entry lets a warm-start read decide whether a snapshot is still
-    /// authoritative without rehashing the source. Failures are swallowed so
-    /// persistence errors cannot poison the in-memory graph.
-    fn persist_resolver_cache(&self, store: &GraphStore) {
-        let mut batch = GraphWriteBatch::new();
+    /// Callers fold this into the same `GraphWriteBatch` they already
+    /// stage partition/metadata changes onto, so the resulting redb
+    /// commit covers metadata, partitions, and resolver cache in one
+    /// fsync. Deletion of stale rows for removed files is handled by
+    /// the caller via [`GraphWriteBatch::remove_resolver_entry`].
+    fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch) {
         for (file_id, file) in &self.graph.files {
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
                 continue;
@@ -2747,7 +2774,6 @@ impl GraphManager {
             }
         }
         let _ = batch.set_import_graph(&snapshot);
-        let _ = store.apply_graph_batch(&batch);
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
@@ -2981,10 +3007,21 @@ impl GraphManager {
         for file_id in &removed_files {
             self.graph.remove_file_data(file_id);
             graph_batch.remove_partition(file_id);
+            // Drop the matching resolver-cache row so deleted files do
+            // not accumulate as dead weight in `RESOLVER_SNAPSHOT_PER_FILE`
+            // — the per-file partition removal above already covers
+            // `GRAPH_PARTITIONS`, but the resolver row would otherwise
+            // outlive its file and over-count
+            // `cache_diagnostics.resolver_entries`.
+            graph_batch.remove_resolver_entry(file_id);
         }
         for file_id in &unsupported_removed_files {
             self.graph.files.remove(file_id);
             graph_batch.remove_partition(file_id);
+            // Best-effort: unsupported files rarely carry resolver rows, but
+            // when they do (e.g. a file flipped from supported to unsupported
+            // on a previous run) the row would otherwise leak.
+            graph_batch.remove_resolver_entry(file_id);
         }
         for record in unsupported_changed_records {
             // A file that flipped from a supported language to unsupported
@@ -3030,17 +3067,18 @@ impl GraphManager {
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
         }
-        if let Some(store) = self.store.as_deref()
-            && !graph_batch.is_empty()
-        {
-            let _ = store.apply_graph_batch(&graph_batch);
-        }
-        // Persist the resolver-cache rows for every file the rebuild
-        // touched. Best-effort: encoding or write failure must not poison
+        // Fold the resolver-cache rows (per-file entries + import-graph
+        // blob) into the same batch as the partition/metadata changes so a
+        // refresh that touches one or two files pays a single redb fsync
+        // instead of one for partitions and a second for the resolver
+        // cache. Best-effort: encoding or write failure must not poison
         // the in-memory graph update; the warm-start path will fall back
         // to a full rebuild when it cannot find an entry.
         if let Some(store) = self.store.as_deref() {
-            self.persist_resolver_cache(store);
+            self.extend_resolver_cache_batch(&mut graph_batch);
+            if !graph_batch.is_empty() {
+                let _ = store.apply_graph_batch(&graph_batch);
+            }
         }
 
         // Only declare the pending set fully drained when we actually parsed
@@ -3108,27 +3146,109 @@ struct LoadedPartitions {
     rebuilt: bool,
 }
 
-/// Per-file entries plus the single-blob import-graph snapshot returned by
-/// [`load_resolver_cache`].
-type ResolverCacheLoad = (
-    Vec<(FileId, resolver_cache::ResolverFileEntry)>,
-    Option<resolver_cache::ResolverSnapshot>,
-);
+#[derive(Debug, Default)]
+struct ResolverCacheLoadReport {
+    entries_loaded: usize,
+    entries_missed: usize,
+    import_graph_loaded: bool,
+}
 
-/// Attempt to load V2 resolver-cache data for a warm start. Returns per-file
-/// `ResolverFileEntry` values (fingerprint will be checked by the caller) and
-/// the optional single-blob `ResolverSnapshot`. Best-effort: store I/O errors
-/// and decode failures are silently swallowed, returning empty collections so
-/// the caller always gets a usable (possibly empty) result.
-fn load_resolver_cache(store: &GraphStore, records: &[FileRecord]) -> ResolverCacheLoad {
-    let file_ids: Vec<FileId> = records.iter().map(|r| r.id.clone()).collect();
-    let entries = store
-        .resolver_entries_for::<resolver_cache::ResolverFileEntry>(&file_ids)
-        .unwrap_or_default();
-    let snapshot = store
-        .import_graph::<resolver_cache::ResolverSnapshot>()
-        .unwrap_or_default();
-    (entries, snapshot)
+fn load_resolver_cache(
+    store: Option<&GraphStore>,
+    graph: &mut SemanticGraph,
+    records: &[FileRecord],
+) -> Result<ResolverCacheLoadReport> {
+    let Some(store) = store else {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed: records.len(),
+            import_graph_loaded: false,
+        });
+    };
+    let ids = records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let entries = store.resolver_entries_for::<resolver_cache::ResolverFileEntry>(&ids)?;
+    let mut by_id = entries.into_iter().collect::<HashMap<_, _>>();
+
+    // Pass 1: validate all entries without mutating the graph. If any entry is
+    // missing or has a stale fingerprint the whole cache is unusable (because
+    // rebuild_resolver_slots would clear resolver_slots immediately), so we bail
+    // early rather than inserting matched entries that would be discarded anyway.
+    let mut slots = Vec::with_capacity(records.len());
+    let mut entries_missed: usize = 0;
+    for record in records {
+        let Some(entry) = by_id.remove(&record.id) else {
+            entries_missed += 1;
+            continue;
+        };
+        if entry.fingerprint.modified_unix_millis != record.modified_unix_millis
+            || entry.fingerprint.size_bytes != record.size_bytes
+        {
+            entries_missed += 1;
+            continue;
+        }
+        slots.push((
+            record.id.clone(),
+            cross_file::ResolverSlot {
+                exports: entry.exports,
+                imports: entry.imports,
+                supertypes: entry.supertypes,
+            },
+        ));
+    }
+
+    if entries_missed > 0 {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed,
+            import_graph_loaded: false,
+        });
+    }
+
+    // Check the import-graph blob BEFORE inserting slots. If it is absent
+    // or unreadable, the caller's gate
+    // (`entries_missed == 0 && import_graph_loaded`) would force a
+    // `rebuild_resolver_slots()` that wipes anything we just inserted —
+    // paying slot-population cost for nothing. Bail early instead.
+    let Some(snapshot) = store.import_graph::<resolver_cache::ResolverSnapshot>()? else {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed: 0,
+            import_graph_loaded: false,
+        });
+    };
+
+    // Pass 2: all entries matched and import-graph available — commit into the graph.
+    let entries_loaded = slots.len();
+    for (id, slot) in slots {
+        graph.resolver_slots.insert(id, slot);
+    }
+
+    let known = graph.files.keys().cloned().collect::<HashSet<_>>();
+    let mut importers_by_file = HashMap::new();
+    for (target, importers) in snapshot.importers_by_file {
+        let target = FileId::new(target);
+        if !known.contains(&target) {
+            continue;
+        }
+        let importers = importers
+            .into_iter()
+            .map(FileId::new)
+            .filter(|id| known.contains(id) && id != &target)
+            .collect::<Vec<_>>();
+        if !importers.is_empty() {
+            importers_by_file.insert(target, importers);
+        }
+    }
+    graph.importers_by_file = importers_by_file;
+
+    Ok(ResolverCacheLoadReport {
+        entries_loaded,
+        entries_missed: 0,
+        import_graph_loaded: true,
+    })
 }
 
 fn load_persisted_partitions(
