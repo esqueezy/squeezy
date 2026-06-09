@@ -4116,13 +4116,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         .history
                         .iter()
                         .map(|record| {
-                            let undo_mark = if record.replacement_id.is_some() {
-                                " [undoable]"
+                            let checkpoint_mark = if record.replacement_id.is_some() {
+                                " [checkpointed]"
                             } else {
                                 ""
                             };
                             format!(
-                                "gen={} trigger={} {before}→{after} tok dropped={dropped}{undo_mark}",
+                                "gen={} trigger={} {before}→{after} tok dropped={dropped}{checkpoint_mark}",
                                 record.generation,
                                 record.trigger.as_str(),
                                 before = record.before.estimated_tokens,

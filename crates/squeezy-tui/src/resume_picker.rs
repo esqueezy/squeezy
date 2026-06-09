@@ -196,11 +196,10 @@ pub(crate) enum ResumeChoice {
     Quit,
 }
 
-/// One selectable row in the picker. Linear sessions produce a single
-/// entry; branched sessions expand into one entry per branch tip so the
-/// user can navigate to either path. `summary` is shared across rows
-/// belonging to the same session so the row renderer still has access
-/// to `cwd`, `repo_root`, etc.
+/// One selectable row in the picker. Each session currently produces a
+/// single linear entry; branched sessions intentionally collapse until
+/// branch-aware resume can honor a selected tip. `summary` gives the row
+/// renderer access to `cwd`, `repo_root`, etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PickerEntry {
     pub(crate) summary: SessionSummary,
@@ -351,8 +350,8 @@ fn global_index_entry_has_resume_content(entry: &GlobalSessionIndexEntry) -> boo
 pub(crate) struct ResumePickerState {
     /// Currently-visible rows, derived from `all_sessions` and the
     /// `show_all_projects` toggle. Recomputed every time the toggle flips.
-    /// One entry per row — branched sessions expand into multiple rows so
-    /// each branch tip is independently selectable.
+    /// Each session contributes one row today; branched sessions collapse
+    /// to that linear row until branch-aware resume is implemented.
     pub(crate) candidates: Vec<PickerEntry>,
     /// Full recent list across every cwd; the cwd-scoped view is a filter
     /// over this. Kept on the state so Tab can re-derive `candidates`

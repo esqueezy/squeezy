@@ -189,7 +189,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/compact",
         description: "compact context now (undo to restore; history to view timeline)",
         available_during_task: false,
-        parameter_hint: None,
+        parameter_hint: Some("[undo|history]"),
         capabilities: &[PermissionCapability::Network],
     },
     // `/clear` rotates to a fresh session; the prior one stays resumable.
