@@ -13652,6 +13652,98 @@ fn detect_inheritance_grep_negatives() {
 }
 
 #[test]
+fn tool_spec_capability_matches_permission_request_baseline() {
+    // For every non-MCP first-party spec whose ToolSpec.capability is not
+    // Read, a baseline ToolCall must produce a PermissionRequest whose
+    // capability is also not Read. This catches drift where a tool is added
+    // with a non-Read spec capability but has no explicit branch in
+    // permission_request, causing it to fall through to the
+    // `_ => (PermissionCapability::Read, "tool:<name>", Medium)` default.
+    //
+    // That default would let a shell/edit/network tool run in read-only
+    // sessions when it should be gated. The `shell` tool is excluded
+    // because it intentionally classifies individual commands to precise
+    // per-command capabilities (some read-only commands get Search/Read),
+    // so the per-command runtime level can legitimately be lower than the
+    // advertised Shell capability.
+    let tmp = std::env::temp_dir().join(format!(
+        "sqz_cap_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let registry = registry_with_shell_sandbox_off(&tmp);
+    let specs = registry.specs();
+    // Only test first-party tools (not MCP server tools whose names begin
+    // with "mcp__" — those are dynamically discovered and use the Mcp branch).
+    let first_party: Vec<_> = specs
+        .iter()
+        .filter(|s| !s.name.starts_with("mcp__"))
+        .collect();
+    assert!(
+        !first_party.is_empty(),
+        "registry must expose at least one first-party spec"
+    );
+    // Provide minimal valid arguments for tools whose permission_request
+    // branch requires argument parsing to reach the correct capability.
+    // Tools not listed here get an empty object; if that causes a false
+    // pass (early Read escape before classification), the test comment
+    // below explains why that is still safe for the current set.
+    let arguments_for = |name: &str| -> serde_json::Value {
+        match name {
+            "apply_patch" => json!({"patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n+line\n"}),
+            "write_file" | "notebook_edit" => json!({"path": "src/foo.rs", "content": ""}),
+            "checkpoint_undo" | "checkpoint_revert" => json!({}),
+            "verify" => json!({}),
+            "refresh_compiler_facts" => json!({}),
+            "webfetch" => json!({"url": "https://example.com/"}),
+            "websearch" => json!({"query": "test"}),
+            "mcp_read_resource" => json!({"server": "test", "uri": "test://resource"}),
+            "grep" => json!({"pattern": "test"}),
+            "glob" => json!({"pattern": "*.rs"}),
+            "decl_search" | "definition_search" | "reference_search" => {
+                json!({"query": "MyType"})
+            }
+            _ => json!({}),
+        }
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for spec in &first_party {
+        // Shell is intentionally command-per-command; a safe echo command
+        // legitimately classifies as Search. Skip it here.
+        if spec.name == "shell" {
+            continue;
+        }
+        // Only check tools where the spec advertises above Read — those must
+        // have explicit branches, not fall through to the Read default.
+        if spec.capability == PermissionCapability::Read {
+            continue;
+        }
+        let call = ToolCall {
+            call_id: "test-consistency".to_string(),
+            name: spec.name.clone(),
+            arguments: arguments_for(&spec.name),
+        };
+        let request = registry.permission_request(&call);
+        if request.capability == PermissionCapability::Read && request.target.starts_with("tool:") {
+            failures.push(format!(
+                "tool {:?}: spec.capability={:?} but permission_request fell through to the \
+                 default Read branch (target={:?}); add an explicit branch in permission_request",
+                spec.name, spec.capability, request.target
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "tool spec / permission_request capability mismatch(es):\n{}",
+        failures.join("\n")
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn detect_inheritance_grep_extraction() {
     // Generic args stripped.
     let g = detect_inheritance_grep("class X extends TypeAdapter<T>").expect("qualifies");
