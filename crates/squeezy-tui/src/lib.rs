@@ -70,6 +70,11 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthStr;
 
 mod approval;
+// Real Terminal Benchmark Suite (§12.10.2). `cfg(test)`-gated so the benchmark
+// harness never compiles into a shipped TUI binary; every item is exercised by
+// its sibling `bench_render_tests.rs`, so the module carries no dead code.
+#[cfg(test)]
+mod bench_render;
 mod clipboard;
 mod commands;
 mod commands_style;
