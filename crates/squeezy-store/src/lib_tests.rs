@@ -1,4 +1,25 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Serialises tests that mutate `XDG_CACHE_HOME` to avoid data races in
+/// parallel test threads (Rust 2024: `env::set_var` is `unsafe`).
+static XDG_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_xdg_cache_home<R>(xdg: &Path, body: impl FnOnce() -> R) -> R {
+    let _guard = XDG_LOCK.lock().expect("XDG_CACHE_HOME lock");
+    let previous = std::env::var_os("XDG_CACHE_HOME");
+    // SAFETY: XDG_LOCK above serialises mutations of XDG_CACHE_HOME across
+    // all tests in this module.
+    unsafe { std::env::set_var("XDG_CACHE_HOME", xdg) };
+    let result = body();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+    result
+}
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
@@ -7,7 +28,8 @@ use squeezy_core::FileId;
 
 use crate::{
     CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphStoreMetadata, GraphWriteBatch,
-    STATE_FILE_NAME, SqueezyStore, fs_util, graph_path, sessions::ResumeItem, state_path,
+    STATE_FILE_NAME, SqueezyStore, cache_dir_path, fs_util, graph_path, sessions::ResumeItem,
+    state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -212,6 +234,66 @@ fn oversized_state_file_rotates_without_redb_open() {
                 .to_string_lossy()
                 .contains("oversized-state")),
         "oversized state file should be moved aside without redb open"
+    );
+}
+
+#[test]
+fn xdg_cache_root_resolves_under_xdg_cache_home_with_repo_id() {
+    let root = temp_root("xdg-cache-root");
+    let xdg = temp_root("xdg-cache-home");
+
+    let resolved = with_xdg_cache_home(&xdg, || cache_dir_path(&root, Some(Path::new("xdg"))));
+
+    assert!(
+        resolved.starts_with(&xdg),
+        "resolved={}",
+        resolved.display()
+    );
+    let expected_parent = xdg.join("squeezy");
+    assert_eq!(resolved.parent(), Some(expected_parent.as_path()));
+    assert!(
+        resolved
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("xdg-cache-root")),
+        "repo id should preserve a readable workspace prefix: {}",
+        resolved.display()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
+    let entries = super::parse_linux_mountinfo(
+        "31 23 0:27 / / rw,relatime - ext4 /dev/sda1 rw\n\
+         32 23 0:28 / /mnt/share rw,relatime - nfs4 server:/share rw\n\
+         33 23 0:29 / /work rw,relatime - overlay overlay rw\n\
+         34 23 0:30 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+    );
+
+    let nfs = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/mnt/share"))
+        .expect("nfs mount");
+    assert_eq!(
+        super::classify_filesystem(&nfs.fs_type),
+        crate::StorageMountClassification::Network
+    );
+    let overlay = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/work"))
+        .expect("overlay mount");
+    assert_eq!(
+        super::classify_filesystem(&overlay.fs_type),
+        crate::StorageMountClassification::Virtual
+    );
+    let procfs = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/proc"))
+        .expect("proc mount");
+    assert_eq!(
+        super::classify_filesystem(&procfs.fs_type),
+        crate::StorageMountClassification::Virtual
     );
 }
 

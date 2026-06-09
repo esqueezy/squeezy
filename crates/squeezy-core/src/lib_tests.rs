@@ -2689,6 +2689,7 @@ exclude_classes = ["generated"]
 [cache]
 root = ".squeezy/cache"
 tool_outputs = ".squeezy/tool_outputs"
+durability = "turn"
 
 [tools]
 checkpoints_enabled = true
@@ -2762,6 +2763,7 @@ reason = "docs lookups are safe"
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
     );
+    assert_eq!(config.cache.durability, CacheDurability::Turn);
     assert!(config.checkpoints_enabled);
     assert_eq!(config.tools.checkpoint_retention_days, 3);
     assert_eq!(config.tools.checkpoint_max_file_bytes, 8192);
@@ -4502,8 +4504,62 @@ fn inspect_omits_optional_cache_keys_when_unset() {
     let inspect = config.inspect_redacted();
 
     assert!(inspect.contains("[cache]"));
+    assert!(inspect.contains("durability = \"fast\""));
     assert!(!inspect.contains("root ="));
     assert!(!inspect.contains("tool_outputs ="));
+}
+
+#[test]
+fn cache_durability_rejects_unknown_values() {
+    let error = SettingsFile::from_toml_str(
+        r#"
+[cache]
+durability = "forever"
+"#,
+        "test",
+    )
+    .expect_err("unknown durability should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("expected one of fast, turn, strict"),
+        "{error}"
+    );
+}
+
+#[test]
+fn cache_durability_serde_and_parse_are_consistent() {
+    for variant in [
+        CacheDurability::Fast,
+        CacheDurability::Turn,
+        CacheDurability::Strict,
+    ] {
+        let name = variant.as_str();
+
+        // `parse` round-trip
+        assert_eq!(
+            CacheDurability::parse(name),
+            Some(variant),
+            "parse({name:?}) should return {variant:?}"
+        );
+
+        // serde round-trip: JSON value produced by Serialize must re-produce the
+        // same variant through Deserialize, confirming the two paths stay in sync.
+        let json = serde_json::to_value(variant).expect("serialize");
+        let back: CacheDurability = serde_json::from_value(json.clone()).expect("deserialize");
+        assert_eq!(
+            back, variant,
+            "serde round-trip for {variant:?} failed (got JSON {json})"
+        );
+
+        // The serde snake_case representation must match `as_str`/`parse`.
+        let serde_str = json.as_str().expect("serialized as string");
+        assert_eq!(
+            serde_str, name,
+            "serde name {serde_str:?} diverges from parse name {name:?}"
+        );
+    }
 }
 
 #[test]

@@ -650,6 +650,30 @@ fn graph_store_check_reports_absent_without_creating_redb() {
 }
 
 #[test]
+fn storage_error_hint_classifies_common_failures() {
+    assert_eq!(
+        storage_error_hint("database lock would block"),
+        "likely lock contention"
+    );
+    assert_eq!(
+        storage_error_hint("permission denied"),
+        "likely permission problem"
+    );
+    assert_eq!(
+        storage_error_hint("No space left on device"),
+        "likely disk full"
+    );
+    assert_eq!(
+        storage_error_hint("invalid database checksum"),
+        "possible redb corruption"
+    );
+    assert_eq!(
+        storage_error_hint("operation not supported"),
+        "possible unsupported filesystem behavior"
+    );
+}
+
+#[test]
 fn graph_store_check_opens_existing_redb_in_tempdir() {
     let workspace = std::env::temp_dir().join(format!(
         "squeezy-doctor-graph-existing-{}-{}",
@@ -734,7 +758,7 @@ fn cache_check_warns_about_redb_backups() {
     config.workspace_root = workspace.clone();
     config.cache.root = None;
 
-    let check = cache_check(&config, false);
+    let check = cache_check(&config, false, false);
 
     let _ = fs::remove_dir_all(&workspace);
     assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
@@ -760,12 +784,94 @@ fn cache_check_prunes_redb_backups() {
     config.workspace_root = workspace.clone();
     config.cache.root = None;
 
-    let check = cache_check(&config, true);
+    let check = cache_check(&config, true, false);
 
     assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("pruned 1 backups"));
     assert!(!backup.exists(), "backup should be removed");
     let _ = fs::remove_dir_all(&workspace);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_check_prune_preserves_storage_warning() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-cache-prune-storage-warn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cache_dir = workspace.join(".squeezy").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let backup = cache_dir.join("schema-2-test.redb.bak");
+    fs::write(&backup, b"old").expect("write backup");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    config.session_logs.log_dir = Some(std::path::PathBuf::from("/proc/squeezy-sessions"));
+
+    let check = cache_check(&config, true, true);
+
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check
+            .detail
+            .contains("storage warning: sessions=proc(virtual)"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(check.detail.contains("pruned 1 backups"));
+    assert!(!backup.exists(), "backup should be removed");
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn cache_check_storage_reports_paths_and_backup_age() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-cache-storage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cache_dir = workspace.join(".squeezy").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let backup = cache_dir.join("schema-2-test.redb.bak");
+    fs::write(&backup, b"old").expect("write backup");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+
+    let check = cache_check(&config, false, true);
+
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("storage:"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("state.redb"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(check.detail.contains("probes:"), "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("graph.redb"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .contains("prune command: squeezy doctor --prune-cache"),
+        "detail: {}",
+        check.detail
+    );
 }
 
 #[cfg(unix)]

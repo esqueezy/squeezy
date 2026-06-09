@@ -286,7 +286,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # custom_patterns = []
 
 [cache]
+# root = ".squeezy/cache"     # or "xdg" on Linux for XDG cache storage
 # tool_outputs = ".squeezy/tool_outputs"
+# durability = "fast"         # fast | turn | strict
 
 # [tools]
 # lazy_schema_loading = true
@@ -339,7 +341,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   approvals are evaluated. `log_dir`, `log_retention_days`, `max_event_bytes`,
   and `max_session_bytes` control redacted local session history and resume
   state. When `log_dir` is unset, sessions are written to `<cache.root>/sessions`
-  if `[cache].root` is set, otherwise `.squeezy/sessions`. In the TUI,
+  if `[cache].root` is set, otherwise `.squeezy/sessions`. With
+  `[cache].root = "xdg"` on Linux, cache and session files resolve under
+  `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`.
+  When neither `$XDG_CACHE_HOME` nor `$HOME` is set, the resolver falls back
+  to `<workspace>/.squeezy/cache/squeezy/<repo-id>`. In the TUI,
   `Shift+Tab` toggles modes; `/plan` and `/build` force a specific mode.
 - `[context]`: deterministic context compaction controls. Squeezy estimates
   model-visible prompt tokens locally and, when enabled, replaces stale raw
@@ -555,10 +561,20 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   `jsx`, `tsx` match only one kind. `javascript`/`js` matches `JavaScript`
   plus `Jsx` only — use the `js-ts` family id (or `typescript`/`ts`) when you
   want to index JS/JSX together with TS/TSX.
-- `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
+- `[cache]`: `root`, `tool_outputs`, and `durability`. Relative paths resolve against the
   workspace root, not the process working directory. Graph warm-start state,
-  cross-session receipt metadata, and internal observations are stored in
-  `state.redb` under `root` or `.squeezy/cache` when `root` is unset.
+  cross-session receipt metadata, and internal observations are stored under
+  `root` or `.squeezy/cache` when `root` is unset. On Linux,
+  `root = "xdg"` stores large cache files under
+  `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`,
+  falling back to `<workspace>/.squeezy/cache/squeezy/<repo-id>` when neither
+  environment variable is set (typically only in sandboxed runs).
+  Cross-session receipt metadata, read snapshots, observations, and small
+  session-side cache state are stored in `state.redb`; semantic graph
+  partitions and resolver-cache snapshots are stored in `graph.redb`.
+  `durability = "fast"` keeps session JSONL appends unsynced for speed,
+  `"turn"` syncs them on explicit session flush/shutdown boundaries, and
+  `"strict"` syncs every durable JSONL append.
 - `[tools]`: lazy schema loading controls. With
   `lazy_schema_loading = true` (default), Squeezy sends full JSON schemas for
   the core tool list plus `load_tool_schema`; other tools are listed in a
