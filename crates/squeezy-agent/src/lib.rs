@@ -2149,8 +2149,9 @@ impl Agent {
     /// explicit overrides in `[model].small_fast_model` or
     /// `[providers.<name>].cheap_model` before falling back to the built-in
     /// per-provider mini tier. Returns `None` when the provider has no
-    /// distinct cheap tier and no override is configured — in that case
-    /// `/cheap` falls back to the parent model silently.
+    /// distinct cheap tier and no override is configured; `/cheap` will fall
+    /// back to the parent model in that case (the TUI surfaces a preflight
+    /// notice so the fallback is not silent).
     pub fn cheap_model(&self) -> Option<String> {
         cheap_model_for(self.provider.name(), &self.config)
     }
@@ -2163,8 +2164,8 @@ impl Agent {
     /// window. Routing fields are read from the same `routing_state` lock so
     /// that portion of the snapshot is internally consistent.
     pub fn mode_state_snapshot(&self) -> ModeStateSnapshot {
-        let routing = self.routing_state.lock().expect("routing state lock");
         let session_mode = self.session_mode();
+        let routing = self.routing_state.lock().expect("routing state lock");
         ModeStateSnapshot {
             session_mode,
             routing_session_disabled: routing.pending_override.session_disabled,

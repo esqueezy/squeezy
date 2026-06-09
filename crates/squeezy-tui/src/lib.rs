@@ -4226,22 +4226,22 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Cheap => {
             agent.request_routing_force_cheap();
-            let config = agent.config_snapshot();
+            let cheap = agent.cheap_model();
             let provider = agent.provider_name();
-            let raw_parent = &config.model;
-            let parent_model = squeezy_core::resolve_model_alias(provider, raw_parent)
-                .unwrap_or(raw_parent)
-                .to_owned();
-            let note = match agent.cheap_model() {
-                Some(ref cheap) if cheap == &parent_model => {
+            let raw_parent = agent.config().model.as_str();
+            let parent_model =
+                squeezy_core::resolve_model_alias(provider, raw_parent).unwrap_or(raw_parent);
+            const FALLBACK_NOTE_SUFFIX: &str = "the next turn will fall back to the parent model.";
+            let note = match cheap.as_deref() {
+                Some(c) if c == parent_model => format!(
                     "\nNote: the cheap model resolves to the same model as the parent; \
-                     the next turn will use the parent model."
-                }
-                None => {
+                     {FALLBACK_NOTE_SUFFIX}"
+                ),
+                None => format!(
                     "\nNote: no distinct cheap model is configured for this provider; \
-                     the next turn will fall back to the parent model."
-                }
-                Some(_) => "",
+                     {FALLBACK_NOTE_SUFFIX}"
+                ),
+                Some(_) => String::new(),
             };
             app.push_transcript_item(TranscriptItem::system(format!(
                 "next turn forced to the cheap model (one-shot){note}"
@@ -5323,8 +5323,9 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
 /// `/router [on|off]`. Bare opens the Routing config page (like `/model`),
 /// where the global toggles and the per-provider reroute/judge models live.
 /// `on` re-enables session-wide auto-routing to the cheap tier; `off` disables
-/// it (explicit `/cheap` still works). The toggle is one-shot at the override
-/// level — the user's persisted `[routing].enabled` config is not touched.
+/// it (explicit `/cheap` still works). The toggle is session-scoped (persists
+/// for the rest of the session and across `resume`) — the user's persisted
+/// `[routing].enabled` config is not touched.
 fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
     let Some(raw) = value else {
         toggle_config_screen(

@@ -886,7 +886,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/router",
-        what: "Toggle cheap-model turn routing on or off for this session (session-only; does not change `[routing].enabled` in your config). Omit the argument to open the router config screen where the setting can be persisted.",
+        what: "Toggle cheap-model turn routing on or off for the current session. Bare `/router` opens the persistent setting.",
         syntax: "/router [on|off]",
         examples: &[
             "/router on   — enable cheap-model routing for this session",
@@ -895,7 +895,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         ],
         available_during_turn: true,
         capability_note: None,
-        related: &["providers", "config"],
+        related: &["providers", "config", "cheap", "parent"],
     },
     SlashCommandHelp {
         name: "/config",
@@ -1032,12 +1032,12 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/cheap",
-        what: "Force the next turn to use the cheap/judge model tier (one-shot; only affects the immediately following prompt).",
+        what: "Force the next turn to use the cheap/judge model tier (one-shot).",
         syntax: "/cheap",
         examples: &["/cheap  — run the next turn with the cheapest available model"],
         available_during_turn: true,
         capability_note: None,
-        related: &["providers", "config"],
+        related: &["providers", "config", "parent", "router"],
     },
     SlashCommandHelp {
         name: "/parent",
@@ -1046,7 +1046,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         examples: &["/parent  — run the next turn with the parent model regardless of routing"],
         available_during_turn: true,
         capability_note: None,
-        related: &["providers", "config"],
+        related: &["providers", "config", "cheap", "router"],
     },
     SlashCommandHelp {
         name: "/reviewer",

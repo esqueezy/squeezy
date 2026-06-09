@@ -1935,7 +1935,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_subagent_max_concurrent,
                 default_display: "20",
                 default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_CONCURRENT as i64),
-                help: "Maximum number of subagents that may run concurrently per parent agent turn.",
+                help: "Maximum number of subagents that may run concurrently per parent agent turn. The `/config` UI accepts 1–256; values set via TOML or `SQUEEZY_SUBAGENT_MAX_CONCURRENT` are not capped at the runtime but are clamped to ≥1.",
                 env_override: Some("SQUEEZY_SUBAGENT_MAX_CONCURRENT"),
                 secret: false,
             },
