@@ -137,6 +137,7 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 }
 
 /// Grant read/write/execute/delete rights (inheritable) to `sid_str` on `path`.
+#[allow(dead_code)]
 pub(crate) fn add_allow_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
     let mask =
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
@@ -227,6 +228,7 @@ pub(crate) fn add_deny_write_ace_no_inherit(path: &Path, sid_str: &str) -> crate
 }
 
 /// Add an inheritable deny ACE blocking all read operations.
+#[allow(dead_code)]
 pub(crate) fn add_deny_read_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
     apply_ace(path, sid_str, FILE_GENERIC_READ, DENY_ACCESS, true)
 }
