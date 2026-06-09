@@ -7819,7 +7819,7 @@ impl TurnRuntime {
                     // variants flow past without disturbing the turn — they
                     // get a dedicated arm once consumers are taught about
                     // them.
-                    _ => { /* future variant */ }
+                    _ => {}
                 }
             }
 
@@ -11229,6 +11229,12 @@ async fn run_subagent_rounds(
                     // Refusal prose arrives on `LlmEvent::Refusal` deltas
                     // accumulated in `refusal_text`; the `StopReason::Refusal`
                     // terminal here gates the early return.
+                    //
+                    // The `tool_calls.is_empty()` gate is intentional: if the
+                    // provider asked for one or more tool calls and *also*
+                    // signalled `Refusal`, that contradiction is resolved by
+                    // executing the requested tools rather than abandoning the
+                    // round, matching `TurnRuntime::run`'s behaviour.
                     if matches!(stop_reason, Some(StopReason::Refusal)) && tool_calls.is_empty() {
                         // Fold the final round's cost before returning so the
                         // parent's subagent metrics do not silently report zero
@@ -11238,6 +11244,17 @@ async fn run_subagent_rounds(
                                 estimate_cost(parent.provider.name(), &effective_model, &cost);
                         }
                         broker.metrics.record_provider(&cost);
+                        // Flush the assistant stream before reading
+                        // `assistant_message`. `StreamRedactor::push` buffers
+                        // small deltas (sub-1KiB) so a complete refusal whose
+                        // prose arrived via `TextDelta` may still be sitting
+                        // in the buffer at this point; without the flush, the
+                        // Anthropic-style fallback below sees an empty
+                        // `assistant_message`.
+                        let tail = assistant_stream.finish();
+                        if !tail.text.is_empty() {
+                            assistant_message.push_str(&tail.text);
+                        }
                         broker.metrics.redactions += assistant_stream.total_redactions();
                         // Some providers (e.g. Anthropic) emit refusal text as
                         // ordinary `TextDelta` rather than `Refusal` deltas;
@@ -11248,17 +11265,15 @@ async fn run_subagent_rounds(
                         } else {
                             refusal_text.as_str()
                         };
+                        let refusal_compact = compact_text(refusal_prose, 512);
                         let detail = if refusal_prose.is_empty() {
                             "subagent model refused the request".to_string()
                         } else {
-                            format!(
-                                "subagent model refused: {}",
-                                compact_text(refusal_prose, 512)
-                            )
+                            format!("subagent model refused: {refusal_compact}")
                         };
                         return SubagentExecution {
                             status: ToolStatus::Error,
-                            summary: compact_text(refusal_prose, 512),
+                            summary: refusal_compact,
                             status_label: "refusal",
                             error: Some(detail),
                             metrics: broker.metrics.clone(),
@@ -11310,9 +11325,9 @@ async fn run_subagent_rounds(
                 // unknown future variants.
                 LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
                 // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
-                // are silently passed over in the subagent loop until a
-                // dedicated arm exists.
-                _ => { /* future variant */ }
+                // flow past without disturbing the subagent round — they
+                // get a dedicated arm once consumers are taught about them.
+                _ => {}
             }
         }
 
@@ -13475,7 +13490,6 @@ async fn flush_parallel_batch(
         }
         return;
     }
-
     // Run the reads *concurrently* (independent reads must not serialize
     // behind one another — that one-at-a-time `.await` per read dominated
     // turn latency), then fold them back with incremental per-turn budget
@@ -14430,7 +14444,18 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
 }
 
 /// SHA-256 of the canonical JSON arguments the model sent for a tool call.
-/// Used to pair with `output_sha256` in telemetry (F06).
+/// Used to pair with `output_sha256` in telemetry (F06) and to detect
+/// intra-batch duplicates in `mark_intra_batch_duplicates`.
+///
+/// CANONICAL ORDERING: dedup correctness depends on `serde_json::to_vec`
+/// producing the same bytes for two semantically-identical
+/// `serde_json::Value` objects whose keys arrived in different
+/// insertion order. The default `serde_json` build backs `Value::Object`
+/// with `BTreeMap` (always sorted, canonical), so this holds today. If
+/// the agent crate ever enables `serde_json/preserve_order` the map flips
+/// to `IndexMap` (insertion-order) and dedup will start false-missing on
+/// reordered-but-equivalent calls; this hash must then be replaced with
+/// an explicit canonical serializer.
 fn tool_call_args_sha256(call: &ToolCall) -> Option<String> {
     serde_json::to_vec(&call.arguments)
         .ok()
@@ -14986,30 +15011,23 @@ async fn permission_decision_for_request(
         )
         .await
     {
-        // Fold the classifier's billable LLM spend into persisted session
-        // cost so `/cost`, the per-model ledger, and session-cap checks all
-        // see this spend. Mirrors the AI-reviewer accounting path directly
-        // above. KNOWN LIMITATION: the active turn's CostBroker is not
-        // available on the permission path, so the *current* turn's live
-        // status-line snapshot and cap checks don't see this spend until
-        // the next turn re-seeds the broker from `state.cost`.
-        // Guard mirrors the AI-reviewer cost-fold: if all three counters are
-        // None (e.g. the provider returned an empty CostSnapshot AND
-        // estimate_cost returned None for an unknown/mock model), the fold
-        // is skipped. In production, `config.model` is always a known model
-        // and `estimate_cost` fills in `estimated_usd_micros` before we reach
-        // here, so the guard fires only in test environments with stub models.
-        if (classifier.cost.estimated_usd_micros.is_some()
-            || classifier.cost.input_tokens.is_some()
-            || classifier.cost.output_tokens.is_some())
-            && let Some(conversation_state) = &context.conversation_state
-        {
+        // Mirrors the AI-reviewer fold above — same KNOWN LIMITATION (the
+        // active turn's CostBroker is not on the permission path, so the
+        // current turn's live status-line snapshot and cap checks lag by
+        // one turn). Tightened to `> 0` so a provider that streams a
+        // `CostSnapshot` with zeroed counters (e.g. cancelled mid-stream
+        // after some delta but before billing) does not churn the ledger
+        // with a no-op row.
+        let cost_present = classifier.cost.estimated_usd_micros.unwrap_or(0) > 0
+            || classifier.cost.input_tokens.unwrap_or(0) > 0
+            || classifier.cost.output_tokens.unwrap_or(0) > 0;
+        if cost_present && let Some(conversation_state) = &context.conversation_state {
             let mut state = conversation_state.lock().await;
             merge_cost(&mut state.cost, &classifier.cost);
             merge_cost(&mut state.metrics.provider, &classifier.cost);
             state.metrics.model_ledger.record(
                 context.provider.name(),
-                &context.config.model,
+                &classifier.model,
                 CostOrigin::Main,
                 &classifier.cost,
             );
@@ -15577,11 +15595,25 @@ fn should_classify_shell(
         && verdict.action == PermissionAction::Ask
 }
 
-/// Result of the out-of-band shell-classifier LLM call: verdict plus the
-/// cost snapshot so the caller can fold the spend into session accounting.
+/// Result of the out-of-band shell-classifier LLM call: verdict, billed
+/// cost snapshot, and the model the classifier actually used. The caller
+/// folds `cost` into session accounting and keys the per-model ledger by
+/// `model`, mirroring `AiReviewerResult` so a future move of the
+/// classifier onto a cheap-tier model (separate from `config.model`) does
+/// not silently misroute ledger rows.
+///
+/// **Cancellation gap (intentional, bounded):** the classifier loop returns
+/// `None` on `LlmEvent::Cancelled`, dropping any partial cost the provider
+/// streamed before cancellation. Unlike `TurnRuntime::run`'s
+/// `fold_partial_cancel_cost` path, this path has no broker to attribute
+/// the partial spend to. The gap is bounded by the classifier's tiny
+/// prompt (one user message, `max_output_tokens: 80`) and the next turn
+/// reseeds session accounting from `state.cost`. Closing it fully needs
+/// the unified out-of-band LLM accounting path (Category3.md `:44`).
 struct ClassifierResult {
     verdict: PermissionVerdict,
     cost: CostSnapshot,
+    model: Arc<str>,
 }
 
 async fn classify_ambiguous_shell(
@@ -15601,8 +15633,9 @@ Working target: {:?}",
     );
     let output_schema = provider_honors_output_schema(provider.name(), &config.model)
         .then(shell_classifier_output_schema);
+    let model: Arc<str> = Arc::from(config.model.as_str());
     let llm_request = LlmRequest {
-        model: Arc::from(config.model.as_str()),
+        model: model.clone(),
         instructions: Arc::from(
             "You classify shell-command risk for a local coding agent. Return JSON only.",
         ),
@@ -15621,7 +15654,6 @@ Working target: {:?}",
         beta_headers: std::sync::Arc::from(Vec::new()),
         ..LlmRequest::default()
     };
-    let model = Arc::from(config.model.as_str());
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
     let mut cost = CostSnapshot::default();
@@ -15635,6 +15667,8 @@ Working target: {:?}",
                 cost = snap;
                 break;
             }
+            // Cancellation drops any partial cost streamed so far (see the
+            // `ClassifierResult` doc comment for the bounded gap rationale).
             LlmEvent::Cancelled => return None,
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
@@ -15650,8 +15684,9 @@ Working target: {:?}",
             | LlmEvent::Citation { .. }
             | LlmEvent::ToolCallDelta { .. } => {}
             // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
-            // contribute nothing to the classifier verdict text.
-            _ => { /* future variant */ }
+            // flow past without disturbing the classifier — they get a
+            // dedicated arm once the verdict parser learns to read them.
+            _ => {}
         }
     }
     // Fill in estimated cost when the provider did not return a token count.
@@ -15661,6 +15696,7 @@ Working target: {:?}",
     Some(ClassifierResult {
         verdict: parse_classifier_verdict(&text),
         cost,
+        model,
     })
 }
 
@@ -17597,6 +17633,14 @@ pub enum AgentEvent {
     /// annotations, xAI Live Search). `text_index` is the byte offset in
     /// the running assistant-text buffer the citation refers to. Consumers
     /// that do not display source attribution can ignore this event.
+    ///
+    /// **Emission deferred** (same constraint as
+    /// [`AgentEvent::ControlToolTrace`] below): constructing a
+    /// `sizeof(AgentEvent)`-byte (~1 KiB) temporary inside the deeply
+    /// nested `TurnRuntime::run` stream loop pushes borderline tests over
+    /// the default thread-stack ceiling on macOS/ARM64 debug builds. The
+    /// variant + consumer-side handlers are in place; emission will move
+    /// to a dedicated transcript-sink path once that exists.
     Citation {
         turn_id: TurnId,
         text_index: u32,

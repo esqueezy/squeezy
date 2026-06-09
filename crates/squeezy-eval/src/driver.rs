@@ -2674,7 +2674,14 @@ impl Driver {
                 AgentEvent::TurnRouted { .. } => {}
                 AgentEvent::ContextUsageUpdate { .. } => {}
                 AgentEvent::CostCapUnenforceable { .. } => {}
+                // Citation annotations from provider streams: surfaced for
+                // future eval-replay rendering (source attribution); ignored
+                // for now. Producer-side emission is deferred (see the
+                // `AgentEvent::Citation` doc).
                 AgentEvent::Citation { .. } => {}
+                // Control-tool trace events: useful for debugging and eval
+                // replay; ignored for now. Producer-side emission is deferred
+                // (see the `AgentEvent::ControlToolTrace` doc).
                 AgentEvent::ControlToolTrace { .. } => {}
             }
             if should_break_on_text {

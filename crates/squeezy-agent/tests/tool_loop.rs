@@ -155,6 +155,13 @@ impl LlmProvider for DelegateFanoutProvider {
     }
 }
 
+/// Run the given future on a Tokio multi-thread runtime with an enlarged
+/// (32 MiB) worker thread stack. Used for tool-loop integration tests
+/// that drive `TurnRuntime::run` end-to-end, whose nested async state
+/// machines exceed the default OS thread stack on macOS/ARM64 debug
+/// builds. See `docs/internal/TEST_STACK_POSTURE.md` for the project
+/// posture and when to reuse this helper vs. the smaller
+/// `run_high_stack_async_test` in `crates/squeezy-agent/src/lib_tests.rs`.
 fn run_high_stack_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -3974,7 +3981,8 @@ async fn session_cost_warning_fires_once_at_threshold() {
 /// Cancelled-turn cost persistence test. Wrapped in `run_high_stack_test`
 /// (32 MiB thread stack) because the async state machines nested in
 /// `TurnRuntime::run` → `execute_tool_calls` → `flush_parallel_batch` can
-/// exceed the default OS thread stack on macOS/ARM64 debug builds.
+/// exceed the default OS thread stack on macOS/ARM64 debug builds. See
+/// `docs/internal/TEST_STACK_POSTURE.md` for the project posture.
 #[test]
 fn cancelled_turn_persists_partial_cost_and_metrics() {
     run_high_stack_test(async {
