@@ -13,16 +13,16 @@ use serde_json::json;
 use squeezy_core::SqueezyError;
 
 use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamInputBuilder;
-use squeezy_core::{BedrockConfig, ProviderTransportConfig};
+use squeezy_core::{BedrockConfig, ProviderTransportConfig, extract_url_host};
 
 use super::{
     BedrockProvider, BedrockStreamState, BreakpointBudget, apply_inference_profile_prefix,
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
     bedrock_idle_timeout, bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
     classify_stream_sdk_error, compute_thinking_extra_fields, conversation_messages,
-    current_bearer_token, extract_echoed_model, extract_url_host, handle_bedrock_event, hex_decode,
-    hex_encode, inference_configuration, json_to_document, region_prefix,
-    sanitize_bedrock_document_name, system_blocks, tool_configuration,
+    current_bearer_token, extract_echoed_model, handle_bedrock_event, hex_decode, hex_encode,
+    inference_configuration, json_to_document, region_prefix, sanitize_bedrock_document_name,
+    system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};

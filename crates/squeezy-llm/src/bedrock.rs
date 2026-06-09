@@ -23,7 +23,7 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_types::{Blob, Document, Number};
 use serde_json::Value;
 use squeezy_core::{
-    BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError,
+    BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError, extract_url_host,
     is_metadata_or_link_local_host,
 };
 use tokio::time::timeout;
@@ -128,46 +128,6 @@ impl BedrockProvider {
         // forcing operators to rebuild the provider.
         let bearer_token = current_bearer_token(self.bearer_token.as_deref());
         build_bedrock_client(shared, bearer_token.as_deref())
-    }
-}
-
-/// Extract the hostname from a URL string without requiring a full URL
-/// parser.  Strips the scheme prefix (`://`), any userinfo@ component,
-/// the optional `:port` suffix, and — for IPv6 literals — the enclosing
-/// `[` `]` brackets.  Returns `None` for inputs with no authority
-/// component (relative paths, opaque URIs, etc.).
-///
-/// The returned string is suitable for direct use with
-/// `is_metadata_or_link_local_host`: IPv6 literals are unbracketed so
-/// they can be parsed as `IpAddr` by that function.
-fn extract_url_host(url: &str) -> Option<String> {
-    let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
-    let authority = after_scheme.split('/').next()?;
-    let after_userinfo = authority.split('@').next_back().unwrap_or(authority);
-    let host = if after_userinfo.starts_with('[') {
-        // IPv6 literal: "[::1]" or "[::1]:8080" — strip brackets.
-        // If ']' is absent (malformed input like "[") use `len()` so the
-        // slice `[1..len]` is valid and yields an empty string, which the
-        // trailing `host.is_empty()` check turns into `None`.
-        let close = after_userinfo.find(']').unwrap_or(after_userinfo.len());
-        &after_userinfo[1..close]
-    } else {
-        // Strip port if present and purely numeric.
-        match after_userinfo.rfind(':') {
-            Some(colon)
-                if after_userinfo[colon + 1..]
-                    .chars()
-                    .all(|c| c.is_ascii_digit()) =>
-            {
-                &after_userinfo[..colon]
-            }
-            _ => after_userinfo,
-        }
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
     }
 }
 

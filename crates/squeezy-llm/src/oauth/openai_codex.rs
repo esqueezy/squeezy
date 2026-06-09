@@ -620,8 +620,7 @@ where
 
     on_open_url(&authorize_url)?;
 
-    let cancel = CancellationToken::new();
-    let code = wait_for_callback_code(listener, &state, &cancel).await?;
+    let code = wait_for_callback_code(listener, &state).await?;
 
     let client = shared_client(&ProviderTransportConfig::default());
     let token = exchange_authorization_code(
@@ -648,40 +647,38 @@ where
 /// Bounded by [`CODEX_CALLBACK_TIMEOUT`] so an abandoned browser
 /// session or a headless Linux environment where no browser ever
 /// opens cannot leave a listening socket holding the TTY indefinitely.
-/// Also observes `cancel` so callers can abort the flow (e.g. on
-/// Ctrl+C) before the deadline expires.
 async fn wait_for_callback_code(
     listener: tokio::net::TcpListener,
     expected_state: &str,
-    cancel: &CancellationToken,
 ) -> Result<String> {
-    wait_for_callback_code_with_timeout(listener, expected_state, cancel, CODEX_CALLBACK_TIMEOUT)
-        .await
+    wait_for_callback_code_with_timeout(listener, expected_state, CODEX_CALLBACK_TIMEOUT).await
 }
 
 /// Inner timeout-parameterised form used by both the production path
 /// (which passes [`CODEX_CALLBACK_TIMEOUT`]) and tests (which pass a
 /// short duration to exercise the timeout error path without waiting).
+///
+/// Reports the timeout via [`SqueezyError::Config`] rather than
+/// `ProviderNotConfigured`: the variant is consumed elsewhere as
+/// "fall through on a missing-token path", which would mis-classify
+/// an interactive OAuth abort.
 pub(crate) async fn wait_for_callback_code_with_timeout(
     listener: tokio::net::TcpListener,
     expected_state: &str,
-    cancel: &CancellationToken,
     deadline: Duration,
 ) -> Result<String> {
-    tokio::select! {
-        result = timeout(deadline, wait_for_callback_code_inner(listener, expected_state)) => {
-            result.map_err(|_| SqueezyError::ProviderNotConfigured(format!(
-                "OpenAI Codex OAuth callback timed out after {} seconds; \
+    timeout(
+        deadline,
+        wait_for_callback_code_inner(listener, expected_state),
+    )
+    .await
+    .map_err(|_| {
+        SqueezyError::Config(format!(
+            "OpenAI Codex OAuth callback timed out after {} seconds; \
                  re-run `squeezy auth openai-codex login` to start a new session",
-                deadline.as_secs()
-            )))?
-        }
-        _ = cancel.cancelled() => {
-            Err(SqueezyError::ProviderNotConfigured(
-                "OpenAI Codex OAuth login was cancelled".to_string(),
-            ))
-        }
-    }
+            deadline.as_secs()
+        ))
+    })?
 }
 
 /// Inner loop for [`wait_for_callback_code`]: accepts connections until

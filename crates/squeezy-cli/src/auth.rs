@@ -396,8 +396,11 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
             if is_headless_linux() {
                 eprintln!(
                     "(headless Linux: no DISPLAY or WAYLAND_DISPLAY detected; \
-                     open the URL above in a browser on another machine, \
-                     then paste the full redirect URL here when prompted)"
+                     SSH-tunnel port 1455 to a workstation \
+                     (`ssh -L 1455:localhost:1455 <this-host>`), then open \
+                     the URL above in that workstation's browser. \
+                     The local listener will accept the redirect through \
+                     the tunnel.)"
                 );
                 return Ok(());
             }

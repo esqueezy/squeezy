@@ -10610,7 +10610,7 @@ fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
     // Extract the host irrespective of scheme so the metadata-sentinel
     // check fires for `https://` too (the original http-only filter
     // shipped Bearer tokens to AWS IMDS over TLS without complaint).
-    let host_only = extract_host_only(trimmed);
+    let host_only = extract_url_host(trimmed);
     if let Some(host) = host_only.as_deref()
         && is_metadata_or_link_local_host(host)
     {
@@ -10634,30 +10634,54 @@ fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
     )))
 }
 
-/// Parse the host component out of a `base_url` string irrespective of
-/// scheme. Returns `None` when the input lacks an `://` separator (we
-/// only have a path) or is empty after the separator.
-fn extract_host_only(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map(|(_, rest)| rest)?;
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .rsplit('@')
-        .next()
-        .unwrap_or("");
+/// Extract the hostname from a URL string without requiring a full URL
+/// parser. Strips the scheme prefix (`://`), any userinfo@ component,
+/// the optional `:port` suffix, and — for IPv6 literals — the enclosing
+/// `[` `]` brackets.
+///
+/// Posture for unusual inputs:
+/// - Inputs without an `://` scheme are treated as bare authority + path
+///   (e.g. `"169.254.169.254/foo"` yields `Some("169.254.169.254")`).
+///   This is a deliberately *safer* posture than returning `None`: a
+///   schemeless config typo still gets caught by the metadata /
+///   link-local SSRF filter callers layer on top of this function.
+/// - Authorities that are only `"["` or `"[/..."` (no closing bracket)
+///   collapse to an empty host and yield `None`.
+/// - The `:port` strip only fires when the suffix after the last colon
+///   is purely ASCII digits, so `"::1"` (an IPv6 literal not in
+///   brackets) is preserved verbatim instead of being truncated.
+///
+/// The returned string is suitable for direct use with
+/// [`is_metadata_or_link_local_host`]: IPv6 literals are unbracketed so
+/// they parse as `IpAddr` without further massaging.
+pub fn extract_url_host(url: &str) -> Option<String> {
+    let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
+    let authority = after_scheme.split('/').next()?;
+    let after_userinfo = authority.split('@').next_back().unwrap_or(authority);
+    let host = if after_userinfo.starts_with('[') {
+        // IPv6 literal: "[::1]" or "[::1]:8080" — strip brackets.
+        // If ']' is absent (malformed input like "[") use `len()` so the
+        // slice `[1..len]` is valid and yields an empty string, which the
+        // trailing `host.is_empty()` check turns into `None`.
+        let close = after_userinfo.find(']').unwrap_or(after_userinfo.len());
+        &after_userinfo[1..close]
+    } else {
+        // Strip port if present and purely numeric.
+        match after_userinfo.rfind(':') {
+            Some(colon)
+                if after_userinfo[colon + 1..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit()) =>
+            {
+                &after_userinfo[..colon]
+            }
+            _ => after_userinfo,
+        }
+    };
     if host.is_empty() {
-        return None;
-    }
-    let stripped = host
-        .strip_prefix('[')
-        .and_then(|s| s.split_once(']'))
-        .map(|(h, _)| h.to_string())
-        .unwrap_or_else(|| host.split(':').next().unwrap_or("").to_string());
-    if stripped.is_empty() {
         None
     } else {
-        Some(stripped)
+        Some(host.to_string())
     }
 }
 

@@ -232,16 +232,13 @@ fn load_codex_token_rejects_group_readable_file() {
 #[tokio::test]
 async fn wait_for_callback_code_times_out_when_no_browser_connects() {
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
-    let cancel = CancellationToken::new();
     let err = wait_for_callback_code_with_timeout(
         listener,
         "irrelevant-state",
-        &cancel,
         Duration::from_millis(50),
     )
     .await
