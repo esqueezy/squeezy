@@ -21,13 +21,15 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
     ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
     ContextCompactionTrigger, ContextEstimate, ContextPin, CostOrigin, CostSnapshot,
-    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL, PROJECT_SETTINGS_FILE,
-    PermissionAction, PermissionCapability, PermissionPolicyMode, PermissionRequest,
-    PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError,
-    StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig,
-    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
-    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_COST_WARN_PERCENT,
+    DEFAULT_MAX_SEARCH_FILES_PER_TURN, DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL, PROJECT_SETTINGS_FILE, PermissionAction,
+    PermissionCapability, PermissionPolicyMode, PermissionRequest, PermissionRisk, PermissionRule,
+    PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig, Redactor,
+    ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
+    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
+    default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
@@ -694,7 +696,7 @@ pub struct AttachmentShape {
 /// Snapshot of the configured budget policy for display in `/cost`. Bundles
 /// all enforcement limits into one place so users can see every active
 /// constraint without reading config files.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetPolicySnapshot {
     pub max_session_cost_usd_micros: Option<u64>,
     pub cost_warn_percent: u8,
@@ -703,6 +705,20 @@ pub struct BudgetPolicySnapshot {
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
     pub disable_prompt_cache: bool,
+}
+
+impl Default for BudgetPolicySnapshot {
+    fn default() -> Self {
+        Self {
+            max_session_cost_usd_micros: None,
+            cost_warn_percent: DEFAULT_COST_WARN_PERCENT,
+            max_round_input_tokens: None,
+            max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+            max_tool_bytes_read_per_turn: DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+            max_search_files_per_turn: DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+            disable_prompt_cache: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1334,6 +1350,36 @@ where
 /// Shared, mutex-protected cache for the Ollama live context-window probe.
 /// Uses a type alias to satisfy the `type_complexity` lint.
 type OllamaWindowCache = Arc<tokio::sync::Mutex<Option<(Instant, Option<u64>)>>>;
+
+/// TTL for the cached Ollama live context-window probe. Short enough that
+/// a model-side window change is picked up within a turn; long enough that
+/// rapid `/cost` then `/context` invocations (or back-to-back rounds in a
+/// single turn) coalesce on one HTTP probe.
+const OLLAMA_WINDOW_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Probe the Ollama live context window with a TTL cache.
+///
+/// Shared by `Agent::session_accounting_snapshot` (for `/cost` and
+/// `/context`) and `TurnRuntime::provider_live_context_window_for_model`
+/// (called on every assembled-request path). Without the cache, every
+/// Ollama round paid a blocking HTTP round-trip. Negative results are
+/// cached intentionally so a model the probe cannot identify does not
+/// retry on every request inside the TTL.
+async fn probe_ollama_window_cached(
+    cache: &OllamaWindowCache,
+    base_url: &str,
+    model: &str,
+) -> Option<u64> {
+    let mut guard = cache.lock().await;
+    if let Some((at, window)) = guard.as_ref()
+        && at.elapsed() < OLLAMA_WINDOW_CACHE_TTL
+    {
+        return *window;
+    }
+    let window = fetch_ollama_context_window(base_url, model).await;
+    *guard = Some((Instant::now(), window));
+    window
+}
 
 #[derive(Clone)]
 pub struct Agent {
@@ -2773,24 +2819,17 @@ impl Agent {
         let mode = load_session_mode(&self.session_mode);
         // Live provider window probe (Ollama only today). Folded into the
         // resolver as the `provider_live_window` layer rather than a blanket
-        // override so its provenance shows as "provider live".
-        // Cache with a 30-second TTL so repeated /cost or /context invocations
-        // in quick succession skip the blocking network probe.
-        const OLLAMA_WINDOW_CACHE_TTL: Duration = Duration::from_secs(30);
+        // override so its provenance shows as "provider live". The shared
+        // `ollama_window_cache` coalesces this probe with the per-round one
+        // fired inside `TurnRuntime` under `OLLAMA_WINDOW_CACHE_TTL`.
         let provider_live_window = match &self.config.provider {
             ProviderConfig::Ollama(ollama) => {
-                let mut cache = self.ollama_window_cache.lock().await;
-                let cached = cache
-                    .as_ref()
-                    .filter(|(at, _)| at.elapsed() < OLLAMA_WINDOW_CACHE_TTL);
-                if let Some((_, window)) = cached {
-                    *window
-                } else {
-                    let window =
-                        fetch_ollama_context_window(&ollama.base_url, &self.config.model).await;
-                    *cache = Some((Instant::now(), window));
-                    window
-                }
+                probe_ollama_window_cached(
+                    &self.ollama_window_cache,
+                    &ollama.base_url,
+                    &self.config.model,
+                )
+                .await
             }
             _ => None,
         };
@@ -4540,6 +4579,7 @@ impl Agent {
         set_active_turn(&active_turn, turn_id, cancel.clone());
         let last_request_overhead_tokens = self.last_request_overhead_tokens.clone();
         let configured_model_context_window = self.configured_model_context_window;
+        let ollama_window_cache = self.ollama_window_cache.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -4703,6 +4743,7 @@ impl Agent {
                     active_turn,
                     last_request_overhead_tokens,
                     configured_model_context_window,
+                    ollama_window_cache,
                 }
                 .run(task_title.clone())
                 .await;
@@ -4744,6 +4785,7 @@ impl Agent {
                         .send(AgentEvent::Failed {
                             turn_id,
                             error,
+                            cost: CostSnapshot::default(),
                             session_cost: None,
                         })
                         .await;
@@ -4860,6 +4902,7 @@ where
                 .send(AgentEvent::Failed {
                     turn_id,
                     error,
+                    cost: CostSnapshot::default(),
                     session_cost: None,
                 })
                 .await;
@@ -5771,6 +5814,12 @@ struct TurnRuntime {
     /// fit-check apply it as the cheap model's override fallback, mirroring how
     /// the parent model's compaction window honors it.
     configured_model_context_window: Option<u64>,
+    /// Shared with the owning `Agent`: TTL cache for the Ollama live
+    /// context-window probe. Plumbed into the turn so every assembled-request
+    /// path (`provider_live_context_window_for_model`) coalesces with the
+    /// `/cost` / `/context` snapshot probe under `OLLAMA_WINDOW_CACHE_TTL`,
+    /// avoiding a blocking HTTP round-trip on every Ollama round.
+    ollama_window_cache: OllamaWindowCache,
 }
 
 impl TurnRuntime {
@@ -6035,7 +6084,7 @@ impl TurnRuntime {
     async fn provider_live_context_window_for_model(&self, model: &str) -> Option<u64> {
         match &self.config.provider {
             ProviderConfig::Ollama(ollama) => {
-                fetch_ollama_context_window(&ollama.base_url, model).await
+                probe_ollama_window_cached(&self.ollama_window_cache, &ollama.base_url, model).await
             }
             _ => None,
         }
@@ -7157,6 +7206,7 @@ impl TurnRuntime {
                     .send(AgentEvent::Failed {
                         turn_id: self.turn_id,
                         error: SqueezyError::Agent(format_cap_reached_reason(status)),
+                        cost: total_cost.clone(),
                         session_cost: Some(broker.session_cost_snapshot()),
                     })
                     .await;
@@ -7188,6 +7238,7 @@ impl TurnRuntime {
                     .send(AgentEvent::Failed {
                         turn_id: self.turn_id,
                         error: SqueezyError::Agent(format_pressure_gate_reason(status)),
+                        cost: total_cost.clone(),
                         session_cost: Some(broker.session_cost_snapshot()),
                     })
                     .await;
@@ -7312,6 +7363,7 @@ impl TurnRuntime {
                         .send(AgentEvent::Failed {
                             turn_id: self.turn_id,
                             error: SqueezyError::Agent(reason),
+                            cost: total_cost.clone(),
                             session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
@@ -8161,6 +8213,7 @@ impl TurnRuntime {
                             error: SqueezyError::Agent(
                                 "model response stopped after max_tokens before completing; lower reasoning_effort, raise the provider's max_output_tokens, or run /compact and retry".to_string(),
                             ),
+                            cost: total_cost.clone(),
                             session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
@@ -8207,6 +8260,7 @@ impl TurnRuntime {
                             error: SqueezyError::Agent(
                                 "model reported the context window was exceeded; run /compact and retry".to_string(),
                             ),
+                            cost: total_cost.clone(),
                             session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
@@ -8254,6 +8308,7 @@ impl TurnRuntime {
                                 "model refused to produce a response (provider safety filter)"
                                     .to_string(),
                             ),
+                            cost: total_cost.clone(),
                             session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
@@ -8317,6 +8372,7 @@ impl TurnRuntime {
                             error: SqueezyError::Agent(
                                 "model paused the turn (pause_turn) without an actionable continuation after bounded re-issue; retry the turn".to_string(),
                             ),
+                            cost: total_cost.clone(),
                             session_cost: Some(broker.session_cost_snapshot()),
                         })
                         .await;
@@ -17674,6 +17730,13 @@ pub enum AgentEvent {
     Failed {
         turn_id: TurnId,
         error: SqueezyError,
+        /// Cumulative cost for the turn at the moment of failure, including
+        /// the partial work of any completed rounds before the failure.
+        /// Mirrors the shape of [`AgentEvent::Completed::cost`] and
+        /// [`AgentEvent::Cancelled::cost`] so the per-turn cost footer can
+        /// render on the failure path too. Defaults to zero for outer
+        /// failure paths that fire before any broker exists.
+        cost: CostSnapshot,
         /// Session-cumulative cost (token distribution + USD) at the moment of
         /// failure, so a failed turn's already-billed partial spend stays on
         /// the status line. `None` on outer/no-broker failure paths; the TUI

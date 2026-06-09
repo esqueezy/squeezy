@@ -400,8 +400,14 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     // Emit a compact turn-level cost footer so users can
                     // connect a completed turn to its marginal cost without
-                    // needing to open /cost.
-                    if cost.input_tokens.is_some() || cost.estimated_usd_micros.is_some() {
+                    // needing to open /cost. The guard includes
+                    // `output_tokens` so partial streams that only ever
+                    // surface output deltas still activate the
+                    // `format_turn_cost_delta` output-only arm.
+                    if cost.input_tokens.is_some()
+                        || cost.output_tokens.is_some()
+                        || cost.estimated_usd_micros.is_some()
+                    {
                         let delta = format_turn_cost_delta(&cost);
                         app.push_log(delta);
                     }
@@ -486,8 +492,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.cost = session_cost;
                     }
                     // Emit the partial turn cost even on cancel — cancelled
-                    // rounds are billed for completed work.
-                    if cost.input_tokens.is_some() || cost.estimated_usd_micros.is_some() {
+                    // rounds are billed for completed work. The guard
+                    // includes `output_tokens` for the same reason as the
+                    // `Completed` path: surface output-only partials too.
+                    if cost.input_tokens.is_some()
+                        || cost.output_tokens.is_some()
+                        || cost.estimated_usd_micros.is_some()
+                    {
                         let delta = format_turn_cost_delta(&cost);
                         app.push_log(format!("cancelled · {delta}"));
                     }
@@ -525,6 +536,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::Failed {
                     error,
+                    cost,
                     session_cost,
                     ..
                 } => {
@@ -543,6 +555,19 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // A hard turn failure is the error tier (red ✖), not a cyan
                     // ⚠ warning — it stands out and keeps its reason visible.
                     app.push_error(format!("turn failed: {}", app.status));
+                    // Mirror the per-turn cost footer that lands on
+                    // `Completed`/`Cancelled` so a failed turn that already
+                    // paid for partial work surfaces its marginal cost in the
+                    // transcript. The outer / no-broker failure path sends a
+                    // zero `CostSnapshot::default()`; the guard below filters
+                    // that out so empty footers never appear.
+                    if cost.input_tokens.is_some()
+                        || cost.output_tokens.is_some()
+                        || cost.estimated_usd_micros.is_some()
+                    {
+                        let delta = format_turn_cost_delta(&cost);
+                        app.push_log(format!("failed · {delta}"));
+                    }
                     if app.last_turn_had_edits {
                         app.last_turn_had_edits = false;
                     }
@@ -835,7 +860,7 @@ fn prune_tui_jobs(jobs: &mut BTreeMap<JobId, JobSnapshot>) {
 /// Compact per-turn cost/token footer shown in the transcript log at turn
 /// completion. Connects a visible turn to its marginal provider cost without
 /// requiring the user to open `/cost`.
-fn format_turn_cost_delta(cost: &squeezy_core::CostSnapshot) -> String {
+pub(crate) fn format_turn_cost_delta(cost: &squeezy_core::CostSnapshot) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(4);
     if let Some(usd) = cost.estimated_usd_micros {
         parts.push(format!("${:.6}", usd as f64 / 1_000_000.0));

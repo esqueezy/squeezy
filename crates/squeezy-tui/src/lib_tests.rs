@@ -1956,6 +1956,7 @@ async fn failed_turn_clears_live_status_context() {
     tx.send(AgentEvent::Failed {
         turn_id: TurnId::new(1),
         error: squeezy_core::SqueezyError::Agent("boom".to_string()),
+        cost: CostSnapshot::default(),
         session_cost: None,
     })
     .await
@@ -1986,6 +1987,7 @@ async fn status_line_cost_not_clobbered_by_no_broker_failure() {
     tx.send(AgentEvent::Failed {
         turn_id: TurnId::new(1),
         error: squeezy_core::SqueezyError::Agent("boom".to_string()),
+        cost: CostSnapshot::default(),
         session_cost: None,
     })
     .await
@@ -4297,7 +4299,11 @@ fn format_cost_command_renders_active_buckets() {
         AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
         SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
     };
-    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_core::{
+        CostSnapshot, DEFAULT_COST_WARN_PERCENT, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+        DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, SessionMetrics,
+        SessionMode,
+    };
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
 
     let estimate = RequestTokenEstimate {
@@ -4377,12 +4383,268 @@ fn format_cost_command_renders_active_buckets() {
     assert!(output.contains("spills writes=1"), "{output}");
     assert!(output.contains("io bytes_read=12345"), "{output}");
     assert!(output.contains("redactions=2"), "{output}");
+    // Budget policy block always renders, even at default values, so users
+    // debugging unexpected gating can see the active enforcement caps.
+    assert!(output.contains("Budget policy"), "{output}");
+    assert!(output.contains("session_cap=none (uncapped)"), "{output}");
+    assert!(
+        output.contains(&format!("warn_at={DEFAULT_COST_WARN_PERCENT}%")),
+        "{output}"
+    );
+    assert!(output.contains("round_input_cap=none"), "{output}");
+    // The default snapshot mirrors the live AppConfig-derived defaults; no
+    // `(explicit)` decoration should leak when the values match the registry.
+    let default_calls = DEFAULT_MAX_TOOL_CALLS_PER_TURN.to_string();
+    let default_bytes = DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN.to_string();
+    let default_search = DEFAULT_MAX_SEARCH_FILES_PER_TURN.to_string();
+    let default_limits = format!(
+        "max_tool_calls={default_calls} max_bytes_read={default_bytes} max_search_files={default_search}"
+    );
+    assert!(output.contains(&default_limits), "{output}");
+    assert!(
+        !output.contains(&format!("max_tool_calls={default_calls} (explicit)")),
+        "default per-turn limits must not be flagged as explicit: {output}"
+    );
+    // Cache ROI section is suppressed when there is no cache activity — both
+    // `cached_input_tokens` and `cache_write_input_tokens` are unset here.
+    assert!(
+        !output.contains("Cache ROI"),
+        "Cache ROI block must hide when no cache activity: {output}"
+    );
     // The styled output should actually contain ANSI escapes — confirms
     // the formatter is using `commands_style`.
     assert!(
         raw.contains('\x1b'),
         "cost output should embed ANSI escapes: {raw:?}"
     );
+}
+
+#[test]
+fn format_cost_command_renders_cache_roi_when_cache_active() {
+    use squeezy_agent::{
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 0,
+        context_window_tokens: None,
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-cache".to_string()),
+        provider: "anthropic",
+        model: "claude-opus-4-8".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot {
+            input_tokens: Some(10_000),
+            output_tokens: Some(300),
+            cached_input_tokens: Some(7_000),
+            cache_write_input_tokens: Some(2_000),
+            estimated_usd_micros: Some(500_000),
+            ..CostSnapshot::default()
+        },
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot::default(),
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
+    assert!(output.contains("Cache ROI"), "{output}");
+    assert!(
+        output.contains("cache_read_tokens=7000 cache_write_tokens=2000"),
+        "{output}"
+    );
+    // standard_input_tokens = total − reads − writes = 10000 − 7000 − 2000 = 1000.
+    assert!(
+        output.contains("standard_input_tokens=1000 (non-cached, non-write fraction)"),
+        "{output}"
+    );
+}
+
+#[test]
+fn format_cost_command_warns_when_pricing_metadata_missing() {
+    use squeezy_agent::{
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 0,
+        context_window_tokens: None,
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: None,
+        provider: "exotic",
+        model: "unknown-model".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        // No `estimated_usd_micros` triggers the missing-pricing warning.
+        cost: CostSnapshot {
+            input_tokens: Some(500),
+            ..CostSnapshot::default()
+        },
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot::default(),
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
+    assert!(
+        output.contains("pricing metadata missing or incomplete for exotic:unknown-model"),
+        "{output}"
+    );
+}
+
+#[test]
+fn format_cost_command_flags_explicit_budget_caps_and_limits() {
+    use squeezy_agent::{
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
+    };
+    use squeezy_core::{
+        CostSnapshot, DEFAULT_MAX_SEARCH_FILES_PER_TURN, DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+        DEFAULT_MAX_TOOL_CALLS_PER_TURN, SessionMetrics, SessionMode,
+    };
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 0,
+        context_window_tokens: None,
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: None,
+        provider: "scripted",
+        model: "gpt".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot {
+            max_session_cost_usd_micros: Some(2_500_000),
+            cost_warn_percent: 80,
+            max_round_input_tokens: Some(64_000),
+            // One per-turn limit lifted off the default, one left at the
+            // default; the block must decorate only the lifted one.
+            max_tool_calls_per_turn: 50,
+            max_tool_bytes_read_per_turn: DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+            max_search_files_per_turn: DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+            disable_prompt_cache: true,
+        },
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
+    assert!(output.contains("Budget policy"), "{output}");
+    assert!(
+        output.contains("session_cap=$2.5000 (explicit)"),
+        "{output}"
+    );
+    assert!(output.contains("warn_at=80%"), "{output}");
+    assert!(
+        output.contains("round_input_cap=64,000 (explicit)"),
+        "{output}"
+    );
+    // The lifted-off-default limit gains an `(explicit)` decoration.
+    assert!(
+        output.contains("max_tool_calls=50 (explicit)"),
+        "explicit override must be flagged: {output}"
+    );
+    // The two limits that match `DEFAULT_*` render as bare numbers.
+    let default_bytes = DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN.to_string();
+    let default_search = DEFAULT_MAX_SEARCH_FILES_PER_TURN.to_string();
+    assert!(
+        output.contains(&format!("max_bytes_read={default_bytes} ")),
+        "default per-turn limit must not be flagged: {output}"
+    );
+    assert!(
+        !output.contains(&format!("max_bytes_read={default_bytes} (explicit)")),
+        "default per-turn limit must not be flagged: {output}"
+    );
+    assert!(
+        output.contains(&format!("max_search_files={default_search}\n")),
+        "default per-turn limit must not be flagged: {output}"
+    );
+    assert!(
+        output.contains("prompt_cache=disabled"),
+        "disable_prompt_cache flag must render: {output}"
+    );
+    // Sanity: registry-default constants land in the expected numeric range
+    // (compile-time check — these are `pub const` and never zero).
+    const _: () = assert!(DEFAULT_MAX_TOOL_CALLS_PER_TURN > 0);
 }
 
 #[test]
@@ -4775,6 +5037,121 @@ fn context_breaks_out_skills_and_mcp_sources() {
     assert!(
         output.contains("mcp tool schemas:         ~340 tokens"),
         "{output}"
+    );
+}
+
+#[test]
+fn context_input_budget_line_renders_when_budget_present() {
+    use squeezy_agent::{
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    // Window 200k, max_output reserve 64k, input budget 136k. Consumed 50k.
+    let estimate = RequestTokenEstimate {
+        input_tokens: 50_000,
+        context_window_tokens: Some(200_000),
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: Some(64_000),
+        input_budget_tokens: Some(136_000),
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: None,
+        provider: "anthropic",
+        model: "claude-opus-4-8".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot::default(),
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
+    // The actionable input budget surfaces below the raw-window line with
+    // both the absolute remaining tokens and a percent-used readout.
+    assert!(output.contains("input budget:"), "{output}");
+    assert!(output.contains("86,000 tokens available"), "{output}");
+    assert!(output.contains("of 136,000 budget"), "{output}");
+}
+
+#[test]
+fn context_input_budget_line_is_suppressed_when_budget_zero() {
+    use squeezy_agent::{
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    // Degenerate case: `max_output_tokens >= context_window` collapses the
+    // input budget to zero. The formatter's `> 0` guard must keep the line
+    // off so the percent calculation never lands on NaN/Inf.
+    let estimate = RequestTokenEstimate {
+        input_tokens: 10_000,
+        context_window_tokens: Some(100_000),
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: Some(120_000),
+        input_budget_tokens: Some(0),
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: None,
+        provider: "scripted",
+        model: "gpt".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot::default(),
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
+    assert!(
+        !output.contains("input budget:"),
+        "input-budget line must hide when budget is zero: {output}"
     );
 }
 
@@ -10186,6 +10563,7 @@ async fn failed_edit_turn_error_status_mentions_undo() {
     tx.send(AgentEvent::Failed {
         turn_id: TurnId::new(1),
         error: SqueezyError::Permission("denied".to_string()),
+        cost: CostSnapshot::default(),
         session_cost: None,
     })
     .await
@@ -15791,4 +16169,304 @@ fn context_window_anchors_to_resolved_effective_window() {
         Box::new(NoopClipboard),
     );
     assert_eq!(flat_app.context_window_tokens, 109_600);
+}
+
+#[test]
+fn format_turn_cost_delta_renders_usd_only() {
+    // No token fields populated — provider only carried a USD estimate.
+    let cost = CostSnapshot {
+        estimated_usd_micros: Some(12_345),
+        ..CostSnapshot::default()
+    };
+    let line = crate::events::format_turn_cost_delta(&cost);
+    assert_eq!(line, "turn: $0.012345");
+}
+
+#[test]
+fn format_turn_cost_delta_renders_input_only_then_output_only() {
+    let input_only = CostSnapshot {
+        input_tokens: Some(900),
+        ..CostSnapshot::default()
+    };
+    assert_eq!(
+        crate::events::format_turn_cost_delta(&input_only),
+        "turn: in 900"
+    );
+
+    let output_only = CostSnapshot {
+        output_tokens: Some(72),
+        ..CostSnapshot::default()
+    };
+    // The output-only arm must activate independently of `input_tokens` so a
+    // partial-stream cost report does not silently drop its only signal.
+    assert_eq!(
+        crate::events::format_turn_cost_delta(&output_only),
+        "turn: out 72"
+    );
+}
+
+#[test]
+fn format_turn_cost_delta_combines_all_fields() {
+    let cost = CostSnapshot {
+        input_tokens: Some(1_200),
+        output_tokens: Some(340),
+        cached_input_tokens: Some(900),
+        cache_write_input_tokens: Some(120),
+        estimated_usd_micros: Some(415_300),
+        ..CostSnapshot::default()
+    };
+    let line = crate::events::format_turn_cost_delta(&cost);
+    assert_eq!(
+        line,
+        "turn: $0.415300 · in 1200 out 340 · cached 900 · cache_write 120"
+    );
+}
+
+#[test]
+fn format_turn_cost_delta_skips_zero_cache_fields() {
+    let cost = CostSnapshot {
+        input_tokens: Some(500),
+        output_tokens: Some(40),
+        cached_input_tokens: Some(0),
+        cache_write_input_tokens: Some(0),
+        estimated_usd_micros: Some(100),
+        ..CostSnapshot::default()
+    };
+    // Zero-valued cache fields should never render — the `> 0` guard inside
+    // `format_turn_cost_delta` exists exactly so zero-noise turns stay clean.
+    let line = crate::events::format_turn_cost_delta(&cost);
+    assert!(!line.contains("cached"), "zero cache_read leaked: {line}");
+    assert!(
+        !line.contains("cache_write"),
+        "zero cache_write leaked: {line}"
+    );
+    assert_eq!(line, "turn: $0.000100 · in 500 out 40");
+}
+
+#[tokio::test]
+async fn completed_turn_pushes_cost_footer_log() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let cost = CostSnapshot {
+        input_tokens: Some(800),
+        output_tokens: Some(120),
+        estimated_usd_micros: Some(250_000),
+        ..CostSnapshot::default()
+    };
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done".to_string()),
+        response_id: None,
+        cost,
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let footer = app
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log) if log.message.starts_with("turn:") => {
+                Some(log.message.as_str())
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("turn footer log must exist after Completed");
+    assert!(footer.contains("$0.250000"), "{footer}");
+    assert!(footer.contains("in 800 out 120"), "{footer}");
+}
+
+#[tokio::test]
+async fn cancelled_turn_pushes_cost_footer_with_cancel_prefix() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let cost = CostSnapshot {
+        input_tokens: Some(300),
+        output_tokens: Some(50),
+        estimated_usd_micros: Some(10_000),
+        ..CostSnapshot::default()
+    };
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost,
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let cancelled_footer = app
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log) if log.message.starts_with("cancelled · turn:") => {
+                Some(log.message.as_str())
+            }
+            _ => None,
+        })
+        .next()
+        .expect("cancelled cost footer log must exist");
+    assert!(cancelled_footer.contains("$0.010000"), "{cancelled_footer}");
+    assert!(
+        cancelled_footer.contains("in 300 out 50"),
+        "{cancelled_footer}"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_cancel_with_default_cost_suppresses_footer() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    // The watchdog path emits `cost: CostSnapshot::default()` to signal "no
+    // partial spend known"; the TUI guard must filter that out so the
+    // transcript never carries an empty `turn:` footer.
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let any_turn_footer = app.transcript.iter().any(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(log) => log.message.contains("turn:"),
+        _ => false,
+    });
+    assert!(
+        !any_turn_footer,
+        "watchdog-default cost must not surface a turn footer"
+    );
+}
+
+#[tokio::test]
+async fn failed_turn_with_cost_pushes_failure_cost_footer() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let cost = CostSnapshot {
+        input_tokens: Some(100),
+        output_tokens: Some(20),
+        estimated_usd_micros: Some(1_500),
+        ..CostSnapshot::default()
+    };
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: squeezy_core::SqueezyError::Agent("boom".to_string()),
+        cost,
+        session_cost: None,
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let failed_footer = app
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log) if log.message.starts_with("failed · turn:") => {
+                Some(log.message.as_str())
+            }
+            _ => None,
+        })
+        .next()
+        .expect("failed cost footer log must exist");
+    assert!(failed_footer.contains("$0.001500"), "{failed_footer}");
+    assert!(failed_footer.contains("in 100 out 20"), "{failed_footer}");
+}
+
+#[tokio::test]
+async fn failed_turn_with_default_cost_suppresses_footer() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    // Outer / no-broker failure paths send `cost: CostSnapshot::default()`;
+    // the guard must keep that off the transcript exactly like the watchdog
+    // cancel case.
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: squeezy_core::SqueezyError::Agent("outer".to_string()),
+        cost: CostSnapshot::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let any_failed_footer = app.transcript.iter().any(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(log) => log.message.starts_with("failed · turn:"),
+        _ => false,
+    });
+    assert!(
+        !any_failed_footer,
+        "no-broker failure must not surface a turn footer"
+    );
+}
+
+#[test]
+fn cache_hit_status_item_renders_four_corners() {
+    let mut app = test_app(SessionMode::Build);
+
+    // (0, 0): no cache activity → no segment text.
+    app.cost.cached_input_tokens = Some(0);
+    app.cost.cache_write_input_tokens = Some(0);
+    assert!(
+        status::resolve_status_item(&app, status::StatusLineItem::CacheHit).is_none(),
+        "CacheHit must be empty when both fields are zero"
+    );
+
+    // (0, r): read-only.
+    app.cost.cached_input_tokens = Some(700);
+    app.cost.cache_write_input_tokens = Some(0);
+    assert_eq!(
+        status::resolve_status_item(&app, status::StatusLineItem::CacheHit).as_deref(),
+        Some("cache ↓700")
+    );
+
+    // (w, 0): write-only.
+    app.cost.cached_input_tokens = Some(0);
+    app.cost.cache_write_input_tokens = Some(40);
+    assert_eq!(
+        status::resolve_status_item(&app, status::StatusLineItem::CacheHit).as_deref(),
+        Some("cache ↑40")
+    );
+
+    // (w, r): both directions.
+    app.cost.cached_input_tokens = Some(900);
+    app.cost.cache_write_input_tokens = Some(120);
+    assert_eq!(
+        status::resolve_status_item(&app, status::StatusLineItem::CacheHit).as_deref(),
+        Some("cache ↑120/↓900")
+    );
+
+    // Also treat `None` symmetrically with zero so dropped fields look like
+    // no activity rather than `cache ↓0`.
+    app.cost.cached_input_tokens = None;
+    app.cost.cache_write_input_tokens = None;
+    assert!(
+        status::resolve_status_item(&app, status::StatusLineItem::CacheHit).is_none(),
+        "None pair must collapse to no-activity"
+    );
 }

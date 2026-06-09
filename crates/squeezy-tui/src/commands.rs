@@ -5,6 +5,10 @@ use std::time::SystemTime;
 use squeezy_agent::{
     Agent, McpAccounting, ReviewerAuditEntry, SessionAccountingSnapshot, SkillsAccounting,
 };
+use squeezy_core::{
+    DEFAULT_MAX_SEARCH_FILES_PER_TURN, DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+};
 use squeezy_llm::{LimitSource, RequestTokenEstimate};
 use squeezy_store::parse_bug_report_section;
 
@@ -312,12 +316,24 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
             policy.cost_warn_percent,
             round_cap_label,
         ));
+        // Per-turn enforcement limits: decorate as `(explicit)` when the
+        // operator overrode the registry default, so a user reading the
+        // block can tell a configured limit apart from an inherited one.
         out.push_str(&format!(
             "  {} max_tool_calls={} max_bytes_read={} max_search_files={}\n",
             style::accent("⊛"),
-            style_u64(policy.max_tool_calls_per_turn),
-            style_u64(policy.max_tool_bytes_read_per_turn),
-            style_u64(policy.max_search_files_per_turn),
+            limit_label(
+                policy.max_tool_calls_per_turn,
+                DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+            ),
+            limit_label(
+                policy.max_tool_bytes_read_per_turn,
+                DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+            ),
+            limit_label(
+                policy.max_search_files_per_turn,
+                DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+            ),
         ));
         if policy.disable_prompt_cache {
             out.push_str(&format!(
@@ -1122,6 +1138,19 @@ fn style_u64_emphasize_nonzero_err(value: u64) -> String {
         style::muted("0")
     } else {
         style::err(&value.to_string())
+    }
+}
+
+/// Render a per-turn enforcement limit, tagging it `(explicit)` whenever
+/// the operator overrode the registry default. Lets a reader of the
+/// `Budget policy` block distinguish a configured limit from one that
+/// was inherited from `DEFAULT_*` — the asymmetry called out in the
+/// PR review of the original block, which only decorated cap fields.
+fn limit_label(value: u64, default_value: u64) -> String {
+    if value == default_value {
+        style_u64(value)
+    } else {
+        format!("{} ({})", style_u64(value), style::accent("explicit"))
     }
 }
 
