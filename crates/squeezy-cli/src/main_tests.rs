@@ -1385,6 +1385,158 @@ fn config_explain_displays_concrete_wildcard_values() {
 }
 
 #[test]
+fn split_config_field_path_handles_bare_dotted_keys() {
+    assert_eq!(
+        split_config_field_path("model.provider").expect("parse"),
+        vec!["model", "provider"]
+    );
+    assert_eq!(
+        split_config_field_path("tui.tick_rate_ms").expect("parse"),
+        vec!["tui", "tick_rate_ms"]
+    );
+}
+
+#[test]
+fn split_config_field_path_respects_basic_string_quoting() {
+    // Realistic model id with a dot — the dominant case for `model_limits`.
+    let parts =
+        split_config_field_path(r#"model_limits."openai:gpt-5.5".context_window"#).expect("parse");
+    assert_eq!(
+        parts,
+        vec!["model_limits", "openai:gpt-5.5", "context_window"]
+    );
+}
+
+#[test]
+fn split_config_field_path_respects_literal_string_quoting() {
+    let parts = split_config_field_path("providers.'weird.alias'.cheap_model").expect("parse");
+    assert_eq!(parts, vec!["providers", "weird.alias", "cheap_model"]);
+}
+
+#[test]
+fn split_config_field_path_rejects_unterminated_quote() {
+    let err = split_config_field_path(r#"model_limits."openai:gpt-5.5"#).expect_err("err");
+    assert!(
+        err.contains("unterminated"),
+        "expected an unterminated-quote error, got: {err}"
+    );
+}
+
+#[test]
+fn split_config_field_path_rejects_empty_segments_and_input() {
+    assert!(split_config_field_path("").is_err());
+    assert!(split_config_field_path("model..provider").is_err());
+    assert!(split_config_field_path(".model.provider").is_err());
+    assert!(split_config_field_path("model.provider.").is_err());
+}
+
+#[test]
+fn split_config_field_path_rejects_junk_after_closing_quote() {
+    let err = split_config_field_path(r#"model_limits."openai:gpt-5.5"junk.context_window"#)
+        .expect_err("err");
+    assert!(
+        err.contains("after closing quote"),
+        "expected post-quote diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn config_explain_resolves_dotted_model_id_via_quoted_path() {
+    let mut config = AppConfig::default();
+    config.model_limits.insert(
+        "openai:gpt-5.5".to_string(),
+        squeezy_core::ModelLimitOverride {
+            context_window: Some(2_000_000),
+        },
+    );
+
+    let raw_path = r#"model_limits."openai:gpt-5.5".context_window"#;
+    let parts_owned = split_config_field_path(raw_path).expect("parse");
+    let parts: Vec<&str> = parts_owned.iter().map(String::as_str).collect();
+
+    let field = find_config_field_for_path(&parts).expect("schema match");
+    assert_eq!(field.toml_path, ["model_limits", "*", "context_window"]);
+    assert_eq!(explain_effective_value(&config, field, &parts), "2000000");
+}
+
+#[test]
+fn config_explain_rejects_unquoted_dotted_model_id_and_hints_quoting() {
+    // The naïve `split('.')` behavior breaks `gpt-5.5` into two parts and
+    // produces a 4-segment path that can never match the 3-segment schema.
+    // We keep that failure mode (TOML semantics force it), but surface a
+    // hint mentioning the quoted spelling.
+    let parts_owned = split_config_field_path("model_limits.openai:gpt-5.5.context_window")
+        .expect("split should still succeed for an unquoted dot path");
+    let parts: Vec<&str> = parts_owned.iter().map(String::as_str).collect();
+    assert!(
+        find_config_field_for_path(&parts).is_none(),
+        "unquoted dotted model id must fall through to the unknown-field branch",
+    );
+}
+
+#[test]
+fn explain_effective_value_redacts_secret_fields() {
+    use squeezy_core::config_schema::{ApplyTier, FieldKind, FieldMeta, FieldValue};
+
+    fn raw_string_get(_: &AppConfig) -> FieldValue {
+        // Stand in for a misbehaving getter that returns plaintext rather than
+        // `FieldValue::Secret`. The redaction in `explain_effective_value`
+        // must not depend on the getter's discipline.
+        FieldValue::String("super-secret-token".to_string())
+    }
+    fn noop_set(_: &mut AppConfig, _: FieldValue) -> Result<(), &'static str> {
+        Ok(())
+    }
+    fn unset_default() -> FieldValue {
+        FieldValue::Unset
+    }
+
+    let kind_secret = FieldMeta {
+        label: "api key",
+        toml_path: &["providers", "openai", "api_key"],
+        kind: FieldKind::Secret {
+            env_var: "OPENAI_API_KEY",
+        },
+        tier: ApplyTier::NextPrompt,
+        get: raw_string_get,
+        set: noop_set,
+        default_display: "—",
+        default: unset_default,
+        help: "",
+        env_override: None,
+        secret: false,
+    };
+
+    let flag_secret = FieldMeta {
+        label: "api key (flagged)",
+        toml_path: &["providers", "openai", "api_key"],
+        kind: FieldKind::String { multiline: false },
+        tier: ApplyTier::NextPrompt,
+        get: raw_string_get,
+        set: noop_set,
+        default_display: "—",
+        default: unset_default,
+        help: "",
+        env_override: None,
+        secret: true,
+    };
+
+    let config = AppConfig::default();
+    let requested = ["providers", "openai", "api_key"];
+
+    assert_eq!(
+        explain_effective_value(&config, &kind_secret, &requested).to_string(),
+        "••••",
+        "FieldKind::Secret must short-circuit to the redacted sentinel"
+    );
+    assert_eq!(
+        explain_effective_value(&config, &flag_secret, &requested).to_string(),
+        "••••",
+        "FieldMeta::secret = true must short-circuit to the redacted sentinel"
+    );
+}
+
+#[test]
 fn skills_upsert_entry_inserts_when_no_match() {
     let mut entries = toml_edit::ArrayOfTables::new();
     let selector = SkillsSelector {

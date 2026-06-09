@@ -1090,11 +1090,20 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
         }
         Some(ConfigCommand::Explain { field: field_path }) => {
             use squeezy_core::{config_schema::FieldSource, load_separated_settings_sources};
-            let parts: Vec<&str> = field_path.split('.').collect();
+            let parts_owned = split_config_field_path(field_path).map_err(|reason| {
+                SqueezyError::Config(format!(
+                    "could not parse config field {field_path:?}: {reason}. \
+                     Quote keys that contain `.`, e.g. \
+                     `model_limits.\"openai:gpt-5.5\".context_window`."
+                ))
+            })?;
+            let parts: Vec<&str> = parts_owned.iter().map(String::as_str).collect();
             let Some(field_meta) = find_config_field_for_path(&parts) else {
                 return Err(SqueezyError::Config(format!(
                     "unknown config field {field_path:?}; \
-                     use `squeezy config schema` to list all fields"
+                     use `squeezy config schema` to list all fields. \
+                     If a key contains `.` (e.g. a model id), quote it: \
+                     `model_limits.\"openai:gpt-5.5\".context_window`."
                 )));
             };
             let config = config_from_cli(cli)?;
@@ -1148,7 +1157,7 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
                 }
                 if tier.is_some_and(|t| t.contains_path(&parts)) {
                     if !printed_header {
-                        println!("shadowed:");
+                        println!("shadowed: (highest precedence first)");
                         printed_header = true;
                     }
                     let path_str = tier
@@ -1208,6 +1217,110 @@ fn find_config_field_for_path(
         .find(|field| config_field_path_matches(field.toml_path, requested_path))
 }
 
+/// Splits a user-supplied dotted TOML key path into segments, honouring
+/// TOML basic-string (`"..."`) and literal-string (`'...'`) quoting on
+/// individual keys. Naïve `split('.')` breaks any path with a key that
+/// contains a `.` — model identifiers like `gpt-5.5`, `claude-3.5-sonnet`,
+/// or `gemini-2.5-pro` are the dominant case for `model_limits.<id>.<field>`
+/// lookups, so the splitter has to match TOML's tokenisation rather than
+/// raw byte-level dots.
+///
+/// Examples:
+///
+/// - `model.provider`
+///   → `["model", "provider"]`
+/// - `model_limits."openai:gpt-5.5".context_window`
+///   → `["model_limits", "openai:gpt-5.5", "context_window"]`
+/// - `providers.'weird.alias'.cheap_model`
+///   → `["providers", "weird.alias", "cheap_model"]`
+///
+/// Returns a structured error string describing where the parser bailed
+/// (unterminated quote, stray characters after a closing quote, empty
+/// segment) so the caller can surface a hint rather than an opaque
+/// `unknown field` message.
+fn split_config_field_path(path: &str) -> Result<Vec<String>, String> {
+    if path.is_empty() {
+        return Err("empty config field path".to_string());
+    }
+
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    // True after an unquoted `.`: parser is waiting for the next segment.
+    // Falls back to false as soon as a character is pushed onto `current`
+    // or a closing quote produces a segment. A trailing `.` therefore ends
+    // the loop with this flag still set, which is an error.
+    let mut expects_segment = false;
+    let mut chars = path.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '\'' => {
+                if !current.is_empty() {
+                    return Err(format!(
+                        "unexpected quote {ch} inside bare key segment {current:?}"
+                    ));
+                }
+                let quote = ch;
+                let mut quoted = String::new();
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    if c == quote {
+                        closed = true;
+                        break;
+                    }
+                    quoted.push(c);
+                }
+                if !closed {
+                    return Err(format!("unterminated quoted segment starting with {quote}"));
+                }
+                current.push_str(&quoted);
+                match chars.peek().copied() {
+                    Some('.') => {
+                        chars.next();
+                        segments.push(std::mem::take(&mut current));
+                        expects_segment = true;
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "unexpected character {other:?} after closing quote {quote}"
+                        ));
+                    }
+                    None => {
+                        segments.push(std::mem::take(&mut current));
+                        expects_segment = false;
+                    }
+                }
+            }
+            '.' => {
+                if current.is_empty() {
+                    return Err("empty key segment".to_string());
+                }
+                segments.push(std::mem::take(&mut current));
+                expects_segment = true;
+            }
+            _ => {
+                current.push(ch);
+                expects_segment = false;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+        expects_segment = false;
+    }
+
+    if expects_segment {
+        return Err("trailing `.` without a final key segment".to_string());
+    }
+
+    if segments.is_empty() || segments.iter().any(String::is_empty) {
+        return Err("empty key segment".to_string());
+    }
+
+    Ok(segments)
+}
+
 fn config_field_path_matches(schema_path: &[&str], requested_path: &[&str]) -> bool {
     schema_path.len() == requested_path.len()
         && schema_path
@@ -1246,13 +1359,69 @@ fn resolve_explain_field_source(
     FieldSource::Default
 }
 
+/// Display wrapper for the value rendered by `config explain`. Construction
+/// runs the redaction gate, so anything that flows from here into a sink (e.g.
+/// `println!`) has provably been screened against `FieldKind::Secret`. The
+/// newtype also gives the CodeQL `Cleartext logging of sensitive information`
+/// analyzer a structural sanitizer boundary it can recognise — prior to this,
+/// the analyzer followed `Option::as_ref` and `preset.default_api_key_env()`
+/// flows through `FieldMeta::get` callbacks straight into the explain
+/// `println!`, which surfaced as a high-severity alert at the print site even
+/// though `FieldValue::Secret::as_display()` already redacts to `"••••"`.
+#[derive(Debug, Clone)]
+struct RedactedDisplay(String);
+
+impl RedactedDisplay {
+    fn safe(text: String) -> Self {
+        Self(text)
+    }
+
+    fn redacted() -> Self {
+        Self(REDACTED_VALUE_DISPLAY.to_string())
+    }
+}
+
+impl std::fmt::Display for RedactedDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<&str> for RedactedDisplay {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+/// `FieldValue::Secret::as_display()` uses this same sentinel — kept in lock-
+/// step so a cosmetic change flips both sites at once.
+const REDACTED_VALUE_DISPLAY: &str = "••••";
+
+/// Sentinel rendered when a wildcard field cannot be resolved to a concrete
+/// value. Mirrors `FieldValue::as_display()`'s "not set" sentinel so a future
+/// cosmetic change (`"—"` → `"(none)"`) flips both sites at once.
+const EMPTY_FIELD_DISPLAY: &str = "—";
+
 fn explain_effective_value(
     config: &AppConfig,
     field: &squeezy_core::config_schema::FieldMeta,
     requested_path: &[&str],
-) -> String {
-    concrete_explain_value(config, field.toml_path, requested_path)
-        .unwrap_or_else(|| (field.get)(config).as_display())
+) -> RedactedDisplay {
+    use squeezy_core::config_schema::FieldKind;
+
+    // SECURITY: secret fields must never leak through `config explain`.
+    // `FieldValue::Secret::as_display()` already renders "••••", but routing
+    // the check through this explicit branch keeps the redaction contract
+    // visible at the call site and lets static analysis prove the printed
+    // value of a secret field is the constant sentinel, independent of any
+    // `FieldMeta::get` callback or provider-config field.
+    if field.secret || matches!(field.kind, FieldKind::Secret { .. }) {
+        return RedactedDisplay::redacted();
+    }
+
+    let text = concrete_explain_value(config, field.toml_path, requested_path)
+        .unwrap_or_else(|| (field.get)(config).as_display());
+    RedactedDisplay::safe(text)
 }
 
 fn concrete_explain_value(
@@ -1278,9 +1447,10 @@ fn concrete_explain_value(
 
 fn provider_explain_value(config: &AppConfig, provider: &str, key: &str) -> Option<String> {
     match key {
-        "cheap_model" => {
-            Some(provider_cheap_model(config, provider).unwrap_or_else(|| "—".to_string()))
-        }
+        "cheap_model" => Some(
+            provider_cheap_model(config, provider)
+                .unwrap_or_else(|| EMPTY_FIELD_DISPLAY.to_string()),
+        ),
         "judge_model" => Some(provider_judge_model(config, provider)),
         "judge_prompt" => Some(provider_judge_prompt(config, provider)),
         "expensive_models" => Some(squeezy_core::resolved_reroute_filter(config, provider)),
@@ -1315,7 +1485,7 @@ fn provider_judge_model(config: &AppConfig, provider: &str) -> String {
     squeezy_core::judge_model_for_provider(provider)
         .map(str::to_string)
         .or_else(|| provider_cheap_model(config, provider))
-        .unwrap_or_else(|| "—".to_string())
+        .unwrap_or_else(|| EMPTY_FIELD_DISPLAY.to_string())
 }
 
 fn provider_judge_prompt(config: &AppConfig, provider: &str) -> String {
