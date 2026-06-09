@@ -1658,9 +1658,13 @@ async fn begin_frame_clickables_clears_registry() {
 async fn wheel_scroll_works_in_inline_mode() {
     let mut app = test_app(SessionMode::Build);
     // Inline mode used to drop wheel events entirely; the wheel must scroll the
-    // transcript regardless.
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    // transcript regardless. Push enough turns that scrolling up by three lines
+    // is in range — `scroll_by` clamps to the content top, so a one-line
+    // transcript would report no movement at all.
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    assert!(app.transcript_scroll.is_following());
     handle_mouse(
         &mut app,
         crossterm::event::MouseEvent {
@@ -1671,8 +1675,13 @@ async fn wheel_scroll_works_in_inline_mode() {
         },
     );
     assert_eq!(
-        app.transcript_scroll_from_bottom, 3,
+        app.transcript_scroll.from_bottom(),
+        3,
         "wheel must scroll the transcript in inline mode",
+    );
+    assert!(
+        !app.transcript_scroll.is_following(),
+        "scrolling up must unpin from the tail",
     );
     handle_mouse(
         &mut app,
@@ -1683,7 +1692,11 @@ async fn wheel_scroll_works_in_inline_mode() {
             modifiers: KeyModifiers::NONE,
         },
     );
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    assert!(
+        app.transcript_scroll.is_following(),
+        "returning to the tail must re-pin",
+    );
 }
 
 #[tokio::test]
@@ -1713,8 +1726,8 @@ async fn wheel_scroll_targets_transcript_overlay_when_open() {
         3,
         "wheel down must scroll the full transcript overlay"
     );
-    assert_eq!(
-        app.transcript_scroll_from_bottom, 0,
+    assert!(
+        app.transcript_scroll.is_following(),
         "overlay wheel events must not scroll the underlying transcript"
     );
 
@@ -3651,7 +3664,7 @@ async fn prompt_home_end_move_cursor_when_prompt_has_text() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "abc".to_string());
-    app.transcript_scroll_from_bottom = 4;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(4);
 
     handle_key(
         &mut app,
@@ -3661,7 +3674,7 @@ async fn prompt_home_end_move_cursor_when_prompt_has_text() {
     .await
     .expect("home");
     assert_eq!(app.input_cursor, 0);
-    assert_eq!(app.transcript_scroll_from_bottom, 4);
+    assert_eq!(app.transcript_scroll.from_bottom(), 4);
 
     handle_key(
         &mut app,
@@ -3671,7 +3684,7 @@ async fn prompt_home_end_move_cursor_when_prompt_has_text() {
     .await
     .expect("end");
     assert_eq!(app.input_cursor, app.input.len());
-    assert_eq!(app.transcript_scroll_from_bottom, 4);
+    assert_eq!(app.transcript_scroll.from_bottom(), 4);
 }
 
 #[tokio::test]
@@ -3890,7 +3903,11 @@ fn default_mouse_wheel_scrolls_transcript_without_touching_input_or_history() {
     // MouseEvent and we always route it to the transcript). What must
     // NOT happen: the composer or prompt-history cursor shouldn't move.
     let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    // Enough turns that a three-line scroll-up is in range — `scroll_by` clamps
+    // to the content top, so a one-line transcript would not move at all.
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
     push_input_history(&mut app, "previous prompt".to_string());
 
     handle_mouse(
@@ -3903,7 +3920,7 @@ fn default_mouse_wheel_scrolls_transcript_without_touching_input_or_history() {
         },
     );
 
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
+    assert_eq!(app.transcript_scroll.from_bottom(), 3);
     assert!(app.input.is_empty());
     assert!(app.input_history_index.is_none());
 }
@@ -7807,7 +7824,7 @@ fn startup_card_scrolls_with_transcript_history() {
     let at_bottom = render_to_string(&app, 120, 20);
     assert!(!at_bottom.contains("Squeezy v"), "{at_bottom}");
 
-    app.transcript_scroll_from_bottom = usize::MAX;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(usize::MAX);
     let at_top = render_to_string(&app, 120, 20);
     assert!(at_top.contains("Squeezy v"), "{at_top}");
 }
@@ -10730,6 +10747,11 @@ async fn copy_failure_is_actionable_status() {
 async fn transcript_navigation_keys_update_scroll_state() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
+    // Enough turns that PageUp's eight-line jump and Home's jump-to-top both
+    // have room — `scroll_by`/`scroll_to_top` clamp to the content top.
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
 
     handle_key(
         &mut app,
@@ -10738,7 +10760,8 @@ async fn transcript_navigation_keys_update_scroll_state() {
     )
     .await
     .expect("handle key");
-    assert_eq!(app.transcript_scroll_from_bottom, 8);
+    assert_eq!(app.transcript_scroll.from_bottom(), 8);
+    assert!(!app.transcript_scroll.is_following());
 
     handle_key(
         &mut app,
@@ -10747,7 +10770,11 @@ async fn transcript_navigation_keys_update_scroll_state() {
     )
     .await
     .expect("handle key");
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    assert!(
+        app.transcript_scroll.is_following(),
+        "End must re-pin to the tail",
+    );
 
     handle_key(
         &mut app,
@@ -10756,7 +10783,936 @@ async fn transcript_navigation_keys_update_scroll_state() {
     )
     .await
     .expect("handle key");
-    assert_eq!(app.transcript_scroll_from_bottom, usize::MAX);
+    // Home jumps to the very top: the resolved render offset is 0 and the view
+    // is unpinned. The stored `from_bottom` is the real `max_scroll` rather than
+    // the legacy `usize::MAX` sentinel.
+    assert!(app.transcript_scroll.from_bottom() > 8);
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[test]
+fn main_text_and_scrollbar_areas_reserve_one_cell_gutter() {
+    let area = Rect::new(0, 0, 40, 10);
+    let (text_area, scrollbar_area) = transcript_main_text_and_scrollbar_areas(area);
+    assert_eq!(text_area.width, 39);
+    let gutter = scrollbar_area.expect("gutter present for wide area");
+    assert_eq!(gutter.width, 1);
+    assert_eq!(gutter.x, 39);
+    assert_eq!(gutter.height, 10);
+
+    // Too thin to split: keep full width, no gutter.
+    let (text, gutter) = transcript_main_text_and_scrollbar_areas(Rect::new(0, 0, 1, 4));
+    assert_eq!(text.width, 1);
+    assert!(gutter.is_none());
+}
+
+#[test]
+fn main_scrollbar_geometry_present_only_when_content_overflows() {
+    // Content fits: no scrollbar.
+    assert!(scroll::scrollbar_geometry(5, 10, 0).is_none());
+    // Overflow: a thumb shorter than the track, positioned at the bottom when
+    // following the tail (from_bottom == 0).
+    let geo = scroll::scrollbar_geometry(40, 10, 0).expect("overflow draws a thumb");
+    assert!(geo.thumb_len >= 1 && geo.thumb_len <= 10);
+    assert_eq!(
+        geo.thumb_offset + geo.thumb_len,
+        10,
+        "tail pins thumb to bottom"
+    );
+    // Scrolled to the top: thumb at the top of its travel.
+    let top = scroll::scrollbar_geometry(40, 10, 30).expect("thumb");
+    assert_eq!(top.thumb_offset, 0);
+}
+
+#[test]
+fn render_transcript_populates_main_scrollbar_cache_on_overflow() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..120 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    let width = 40u16;
+    let height = 12u16;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = Rect::new(0, 0, width, height);
+            render_transcript(frame, area, &app, false);
+        })
+        .expect("draw");
+    let cache = app
+        .main_scrollbar_cache
+        .get()
+        .expect("overflowing content caches the gutter");
+    assert_eq!(cache.scrollbar_area.width, 1);
+    assert_eq!(cache.scrollbar_area.x, width - 1);
+    assert!(cache.max_from_bottom > 0);
+}
+
+#[test]
+fn render_transcript_clears_scrollbar_cache_when_content_fits() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("only one short turn".to_string()));
+    app.main_scrollbar_cache.set(Some(MainScrollbarCache {
+        scrollbar_area: Rect::new(0, 0, 1, 1),
+        total_rows: 1,
+        viewport_h: 1,
+        max_from_bottom: 1,
+    }));
+    let backend = TestBackend::new(40, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, 40, 24), &app, false))
+        .expect("draw");
+    assert!(
+        app.main_scrollbar_cache.get().is_none(),
+        "content that fits must clear the gutter cache so clicks are inert",
+    );
+}
+
+#[test]
+fn main_scrollbar_click_maps_top_of_track_to_top_of_content() {
+    let app = test_app(SessionMode::Build);
+    app.main_scrollbar_cache.set(Some(MainScrollbarCache {
+        scrollbar_area: Rect::new(39, 0, 1, 10),
+        total_rows: 50,
+        viewport_h: 10,
+        max_from_bottom: 40,
+    }));
+    // Click the very top cell of the gutter → scrolled fully up (from_bottom at
+    // or near the max).
+    let top = main_scrollbar_from_bottom_from_mouse(&app, 39, 0).expect("hit");
+    assert_eq!(top, 40, "top of track jumps to the top of the content");
+    // Click the bottom cell → following the tail (from_bottom 0).
+    let bottom = main_scrollbar_from_bottom_from_mouse(&app, 39, 9).expect("hit");
+    assert_eq!(bottom, 0, "bottom of track pins to the tail");
+    // Outside the gutter column → no hit.
+    assert!(main_scrollbar_from_bottom_from_mouse(&app, 0, 5).is_none());
+}
+
+#[test]
+fn wheel_accumulator_sums_small_bursts_into_line_scroll() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..200 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    let before = app.transcript_scroll.from_bottom();
+    // Three small scroll-up notches in a burst.
+    for _ in 0..3 {
+        let _ = handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+    let after = app.transcript_scroll.from_bottom();
+    assert!(
+        after > before,
+        "wheel-up must scroll the transcript up (from_bottom grew {before} -> {after})",
+    );
+    assert_eq!(
+        app.wheel_accum, 0,
+        "whole-line deltas drain the accumulator"
+    );
+}
+
+#[tokio::test]
+async fn jump_next_user_turn_lands_on_a_later_user_message() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Alternate user/assistant so jumps have distinct targets, with enough
+    // volume that the offsets span more than one viewport.
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {index}")));
+    }
+    // Start at the top so "next" has somewhere to go.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("home");
+    let top = app.transcript_scroll.from_bottom();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump next user turn");
+    assert!(
+        app.transcript_scroll.from_bottom() < top,
+        "jumping to the next user turn moves toward the tail (from_bottom shrinks)",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[tokio::test]
+async fn jump_prev_error_lands_on_a_failed_tool_result() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // A long run of clean turns, one failing tool result early, then more clean
+    // turns so the error is well above the tail.
+    for index in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("warmup {index}")));
+    }
+    let mut failed = sample_tool_result("shell", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result_with_call(failed, None);
+    for index in 0..60 {
+        app.push_transcript_item(TranscriptItem::user(format!("tail {index}")));
+    }
+    // From the live tail, "prev error" must jump up onto the failure.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    assert!(app.transcript_scroll.is_following());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump prev error");
+    assert!(
+        app.transcript_scroll.from_bottom() > 0,
+        "jumping to the previous error scrolls up off the tail",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[tokio::test]
+async fn jump_with_no_matching_entry_is_a_noop() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..30 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    // No assistant messages exist, so "prev assistant" finds nothing.
+    let before = app.transcript_scroll;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump prev assistant");
+    assert_eq!(
+        app.transcript_scroll, before,
+        "a jump with no target must leave the scroll state untouched",
+    );
+}
+
+#[test]
+fn smooth_scroll_anim_eases_from_start_to_target() {
+    let anim = MainScrollAnim {
+        start: 0,
+        target: 100,
+        started_at: std::time::Instant::now(),
+    };
+    assert_eq!(anim.displayed_from_bottom(0), 0, "starts at the origin");
+    let mid = anim.displayed_from_bottom(MAIN_SCROLL_ANIM_MS / 2);
+    assert!(
+        mid > 0 && mid < 100,
+        "interpolates between start and target"
+    );
+    assert_eq!(
+        anim.displayed_from_bottom(MAIN_SCROLL_ANIM_MS),
+        100,
+        "settles exactly on the target",
+    );
+    assert!(anim.is_done(MAIN_SCROLL_ANIM_MS));
+    assert!(!anim.is_done(0));
+}
+
+// =====================================================================
+// Phase 4: scroll-command wiring, follow-tail transitions, jump-nav,
+// wheel accumulation, scrollbar click-to-jump, and resize anchoring.
+// Tests drive the real key/mouse/render paths, not just the pure model.
+// =====================================================================
+
+/// Render only the MAIN transcript surface into a `(width, height)` backend and
+/// return its plain text. Unlike `render_to_string` (which paints the full
+/// `render()` chrome) this isolates `render_transcript`, so a test can resize the
+/// transcript viewport directly and assert which content rows are visible.
+fn render_transcript_to_string(app: &TuiApp, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, width, height), app, false))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+/// A fresh app seeded with `count` short, single-line user turns ("turn N"),
+/// each of which wraps to one row at width 40, so content-row count tracks the
+/// turn count closely and needles like "turn 137" are unambiguous.
+fn app_with_user_turns(count: usize) -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..count {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app
+}
+
+#[tokio::test]
+async fn following_auto_scrolls_to_latest_on_new_output() {
+    let mut app = app_with_user_turns(60);
+    // A fresh app follows the tail.
+    assert!(app.transcript_scroll.is_following());
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    // New output arrives while following: the offset still resolves to the tail,
+    // i.e. the newest line, for any viewport.
+    app.push_transcript_item(TranscriptItem::user("turn 60 (newest)".to_string()));
+    let frame = render_transcript_to_string(&app, 40, 12);
+    assert!(
+        frame.contains("turn 60 (newest)"),
+        "a following view shows the newest output:\n{frame}",
+    );
+    // The state is unchanged: still pinned, still following.
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    assert!(app.transcript_scroll.is_following());
+}
+
+#[tokio::test]
+async fn scrolling_up_freezes_logical_position_across_new_output() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = app_with_user_turns(80);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page up");
+    let frozen = app.transcript_scroll.from_bottom();
+    assert_eq!(
+        frozen, 8,
+        "PageUp freezes the position 8 lines off the tail"
+    );
+    assert!(!app.transcript_scroll.is_following());
+    // More output lands. A frozen (scrolled-up) view must NOT chase the tail:
+    // the logical `from_bottom` is unchanged.
+    for index in 80..90 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        frozen,
+        "new output must not move a scrolled-up (frozen) view",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[tokio::test]
+async fn end_re_pins_a_scrolled_up_view_to_latest() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = app_with_user_turns(80);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page up");
+    assert!(!app.transcript_scroll.is_following());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    assert!(
+        app.transcript_scroll.is_following(),
+        "End re-pins to latest"
+    );
+}
+
+#[tokio::test]
+async fn every_scroll_command_lands_where_expected() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = app_with_user_turns(120);
+
+    // PageUp: +8 from the tail, unpins.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page up");
+    assert_eq!(app.transcript_scroll.from_bottom(), 8);
+    assert!(!app.transcript_scroll.is_following());
+
+    // A second PageUp: +8 again, lands exactly at 16.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page up");
+    assert_eq!(app.transcript_scroll.from_bottom(), 16);
+
+    // PageDown: -8, back to 8.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page down");
+    assert_eq!(app.transcript_scroll.from_bottom(), 8);
+
+    // Home: jump to the very top. The resolved render offset is 0 and the stored
+    // `from_bottom` is the real max_scroll (> a single page), unpinned.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("home");
+    let at_top = app.transcript_scroll.from_bottom();
+    assert!(at_top > 16, "Home lands above any single page jump");
+    assert!(!app.transcript_scroll.is_following());
+    let (line_count, viewport_h) = active_transcript_geometry(&app);
+    assert_eq!(
+        app.transcript_scroll.offset(line_count, viewport_h),
+        0,
+        "Home renders the very top of the content",
+    );
+
+    // PageDown from the top steps back toward the tail by exactly one page.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page down from top");
+    assert_eq!(app.transcript_scroll.from_bottom(), at_top - 8);
+
+    // End: re-pin to the tail.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    assert!(app.transcript_scroll.is_following());
+}
+
+#[tokio::test]
+async fn home_and_end_are_inert_when_the_composer_has_text() {
+    // Home/End act as cursor moves (not transcript jumps) when the composer is
+    // non-empty, so the transcript scroll must be untouched in that case.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = app_with_user_turns(80);
+    app.input = "drafting".to_string();
+    let before = app.transcript_scroll;
+    for key in [KeyCode::Home, KeyCode::End] {
+        let _ = handle_key(&mut app, &mut agent, KeyEvent::new(key, KeyModifiers::NONE))
+            .await
+            .expect("composer cursor move");
+    }
+    assert_eq!(
+        app.transcript_scroll, before,
+        "Home/End must not scroll the transcript while the composer has text",
+    );
+}
+
+#[test]
+fn wheel_deltas_accumulate_without_dropping_fast_small_events() {
+    // Each wheel notch is a small fixed step; a fast burst of N notches must sum
+    // to N steps of movement, never collapsing multiple events into one. This is
+    // the "don't drop small fast events" contract: the accumulator drains whole
+    // lines and keeps any remainder.
+    let mut app = app_with_user_turns(400);
+    let mut last = app.transcript_scroll.from_bottom();
+    let mut steps = Vec::new();
+    for _ in 0..6 {
+        let _ = handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        let now = app.transcript_scroll.from_bottom();
+        steps.push(now - last);
+        last = now;
+    }
+    // Every notch moved the view; none was dropped.
+    assert!(
+        steps.iter().all(|&d| d > 0),
+        "every fast wheel notch must move the view, got per-notch deltas {steps:?}",
+    );
+    // The deltas are uniform (the fixed notch step), and the total is their sum —
+    // i.e. nothing was lost to rounding across the burst.
+    let total = app.transcript_scroll.from_bottom();
+    assert_eq!(total, steps.iter().sum::<usize>());
+    assert!(
+        steps.windows(2).all(|w| w[0] == w[1]),
+        "a steady burst yields a steady per-notch step, got {steps:?}",
+    );
+    assert_eq!(
+        app.wheel_accum, 0,
+        "whole-line deltas drain the accumulator"
+    );
+
+    // Wheel back down by the same number of notches returns to the tail and
+    // re-pins follow-tail.
+    for _ in 0..6 {
+        let _ = handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    assert!(app.transcript_scroll.is_following());
+}
+
+// ---- jump-nav: each command lands on the right entry boundary -----------
+
+#[tokio::test]
+async fn jump_prev_next_user_turn_land_on_user_messages() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {index}")));
+    }
+    // From the top, each Next-user-turn moves toward the tail (from_bottom
+    // shrinks). Step forward twice so a later Prev has an unambiguous target
+    // above it (the very first user entry may not sit at the exact top offset).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("home");
+    let top = app.transcript_scroll.from_bottom();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump next user turn");
+    let after_first = app.transcript_scroll.from_bottom();
+    assert!(after_first < top, "next user turn moves toward the tail");
+    assert!(!app.transcript_scroll.is_following());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump next user turn again");
+    let after_second = app.transcript_scroll.from_bottom();
+    assert!(
+        after_second < after_first,
+        "a second next user turn steps further down"
+    );
+    // Prev-user-turn from there lands back on the previous user-turn boundary,
+    // i.e. exactly where the first Next left us.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump prev user turn");
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        after_first,
+        "prev user turn returns to the previous user-turn boundary",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[tokio::test]
+async fn jump_prev_next_assistant_land_on_assistant_messages() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {index}")));
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("home");
+    let top = app.transcript_scroll.from_bottom();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump next assistant");
+    let after_first = app.transcript_scroll.from_bottom();
+    assert!(after_first < top, "next assistant moves toward the tail");
+    assert!(!app.transcript_scroll.is_following());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump next assistant again");
+    let after_second = app.transcript_scroll.from_bottom();
+    assert!(
+        after_second < after_first,
+        "a second next assistant steps further down"
+    );
+    // Prev-assistant returns exactly to the previous assistant boundary.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump prev assistant");
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        after_first,
+        "prev assistant returns to the previous assistant boundary",
+    );
+}
+
+#[tokio::test]
+async fn jump_prev_next_tool_call_land_on_tool_results() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Two well-separated tool results so prev/next have distinct targets.
+    for index in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("warmup {index}")));
+    }
+    app.push_tool_result_with_call(sample_tool_result("shell", "first"), None);
+    for index in 0..30 {
+        app.push_transcript_item(TranscriptItem::user(format!("middle {index}")));
+    }
+    app.push_tool_result_with_call(sample_tool_result("shell", "second"), None);
+    for index in 0..30 {
+        app.push_transcript_item(TranscriptItem::user(format!("tail {index}")));
+    }
+    // From the tail, Prev-tool-call jumps up onto the nearest tool result.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    assert!(app.transcript_scroll.is_following());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump prev tool call");
+    let first_back = app.transcript_scroll.from_bottom();
+    assert!(first_back > 0, "prev tool call scrolls up off the tail");
+    assert!(!app.transcript_scroll.is_following());
+    // A second Prev-tool-call lands on the earlier tool result, further up.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump prev tool call again");
+    assert!(
+        app.transcript_scroll.from_bottom() > first_back,
+        "the earlier tool result is further from the tail",
+    );
+    // Next-tool-call walks back down toward the later result.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump next tool call");
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        first_back,
+        "next tool call returns to the later tool result boundary",
+    );
+}
+
+#[tokio::test]
+async fn jump_next_error_lands_on_a_failed_tool_result() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // A failure early, clean turns around it, viewed from the top so "next
+    // error" has a downward target.
+    for index in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("warmup {index}")));
+    }
+    let mut failed = sample_tool_result("shell", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result_with_call(failed, None);
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("tail {index}")));
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("home");
+    let top = app.transcript_scroll.from_bottom();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("jump next error");
+    assert!(
+        app.transcript_scroll.from_bottom() < top,
+        "next error moves down from the top toward the failure",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[tokio::test]
+async fn jump_nav_with_no_target_leaves_scroll_untouched() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = app_with_user_turns(40);
+    // No assistant/tool/error entries exist; each such jump must be a no-op.
+    let before = app.transcript_scroll;
+    for key in [
+        KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), // prev assistant
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), // next assistant
+        KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT), // prev tool
+        KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT), // next tool
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT), // prev error
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT), // next error
+    ] {
+        let _ = handle_key(&mut app, &mut agent, key).await.expect("jump");
+        assert_eq!(
+            app.transcript_scroll, before,
+            "a jump with no matching target must not move the scroll state",
+        );
+    }
+}
+
+// ---- scrollbar click-to-jump mapping ------------------------------------
+
+#[test]
+fn main_scrollbar_click_maps_middle_of_track_to_middle_of_content() {
+    let app = test_app(SessionMode::Build);
+    // A 10-row gutter over 110 rows of content (viewport 10 => max_from_bottom
+    // 100). Mid-track should map near the middle of the scroll range.
+    app.main_scrollbar_cache.set(Some(MainScrollbarCache {
+        scrollbar_area: Rect::new(39, 0, 1, 10),
+        total_rows: 110,
+        viewport_h: 10,
+        max_from_bottom: 100,
+    }));
+    let top = main_scrollbar_from_bottom_from_mouse(&app, 39, 0).expect("top hit");
+    let bottom = main_scrollbar_from_bottom_from_mouse(&app, 39, 9).expect("bottom hit");
+    let middle = main_scrollbar_from_bottom_from_mouse(&app, 39, 5).expect("mid hit");
+    assert_eq!(top, 100, "top of the track jumps to the top of the content");
+    assert_eq!(bottom, 0, "bottom of the track pins to the tail");
+    assert!(
+        middle > bottom && middle < top,
+        "a mid-track click lands between the tail and the top (got {middle})",
+    );
+    // Monotonic: lower in the track ⇒ closer to the tail (smaller from_bottom).
+    let upper = main_scrollbar_from_bottom_from_mouse(&app, 39, 2).expect("upper hit");
+    let lower = main_scrollbar_from_bottom_from_mouse(&app, 39, 7).expect("lower hit");
+    assert!(upper > lower, "click-to-jump is monotonic down the track");
+    // A click outside the gutter column is not a scrollbar hit.
+    assert!(main_scrollbar_from_bottom_from_mouse(&app, 0, 5).is_none());
+}
+
+#[test]
+fn main_scrollbar_click_routes_through_handle_mouse() {
+    // End-to-end: a left-click on the cached gutter actually moves the scroll
+    // state via the production `handle_mouse` dispatch.
+    let mut app = app_with_user_turns(200);
+    // Populate the gutter cache by rendering the transcript once.
+    let _ = render_transcript_to_string(&app, 40, 12);
+    let cache = app
+        .main_scrollbar_cache
+        .get()
+        .expect("overflow caches the gutter");
+    let gutter_x = cache.scrollbar_area.x;
+    let gutter_top_y = cache.scrollbar_area.y;
+    assert!(app.transcript_scroll.is_following());
+    let moved = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: gutter_x,
+            row: gutter_top_y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        moved,
+        "clicking the top of the gutter changes the scroll state"
+    );
+    assert!(
+        app.transcript_scroll.from_bottom() > 0,
+        "clicking the top of the gutter scrolls up off the tail",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+// ---- resize anchoring (render-level) ------------------------------------
+
+#[test]
+fn resize_while_following_stays_at_latest() {
+    // A following view shows the newest entry at every viewport height.
+    let mut app = app_with_user_turns(199);
+    app.push_transcript_item(TranscriptItem::user("LATEST_ENTRY".to_string()));
+    assert!(app.transcript_scroll.is_following());
+    for height in [8u16, 16, 24, 40] {
+        let frame = render_transcript_to_string(&app, 40, height);
+        assert!(
+            frame.contains("LATEST_ENTRY"),
+            "a following view shows the latest entry at height {height}:\n{frame}",
+        );
+    }
+}
+
+#[test]
+fn resize_while_scrolled_up_keeps_same_logical_content_visible() {
+    // Scroll up to a fixed logical anchor, then resize the viewport. Because the
+    // scroll position is logical (`from_bottom`), the BOTTOM line of the viewport
+    // is `total - 1 - from_bottom` regardless of viewport height, so the content
+    // anchored at the bottom of the view is identical across resizes.
+    let width = 40u16;
+    let text_width = width - 1; // 1-cell scrollbar gutter.
+    let mut app = app_with_user_turns(300);
+    // True wrapped-row count at this text width (constant across height changes,
+    // since only the height varies below). Pick an anchor safely mid-content.
+    let total = transcript_lines_for_render(&app, Some(text_width), false).len();
+    assert!(
+        total > 80,
+        "need plenty of rows to scroll within; got {total}"
+    );
+    let from_bottom = 30usize;
+    // Use the SMALLEST height's geometry to store the anchor; smaller height =>
+    // larger max_scroll, so this anchor is in range for every larger height too.
+    let smallest = 10u16;
+    app.transcript_scroll
+        .set_from_bottom(from_bottom, total, smallest as usize);
+    assert_eq!(app.transcript_scroll.from_bottom(), from_bottom);
+    assert!(!app.transcript_scroll.is_following());
+
+    // At the smallest height, capture the needle on the LAST content row — the
+    // row anchored at `total - 1 - from_bottom`, which is height-independent.
+    let small = render_transcript_to_string(&app, width, smallest);
+    let needle = small
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|w| (w[0] == "turn").then(|| format!("turn {}", w[1])))
+        })
+        .expect("a 'turn N' needle is visible on screen");
+
+    // Resize to larger heights without touching the scroll state. The same
+    // bottom-anchored content must remain visible, and the view stays scrolled.
+    for height in [16u16, 24, 30] {
+        let frame = render_transcript_to_string(&app, width, height);
+        assert!(
+            frame.contains(&needle),
+            "scrolled-up content {needle:?} must stay visible after resize to height {height}:\n{frame}",
+        );
+        assert!(
+            !app.transcript_scroll.is_following(),
+            "a resize must not silently re-pin a scrolled-up view",
+        );
+    }
+}
+
+#[test]
+fn reanchor_on_resize_re_pins_following_and_clamps_scrolled_up() {
+    // `reanchor_active_scroll_on_resize` is the production resize hook. A
+    // following view re-pins; a scrolled-up view keeps a meaningful (clamped)
+    // anchor. Geometry here resolves through the 80x24 fallback.
+    let mut app = app_with_user_turns(200);
+    // Following: stays pinned.
+    reanchor_active_scroll_on_resize(&mut app);
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+    assert!(app.transcript_scroll.is_following());
+    // Scrolled up beyond what the (clamped) geometry allows: the reanchor caps
+    // it to the real max_scroll rather than leaving it pointing past content.
+    let (line_count, viewport_h) = active_transcript_geometry(&app);
+    let max_scroll = line_count.saturating_sub(viewport_h);
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(max_scroll + 1_000);
+    reanchor_active_scroll_on_resize(&mut app);
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        max_scroll,
+        "a resize clamps an over-scrolled anchor to the content top",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+// ---- scrolled-vs-live indicator ----------------------------------------
+
+#[test]
+fn scrolled_indicator_appears_only_when_scrolled_up() {
+    let mut app = app_with_user_turns(120);
+    // Following: no "from live" badge.
+    let live = render_transcript_to_string(&app, 60, 12);
+    assert!(
+        !live.contains("from live"),
+        "a following view shows no scrolled indicator:\n{live}",
+    );
+    // Scroll up: the badge appears and reports the live distance.
+    app.transcript_scroll.set_from_bottom(20, 320, 12);
+    let scrolled = render_transcript_to_string(&app, 60, 12);
+    assert!(
+        scrolled.contains("from live"),
+        "a scrolled-up view shows the 'from live' indicator:\n{scrolled}",
+    );
 }
 
 #[test]
@@ -11554,7 +12510,7 @@ async fn proposed_plan_block_renders_as_log_entry_and_persists_under_plans_dir()
 #[tokio::test]
 async fn assistant_delta_preserves_scroll_offset_in_history() {
     let mut app = test_app(SessionMode::Build);
-    app.transcript_scroll_from_bottom = 8;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(8);
     let (tx, rx) = mpsc::channel(4);
     app.turn_rx = Some(rx);
     tx.send(AgentEvent::AssistantDelta {
@@ -11568,7 +12524,8 @@ async fn assistant_delta_preserves_scroll_offset_in_history() {
     drain_agent_events(&mut app).await;
 
     assert_eq!(
-        app.transcript_scroll_from_bottom, 8,
+        app.transcript_scroll.from_bottom(),
+        8,
         "history scroll must survive incoming deltas",
     );
     assert_eq!(app.pending_assistant.text(), "streamed");
@@ -11577,7 +12534,7 @@ async fn assistant_delta_preserves_scroll_offset_in_history() {
 #[tokio::test]
 async fn completed_event_preserves_scroll_offset_in_history() {
     let mut app = test_app(SessionMode::Build);
-    app.transcript_scroll_from_bottom = 5;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(5);
     let (tx, rx) = mpsc::channel(4);
     app.turn_rx = Some(rx);
     tx.send(AgentEvent::Completed {
@@ -11598,7 +12555,8 @@ async fn completed_event_preserves_scroll_offset_in_history() {
     drain_agent_events(&mut app).await;
 
     assert_eq!(
-        app.transcript_scroll_from_bottom, 5,
+        app.transcript_scroll.from_bottom(),
+        5,
         "history scroll must survive turn completion",
     );
     assert_eq!(app.status, "ready");
@@ -11923,7 +12881,7 @@ fn status_footer_stays_context_only_when_scrolled() {
         "no marker while at bottom: {live}"
     );
 
-    app.transcript_scroll_from_bottom = 4;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(4);
     let scrolled = format_status_tokens(&app);
     assert!(
         !scrolled.contains("selected transcript entry"),
@@ -14440,7 +15398,7 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
     for index in 0..80 {
         app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
     }
-    app.transcript_scroll_from_bottom = 12;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(12);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
@@ -14461,7 +15419,8 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
         "PageDown should scroll the Ctrl+T transcript overlay"
     );
     assert_eq!(
-        app.transcript_scroll_from_bottom, 12,
+        app.transcript_scroll.from_bottom(),
+        12,
         "PageDown must not scroll the underlying transcript while Ctrl+T is open"
     );
 }

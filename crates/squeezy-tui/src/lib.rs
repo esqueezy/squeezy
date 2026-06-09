@@ -928,6 +928,9 @@ async fn run_inner_with_terminal(
         if app.finalize_elapsed_settles() {
             app.needs_redraw = true;
         }
+        if app.finalize_elapsed_main_scroll_anim() {
+            app.needs_redraw = true;
+        }
         if app.toasts.tick() {
             app.needs_redraw = true;
         }
@@ -2035,6 +2038,13 @@ async fn handle_input_event(
         Event::Resize(_, _) => {
             app.pending_resize = true;
             app.needs_redraw = true;
+            // A live (following) view re-pins to the tail; a scrolled-up view
+            // keeps its logical anchor, clamped to the reflowed geometry so the
+            // stored `from_bottom` never points past the new content. Any
+            // in-flight ease was computed against the old geometry, so cancel it
+            // and let the new geometry govern the painted position.
+            cancel_main_scroll_anim(app);
+            reanchor_active_scroll_on_resize(app);
             Ok(false)
         }
         // Crossterm only emits these after `EnableFocusChange` succeeded
@@ -2078,25 +2088,103 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         dispatch_click_action(app, action);
         return true;
     }
+    // Main-view scrollbar gutter: a left-click jumps the thumb to the row;
+    // a left-drag (only delivered while terminal mouse capture is on) tracks
+    // the pointer continuously. When capture is off no `Drag` events arrive, so
+    // the drag arm is simply inert — no guard plumbing needed. Hit-tested before
+    // the wheel arms so a click on the gutter never doubles as a scroll.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    | MouseEventKind::Drag(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some(from_bottom) =
+            main_scrollbar_from_bottom_from_mouse(app, mouse.column, mouse.row)
+    {
+        // Direct manipulation: snap (no ease) so the thumb tracks the pointer.
+        cancel_main_scroll_anim(app);
+        let (line_count, viewport_h) = active_transcript_geometry(app);
+        let before = active_transcript_scroll(app);
+        active_transcript_scroll_mut(app).set_from_bottom(from_bottom, line_count, viewport_h);
+        return active_transcript_scroll(app) != before;
+    }
     // Wheel scroll always scrolls the transcript — the inline viewport
     // disables the terminal's native wheel-to-arrow translation, so without
     // this the user would have no way to scroll once mouse capture was on.
     // Compare the *active* conversation's scroll (subagent records carry
     // their own offset), not always main's, so wheeling a selected subagent
     // transcript still reports the change and triggers a redraw.
+    //
+    // Trackpads emit many small high-frequency notches; accumulate them and
+    // apply whole lines while keeping the remainder, so a fast burst of small
+    // events sums instead of each rounding to the same fixed step. The notch
+    // step (3 lines) matches the previous fixed behavior for a single notch.
+    const WHEEL_STEP_LINES: i32 = 3;
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            let before = active_transcript_scroll_from_bottom(app);
-            scroll_transcript_up(app, 3);
-            active_transcript_scroll_from_bottom(app) != before
+            let before = active_transcript_scroll(app);
+            app.wheel_accum = app.wheel_accum.saturating_add(WHEEL_STEP_LINES);
+            apply_wheel_accumulated_scroll(app);
+            active_transcript_scroll(app) != before
         }
         MouseEventKind::ScrollDown => {
-            let before = active_transcript_scroll_from_bottom(app);
-            scroll_transcript_down(app, 3);
-            active_transcript_scroll_from_bottom(app) != before
+            let before = active_transcript_scroll(app);
+            app.wheel_accum = app.wheel_accum.saturating_sub(WHEEL_STEP_LINES);
+            apply_wheel_accumulated_scroll(app);
+            active_transcript_scroll(app) != before
         }
         _ => false,
     }
+}
+
+/// Drain the whole-line portion of the wheel accumulator into the transcript
+/// scroll, keeping the sub-line remainder for the next event. Positive sums
+/// scroll up (away from the tail); negative scroll down.
+fn apply_wheel_accumulated_scroll(app: &mut TuiApp) {
+    let lines = app.wheel_accum;
+    if lines == 0 {
+        return;
+    }
+    app.wheel_accum = 0;
+    if lines > 0 {
+        scroll_transcript_up(app, lines as usize);
+    } else {
+        scroll_transcript_down(app, lines.unsigned_abs() as usize);
+    }
+}
+
+/// Map an absolute `(column, row)` mouse position onto a `from_bottom` for the
+/// MAIN transcript scrollbar, using the per-frame `main_scrollbar_cache`.
+/// Returns `None` when the position is outside the cached gutter rect (or no
+/// scrollbar was drawn this frame). The row→scroll math mirrors the overlay's
+/// `transcript_overlay_scroll_for_cached_scrollbar_row`, then inverts the
+/// top-line scroll into `from_bottom = max_from_bottom - top_line_scroll`.
+fn main_scrollbar_from_bottom_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<usize> {
+    let cached = app.main_scrollbar_cache.get()?;
+    let area = cached.scrollbar_area;
+    if column != area.x || row < area.y || row >= area.y.saturating_add(area.height) {
+        return None;
+    }
+    // Recompute the thumb height from the cached content/viewport so the
+    // pointer-to-scroll mapping centres the thumb under the cursor.
+    let geometry = scroll::scrollbar_geometry(
+        cached.total_rows,
+        usize::from(cached.viewport_h),
+        // `from_bottom` only positions the thumb, which we don't need here.
+        0,
+    )?;
+    let track_height = usize::from(area.height);
+    let thumb_len = geometry.thumb_len;
+    let travel = track_height.saturating_sub(thumb_len);
+    let local_row = usize::from(
+        row.saturating_sub(area.y)
+            .min(area.height.saturating_sub(1)),
+    );
+    let top_line_scroll = if travel == 0 {
+        0
+    } else {
+        let centered = local_row.saturating_sub(thumb_len / 2);
+        let position = centered.min(travel);
+        (position * cached.max_from_bottom) / travel
+    };
+    Some(cached.max_from_bottom.saturating_sub(top_line_scroll))
 }
 
 fn handle_transcript_overlay_mouse(
@@ -2347,7 +2435,7 @@ fn selected_conversation_source(app: &TuiApp) -> ConversationSource {
 /// Used by Enter (both modes) and by alternate-screen live preview.
 fn select_subagent_row(app: &mut TuiApp) {
     app.subagent_pane.active = selected_conversation_source(app);
-    set_active_transcript_scroll_from_bottom(app, 0);
+    active_transcript_scroll_mut(app).pin_to_bottom();
     app.status = match app.subagent_pane.active {
         ConversationSource::Main => "main conversation".to_string(),
         ConversationSource::Subagent(_) => "subagent conversation".to_string(),
@@ -2457,7 +2545,7 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             app.subagent_pane.focused = false;
             app.subagent_pane.active = ConversationSource::Main;
             app.subagent_pane.selected = 0;
-            set_active_transcript_scroll_from_bottom(app, 0);
+            active_transcript_scroll_mut(app).pin_to_bottom();
             app.status = "main conversation selected".to_string();
             true
         }
@@ -3285,7 +3373,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                set_active_transcript_scroll_from_bottom(app, usize::MAX);
+                jump_main_to_top_animated(app);
                 true
             } else {
                 false
@@ -3296,13 +3384,151 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                set_active_transcript_scroll_from_bottom(app, 0);
+                // Live == `from_bottom` 0; animate the pin so a long scrollback
+                // eases back to the tail.
+                commit_main_from_bottom_animated(app, 0);
                 true
             } else {
                 false
             }
         }
+        keymap::Action::JumpPrevUserTurn => {
+            jump_transcript_nav(app, JumpTarget::UserTurn, JumpDirection::Prev)
+        }
+        keymap::Action::JumpNextUserTurn => {
+            jump_transcript_nav(app, JumpTarget::UserTurn, JumpDirection::Next)
+        }
+        keymap::Action::JumpPrevAssistant => {
+            jump_transcript_nav(app, JumpTarget::Assistant, JumpDirection::Prev)
+        }
+        keymap::Action::JumpNextAssistant => {
+            jump_transcript_nav(app, JumpTarget::Assistant, JumpDirection::Next)
+        }
+        keymap::Action::JumpPrevToolCall => {
+            jump_transcript_nav(app, JumpTarget::ToolCall, JumpDirection::Prev)
+        }
+        keymap::Action::JumpNextToolCall => {
+            jump_transcript_nav(app, JumpTarget::ToolCall, JumpDirection::Next)
+        }
+        keymap::Action::JumpPrevError => {
+            jump_transcript_nav(app, JumpTarget::Error, JumpDirection::Prev)
+        }
+        keymap::Action::JumpNextError => {
+            jump_transcript_nav(app, JumpTarget::Error, JumpDirection::Next)
+        }
     }
+}
+
+/// The category of transcript entry a jump command targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpTarget {
+    UserTurn,
+    Assistant,
+    ToolCall,
+    Error,
+}
+
+/// Search direction for a jump command, relative to the entry currently at the
+/// top of the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpDirection {
+    Prev,
+    Next,
+}
+
+/// True when entry `index` matches the jump `target`. Pure over the entry slice
+/// + grouping flags, mirroring the classifications the renderer uses.
+fn entry_matches_jump_target(
+    entries: &[TranscriptEntry],
+    index: usize,
+    target: JumpTarget,
+    coalesce_tool_runs: bool,
+) -> bool {
+    let Some(entry) = entries.get(index) else {
+        return false;
+    };
+    match target {
+        JumpTarget::UserTurn => {
+            matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::User)
+        }
+        JumpTarget::Assistant => {
+            matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::Assistant)
+        }
+        JumpTarget::ToolCall => {
+            // Land on a coalesced run's lead, not its suppressed members.
+            matches!(&entry.kind, TranscriptEntryKind::ToolResult(_))
+                && matches!(
+                    tool_run_info(entries, index, coalesce_tool_runs),
+                    None | Some(ToolRun::Lead { .. })
+                )
+        }
+        JumpTarget::Error => entry_is_error(entries, index),
+    }
+}
+
+/// True when entry `index` is a failure surface: a failed tool result, a
+/// failure log, or a message whose `message_outcome` is `Failed`.
+fn entry_is_error(entries: &[TranscriptEntry], index: usize) -> bool {
+    let Some(entry) = entries.get(index) else {
+        return false;
+    };
+    match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => tool.result.status != ToolStatus::Success,
+        TranscriptEntryKind::Log(log) => is_failure_log(log.message()),
+        TranscriptEntryKind::Message(_) => {
+            message_outcome(entries, index) == MessageOutcome::Failed
+        }
+        _ => false,
+    }
+}
+
+/// Execute a jump-navigation command: find the previous/next entry matching
+/// `target` relative to the entry currently anchored at the viewport top, then
+/// scroll (with a smooth ease) so that entry sits at the top. Returns `true`
+/// when it moved, `false` when guarded out or no such entry exists.
+fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDirection) -> bool {
+    if app.config_screen.is_some() || app.status_line_setup.is_some() {
+        return false;
+    }
+    let (width, height) = terminal_size().unwrap_or((80, 24));
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let include_startup_card = area.height >= 16;
+    let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
+    let text_width = area.width.saturating_sub(1).max(1);
+    let (rows, entry_offsets) =
+        transcript_lines_and_entry_offsets(app, Some(text_width), include_startup_card);
+    let total_rows = rows.len();
+    if entry_offsets.is_empty() || total_rows == 0 {
+        return false;
+    }
+    // The wrapped-row currently at the top of the viewport.
+    let top_row = active_transcript_scroll(app).offset(total_rows, viewport_h);
+    // Index of the matching entry to jump to.
+    let entries = active_transcript_entries(app);
+    let coalesce = app.coalesce_tool_runs;
+    let target_index = match direction {
+        JumpDirection::Prev => (0..entries.len())
+            .rev()
+            .filter(|&i| entry_matches_jump_target(entries, i, target, coalesce))
+            .find(|&i| entry_offsets[i] < top_row),
+        JumpDirection::Next => (0..entries.len())
+            .filter(|&i| entry_matches_jump_target(entries, i, target, coalesce))
+            .find(|&i| entry_offsets[i] > top_row),
+    };
+    let Some(target_index) = target_index else {
+        return false;
+    };
+    // Convert the target row into a `from_bottom`: top-line scroll
+    // `entry_offsets[target]` ⇒ `from_bottom = max_scroll - scroll`.
+    let max_scroll = total_rows.saturating_sub(viewport_h);
+    let from_bottom = max_scroll.saturating_sub(entry_offsets[target_index].min(max_scroll));
+    commit_main_from_bottom_animated(app, from_bottom);
+    true
 }
 
 /// Toggle the prompt-queue reorder overlay. Hard-coded as a chord
@@ -3337,14 +3563,99 @@ fn dispatch_click_action(app: &mut TuiApp, action: ClickAction) {
     }
 }
 
+/// Current `(line_count, viewport_h)` for the *active* transcript, using the
+/// live terminal width and the transcript area height. Mirrors the geometry
+/// `render_transcript` feeds to `ScrollState::offset` so `scroll_by`/
+/// `scroll_to_top`/`clamp` clamp against the same numbers the renderer uses.
+///
+/// Recomputed off-frame the same way `transcript_overlay_max_scroll` rebuilds
+/// the overlay `Rect` from `terminal_size()`.
+fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
+    let (width, height) = terminal_size().unwrap_or((80, 24));
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    // `render()` renders the main transcript only when no overlay/setup/config
+    // screen is up and includes the startup card on a tall enough terminal.
+    let include_startup_card = area.height >= 16;
+    let viewport_h = main_transcript_height(app, area, include_startup_card);
+    let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
+    (lines.len(), viewport_h as usize)
+}
+
+/// Re-clamp the active transcript scroll to the current (post-resize) geometry.
+/// A following view re-pins to the tail; a scrolled-up view keeps its stored
+/// `from_bottom` clamped into the new `[0, max_scroll]` so the logical anchor
+/// survives the reflow without pointing past the content.
+fn reanchor_active_scroll_on_resize(app: &mut TuiApp) {
+    let (line_count, viewport_h) = active_transcript_geometry(app);
+    active_transcript_scroll_mut(app).clamp(line_count, viewport_h);
+}
+
 fn scroll_transcript_up(app: &mut TuiApp, lines: usize) {
-    let scroll = active_transcript_scroll_from_bottom(app).saturating_add(lines);
-    set_active_transcript_scroll_from_bottom(app, scroll);
+    // Direct nudges snap: cancel any in-flight ease so the view doesn't fight
+    // the user's wheel/page input. `cancel_main_scroll_anim` makes the painted
+    // position jump straight to the (about-to-change) logical state.
+    cancel_main_scroll_anim(app);
+    let (line_count, viewport_h) = active_transcript_geometry(app);
+    active_transcript_scroll_mut(app).scroll_by(lines as isize, line_count, viewport_h);
 }
 
 fn scroll_transcript_down(app: &mut TuiApp, lines: usize) {
-    let scroll = active_transcript_scroll_from_bottom(app).saturating_sub(lines);
-    set_active_transcript_scroll_from_bottom(app, scroll);
+    cancel_main_scroll_anim(app);
+    let (line_count, viewport_h) = active_transcript_geometry(app);
+    active_transcript_scroll_mut(app).scroll_by(-(lines as isize), line_count, viewport_h);
+}
+
+/// Cancel any in-flight main-view smooth-scroll ease, snapping the painted
+/// position to the logical destination. Called on every fresh input so an
+/// animation never lingers past new scrolling.
+fn cancel_main_scroll_anim(app: &mut TuiApp) {
+    app.main_scroll_anim = None;
+}
+
+/// Commit an absolute `from_bottom` to the active transcript and, for a large
+/// enough jump, arm a smooth-scroll ease from the previous position. The logical
+/// state is set to the destination immediately (the stable anchor); the ease
+/// only governs the painted position on the way there. Honours the
+/// reduced-motion / instant-scroll switch (`smooth_scroll_enabled`).
+fn commit_main_from_bottom_animated(app: &mut TuiApp, target_from_bottom: usize) {
+    let (line_count, viewport_h) = active_transcript_geometry(app);
+    let start = active_transcript_scroll(app).offset_from_bottom(line_count, viewport_h);
+    active_transcript_scroll_mut(app).set_from_bottom(target_from_bottom, line_count, viewport_h);
+    arm_main_scroll_anim_from(app, start);
+}
+
+/// Jump the active transcript to the very top with a smooth ease. Uses
+/// `scroll_to_top` so the stored `from_bottom` is the real top offset (not the
+/// `usize::MAX` sentinel), keeping it meaningful for a later `clamp`.
+fn jump_main_to_top_animated(app: &mut TuiApp) {
+    let (line_count, viewport_h) = active_transcript_geometry(app);
+    let start = active_transcript_scroll(app).offset_from_bottom(line_count, viewport_h);
+    active_transcript_scroll_mut(app).scroll_to_top(line_count, viewport_h);
+    arm_main_scroll_anim_from(app, start);
+}
+
+/// Arm (or clear) the smooth-scroll ease after the logical state has already
+/// moved to its destination. `start` is the pre-move displayed `from_bottom`;
+/// the destination is read back from the (now-updated) state. Small jumps and
+/// reduced-motion both snap (no ease).
+fn arm_main_scroll_anim_from(app: &mut TuiApp, start: usize) {
+    let (line_count, viewport_h) = active_transcript_geometry(app);
+    let target = active_transcript_scroll(app).offset_from_bottom(line_count, viewport_h);
+    let distance = start.abs_diff(target);
+    if app.smooth_scroll_enabled && distance >= MAIN_SCROLL_ANIM_MIN_DISTANCE {
+        app.main_scroll_anim = Some(MainScrollAnim {
+            start,
+            target,
+            started_at: std::time::Instant::now(),
+        });
+    } else {
+        app.main_scroll_anim = None;
+    }
 }
 
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
@@ -5471,7 +5782,7 @@ fn close_transcript_overlay(app: &mut TuiApp) {
         app.subagent_pane.focused = false;
         app.subagent_pane.active = ConversationSource::Main;
         app.subagent_pane.selected = 0;
-        set_active_transcript_scroll_from_bottom(app, 0);
+        active_transcript_scroll_mut(app).pin_to_bottom();
         app.status = "main conversation selected".to_string();
     } else {
         app.status = "transcript overlay closed".to_string();
@@ -6894,22 +7205,30 @@ fn approval_block_capped(
     out
 }
 
-pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
-    app.begin_frame_clickables();
-    let area = frame.area();
-    if app.transcript_overlay.is_some() {
-        render_transcript_overlay_surface(frame, area, app);
-        return;
-    }
-    if let Some(state) = &app.status_line_setup {
-        status_line_setup::render(frame, area, state, app);
-        return;
-    }
-    if let Some(state) = &app.config_screen {
-        config_screen::render(frame, area, state);
-        return;
-    }
-    let include_startup_card = area.height >= 16;
+/// Resolved heights for the main (inline) view's vertical layout. The
+/// transcript viewport height (`transcript_height`) is the single source of
+/// truth shared by `render()` and the off-frame `active_transcript_geometry`,
+/// so the scroll math clamps against exactly the height the renderer draws.
+struct MainTranscriptLayout {
+    task_height: Option<u16>,
+    approval_height: u16,
+    plan_indicator_height: u16,
+    subagent_height: u16,
+    attachment_height: u16,
+    transcript_prompt_gap_height: u16,
+    transcript_height: u16,
+    show_completed_turn_divider: bool,
+    input_height: u16,
+}
+
+/// Compute the main-view layout heights for `area`. Extracted from `render()`
+/// so the scroll commands can recompute the transcript viewport height
+/// off-frame without re-running a full frame.
+fn main_transcript_layout(
+    app: &TuiApp,
+    area: Rect,
+    include_startup_card: bool,
+) -> MainTranscriptLayout {
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
@@ -6963,6 +7282,53 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let available_transcript_height =
         available_without_gap.saturating_sub(transcript_prompt_gap_height);
     let transcript_height = transcript_visual_height.min(available_transcript_height);
+    MainTranscriptLayout {
+        task_height,
+        approval_height,
+        plan_indicator_height,
+        subagent_height,
+        attachment_height,
+        transcript_prompt_gap_height,
+        transcript_height,
+        show_completed_turn_divider,
+        input_height,
+    }
+}
+
+/// The main transcript viewport height for `area`, matching what `render()`
+/// hands `render_transcript`. The off-frame scroll-geometry path uses this.
+fn main_transcript_height(app: &TuiApp, area: Rect, include_startup_card: bool) -> u16 {
+    main_transcript_layout(app, area, include_startup_card).transcript_height
+}
+
+pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
+    app.begin_frame_clickables();
+    let area = frame.area();
+    if app.transcript_overlay.is_some() {
+        render_transcript_overlay_surface(frame, area, app);
+        return;
+    }
+    if let Some(state) = &app.status_line_setup {
+        status_line_setup::render(frame, area, state, app);
+        return;
+    }
+    if let Some(state) = &app.config_screen {
+        config_screen::render(frame, area, state);
+        return;
+    }
+    let include_startup_card = area.height >= 16;
+    let layout = main_transcript_layout(app, area, include_startup_card);
+    let MainTranscriptLayout {
+        task_height,
+        approval_height,
+        plan_indicator_height,
+        subagent_height,
+        attachment_height,
+        transcript_prompt_gap_height,
+        transcript_height,
+        show_completed_turn_divider,
+        input_height,
+    } = layout;
     let mut constraints = Vec::new();
     if transcript_height > 0 {
         constraints.push(Constraint::Length(transcript_height));
@@ -7769,16 +8135,171 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
-    let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
-    let scroll = scroll::to_u16_clamped(transcript_scroll_offset(
-        lines.len(),
-        area.height as usize,
-        active_transcript_scroll_from_bottom(app),
+    // Reserve a 1-cell right gutter for the scrollbar; the text wraps to the
+    // narrower column. When the area is too thin to split, fall back to the
+    // full width with no gutter.
+    let (text_area, scrollbar_area) = transcript_main_text_and_scrollbar_areas(area);
+    let lines = transcript_lines_for_render(app, Some(text_area.width), include_startup_card);
+    let total_rows = lines.len();
+    let viewport_h = text_area.height as usize;
+    let state = active_transcript_scroll(app);
+    // The logical scroll state holds the destination `from_bottom`; an in-flight
+    // smooth-scroll ease overrides only what is *painted* this frame. The ease
+    // is computed off the same geometry the state uses, so the anchor stays put.
+    let from_bottom = displayed_main_from_bottom(app, state, total_rows, viewport_h);
+    let scroll = scroll::to_u16_clamped(scroll_offset_for_from_bottom(
+        from_bottom,
+        total_rows,
+        viewport_h,
     ));
     let paragraph = Paragraph::new(lines)
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, text_area);
+
+    // Scrollbar thumb in the gutter. `None` (content fits) clears the cache so
+    // the gutter is inert to clicks.
+    if let Some(scrollbar_area) = scrollbar_area {
+        if scrollbar_area.width > 0
+            && let Some(geometry) = scroll::scrollbar_geometry(total_rows, viewport_h, from_bottom)
+        {
+            render_main_scrollbar(
+                frame,
+                scrollbar_area,
+                scroll::to_u16_clamped(geometry.thumb_offset),
+                scroll::to_u16_clamped(geometry.thumb_len),
+            );
+            app.main_scrollbar_cache.set(Some(MainScrollbarCache {
+                scrollbar_area,
+                total_rows,
+                viewport_h: text_area.height,
+                max_from_bottom: total_rows.saturating_sub(viewport_h),
+            }));
+        } else {
+            app.main_scrollbar_cache.set(None);
+        }
+    } else {
+        app.main_scrollbar_cache.set(None);
+    }
+
+    // "Scrolled vs live" indicator: only while scrolled up off the tail. Uses
+    // the logical state's `from_bottom` (the destination) so it doesn't flicker
+    // during the ease.
+    let logical_from_bottom = state.offset_from_bottom(total_rows, viewport_h);
+    if logical_from_bottom > 0 {
+        render_scrolled_indicator(frame, text_area, app, logical_from_bottom);
+    }
+}
+
+/// The `from_bottom` to *paint* this frame: the in-flight smooth-scroll ease's
+/// interpolated value, clamped to the live geometry, or the logical state's own
+/// `from_bottom` when no animation is running.
+fn displayed_main_from_bottom(
+    app: &TuiApp,
+    state: scroll::ScrollState,
+    total_rows: usize,
+    viewport_h: usize,
+) -> usize {
+    let logical = state.offset_from_bottom(total_rows, viewport_h);
+    let Some(anim) = app.main_scroll_anim else {
+        return logical;
+    };
+    let elapsed = anim.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let displayed = anim.displayed_from_bottom(elapsed);
+    let max_from_bottom = total_rows.saturating_sub(viewport_h);
+    displayed.min(max_from_bottom)
+}
+
+/// Resolve a `from_bottom` distance into the renderer's top-line `scroll`
+/// offset: `max_scroll - from_bottom`, saturating. Mirrors
+/// [`scroll::ScrollState::offset`] for a bare `from_bottom`.
+fn scroll_offset_for_from_bottom(
+    from_bottom: usize,
+    total_rows: usize,
+    viewport_h: usize,
+) -> usize {
+    total_rows
+        .saturating_sub(viewport_h)
+        .saturating_sub(from_bottom)
+}
+
+/// Split a transcript area into a text column and a 1-cell right gutter for the
+/// scrollbar. Mirrors `transcript_overlay_text_and_scrollbar_areas`, but for the
+/// borderless main view. Returns `(text_area, None)` when the area is too thin
+/// to host a gutter (so the text keeps the full width).
+fn transcript_main_text_and_scrollbar_areas(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width <= 1 || area.height == 0 {
+        return (area, None);
+    }
+    let text_area = Rect {
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    let scrollbar_area = Rect {
+        x: area.x + area.width - 1,
+        y: area.y,
+        width: 1,
+        height: area.height,
+    };
+    (text_area, Some(scrollbar_area))
+}
+
+/// Draw the main-view scrollbar thumb (`█`, accent bold) on a quiet `░` track.
+/// Shares glyphs/style with `render_transcript_overlay_scrollbar`.
+fn render_main_scrollbar(frame: &mut Frame<'_>, area: Rect, thumb_offset: u16, thumb_len: u16) {
+    let thumb_end = thumb_offset.saturating_add(thumb_len);
+    let lines = (0..area.height)
+        .map(|offset| {
+            let in_thumb = offset >= thumb_offset && offset < thumb_end;
+            let (symbol, style) = if in_thumb {
+                (
+                    "█",
+                    Style::default()
+                        .fg(crate::render::theme::accent())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("░", Style::default().fg(crate::render::theme::quiet()))
+            };
+            Line::from(Span::styled(symbol, style))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Draw the compact "scrolled vs live" badge in the top-right of the transcript
+/// text area, e.g. `↑ 42 from live · End to re-pin`. Only called while scrolled
+/// up. Reuses the toast-style right-align placement math.
+fn render_scrolled_indicator(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, from_bottom: usize) {
+    if area.width < 12 || area.height == 0 {
+        return;
+    }
+    let key = key_hint(app, keymap::Action::TranscriptEnd);
+    let label = format!("↑ {from_bottom} from live · {key} to re-pin");
+    let max_width = area.width.saturating_sub(1);
+    let visual: String = label.chars().take(max_width as usize).collect();
+    let line_width = visual.chars().count() as u16;
+    if line_width == 0 {
+        return;
+    }
+    let x = area.right().saturating_sub(line_width + 1).max(area.left());
+    let rect = Rect {
+        x,
+        y: area.top(),
+        width: line_width.min(area.right().saturating_sub(x)),
+        height: 1,
+    };
+    if rect.width == 0 {
+        return;
+    }
+    let style = Style::default()
+        .fg(crate::render::theme::accent())
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(visual, style))),
+        rect,
+    );
 }
 
 const TRANSCRIPT_OVERLAY_SCROLL_BOTTOM: usize = usize::MAX;
@@ -8228,6 +8749,89 @@ struct TranscriptScrollbarGeometry {
 pub(crate) struct TranscriptOverlayScrollbarCache {
     scrollbar_area: Rect,
     geometry: TranscriptScrollbarGeometry,
+}
+
+/// Per-frame snapshot of the MAIN transcript scrollbar so `handle_mouse` can
+/// hit-test the gutter (click-to-jump / drag) without re-deriving the layout.
+///
+/// `total_rows`/`viewport_h` are the wrapped-row content length and the text
+/// viewport height the renderer fed to [`scroll::scrollbar_geometry`];
+/// `max_from_bottom` is `total_rows - viewport_h`, the largest scroll-up the
+/// content allows. Stored on `TuiApp` behind a `Cell`, set at the end of
+/// `render_transcript`, cleared to `None` when the content fits (no scrollbar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MainScrollbarCache {
+    scrollbar_area: Rect,
+    total_rows: usize,
+    viewport_h: u16,
+    max_from_bottom: usize,
+}
+
+/// In-flight smooth-scroll animation for the MAIN transcript view.
+///
+/// A large discrete jump (PageUp/PageDown, Home/End, jump-nav) eases the
+/// *displayed* `from_bottom` from `start` toward `target` over
+/// [`MAIN_SCROLL_ANIM_MS`]. The logical scroll state already holds `target`, so
+/// the anchor is stable: the animation only governs what is painted on the way
+/// there. Any fresh input cancels the animation by snapping to `target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MainScrollAnim {
+    /// `from_bottom` the animation eases away from.
+    start: usize,
+    /// `from_bottom` the logical state already holds (the destination).
+    target: usize,
+    /// Absolute clock the ease started on (independent of `animation_tick`).
+    started_at: std::time::Instant,
+}
+
+/// Duration of the main-view smooth-scroll ease for large jumps.
+const MAIN_SCROLL_ANIM_MS: u64 = 140;
+
+/// Minimum jump distance (in logical lines) that arms a smooth-scroll ease.
+/// Small wheel/page nudges snap instantly so scrolling stays crisp; only big
+/// jumps (Home/End, jump-nav) animate.
+const MAIN_SCROLL_ANIM_MIN_DISTANCE: usize = 12;
+
+impl MainScrollAnim {
+    /// The displayed `from_bottom` at `elapsed_ms`, easing `start`→`target`
+    /// with a quadratic ease-out. Returns `target` once the window elapses.
+    fn displayed_from_bottom(self, elapsed_ms: u64) -> usize {
+        if elapsed_ms >= MAIN_SCROLL_ANIM_MS {
+            return self.target;
+        }
+        let t = elapsed_ms as f64 / MAIN_SCROLL_ANIM_MS as f64;
+        let eased = 1.0 - (1.0 - t) * (1.0 - t);
+        let start = self.start as f64;
+        let target = self.target as f64;
+        let value = start + (target - start) * eased;
+        value.round().max(0.0) as usize
+    }
+
+    /// Whether the ease has reached its target (so it can be dropped).
+    fn is_done(self, elapsed_ms: u64) -> bool {
+        elapsed_ms >= MAIN_SCROLL_ANIM_MS || self.start == self.target
+    }
+}
+
+/// True when the environment asks for reduced motion: any of
+/// `SQUEEZY_REDUCE_MOTION`, `NO_MOTION`, or `PREFERS_REDUCED_MOTION` set to a
+/// truthy value (`1`/`true`/`yes`/`on`, case-insensitive). Drives the
+/// instant-scroll switch so large jumps snap instead of easing.
+fn reduced_motion_requested() -> bool {
+    [
+        "SQUEEZY_REDUCE_MOTION",
+        "NO_MOTION",
+        "PREFERS_REDUCED_MOTION",
+    ]
+    .iter()
+    .any(|key| {
+        std::env::var(key).is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    })
 }
 
 fn transcript_overlay_max_scroll_for_content(content_len: usize, viewport_height: u16) -> usize {
@@ -8952,33 +9556,35 @@ fn active_subagent_record(app: &TuiApp) -> Option<&SubagentRecord> {
         .find(|record| record.id == id)
 }
 
-fn active_subagent_record_mut(app: &mut TuiApp) -> Option<&mut SubagentRecord> {
-    let ConversationSource::Subagent(id) = app.subagent_pane.active else {
-        return None;
-    };
-    app.subagent_pane
-        .records
-        .iter_mut()
-        .find(|record| record.id == id)
-}
-
 fn active_transcript_entries(app: &TuiApp) -> &[TranscriptEntry] {
     active_subagent_record(app)
         .map(|record| record.transcript.as_slice())
         .unwrap_or(app.transcript.as_slice())
 }
 
-fn active_transcript_scroll_from_bottom(app: &TuiApp) -> usize {
+fn active_transcript_scroll(app: &TuiApp) -> scroll::ScrollState {
     active_subagent_record(app)
-        .map(|record| record.scroll_from_bottom)
-        .unwrap_or(app.transcript_scroll_from_bottom)
+        .map(|record| record.scroll)
+        .unwrap_or(app.transcript_scroll)
 }
 
-fn set_active_transcript_scroll_from_bottom(app: &mut TuiApp, scroll: usize) {
-    if let Some(record) = active_subagent_record_mut(app) {
-        record.scroll_from_bottom = scroll;
-    } else {
-        app.transcript_scroll_from_bottom = scroll;
+fn active_transcript_scroll_mut(app: &mut TuiApp) -> &mut scroll::ScrollState {
+    // Resolve the active subagent id and index up front, then take a single
+    // `&mut` borrow. Routing through `active_subagent_record_mut` (or even an
+    // early `return` out of an `if let`) makes the subagent borrow and the
+    // fall-through `&mut app.transcript_scroll` overlap under the pre-Polonius
+    // borrow checker; computing the index first sidesteps that entirely.
+    let record_index = match app.subagent_pane.active {
+        ConversationSource::Subagent(id) => app
+            .subagent_pane
+            .records
+            .iter()
+            .position(|record| record.id == id),
+        ConversationSource::Main => None,
+    };
+    match record_index {
+        Some(index) => &mut app.subagent_pane.records[index].scroll,
+        None => &mut app.transcript_scroll,
     }
 }
 
@@ -9108,7 +9714,31 @@ fn transcript_lines_for_render(
     width: Option<u16>,
     include_startup_card: bool,
 ) -> Vec<Line<'static>> {
+    transcript_lines_and_entry_offsets(app, width, include_startup_card).0
+}
+
+/// Like [`transcript_lines_for_render`], but also returns a per-entry offset map
+/// for jump navigation: `entry_offsets[i]` is the row index (in the same unit as
+/// the returned `Vec<Line>`) at which entry `i`'s rendered block begins.
+///
+/// When `width` is `Some`, the returned lines are *wrapped* rows and the offsets
+/// are wrapped-row indices, so a jump composes with the scroll model (which
+/// scrolls over `lines.len()`). When `width` is `None` the offsets are
+/// logical-line indices. Entries that render to nothing (suppressed run members,
+/// hidden reasoning) still get an offset — the position they *would* occupy —
+/// so `entry_offsets` is always exactly `entries.len()` long and indexable by
+/// entry index.
+fn transcript_lines_and_entry_offsets(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
+    // Logical-line index at which each entry's block starts. Filled lazily —
+    // `entry_line_starts[i]` is set to `lines.len()` the first time entry `i`
+    // is reached, before any of its lines are pushed.
+    let entries_len = active_transcript_entries(app).len();
+    let mut entry_line_starts: Vec<usize> = vec![0; entries_len];
     if let Some(title) = active_conversation_title(app) {
         lines.push(title);
         lines.push(Line::from(""));
@@ -9127,6 +9757,11 @@ fn transcript_lines_for_render(
     let turn_divider_width = width.unwrap_or(SETTLE_MEASURE_WIDTH);
     let mut turn_divider_pushed = false;
     for (index, item) in entries.iter().enumerate() {
+        // Record the logical-line offset of this entry's block before anything
+        // (including a `prev_work` rail connector) is pushed for it. Suppressed
+        // run members never push lines, so their offset stays at the position
+        // they would have occupied — close enough for "jump near this entry".
+        entry_line_starts[index] = lines.len();
         // A finished work node that is mid settle-fold renders folded —
         // its expanded block truncated to an eased height that descends to
         // the collapsed preview — instead of from the line cache (whose key
@@ -9280,9 +9915,26 @@ fn transcript_lines_for_render(
         lines.push(Line::from(""));
     }
     if let Some(width) = width {
-        wrap_transcript_overlay_rows(&lines, width)
+        // Wrap to visual rows, building a logical-line → wrapped-row prefix-sum
+        // so the per-entry offsets can be remapped into the wrapped-row space
+        // the scroll model uses. `wrap_transcript_overlay_rows` is the same wrap
+        // the renderer would apply; we just track each logical line's row count.
+        let mut rows: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+        // `row_starts[i]` = wrapped-row index where logical line `i` begins;
+        // one extra trailing entry holds the total row count.
+        let mut row_starts: Vec<usize> = Vec::with_capacity(lines.len() + 1);
+        for line in &lines {
+            row_starts.push(rows.len());
+            wrap_transcript_overlay_line(line, usize::from(width.max(1)), &mut rows);
+        }
+        row_starts.push(rows.len());
+        let entry_offsets = entry_line_starts
+            .iter()
+            .map(|&logical| row_starts.get(logical).copied().unwrap_or(rows.len()))
+            .collect();
+        (rows, entry_offsets)
     } else {
-        lines
+        (lines, entry_line_starts)
     }
 }
 
@@ -16220,7 +16872,7 @@ struct SubagentRecord {
     prompt: String,
     lifecycle: SubagentLifecycle,
     latest: String,
-    scroll_from_bottom: usize,
+    scroll: scroll::ScrollState,
     metrics: Option<TurnMetrics>,
     transcript: Vec<TranscriptEntry>,
 }
@@ -16316,6 +16968,22 @@ pub(crate) struct TuiApp {
     pub(crate) transcript_overlay_scrollbar_cache:
         std::cell::Cell<Option<TranscriptOverlayScrollbarCache>>,
     pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
+    /// Per-frame snapshot of the MAIN transcript scrollbar gutter so a mouse
+    /// click/drag can map to a `from_bottom` without re-deriving the layout.
+    /// Set at the end of `render_transcript`; `None` when content fits.
+    pub(crate) main_scrollbar_cache: std::cell::Cell<Option<MainScrollbarCache>>,
+    /// Sub-notch wheel/trackpad accumulator. Trackpads emit many small
+    /// high-frequency notches; summing them here (and applying whole lines while
+    /// keeping the remainder) means fast bursts of small events add up instead
+    /// of each rounding to the same fixed step.
+    pub(crate) wheel_accum: i32,
+    /// In-flight main-view smooth-scroll ease for a large jump. `None` when no
+    /// animation is running (the steady state). Display-only: the logical
+    /// scroll state already holds the destination.
+    pub(crate) main_scroll_anim: Option<MainScrollAnim>,
+    /// When false, large jumps snap instantly (reduced-motion / instant-scroll
+    /// switch). Honoured by the smooth-scroll arming path.
+    pub(crate) smooth_scroll_enabled: bool,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
     /// The resolved context window (real model window when known, else the
@@ -16362,7 +17030,7 @@ pub(crate) struct TuiApp {
     /// clobber each other's entries through the colliding `entry_id = 0`
     /// they both restart from.
     pub(crate) render_cache_session: u64,
-    pub(crate) transcript_scroll_from_bottom: usize,
+    pub(crate) transcript_scroll: scroll::ScrollState,
     pub(crate) pending_assistant: streaming::StreamingController,
     /// Streaming buffer for reasoning/thinking deltas emitted during the
     /// current turn. Rendered as a grey transient block above the
@@ -16819,6 +17487,15 @@ impl TuiApp {
             transcript_overlay_render_cache: std::cell::RefCell::new(
                 TranscriptOverlayRenderCache::default(),
             ),
+            main_scrollbar_cache: std::cell::Cell::new(None),
+            wheel_accum: 0,
+            main_scroll_anim: None,
+            // Smooth/eased scroll for large jumps. Honour a reduced-motion /
+            // instant-scroll switch: `SQUEEZY_REDUCE_MOTION` (truthy) and the
+            // cross-app `NO_MOTION`/`PREFERS_REDUCED_MOTION` hints all force
+            // instant scrolling. Self-contained in the TUI crate so no core
+            // config-schema surface is added.
+            smooth_scroll_enabled: !reduced_motion_requested(),
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
             context_window_tokens: config.context_compaction.effective_window(),
@@ -16836,7 +17513,7 @@ impl TuiApp {
             selected_entry: None,
             next_entry_id,
             render_cache_session: render::cache::next_session_id(),
-            transcript_scroll_from_bottom: 0,
+            transcript_scroll: scroll::ScrollState::pinned(),
             pending_assistant: streaming::StreamingController::new(),
             pending_reasoning: String::new(),
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
@@ -17129,6 +17806,9 @@ impl TuiApp {
             // not repaint a fold it cannot show — the fold still finalizes
             // collapsed via `finalize_elapsed_settles` when focus returns.
             || self.has_settling_entry()
+            // A smooth-scroll ease is wall-clock driven too; keep repainting
+            // while one is running so the painted position advances to target.
+            || self.main_scroll_anim.is_some()
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -17294,7 +17974,7 @@ impl TuiApp {
             record.prompt = prompt;
             record.lifecycle = SubagentLifecycle::Running;
             record.latest = "starting".to_string();
-            record.scroll_from_bottom = 0;
+            record.scroll = scroll::ScrollState::pinned();
             record.metrics = None;
             record.transcript = transcript;
         } else {
@@ -17304,7 +17984,7 @@ impl TuiApp {
                 prompt,
                 lifecycle: SubagentLifecycle::Running,
                 latest: "starting".to_string(),
-                scroll_from_bottom: 0,
+                scroll: scroll::ScrollState::pinned(),
                 metrics: None,
                 transcript,
             });
@@ -17454,7 +18134,7 @@ impl TuiApp {
             prompt: detail.clone(),
             lifecycle: SubagentLifecycle::Rejected,
             latest: compact_text(&detail, 120),
-            scroll_from_bottom: 0,
+            scroll: scroll::ScrollState::pinned(),
             metrics: None,
             transcript,
         });
@@ -17624,6 +18304,23 @@ impl TuiApp {
             }
         }
         changed
+    }
+
+    /// Drop the main-view smooth-scroll ease once it has reached its target.
+    /// Returns `true` when an animation was finalized this tick (so the caller
+    /// can request one last repaint that paints the exact destination). Run from
+    /// the main loop's mutation pass alongside `finalize_elapsed_settles`.
+    fn finalize_elapsed_main_scroll_anim(&mut self) -> bool {
+        let Some(anim) = self.main_scroll_anim else {
+            return false;
+        };
+        let elapsed = anim.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if anim.is_done(elapsed) {
+            self.main_scroll_anim = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Force every in-flight settle-fold to its resting collapsed state

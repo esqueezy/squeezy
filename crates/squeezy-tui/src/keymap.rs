@@ -55,6 +55,24 @@ pub(crate) enum Action {
     /// Jump to the bottom of the transcript when the composer is
     /// empty (`End` default; falls through to line-end otherwise).
     TranscriptEnd,
+    /// Jump the transcript to the previous user turn (`Alt+Up` default).
+    JumpPrevUserTurn,
+    /// Jump the transcript to the next user turn (`Alt+Down` default).
+    JumpNextUserTurn,
+    /// Jump the transcript to the previous assistant answer (`Alt+Left`
+    /// default).
+    JumpPrevAssistant,
+    /// Jump the transcript to the next assistant answer (`Alt+Right`
+    /// default).
+    JumpNextAssistant,
+    /// Jump the transcript to the previous tool call (`Alt+,` default).
+    JumpPrevToolCall,
+    /// Jump the transcript to the next tool call (`Alt+.` default).
+    JumpNextToolCall,
+    /// Jump the transcript to the previous error (`Alt+[` default).
+    JumpPrevError,
+    /// Jump the transcript to the next error (`Alt+]` default).
+    JumpNextError,
 }
 
 impl Action {
@@ -69,6 +87,14 @@ impl Action {
             Self::ScrollTranscriptPageDown => "page_down",
             Self::TranscriptHome => "transcript_home",
             Self::TranscriptEnd => "transcript_end",
+            Self::JumpPrevUserTurn => "jump_prev_user_turn",
+            Self::JumpNextUserTurn => "jump_next_user_turn",
+            Self::JumpPrevAssistant => "jump_prev_assistant",
+            Self::JumpNextAssistant => "jump_next_assistant",
+            Self::JumpPrevToolCall => "jump_prev_tool_call",
+            Self::JumpNextToolCall => "jump_next_tool_call",
+            Self::JumpPrevError => "jump_prev_error",
+            Self::JumpNextError => "jump_next_error",
         }
     }
 
@@ -82,6 +108,14 @@ impl Action {
         Action::ScrollTranscriptPageDown,
         Action::TranscriptHome,
         Action::TranscriptEnd,
+        Action::JumpPrevUserTurn,
+        Action::JumpNextUserTurn,
+        Action::JumpPrevAssistant,
+        Action::JumpNextAssistant,
+        Action::JumpPrevToolCall,
+        Action::JumpNextToolCall,
+        Action::JumpPrevError,
+        Action::JumpNextError,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -108,6 +142,18 @@ impl Action {
             }
             Self::TranscriptHome => KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
             Self::TranscriptEnd => KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
+            // Jump navigation defaults use `Alt`+key chords. Single-`Ctrl`
+            // letters are deliberately avoided (terminal flow-control / host
+            // collisions); `normalise_control_byte` canonicalises `META`→`ALT`
+            // so these match regardless of the terminal protocol level.
+            Self::JumpPrevUserTurn => KeyBinding::new(KeyCode::Up, KeyModifiers::ALT),
+            Self::JumpNextUserTurn => KeyBinding::new(KeyCode::Down, KeyModifiers::ALT),
+            Self::JumpPrevAssistant => KeyBinding::new(KeyCode::Left, KeyModifiers::ALT),
+            Self::JumpNextAssistant => KeyBinding::new(KeyCode::Right, KeyModifiers::ALT),
+            Self::JumpPrevToolCall => KeyBinding::new(KeyCode::Char(','), KeyModifiers::ALT),
+            Self::JumpNextToolCall => KeyBinding::new(KeyCode::Char('.'), KeyModifiers::ALT),
+            Self::JumpPrevError => KeyBinding::new(KeyCode::Char('['), KeyModifiers::ALT),
+            Self::JumpNextError => KeyBinding::new(KeyCode::Char(']'), KeyModifiers::ALT),
         }
     }
 }

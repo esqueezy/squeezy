@@ -1,8 +1,9 @@
 ---
-source: crates/squeezy-tui/src/termsim/matrix.rs
+source: crates/squeezy-tui/src/termsim/matrix_tests.rs
+assertion_line: 72
 expression: redacted
 ---
-                                            ○ ☽ ◑ ●  Squeezy v0.1.0  ● ◐ ☾ ○
+                                           ○ ☽ ◑ ●  Squeezy v0.1.0  ● ◐ ☾ ○
 
    ☽ Here is a multi-line answer.
      It spans several lines so the history commit and footer

@@ -271,3 +271,183 @@ fn clean_exit_mirror() {
         "clean exit must not purge scrollback (\\x1b[3J)",
     );
 }
+
+/// The `long_transcript_scroll` term-matrix scenario (plan §8.4): drive
+/// PageUp/Home/End/wheel over a many-hundred-entry transcript through the real
+/// key/mouse handlers and the fullscreen `render()` surface, asserting at each
+/// stop that (a) the visible window holds the expected content and (b) the
+/// follow/scrolled indicator matches the logical state.
+///
+/// Unlike the other shipped scenarios (which the matrix replays through the
+/// emulator legs), this one needs hundreds of seeded entries and a wheel event,
+/// neither of which the `Step` script vocabulary expresses today, so it builds
+/// its own headless `TuiHarness` and drives the production paths directly — the
+/// same approach `clean_exit_mirror` takes for its byte-order contract.
+#[test]
+fn long_transcript_scroll() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+
+    // ---- build a deterministic headless harness ----
+    // Size the harness to (80, 24): the off-frame scroll commands resolve their
+    // geometry through `terminal_size()`, which in this TTY-less test falls back
+    // to (80, 24). Rendering at that same size keeps the absolute jumps (Home/End)
+    // consistent with the surface the badge and viewport are computed against.
+    let (w, h) = (80u16, 24u16);
+    let config = squeezy_core::AppConfig {
+        model: "termsim-model".to_string(),
+        workspace_root: std::env::temp_dir().join(format!(
+            "squeezy_termsim_long_scroll_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )),
+        ..squeezy_core::AppConfig::default()
+    };
+    let _ = std::fs::create_dir_all(&config.workspace_root);
+    let provider: std::sync::Arc<dyn squeezy_llm::LlmProvider> =
+        std::sync::Arc::new(MirrorStubProvider);
+    let mut harness = crate::testing::TuiHarness::new(
+        config,
+        squeezy_core::SessionMode::Build,
+        provider,
+        w,
+        h,
+        None,
+    )
+    .expect("termsim harness builds with stub provider");
+
+    // Instant scrolling: the absolute jumps (Home/End) otherwise arm a
+    // smooth-scroll ease, so the frame rendered immediately after the key would
+    // paint a mid-animation position while the badge already reports the
+    // destination. This test asserts the landing window, not the ease, so it
+    // pins the painted position to the logical destination.
+    harness.app_mut().smooth_scroll_enabled = false;
+
+    // Seed a long transcript: hundreds of single-line, uniquely-marked entries.
+    const COUNT: usize = 400;
+    const FIRST: &str = "ENTRY_0000_FIRST";
+    const LAST: &str = "ENTRY_0399_LAST";
+    {
+        let app = harness.app_mut();
+        for index in 0..COUNT {
+            let marker = if index == 0 {
+                FIRST.to_string()
+            } else if index == COUNT - 1 {
+                LAST.to_string()
+            } else {
+                format!("ENTRY_{index:04}")
+            };
+            app.push_transcript_item(squeezy_core::TranscriptItem::user(marker));
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("termsim tokio runtime");
+
+    // The "scrolled vs live" badge text rendered by `render_scrolled_indicator`.
+    const SCROLLED_BADGE: &str = "from live";
+
+    // ---- 1. Fresh: following the tail. Latest visible, NO scrolled badge. ----
+    let live = harness.render_frame().expect("render live frame");
+    assert!(
+        live.plain_text.contains(LAST),
+        "a following view shows the latest entry:\n{}",
+        live.plain_text
+    );
+    assert!(
+        !live.plain_text.contains(SCROLLED_BADGE),
+        "a following view must NOT show the scrolled indicator:\n{}",
+        live.plain_text
+    );
+
+    // ---- 2. Wheel up a burst: scroll off the tail. Badge appears. ----
+    for _ in 0..4 {
+        let _ = crate::handle_mouse(
+            harness.app_mut(),
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+    let wheeled = harness.render_frame().expect("render after wheel up");
+    assert!(
+        wheeled.plain_text.contains(SCROLLED_BADGE),
+        "wheeling up off the tail shows the scrolled indicator:\n{}",
+        wheeled.plain_text
+    );
+    assert!(
+        !wheeled.plain_text.contains(LAST),
+        "after wheeling up, the latest entry scrolls out of view:\n{}",
+        wheeled.plain_text
+    );
+
+    // ---- 3. PageUp several times: climb further; window holds mid content. ----
+    runtime
+        .block_on(harness.send_keys(&[KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE); 6]))
+        .expect("page up");
+    let paged = harness.render_frame().expect("render after page up");
+    assert!(
+        paged.plain_text.contains(SCROLLED_BADGE),
+        "still scrolled after PageUp:\n{}",
+        paged.plain_text
+    );
+    assert!(
+        !paged.plain_text.contains(LAST),
+        "PageUp keeps the latest entry out of view:\n{}",
+        paged.plain_text
+    );
+    // The visible window must hold *some* ENTRY_ marker (it is not blank).
+    assert!(
+        paged.plain_text.contains("ENTRY_"),
+        "the scrolled viewport shows transcript content:\n{}",
+        paged.plain_text
+    );
+
+    // ---- 4. Home: jump to the very top. First entry visible, still scrolled. ----
+    runtime
+        .block_on(harness.send_keys(&[KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)]))
+        .expect("home");
+    let top = harness.render_frame().expect("render after home");
+    assert!(
+        top.plain_text.contains(FIRST),
+        "Home shows the very first entry:\n{}",
+        top.plain_text
+    );
+    assert!(
+        !top.plain_text.contains(LAST),
+        "Home keeps the latest entry out of view:\n{}",
+        top.plain_text
+    );
+    assert!(
+        top.plain_text.contains(SCROLLED_BADGE),
+        "Home leaves the view scrolled (not following):\n{}",
+        top.plain_text
+    );
+
+    // ---- 5. End: re-pin to the latest. Latest visible, badge gone. ----
+    runtime
+        .block_on(harness.send_keys(&[KeyEvent::new(KeyCode::End, KeyModifiers::NONE)]))
+        .expect("end");
+    let back = harness.render_frame().expect("render after end");
+    assert!(
+        back.plain_text.contains(LAST),
+        "End re-pins so the latest entry is visible again:\n{}",
+        back.plain_text
+    );
+    assert!(
+        !back.plain_text.contains(FIRST),
+        "End scrolls the first entry back out of view:\n{}",
+        back.plain_text
+    );
+    assert!(
+        !back.plain_text.contains(SCROLLED_BADGE),
+        "End clears the scrolled indicator (following again):\n{}",
+        back.plain_text
+    );
+}

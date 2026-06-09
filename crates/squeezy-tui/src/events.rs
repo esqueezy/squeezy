@@ -32,7 +32,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.push_transcript_item(message);
                     }
                     app.pending_assistant.clear();
-                    app.transcript_scroll_from_bottom = 0;
+                    app.transcript_scroll.pin_to_bottom();
                 }
                 AgentEvent::Started { .. } => {
                     app.status = "thinking".to_string();
@@ -121,7 +121,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                             )),
                         }
                     }
-                    // Intentionally preserve `transcript_scroll_from_bottom`
+                    // Intentionally preserve `transcript_scroll`
                     // here: if the user paged up to read history we would
                     // otherwise yank them back to the bottom on every delta.
                     // The End key (or any tool/status event that explicitly

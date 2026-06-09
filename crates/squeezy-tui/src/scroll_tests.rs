@@ -209,6 +209,113 @@ fn scroll_when_content_fits_is_noop() {
     assert!(s.is_following());
 }
 
+// ---- Phase 4: page-sized scrolls land exactly --------------------------
+
+#[test]
+fn page_up_then_page_down_is_a_round_trip() {
+    // PageUp/PageDown are `scroll_by(±8)` at the app layer; the model must move
+    // by exactly the page and come back to the same spot.
+    let mut s = ScrollState::pinned();
+    s.scroll_by(8, 100, 24);
+    assert_eq!(s.from_bottom(), 8);
+    assert!(!s.is_following(), "a page up unpins follow-tail");
+    s.scroll_by(8, 100, 24);
+    assert_eq!(
+        s.from_bottom(),
+        16,
+        "a second page lands exactly 8 further up"
+    );
+    s.scroll_by(-8, 100, 24);
+    assert_eq!(s.from_bottom(), 8);
+    s.scroll_by(-8, 100, 24);
+    assert_eq!(s.from_bottom(), 0, "paging back down to the tail re-pins");
+    assert!(s.is_following());
+}
+
+#[test]
+fn home_then_end_round_trips_top_to_tail() {
+    // Home == scroll_to_top, End == pin_to_bottom. The pair must visit the real
+    // extremes and leave follow-tail set only at the tail.
+    let mut s = ScrollState::pinned();
+    s.scroll_to_top(100, 24);
+    assert_eq!(
+        s.from_bottom(),
+        76,
+        "Home lands on the real max_scroll, not MAX"
+    );
+    assert!(!s.is_following());
+    assert_eq!(s.offset(100, 24), 0, "top of content renders at offset 0");
+    s.pin_to_bottom();
+    assert_eq!(s.from_bottom(), 0);
+    assert!(s.is_following(), "End re-pins to the live tail");
+    assert_eq!(s.offset(100, 24), 76, "tail renders the last viewport");
+}
+
+// ---- set_from_bottom (scrollbar click / jump-nav target) ---------------
+
+#[test]
+fn set_from_bottom_clamps_and_repins_at_tail() {
+    let mut s = ScrollState::scrolled_up(40);
+    // A mid-content target: stored verbatim, unpinned.
+    s.set_from_bottom(30, 100, 24);
+    assert_eq!(s.from_bottom(), 30);
+    assert!(!s.is_following());
+    // Past the top: clamped to max_scroll (76), still unpinned.
+    s.set_from_bottom(1000, 100, 24);
+    assert_eq!(s.from_bottom(), 76);
+    assert!(!s.is_following());
+    // Exactly the tail: re-pins follow-tail.
+    s.set_from_bottom(0, 100, 24);
+    assert_eq!(s.from_bottom(), 0);
+    assert!(s.is_following());
+}
+
+// ---- Phase 4: resize keeps the SAME logical content (model level) ------
+
+#[test]
+fn clamp_on_shrink_preserves_scrolled_up_anchor_when_in_range() {
+    // Scrolled up 20 from the tail over 200 lines. Shrinking the viewport keeps
+    // max_scroll well above 20, so the logical anchor (from_bottom) is unchanged
+    // — the same content stays anchored at the bottom of the viewport.
+    let mut s = ScrollState::scrolled_up(20);
+    let changed = s.clamp(200, 10); // max_scroll = 190
+    assert!(!changed, "an in-range anchor survives the reflow unchanged");
+    assert_eq!(s.from_bottom(), 20);
+    assert!(!s.is_following());
+}
+
+#[test]
+fn resize_following_view_stays_at_latest() {
+    // A following view stays pinned across both a shrink and a grow: offset
+    // always resolves to the tail (max_scroll) for the new geometry.
+    let mut s = ScrollState::pinned();
+    s.clamp(200, 10);
+    assert_eq!(s.from_bottom(), 0);
+    assert_eq!(s.offset(200, 10), 190, "tail for the 10-row viewport");
+    s.clamp(200, 50);
+    assert_eq!(s.from_bottom(), 0);
+    assert_eq!(s.offset(200, 50), 150, "tail for the 50-row viewport");
+    assert!(s.is_following());
+}
+
+#[test]
+fn resize_scrolled_up_keeps_same_bottom_line_in_view() {
+    // The user is scrolled up so the viewport's BOTTOM shows content line
+    // `total - 1 - from_bottom`. Across a viewport-height change (while the
+    // anchor stays in range) that same content line must remain the bottom of
+    // the viewport — that's what "same logical content visible" means here.
+    let total = 300usize;
+    let from_bottom = 50usize;
+    let s = ScrollState::scrolled_up(from_bottom);
+    // bottom_line = top_offset + viewport_h - 1 = (max_scroll - from_bottom) + h - 1
+    //            = (total - h - from_bottom) + h - 1 = total - 1 - from_bottom.
+    let bottom_line = |h: usize| s.offset(total, h) + h - 1;
+    let want = total - 1 - from_bottom;
+    assert_eq!(bottom_line(24), want);
+    assert_eq!(bottom_line(12), want, "shrink keeps the same bottom line");
+    assert_eq!(bottom_line(40), want, "grow keeps the same bottom line");
+}
+
 // ---- scrollbar_geometry (mirrors overlay geometry) ------------------
 
 /// Reference: the exact thumb math from
