@@ -90,7 +90,7 @@ fn handle_list(
         .max(4);
     let env_w = entries
         .iter()
-        .map(|e| env_column_label(e.name, e.api_key_env).len())
+        .map(|e| e.api_key_env.len())
         .max()
         .unwrap_or(7)
         .max(7);
@@ -102,7 +102,7 @@ fn handle_list(
         println!(
             "{:<name_w$}  {:<env_w$}  {:<10}  {:>6}  {}",
             entry.name,
-            env_column_label(entry.name, entry.api_key_env),
+            non_empty(entry.api_key_env),
             if entry.configured { "yes" } else { "no" },
             entry.model_count,
             non_empty(entry.base_url),
@@ -146,10 +146,7 @@ fn handle_info(
     }
     println!("{} ({})", entry.display_name, entry.name);
     println!("  base_url    {}", non_empty(entry.base_url));
-    println!(
-        "  api_key_env {}",
-        env_column_label(entry.name, entry.api_key_env),
-    );
+    println!("  api_key_env {}", non_empty(entry.api_key_env));
     println!(
         "  configured  {}",
         if entry.configured { "yes" } else { "no" }
@@ -214,27 +211,6 @@ fn model_json(model: &ModelInfo) -> Value {
 
 fn non_empty(value: &str) -> &str {
     if value.is_empty() { "(unset)" } else { value }
-}
-
-/// Label printed in the `env` column of `providers list` / `providers info`.
-/// Bedrock and Ollama deliberately set `api_key_env = ""` (Bedrock uses the
-/// AWS credential chain; Ollama runs unauthenticated by default), so the
-/// generic `(unset)` sentinel from [`non_empty`] would mislead operators
-/// into thinking the column is reporting a missing env var. Surface
-/// `(none required)` for those two rows instead so the UX matches the
-/// comments on the [`BASE_PROVIDERS`] entries.
-///
-/// Takes the registry name and env-var name as separate `&'static str`
-/// args (not the whole [`ProviderEntry`]) so static analyzers don't see a
-/// `provider.api_key_env` field-access flowing into a `println!` sink — the
-/// printed value is just the env var *name* (e.g. `OPENAI_API_KEY`), not
-/// any secret, but field-name heuristics flag the call regardless.
-fn env_column_label(name: &'static str, api_key_env: &'static str) -> &'static str {
-    if api_key_env.is_empty() && matches!(name, "bedrock" | "ollama") {
-        "(none required)"
-    } else {
-        non_empty(api_key_env)
-    }
 }
 
 /// Resolve user-typed provider names to the canonical registry id. Accepts
