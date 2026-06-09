@@ -162,11 +162,13 @@ fn grid_from_term(term: &Term<NoopListener>) -> Grid {
         let mut s = String::with_capacity(cols);
         for col in 0..cols {
             let cell: &Cell = &row[Column(col)];
-            // Spacer cell trailing a wide glyph carries '\0'; skip it so widths
-            // line up with the source text rather than doubling.
-            if cell.c == '\0' {
-                continue;
-            }
+            // A wide glyph occupies two columns: the glyph cell plus a trailing
+            // spacer. alacritty stores `' '` in that spacer (marked by the
+            // `WIDE_CHAR_SPACER` flag, NOT `'\0'`), so we deliberately push it
+            // through — the blank keeps the reconstructed row's column widths
+            // aligned with the source (`好` reconstructs as `好 `, matching the
+            // two columns it paints). See the `wide_glyphs_survive_reflow` test,
+            // which pins the exact `好 好 好 x` spacing this produces.
             s.push(cell.c);
         }
         // Trailing blanks carry no information for the invariant checks; trim

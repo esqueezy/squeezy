@@ -95,3 +95,19 @@ pub(crate) enum CursorTracking {
     /// Cursor tracking is not meaningful for this backend.
     NotApplicable,
 }
+
+impl CursorTracking {
+    /// Project a well-behaved `logical_row` through this tracking profile given
+    /// `below_fold_wrapped_rows` (the count of wrapped rows that fell below the
+    /// live region). [`Self::DriftsByBelowWrapDelta`] models the xterm.js bug by
+    /// pushing the cursor DOWN by that delta — the exact drift the matrix's
+    /// `cursor_row_in_bounds` invariant exists to catch — while the well-behaved
+    /// profiles leave the row untouched. Lets the named drift variant be
+    /// exercised in-process (the Rust legs never produce it themselves).
+    pub(crate) fn project_logical_row(self, logical_row: i32, below_fold_wrapped_rows: i32) -> i32 {
+        match self {
+            CursorTracking::DriftsByBelowWrapDelta => logical_row + below_fold_wrapped_rows,
+            CursorTracking::TracksLogicalLine | CursorTracking::NotApplicable => logical_row,
+        }
+    }
+}

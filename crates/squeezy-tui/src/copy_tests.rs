@@ -21,7 +21,6 @@ fn row(id: usize, entry: Option<u64>, kind: Option<RowKind>, text: &str) -> Tran
         style_spans: Vec::new(),
         fold_state: FoldState::Expanded,
         search_match_ranges: Vec::new(),
-        click_targets: Vec::new(),
     }
 }
 

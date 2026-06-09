@@ -1,4 +1,4 @@
-//! Unit tests for the frame-local hit-test registry, focus model, and gesture
+//! Unit tests for the frame-local hit-test registry and gesture
 //! recognizer. Included into [`crate::interaction`] via `#[path]` per the repo
 //! test layout. Every assertion is a pure function over model state — no
 //! terminal, no clock except an injected `Instant`.
@@ -127,78 +127,6 @@ fn rowspan_target_round_trips() {
     let key = TargetKey::RowSpan(RowId(4), RowSpan::new(2, 9));
     reg.register(rect(2, 0, 7, 1), key, Action::JumpToLatest);
     assert_eq!(reg.hit_test(5, 0), Some((key, Action::JumpToLatest)));
-}
-
-// ===========================================================================
-// Focus model
-// ===========================================================================
-
-#[test]
-fn focus_next_prev_wrap_and_step() {
-    let ids = [100u64, 101, 102];
-    let mut focus = Focus::new();
-    assert_eq!(focus.focused(), None);
-
-    // From none, next wraps to the first.
-    assert_eq!(focus.focus_next(&ids), Some(EntryId(100)));
-    assert_eq!(focus.focus_next(&ids), Some(EntryId(101)));
-    assert_eq!(focus.focus_next(&ids), Some(EntryId(102)));
-    // Clamp at the last entry (mirrors select_next_transcript_entry).
-    assert_eq!(focus.focus_next(&ids), Some(EntryId(102)));
-
-    // From none, prev wraps to the last.
-    let mut focus = Focus::new();
-    assert_eq!(focus.focus_prev(&ids), Some(EntryId(102)));
-    assert_eq!(focus.focus_prev(&ids), Some(EntryId(101)));
-    assert_eq!(focus.focus_prev(&ids), Some(EntryId(100)));
-    // Clamp at the first entry.
-    assert_eq!(focus.focus_prev(&ids), Some(EntryId(100)));
-}
-
-#[test]
-fn focus_resolves_id_to_live_index() {
-    let ids = [5u64, 9, 13];
-    let mut focus = Focus::new();
-    focus.set(EntryId(9));
-    assert_eq!(focus.resolve_index(&ids), Some(1));
-    // The same id resolves to a NEW index after an earlier entry is pruned —
-    // this is the whole point of keying focus on the id, not the index.
-    let pruned = [9u64, 13];
-    assert_eq!(focus.resolve_index(&pruned), Some(0));
-    // A focus whose id vanished resolves to None (caller falls back).
-    let gone = [13u64];
-    assert_eq!(focus.resolve_index(&gone), None);
-}
-
-#[test]
-fn focus_next_from_pruned_focus_restarts_from_first() {
-    let ids = [1u64, 2, 3];
-    let mut focus = Focus::new();
-    focus.set(EntryId(99)); // not in `ids`
-    // resolve_index is None, so focus_next behaves like "from none".
-    assert_eq!(focus.focus_next(&ids), Some(EntryId(1)));
-}
-
-#[test]
-fn focus_set_from_index_syncs_id() {
-    let ids = [7u64, 8, 9];
-    let mut focus = Focus::new();
-    focus.set_from_index(Some(2), &ids);
-    assert_eq!(focus.focused(), Some(EntryId(9)));
-    focus.set_from_index(None, &ids);
-    assert_eq!(focus.focused(), None);
-    // Out-of-range index clears focus rather than panicking.
-    focus.set_from_index(Some(99), &ids);
-    assert_eq!(focus.focused(), None);
-}
-
-#[test]
-fn focus_on_empty_order_is_inert() {
-    let ids: [u64; 0] = [];
-    let mut focus = Focus::new();
-    assert_eq!(focus.focus_next(&ids), None);
-    assert_eq!(focus.focus_prev(&ids), None);
-    assert_eq!(focus.focused(), None);
 }
 
 // ===========================================================================
@@ -334,6 +262,34 @@ fn drag_start_extend_end_track_keys_not_pixels() {
         }
     ));
     assert!(!rec.is_dragging());
+}
+
+#[test]
+fn drag_stays_on_origin_emits_start_once_then_extend() {
+    // Regression: a press-and-hold with sub-row jitter keeps landing Drag events
+    // on the ORIGIN key. DragStart must fire on the first Drag only; every later
+    // Drag — even one back on the origin — is DragExtend.
+    let mut rec = Recognizer::new();
+    let now = t0();
+    let origin = hit(TargetKey::QueueItem(1), Action::QueueReorderBegin(1));
+
+    let _ = rec.recognize(Phase::Press, origin, now);
+    // First Drag on the origin key → DragStart (exactly once).
+    let g = rec.recognize(Phase::Drag, origin, now);
+    assert!(matches!(
+        g,
+        Gesture::DragStart {
+            target: Some(TargetKey::QueueItem(1))
+        }
+    ));
+    // Second Drag, still on the origin key → DragExtend, NOT another DragStart.
+    let g = rec.recognize(Phase::Drag, origin, now);
+    assert!(matches!(
+        g,
+        Gesture::DragExtend {
+            target: Some(TargetKey::QueueItem(1))
+        }
+    ));
 }
 
 #[test]

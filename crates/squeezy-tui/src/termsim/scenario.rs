@@ -5,7 +5,7 @@
 //! is identical to a real session. The driver (`driver.rs`) interprets these
 //! against a `TuiHarness` + `FixedSize` + `Capture` sink.
 //!
-//! [`shipped_scenarios`] returns the six named scenarios with fully scripted
+//! [`shipped_scenarios`] returns the named scenarios with fully scripted
 //! step lists, each ending in at least one [`Step::Frame`] so the matrix has a
 //! settled frame to assert against.
 
@@ -78,7 +78,7 @@ impl Scenario {
     }
 }
 
-/// The six scenarios to ship first (§8.E), smallest blast radius first.
+/// The scenarios to ship first (§8.E), smallest blast radius first.
 ///
 /// Each scenario scripts production event sources (`Step`s) ending in at least
 /// one `Step::Frame` so the matrix has a settled frame to assert against. The
@@ -146,6 +146,33 @@ pub(crate) fn shipped_scenarios() -> Vec<Scenario> {
                 Step::Resize(248, 40),
                 Step::Frame,
                 Step::Resize(196, 40),
+                Step::Frame,
+            ],
+        },
+        // 4b. A run of fullwidth CJK glyphs straddling the wrap column,
+        //     oscillating width like the drag storm. Exercises a wide-glyph-at-
+        //     wrap-boundary reflow end-to-end through BOTH emulator legs — the
+        //     class the ASCII storms can't surface. The ASCII tail keeps the
+        //     latest-response needle reflow-safe while the wide run stresses the
+        //     reflow (each glyph occupies two columns, so the run wraps at the
+        //     narrow widths and unwraps at the wide ones).
+        Scenario {
+            name: "wide_glyph_reflow",
+            initial_size: (60, 40),
+            steps: vec![
+                Step::AssistantDelta(format!(
+                    "{} widereflowdone",
+                    "你好世界你好世界你好世界你好世界你好世界你好世界"
+                )),
+                Step::SettleTurn,
+                Step::Frame,
+                Step::Resize(31, 40),
+                Step::Frame,
+                Step::Resize(60, 40),
+                Step::Frame,
+                Step::Resize(24, 40),
+                Step::Frame,
+                Step::Resize(58, 40),
                 Step::Frame,
             ],
         },

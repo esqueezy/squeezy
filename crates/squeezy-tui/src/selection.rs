@@ -240,9 +240,12 @@ pub(crate) fn char_offset_for_display_col(line_plain: &str, display_col: usize) 
 }
 
 /// Snap a `col` to the start/end of the WORD under it within a line's plain
-/// text. A word is a maximal run of non-space, non-rail-gutter chars; a click in
-/// whitespace snaps to that whitespace run so a double-click there does not jump
-/// into the next word. Offsets are char offsets, matching [`Pos::col`].
+/// text. A word is a maximal run of non-whitespace chars (the only break class
+/// is whitespace; rail-gutter glyphs are not special-cased here — the render
+/// paths always emit a space between a gutter run and content, so a double-click
+/// snaps to the gutter run or the content word but never across the seam). A
+/// click in whitespace snaps to that whitespace run so a double-click there does
+/// not jump into the next word. Offsets are char offsets, matching [`Pos::col`].
 pub(crate) fn word_bounds(line_plain: &str, col: usize) -> Range<usize> {
     let chars: Vec<char> = line_plain.chars().collect();
     let n = chars.len();

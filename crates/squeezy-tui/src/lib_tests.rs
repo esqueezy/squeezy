@@ -20266,8 +20266,10 @@ fn undo_restores_exact_order_after_delete() {
 #[test]
 fn undo_restores_exact_order_after_reorder() {
     let mut app = queue_app(&["a", "b", "c", "d"]);
+    // Move "a" (id 0) from the front to the end; record by stable id with no
+    // left-neighbour (it was at the front).
     queue_move_indices(&mut app, 0, 3);
-    push_queue_undo(&mut app, QueueMutation::Reordered { from: 0, to: 3 });
+    push_queue_undo(&mut app, QueueMutation::Reordered { id: 0, prev: None });
     assert_eq!(queue_texts(&app), vec!["b", "c", "d", "a"]);
     assert!(queue_undo(&mut app));
     assert_eq!(queue_texts(&app), vec!["a", "b", "c", "d"]);
@@ -20290,7 +20292,7 @@ fn undo_on_empty_stack_reports_nothing_to_undo() {
 fn undo_stack_is_bounded() {
     let mut app = queue_app(&["x"]);
     for _ in 0..(QUEUE_UNDO_CAP + 10) {
-        push_queue_undo(&mut app, QueueMutation::Reordered { from: 0, to: 0 });
+        push_queue_undo(&mut app, QueueMutation::Reordered { id: 0, prev: None });
     }
     assert_eq!(app.prompt_queue_undo.len(), QUEUE_UNDO_CAP);
 }
@@ -20353,6 +20355,94 @@ async fn keyboard_delete_matches_mouse_delete_result() {
 
     assert_eq!(queue_texts(&kb), queue_texts(&ms));
     assert_eq!(queue_texts(&kb), vec!["a", "c"]);
+}
+
+#[tokio::test]
+async fn keyboard_delete_of_leading_duplicate_removes_correct_id() {
+    // Regression: deleting one of two ADJACENT duplicate prompts must strip the
+    // exact focused slot's id (not the first textual mismatch). With ["y","y",
+    // "z"] and focus on index 0, a value-diff would wrongly compute index 1.
+    let mut kb = queue_app(&["y", "y", "z"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let id0 = queue_id_at(&kb, 0); // the duplicate we delete
+    let id1 = queue_id_at(&kb, 1); // the surviving duplicate
+    let id2 = queue_id_at(&kb, 2);
+    // Focus is on index 0 by default; delete it.
+    handle_key(
+        &mut kb,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("delete key");
+
+    assert_eq!(queue_texts(&kb), vec!["y", "z"]);
+    // The FIRST duplicate's id is gone; the second duplicate and "z" keep theirs
+    // (the id sidecar stays aligned for later id-keyed hit-tests).
+    assert_eq!(queue_index_for_id(&kb, id0), None);
+    assert_eq!(queue_index_for_id(&kb, id1), Some(0));
+    assert_eq!(queue_index_for_id(&kb, id2), Some(1));
+
+    // Undo restores exactly: id0 returns to the front with its original id.
+    assert!(queue_undo(&mut kb));
+    assert_eq!(queue_texts(&kb), vec!["y", "y", "z"]);
+    assert_eq!(
+        kb.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![id0, id1, id2]
+    );
+}
+
+#[test]
+fn undo_reorder_survives_a_front_drain() {
+    // A reorder recorded by stable id must still undo correctly after a queue
+    // drain shifts every absolute index. [a,b,c,d] -> drag a to the end ->
+    // [b,c,d,a]; one turn drains b -> [c,d,a]; undo must put a back at the front.
+    let mut app = queue_app(&["a", "b", "c", "d"]);
+    let id_a = queue_id_at(&app, 0);
+    let drag = QueueDrag {
+        id: id_a,
+        from: 0,
+        prev: queue_prev_id_at(&app, 0),
+    };
+    queue_move_indices(&mut app, 0, 3);
+    app.prompt_queue_drag = Some(drag);
+    finalize_queue_drag(&mut app);
+    assert_eq!(queue_texts(&app), vec!["b", "c", "d", "a"]);
+
+    // Simulate a front-drain as a turn completes (exactly what
+    // drain_prompt_queue_if_idle does to the indices).
+    app.prompt_queue.pop_front();
+    app.prompt_queue_ids.pop_front();
+    assert_eq!(queue_texts(&app), vec!["c", "d", "a"]);
+
+    assert!(queue_undo(&mut app));
+    assert_eq!(queue_texts(&app), vec!["a", "c", "d"]);
+    assert_eq!(queue_index_for_id(&app, id_a), Some(0));
+    assert!(app.status.contains("undid reorder"));
+}
+
+#[test]
+fn undo_reorder_reports_nothing_when_moved_item_drained() {
+    // If the reordered item itself drains out before the undo, queue_undo must
+    // report "nothing to undo" rather than falsely claiming success.
+    let mut app = queue_app(&["a", "b", "c"]);
+    let id_a = queue_id_at(&app, 0);
+    let drag = QueueDrag {
+        id: id_a,
+        from: 0,
+        prev: queue_prev_id_at(&app, 0),
+    };
+    queue_move_indices(&mut app, 0, 2);
+    app.prompt_queue_drag = Some(drag);
+    finalize_queue_drag(&mut app); // [b,c,a]
+    // Drain twice so "a" (the moved item) pops out.
+    for _ in 0..3 {
+        app.prompt_queue.pop_front();
+        app.prompt_queue_ids.pop_front();
+    }
+    assert!(app.prompt_queue.is_empty());
+    assert!(!queue_undo(&mut app));
+    assert_eq!(app.status, "nothing to undo");
 }
 
 #[tokio::test]

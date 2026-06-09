@@ -1,5 +1,5 @@
 use super::*;
-use crate::termsim::types::Grid;
+use crate::termsim::types::{CursorTracking, Grid};
 
 fn grid_with_viewport(rows: &[&str]) -> Grid {
     Grid {
@@ -101,4 +101,40 @@ fn cursor_bounds_checks_against_frame_height() {
         ..Grid::default()
     };
     assert!(cursor_row_in_bounds(&escaped_above, mark).is_err());
+}
+
+#[test]
+fn below_wrap_drift_profile_trips_cursor_bounds_in_process() {
+    // Drive the named `DriftsByBelowWrapDelta` profile (the xterm.js regression
+    // the matrix exists to catch) through the SAME cursor-bounds invariant that
+    // run_matrix uses, proving the assertion fires on a drifting emulator —
+    // not just on a hand-built out-of-bounds Grid literal. The Rust legs never
+    // produce this drift themselves, so this is its only in-process exercise.
+    let mark = FrameMark {
+        byte_offset: 0,
+        w: 80,
+        h: 24,
+    };
+    // A cursor that sits on the last live row, plus 5 wrapped rows that fell
+    // below the fold. The well-behaved profile keeps it in bounds; the drift
+    // profile pushes it below the viewport and the invariant must catch it.
+    let base_row = 23;
+    let below_fold = 5;
+
+    let stable = Grid {
+        logical_cursor_row: CursorTracking::TracksLogicalLine
+            .project_logical_row(base_row, below_fold),
+        ..Grid::default()
+    };
+    assert!(cursor_row_in_bounds(&stable, mark).is_ok());
+
+    let drifted = Grid {
+        logical_cursor_row: CursorTracking::DriftsByBelowWrapDelta
+            .project_logical_row(base_row, below_fold),
+        ..Grid::default()
+    };
+    assert!(
+        cursor_row_in_bounds(&drifted, mark).is_err(),
+        "the below-wrap drift must push the logical cursor past the viewport",
+    );
 }

@@ -1776,7 +1776,6 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
         Ok(transcript) => {
             app.transcript.clear();
             app.selected_entry = None;
-            app.focus.clear();
             app.next_entry_id = 0;
             app.clear_turn_divider();
             for item in transcript {
@@ -2159,10 +2158,12 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // fold, a header click focuses it, a double-click on the caret expands a
     // collapsed card. Hit-tested in ABSOLUTE screen coordinates (the main text
     // area is not footer-relative) against the entry targets `render_transcript`
-    // registered this frame, then run through the gesture recognizer so
-    // multi-click synthesis (keyed on the target key, not the screen cell) is
-    // shared with the rest of the substrate. Only fires on a Down event that
-    // actually lands on an entry target.
+    // registered this frame, then run through the gesture recognizer so card
+    // multi-click synthesis is keyed on the target key, not the screen cell.
+    // NOTE: this recognizer owns ONLY the card-affordance path; the main-text
+    // selection path below still runs its own cell-keyed multi-click counter
+    // (`handle_main_selection_press` + `last_click`). Only fires on a Down event
+    // that actually lands on an entry target.
     //
     // Crucially, a header click is *non-consuming*: it focuses the entry and
     // then falls through to the selection path below so the SAME press still
@@ -2173,6 +2174,13 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // swallows the click.
     if app.transcript_overlay.is_none()
         && app.config_screen.is_none()
+        // Only the MAIN transcript owns card affordances. While a subagent
+        // conversation is active the dispatch handlers (`FocusEntry` /
+        // `ToggleEntryCollapsed`) resolve their EntryId against `app.transcript`
+        // (the main transcript), so a subagent-pane card click would address the
+        // wrong conversation. This mirrors the keyboard path's protection, where
+        // `active_selected_entry` returns `None` for a subagent source.
+        && matches!(app.subagent_pane.active, ConversationSource::Main)
         && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((key, action)) = app.click_target_at(mouse.column, mouse.row)
         && matches!(
@@ -4492,17 +4500,25 @@ pub(crate) enum QueueMutation {
     /// An item was deleted. Undo re-inserts `text` at `index` (clamped) with
     /// its original `id` so its hit-target identity is restored too.
     Deleted { index: usize, id: u64, text: String },
-    /// An item moved from `from` to `to`. Undo moves it back `to`→`from`.
-    Reordered { from: usize, to: usize },
+    /// An item was moved. Recorded by *stable id*, not absolute index, so a
+    /// front-drain between the move and its undo cannot stale the record:
+    /// `id` is the moved item; `prev` is the id that sat immediately before
+    /// `id`'s *original* slot (`None` if it was at the front). Undo resolves
+    /// both ids to live indices and re-inserts `id` right after `prev` (or at
+    /// the front), no-opping if either id has since drained out.
+    Reordered { id: u64, prev: Option<u64> },
 }
 
 /// In-flight mouse drag-reorder. Records which item id is being dragged and
 /// the index it started at, so the drop can be recorded as a `Reordered`
-/// mutation spanning the whole gesture (not each intermediate hop).
+/// mutation spanning the whole gesture (not each intermediate hop). `prev`
+/// captures the stable id that sat immediately before `from` at drag start
+/// (`None` if `from` was the front), so the recorded undo is index-shift-proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueueDrag {
     pub(crate) id: u64,
     pub(crate) from: usize,
+    pub(crate) prev: Option<u64>,
 }
 
 /// Re-establish the `prompt_queue_ids.len() == prompt_queue.len()` invariant.
@@ -4537,6 +4553,15 @@ fn queue_index_for_id(app: &TuiApp, id: u64) -> Option<usize> {
     app.prompt_queue_ids.iter().position(|qid| *qid == id)
 }
 
+/// The stable id of the item immediately before `index`, or `None` if `index`
+/// is the front (or out of range). Used to record a reorder undo by the moved
+/// item's left-neighbour id so a later front-drain can't stale the record.
+fn queue_prev_id_at(app: &TuiApp, index: usize) -> Option<u64> {
+    index
+        .checked_sub(1)
+        .and_then(|i| app.prompt_queue_ids.get(i).copied())
+}
+
 /// Stamp a fresh stable id for the prompt just `push_back`ed onto the queue.
 /// Call immediately after each enqueue so the id sidecar stays aligned.
 fn enqueue_queue_id(app: &mut TuiApp) {
@@ -4552,6 +4577,41 @@ fn push_queue_undo(app: &mut TuiApp, mutation: QueueMutation) {
     if app.prompt_queue_undo.len() > QUEUE_UNDO_CAP {
         app.prompt_queue_undo.remove(0);
     }
+}
+
+/// Move the item with stable `id` so it sits immediately after the item with
+/// id `prev` (or at the front when `prev` is `None`). Resolves both ids to
+/// live indices, so a front-drain between recording and replaying the move
+/// cannot stale it. Returns `true` if it moved an item, `false` on a no-op
+/// (the moved id has drained out, the anchor drained out, or it was already in
+/// place). This is the id-keyed primitive that `queue_undo` replays a recorded
+/// `Reordered` through.
+fn queue_move_id_after(app: &mut TuiApp, id: u64, prev: Option<u64>) -> bool {
+    sync_queue_ids(app);
+    let Some(from) = queue_index_for_id(app, id) else {
+        return false;
+    };
+    let to = match prev {
+        None => 0,
+        Some(prev_id) => {
+            // Re-insert right after the anchor's current slot. If the anchor
+            // drained out, the recorded position is gone: no-op rather than
+            // guess a wrong slot.
+            let Some(prev_index) = queue_index_for_id(app, prev_id) else {
+                return false;
+            };
+            // Removing `id` first shifts everything after it down by one, so a
+            // target that lies past `from` must compensate; landing right
+            // after the anchor means `prev_index` when the anchor is before
+            // `from`, and `prev_index` (post-removal) when it is after.
+            if prev_index < from {
+                prev_index + 1
+            } else {
+                prev_index
+            }
+        }
+    };
+    queue_move_indices(app, from, to)
 }
 
 /// Delete the queue item with `id`. Records the removal (text + former
@@ -4587,9 +4647,12 @@ fn queue_delete_by_id(app: &mut TuiApp, id: u64) -> bool {
 /// Move the item at `from` to `to` in BOTH the queue and its id sidecar,
 /// keeping them in lockstep. Pure index shuffle; records no undo (callers
 /// decide whether the move is an undoable op or a step of an undo itself).
-fn queue_move_indices(app: &mut TuiApp, from: usize, to: usize) {
+/// Returns `true` if it actually moved an item, `false` on a no-op (equal
+/// indices or either index out of range) so callers can surface that the
+/// requested move did nothing rather than claiming success.
+fn queue_move_indices(app: &mut TuiApp, from: usize, to: usize) -> bool {
     if from == to || from >= app.prompt_queue.len() || to >= app.prompt_queue.len() {
-        return;
+        return false;
     }
     if let Some(text) = app.prompt_queue.remove(from) {
         app.prompt_queue.insert(to, text);
@@ -4597,12 +4660,15 @@ fn queue_move_indices(app: &mut TuiApp, from: usize, to: usize) {
     if let Some(id) = app.prompt_queue_ids.remove(from) {
         app.prompt_queue_ids.insert(to, id);
     }
+    true
 }
 
 /// Undo the most recent queue mutation, reversing it exactly. A deleted item
 /// returns to its former position (with its original id); a reorder moves the
-/// item back from `to` to `from`. Sets a status message; safe on an empty
-/// stack ("nothing to undo"). Returns true if anything was undone.
+/// item (by stable id) back to immediately after its recorded left-neighbour.
+/// Sets a status message; safe on an empty stack ("nothing to undo"). Returns
+/// true if anything was undone. A reorder whose ids have since drained out
+/// reports "nothing to undo" rather than falsely claiming success.
 fn queue_undo(app: &mut TuiApp) -> bool {
     sync_queue_ids(app);
     let Some(mutation) = app.prompt_queue_undo.pop() else {
@@ -4618,9 +4684,16 @@ fn queue_undo(app: &mut TuiApp) -> bool {
             app.next_queue_id = app.next_queue_id.max(id + 1);
             app.status = "undid delete".to_string();
         }
-        QueueMutation::Reordered { from, to } => {
-            // Reverse: the item now sits at `to`; move it back to `from`.
-            queue_move_indices(app, to, from);
+        QueueMutation::Reordered { id, prev } => {
+            // Restore the moved item to immediately after its recorded
+            // left-neighbour (resolved live via id, so a front-drain can't
+            // stale it). If it can't apply — the item or its anchor drained
+            // out — surface "nothing to undo" instead of claiming success.
+            if !queue_move_id_after(app, id, prev) {
+                app.status = "nothing to undo".to_string();
+                app.needs_redraw = true;
+                return false;
+            }
             app.status = "undid reorder".to_string();
         }
     }
@@ -4675,13 +4748,6 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
     };
 }
 
-/// The transcript's entry ids in render order. The focus model resolves a
-/// stable [`transcript_surface::EntryId`] back to a live index against this,
-/// the same id-keyed pattern `assistant_entry_ids` / the row builder use.
-fn transcript_entry_ids(app: &TuiApp) -> Vec<u64> {
-    app.transcript.iter().map(|e| e.id).collect()
-}
-
 /// Resolve a focused/clicked `EntryId` back to its live transcript index, or
 /// `None` when the entry no longer exists (pruned/coalesced). Keeps every
 /// index-taking callee (`toggle_transcript_entry_fold`, the render highlight)
@@ -4704,7 +4770,6 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 // Clicking the caret focuses the entry it acts on, then folds it
                 // — the same handler Ctrl+O drives.
                 app.selected_entry = Some(index);
-                app.focus.set(id);
                 if toggle_transcript_entry_fold(app, index) {
                     let collapsed = app.transcript[index].collapsed;
                     app.status = if collapsed {
@@ -4719,7 +4784,6 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::FocusEntry(id) => {
             if let Some(index) = entry_index_for_id(app, id) {
                 app.selected_entry = Some(index);
-                app.focus.set(id);
                 app.status = format!("selected transcript entry {}", app.transcript[index].id + 1);
                 app.needs_redraw = true;
             }
@@ -4729,7 +4793,6 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             // an already-expanded card). Reuses the fold toggle, guarded.
             if let Some(index) = entry_index_for_id(app, id) {
                 app.selected_entry = Some(index);
-                app.focus.set(id);
                 if app.transcript[index].collapsed && toggle_transcript_entry_fold(app, index) {
                     app.status = "entry expanded".to_string();
                     app.needs_redraw = true;
@@ -4739,7 +4802,6 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::OpenEntryInDetail(id) => {
             if let Some(index) = entry_index_for_id(app, id) {
                 app.selected_entry = Some(index);
-                app.focus.set(id);
                 open_focused_entry_in_detail(app);
             }
         }
@@ -4758,7 +4820,8 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::QueueReorderBegin(id) => {
             sync_queue_ids(app);
             if let Some(from) = queue_index_for_id(app, id) {
-                app.prompt_queue_drag = Some(QueueDrag { id, from });
+                let prev = queue_prev_id_at(app, from);
+                app.prompt_queue_drag = Some(QueueDrag { id, from, prev });
                 if let Some(state) = app.prompt_queue_overlay.as_mut() {
                     state.selected = from;
                 }
@@ -6751,11 +6814,6 @@ fn open_pin_picker(app: &mut TuiApp) {
         return;
     };
     app.selected_entry = Some(start);
-    // Mirror the picker's candidate into the id-keyed focus cursor so the two
-    // stay in lockstep (the design's "pin picker call site becomes focus-set").
-    if let Some(entry) = app.transcript.get(start) {
-        app.focus.set(transcript_surface::EntryId(entry.id));
-    }
     app.pin_picker_active = true;
     update_pin_picker_status(app);
 }
@@ -7382,51 +7440,38 @@ fn toggle_transcript_entry_fold(app: &mut TuiApp, index: usize) -> bool {
     true
 }
 
-/// Sync the legacy `selected_entry` index from the id-keyed focus cursor so the
-/// renderer (which compares an index via `active_selected_entry`) stays in
-/// agreement after an id-space focus move. Resolving the id against the live
-/// entry-id order keeps the index correct even if entries were pruned.
-fn sync_selected_entry_from_focus(app: &mut TuiApp) {
-    let ids = transcript_entry_ids(app);
-    app.selected_entry = app.focus.resolve_index(&ids);
-}
-
 /// Move the focused-entry cursor one entry earlier, used by the per-entry fold
-/// controls. Driven through the id-keyed [`interaction::Focus`] (wraps to the
-/// last entry when nothing is focused yet), then mirrored back to
-/// `selected_entry` for the renderer.
+/// controls. `selected_entry` is the single source of truth; this steps it back
+/// one index, parking on the last entry when nothing is focused yet.
 fn select_previous_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
         return;
     }
-    // Adopt the legacy index into the id cursor first so a focus set elsewhere
-    // (pin picker, mouse) is honoured, then step in id space.
-    let ids = transcript_entry_ids(app);
-    app.focus.set_from_index(app.selected_entry, &ids);
-    let focused = app.focus.focus_prev(&ids);
-    sync_selected_entry_from_focus(app);
-    if let Some(transcript_surface::EntryId(id)) = focused {
-        app.status = format!("selected transcript entry {}", id + 1);
-    }
+    let last = app.transcript.len() - 1;
+    let index = match app.selected_entry {
+        Some(i) => i.min(last).saturating_sub(1),
+        None => last,
+    };
+    app.selected_entry = Some(index);
+    app.status = format!("selected transcript entry {}", app.transcript[index].id + 1);
 }
 
 /// Move the focused-entry cursor one entry later, used by the per-entry fold
-/// controls. Driven through the id-keyed [`interaction::Focus`] (wraps to the
-/// first entry when nothing is focused yet), then mirrored back to
-/// `selected_entry` for the renderer.
+/// controls. `selected_entry` is the single source of truth; this steps it
+/// forward one index, parking on the first entry when nothing is focused yet.
 fn select_next_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
         return;
     }
-    let ids = transcript_entry_ids(app);
-    app.focus.set_from_index(app.selected_entry, &ids);
-    let focused = app.focus.focus_next(&ids);
-    sync_selected_entry_from_focus(app);
-    if let Some(transcript_surface::EntryId(id)) = focused {
-        app.status = format!("selected transcript entry {}", id + 1);
-    }
+    let last = app.transcript.len() - 1;
+    let index = match app.selected_entry {
+        Some(i) => (i + 1).min(last),
+        None => 0,
+    };
+    app.selected_entry = Some(index);
+    app.status = format!("selected transcript entry {}", app.transcript[index].id + 1);
 }
 
 /// Handle a keystroke while the full-screen transcript overlay is open.
@@ -7601,6 +7646,22 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     }
     sync_queue_ids(app);
     let before: Vec<String> = app.prompt_queue.iter().cloned().collect();
+    // Capture the cursor's stable identity BEFORE the dispatch mutates the
+    // queue. `PromptQueueState` deletes/swaps relative to `selected`, so this
+    // is the exact slot the op acts on — id-exact like the mouse path, immune
+    // to the adjacent-duplicate ambiguity a before/after value diff has.
+    let cursor = {
+        let state = app
+            .prompt_queue_overlay
+            .as_ref()
+            .expect("checked is_some above");
+        let selected = state.selected;
+        PreDispatchCursor {
+            selected,
+            id: app.prompt_queue_ids.get(selected).copied(),
+            prev_id: queue_prev_id_at(app, selected),
+        }
+    };
     let mut state = app
         .prompt_queue_overlay
         .take()
@@ -7614,7 +7675,7 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             app.status = "prompt queue closed".to_string();
         }
         prompt_queue::QueueDispatch::Handled => {
-            reconcile_queue_after_dispatch(app, &before);
+            reconcile_queue_after_dispatch(app, &before, cursor);
         }
         // Stay modal: swallow the key so stray input can't leak into the
         // composer while the overlay owns the surface.
@@ -7623,23 +7684,41 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     true
 }
 
+/// The overlay cursor's identity captured *before* `dispatch`, so the id
+/// sidecar + undo can be reconciled against the exact slot the keyboard op
+/// acted on (rather than re-inferred by diffing queue contents, which is
+/// ambiguous when adjacent items are equal).
+#[derive(Debug, Clone, Copy)]
+struct PreDispatchCursor {
+    /// The focused index at dispatch time (the slot delete/swap acts on).
+    selected: usize,
+    /// The stable id at `selected` (None if the queue was empty).
+    id: Option<u64>,
+    /// The stable id immediately before `selected` (None if it was the front).
+    prev_id: Option<u64>,
+}
+
 /// After `PromptQueueState::dispatch` mutated `prompt_queue`, mirror the one
 /// op it performed onto the id sidecar + undo stack. `before` is the queue's
-/// contents prior to the dispatch. Recognises exactly the two mutating ops the
+/// contents prior to the dispatch; `cursor` is the focused slot's identity
+/// captured before dispatch. Recognises exactly the two mutating ops the
 /// dispatcher can do — a single delete (length shrank by one) or an adjacent
-/// swap (same length, two neighbours transposed) — and leaves the ids
-/// untouched for a pure cursor move.
-fn reconcile_queue_after_dispatch(app: &mut TuiApp, before: &[String]) {
+/// swap (same length) — and leaves the ids untouched for a pure cursor move.
+/// Both ops key off `cursor` (the exact acted-on slot), so they stay id-exact
+/// even when adjacent queue items are textually identical.
+fn reconcile_queue_after_dispatch(app: &mut TuiApp, before: &[String], cursor: PreDispatchCursor) {
     let after_len = app.prompt_queue.len();
     if after_len + 1 == before.len() {
-        // A delete: find the single index whose item is gone. Walk both
-        // sequences in step; the first mismatch is the removed slot (or the
-        // tail if every kept item matched).
-        let index = (0..after_len)
-            .find(|&i| app.prompt_queue[i] != before[i])
-            .unwrap_or(before.len() - 1);
+        // A delete: `PromptQueueState::delete` removed `cursor.selected`, so
+        // that exact index/id is the removed slot — no diffing, no ambiguity
+        // with leading duplicates.
+        let index = cursor.selected.min(before.len() - 1);
         let next_id = app.next_queue_id;
-        let id = app.prompt_queue_ids.remove(index).unwrap_or(next_id);
+        let id = app
+            .prompt_queue_ids
+            .remove(index)
+            .or(cursor.id)
+            .unwrap_or(next_id);
         push_queue_undo(
             app,
             QueueMutation::Deleted {
@@ -7659,9 +7738,19 @@ fn reconcile_queue_after_dispatch(app: &mut TuiApp, before: &[String]) {
             && app.prompt_queue[i] == before[i + 1]
             && app.prompt_queue[i + 1] == before[i]
         {
-            // Adjacent swap of i and i+1: mirror on the ids, record undo.
+            // Adjacent swap of i and i+1: mirror on the ids, record undo by the
+            // moved item's stable id (the one originally at `cursor.selected`)
+            // and its original left-neighbour, so undo survives a front-drain.
             app.prompt_queue_ids.swap(i, i + 1);
-            push_queue_undo(app, QueueMutation::Reordered { from: i, to: i + 1 });
+            if let Some(id) = cursor.id {
+                push_queue_undo(
+                    app,
+                    QueueMutation::Reordered {
+                        id,
+                        prev: cursor.prev_id,
+                    },
+                );
+            }
             app.status = "moved queued prompt".to_string();
             app.needs_redraw = true;
         }
@@ -7683,9 +7772,19 @@ fn handle_queue_overlay_mouse(
 ) -> Option<bool> {
     use crossterm::event::MouseButton;
     let now = std::time::Instant::now();
+    // The queue-item targets are registered against the footer-relative `area`
+    // (footer_origin is 0 in the always-on fullscreen renderer, non-zero only in
+    // the inline-repro path). Translate the pointer the same way the footer
+    // chrome arm does (`mouse.row - app.footer_origin`, guarded) so the hit-test
+    // shares one coordinate convention with the painted rows. Above the footer
+    // there are no queue items, so a row < footer_origin resolves to no hit.
+    let hit_test = |app: &TuiApp, mouse: &crossterm::event::MouseEvent| {
+        let row = mouse.row.checked_sub(app.footer_origin)?;
+        app.click_target_at(mouse.column, row)
+    };
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            let hit = app.click_target_at(mouse.column, mouse.row);
+            let hit = hit_test(app, &mouse);
             // Only claim presses that land on a queue item; a press elsewhere
             // (e.g. the indicator strip, handled by the footer arm, or empty
             // space) falls through.
@@ -7703,13 +7802,13 @@ fn handle_queue_overlay_mouse(
         // otherwise fall through (a held drag with no queue drag is a
         // text-selection / scrollbar gesture the later arms own).
         MouseEventKind::Drag(MouseButton::Left) if app.prompt_queue_drag.is_some() => {
-            let hit = app.click_target_at(mouse.column, mouse.row);
+            let hit = hit_test(app, &mouse);
             app.gestures.recognize(interaction::Phase::Drag, hit, now);
             queue_drag_move_to(app, hit);
             Some(true)
         }
         MouseEventKind::Up(MouseButton::Left) if app.prompt_queue_drag.is_some() => {
-            let hit = app.click_target_at(mouse.column, mouse.row);
+            let hit = hit_test(app, &mouse);
             app.gestures
                 .recognize(interaction::Phase::Release, hit, now);
             finalize_queue_drag(app);
@@ -7763,11 +7862,13 @@ fn finalize_queue_drag(app: &mut TuiApp) {
     if let Some(to) = queue_index_for_id(app, drag.id)
         && to != drag.from
     {
+        // Record by stable id + the id that originally preceded the dragged
+        // item (captured at drag start), so undo survives a front-drain.
         push_queue_undo(
             app,
             QueueMutation::Reordered {
-                from: drag.from,
-                to,
+                id: drag.id,
+                prev: drag.prev,
             },
         );
         app.status = "moved queued prompt".to_string();
@@ -18307,27 +18408,8 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
-/// Number of overlay item rows shown at once. Mirrors `prompt_queue`'s private
-/// `WINDOW`; kept in sync so the registered hit rows line up with the painted
-/// rows exactly.
-const QUEUE_OVERLAY_WINDOW: usize = 5;
 /// Width of the trailing delete affordance (`[x]`) on each item row.
 const QUEUE_DELETE_AFFORDANCE_WIDTH: u16 = 3;
-
-/// Compute the `(start, count)` slice of queued items the overlay shows, given
-/// the focus cursor. Mirrors the windowing in `prompt_queue::render_lines` so
-/// the registered hit rects match the painted rows one-for-one.
-fn queue_overlay_window(selected: usize, total: usize) -> (usize, usize) {
-    if total == 0 {
-        return (0, 0);
-    }
-    let window = QUEUE_OVERLAY_WINDOW.min(total);
-    let half = QUEUE_OVERLAY_WINDOW / 2;
-    let start = selected
-        .saturating_sub(half)
-        .min(total.saturating_sub(window));
-    (start, window)
-}
 
 /// Register the per-item mouse affordances for the open reorder overlay: a
 /// trailing delete zone (`QueueDelete`) and the rest of the row as a
@@ -18342,7 +18424,7 @@ fn register_queue_item_targets(app: &TuiApp, area: Rect, overlay_base: usize, sc
     if total == 0 {
         return;
     }
-    let (start, count) = queue_overlay_window(state.selected, total);
+    let (start, count) = prompt_queue::visible_window(state.selected, total);
     let bottom = area.y.saturating_add(area.height);
     for rel in 0..count {
         let item_index = start + rel;
@@ -20151,17 +20233,14 @@ pub(crate) struct TuiApp {
     /// the start of every draw via `begin_frame_clickables`. Replaces the
     /// former bare `Vec<Clickable>`.
     pub(crate) clickables: std::cell::RefCell<interaction::Registry>,
-    /// Id-keyed focused-entry cursor (see [`interaction::Focus`]). Kept in
-    /// sync with the legacy `selected_entry` index so the renderer keeps
-    /// comparing an index while mouse/keyboard dispatch can address the
-    /// stable EntryId. The index remains the render read-funnel via
-    /// `active_selected_entry`.
-    pub(crate) focus: interaction::Focus,
     /// Mouse gesture recognizer (see [`interaction::Recognizer`]). Turns
-    /// the raw crossterm Down/Drag/Up/Move stream into semantic gestures,
-    /// absorbing the multi-click synthesis formerly inlined in
-    /// `handle_main_selection_press` and keying multiplicity on the target
-    /// key rather than the screen cell.
+    /// the raw crossterm Down/Drag/Up/Move stream into semantic gestures for
+    /// the card-affordance path, keying multiplicity on the target key rather
+    /// than the screen cell. NOTE: this does NOT yet replace the main-transcript
+    /// selection path — `handle_main_selection_press` still owns its own
+    /// cell-keyed multi-click counter (`last_click` + `MULTI_CLICK_MS`); the two
+    /// recognizers coexist, both using a 400ms window, until the main-selection
+    /// path is migrated onto the recognizer in a later phase.
     pub(crate) gestures: interaction::Recognizer,
     /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
     /// `<workspace>/.squeezy/prompts/`. Consulted by
@@ -20532,7 +20611,6 @@ impl TuiApp {
             auto_drain_queue: false,
             pending_chord: None,
             clickables: std::cell::RefCell::new(interaction::Registry::new()),
-            focus: interaction::Focus::new(),
             gestures: interaction::Recognizer::new(),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,

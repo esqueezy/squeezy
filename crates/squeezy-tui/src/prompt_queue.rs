@@ -110,6 +110,27 @@ impl PromptQueueState {
     }
 }
 
+/// Number of overlay item rows shown at once. The single source of truth for
+/// the visible window: both `render_lines` (painting) and the lib.rs hit-target
+/// registration derive their slice from `visible_window`, so the painted rows
+/// and the registered click rects can never drift apart.
+pub(crate) const WINDOW: usize = 5;
+
+/// The `(start, count)` slice of queued items the overlay shows, centred on the
+/// focus cursor. Shared by `render_lines` and `register_queue_item_targets` so
+/// the hit rects line up with the painted rows one-for-one.
+pub(crate) fn visible_window(selected: usize, total: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let count = WINDOW.min(total);
+    let half = WINDOW / 2;
+    let start = selected
+        .saturating_sub(half)
+        .min(total.saturating_sub(count));
+    (start, count)
+}
+
 /// One-line preview of a queued prompt for the overlay / indicator.
 fn preview(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
@@ -154,15 +175,9 @@ pub(crate) fn render_lines(
         )));
         return lines;
     }
-    const WINDOW: usize = 5;
     let total = queue.len();
-    let half = WINDOW / 2;
-    let start = state
-        .selected
-        .saturating_sub(half)
-        .min(total.saturating_sub(WINDOW.min(total)));
-    let end = (start + WINDOW).min(total);
-    for (rel, item) in queue.iter().skip(start).take(end - start).enumerate() {
+    let (start, count) = visible_window(state.selected, total);
+    for (rel, item) in queue.iter().skip(start).take(count).enumerate() {
         let index = start + rel;
         let is_selected = index == state.selected;
         let marker = if is_selected { "› " } else { "  " };

@@ -255,26 +255,6 @@ fn strip_message_marker(line: &str) -> &str {
     }
 }
 
-/// A click target inside a row: a half-open `text_range` (in `copy_text`
-/// char offsets) and the action it triggers. Built empty today; the integration
-/// step populates it for entry headers (collapse/expand toggles) and any
-/// in-row affordances so the mouse handler can hit-test against the row model
-/// instead of re-deriving geometry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClickTarget {
-    /// Char-offset span within the row's `copy_text` the target covers.
-    pub(crate) text_range: Range<usize>,
-    /// What clicking the target does.
-    pub(crate) action: ClickAction,
-}
-
-/// The action a [`ClickTarget`] triggers when the row is clicked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClickAction {
-    /// Toggle the owning entry's collapsed/expanded state.
-    ToggleEntryCollapsed(EntryId),
-}
-
 /// One visual row of the transcript: a single wrapped line plus the identity,
 /// plain-text projection, style metadata, and interaction state the
 /// higher-level features need.
@@ -327,9 +307,6 @@ pub(crate) struct TranscriptRow {
     /// step, which scans `copy_text` for the active query and records hit
     /// ranges here so the renderer highlights them in place.
     pub(crate) search_match_ranges: Vec<Range<usize>>,
-    /// Click targets inside this row (header toggles, affordances). Default
-    /// empty; populated by the integration step that wires the mouse handler.
-    pub(crate) click_targets: Vec<ClickTarget>,
 }
 
 /// Whether a row's owning entry renders folded or expanded. Mirrors the build's
@@ -450,7 +427,6 @@ fn build_transcript_rows_uncached(
             fold_state,
             // TODO(parallelization-plan Phase 7): incremental search fills this.
             search_match_ranges: Vec::new(),
-            click_targets: Vec::new(),
         });
     }
     rows

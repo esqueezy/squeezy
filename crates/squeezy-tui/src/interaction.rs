@@ -1,10 +1,11 @@
-//! Frame-local hit-test registry + focus model + gesture recognizer — the
+//! Frame-local hit-test registry + gesture recognizer — the
 //! Phase 7B direct-manipulation substrate.
 //!
 //! This module formalizes the ad-hoc click plumbing that previously lived as a
-//! bare `Vec<Clickable>` + a footer-only `ClickAction` enum in `lib.rs` and a
-//! separate row-local `ClickTarget`/`ClickAction` in `transcript_surface.rs`.
-//! It unifies all of that into one id-anchored vocabulary so a clickable target
+//! bare `Vec<Clickable>` + a footer-only `ClickAction` enum in `lib.rs` (plus a
+//! never-populated row-local `ClickTarget`/`ClickAction` in `transcript_surface`
+//! that this module replaced and which has since been removed). It unifies that
+//! into one id-anchored vocabulary so a clickable target
 //! is *keyed by identity* (an `EntryId`, a `RowId`, a queue-item id, or a small
 //! set of chrome keys), not by a remembered cursor coordinate. Rects are
 //! recomputed every frame from current geometry; the key is the stable handle,
@@ -15,7 +16,7 @@
 //! id newtypes in [`crate::transcript_surface`], on [`crate::keymap`], and on
 //! `ratatui::layout::Rect`. It does NOT depend back on `lib.rs`'s `TuiApp`,
 //! mirroring the discipline `transcript_surface.rs` already keeps, so every
-//! piece here (hit-test, focus resolver, gesture transitions) is a pure
+//! piece here (hit-test, gesture transitions) is a pure
 //! function over model state and is unit-testable without a terminal.
 
 use std::time::Instant;
@@ -36,11 +37,12 @@ use crate::transcript_surface::{EntryId, RowId};
 /// caller tell *which* card/row was hit even when two cards share the same
 /// action variant.
 ///
-/// `Entry` and `Chrome(QueueStrip)` are registered today (card headers/carets
-/// and the queue strip). `RowSpan` (sub-row code-block copy), `QueueItem`
-/// (delete/reorder), and the `JumpToLatest`/`ScrollbarGutter` chrome keys are
-/// the substrate vocabulary their affordances register in later phases; the
-/// hit-test handles them uniformly already and the tests exercise them.
+/// `Entry`, `Chrome(QueueStrip)`, and `QueueItem` (delete/reorder) are
+/// registered today (card headers/carets, the queue strip, and the per-item
+/// overlay affordances). `RowSpan` (sub-row code-block copy) and the
+/// `JumpToLatest`/`ScrollbarGutter` chrome keys are the substrate vocabulary
+/// their affordances register in later phases; the hit-test handles them
+/// uniformly already and the tests exercise them.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TargetKey {
@@ -49,8 +51,8 @@ pub(crate) enum TargetKey {
     /// it survives coalescing/reflow/resize.
     Entry(EntryId),
     /// A sub-row affordance: a specific row plus an in-row char span (e.g. a
-    /// code-block copy button). Derived from `RowId` + a `ClickTarget`'s
-    /// `text_range`.
+    /// code-block copy button). Derived from a [`RowId`] plus the affordance's
+    /// `copy_text` char range.
     RowSpan(RowId, RowSpan),
     /// A prompt-queue item, addressed by its stable per-item id, NOT its Vec
     /// index — so a reorder/delete mid-gesture never shifts the hit target.
@@ -98,12 +100,13 @@ pub(crate) enum ChromeKey {
 /// — the same handlers the keyboard path calls, so keyboard/mouse parity holds
 /// by construction.
 ///
-/// `ToggleQueueOverlay`, `ToggleEntryCollapsed`, `FocusEntry`, and `ExpandEntry`
-/// are wired to live affordances today. `OpenEntryInDetail` (mouse twin of the
-/// `Ctrl+Enter` keyboard verb, which goes straight through
-/// `open_focused_entry_in_detail`), the queue delete/reorder actions, and the
-/// jump/scrollbar actions complete the unified vocabulary and dispatch their
-/// handlers as their registering affordances land.
+/// `ToggleQueueOverlay`, `ToggleEntryCollapsed`, `FocusEntry`, `ExpandEntry`,
+/// and the queue `QueueDelete` / `QueueReorderBegin` / `QueueUndo` actions are
+/// wired to live affordances today (real dispatch arms + registered hit
+/// targets + keyboard parity). Only `OpenEntryInDetail` (no mouse affordance
+/// registers it yet; the `Ctrl+Enter` keyboard verb goes straight through
+/// `open_focused_entry_in_detail`) and the jump/scrollbar actions remain
+/// substrate that dispatches its handlers as its registering affordances land.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -204,102 +207,13 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 }
 
 // ===========================================================================
-// Focus model
-// ===========================================================================
-
-/// The focused-entry cursor, expressed as an [`EntryId`]-or-none rather than a
-/// fragile transcript *index*. The id is the same stable handle the render
-/// cache and row model already key on, so it survives entries being
-/// pruned/coalesced — whereas an index would drift.
-///
-/// Callees that take an index keep working via [`Focus::resolve_index`], which
-/// maps the focused id back to a live transcript index on demand (linear find
-/// by `entry.id`, the same pattern `assistant_entry_ids` /
-/// `build_transcript_rows_uncached` already use).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Focus {
-    entry: Option<EntryId>,
-}
-
-impl Focus {
-    pub(crate) fn new() -> Self {
-        Self { entry: None }
-    }
-
-    /// The currently focused entry id, if any. Read by the recognizer/focus
-    /// tests and by dispatch paths that want the id without re-resolving an
-    /// index.
-    #[allow(dead_code)]
-    pub(crate) fn focused(self) -> Option<EntryId> {
-        self.entry
-    }
-
-    /// Set the focus directly to a given entry (mouse header-click, pin picker).
-    pub(crate) fn set(&mut self, entry: EntryId) {
-        self.entry = Some(entry);
-    }
-
-    /// Clear the focus.
-    pub(crate) fn clear(&mut self) {
-        self.entry = None;
-    }
-
-    /// Adopt focus from a raw transcript index against the given id order.
-    /// Keeps the id-based focus in sync when a legacy index-based path
-    /// (`selected_entry`) is the source of truth.
-    pub(crate) fn set_from_index(&mut self, index: Option<usize>, ids: &[u64]) {
-        self.entry = index.and_then(|i| ids.get(i)).map(|id| EntryId(*id));
-    }
-
-    /// Resolve the focused id back to a live index in `ids` (the transcript's
-    /// entry-id order). `None` when nothing is focused or the id is no longer
-    /// present (entry pruned). This is the shim every index-taking callee uses.
-    pub(crate) fn resolve_index(self, ids: &[u64]) -> Option<usize> {
-        let EntryId(want) = self.entry?;
-        ids.iter().position(|id| *id == want)
-    }
-
-    /// Step the focus to the previous entry in `ids` order. Wraps to the last
-    /// entry when nothing is focused yet (or the focused id was pruned),
-    /// mirroring `select_previous_transcript_entry`. No-op on an empty order.
-    /// Returns the resulting focused id, if any.
-    pub(crate) fn focus_prev(&mut self, ids: &[u64]) -> Option<EntryId> {
-        if ids.is_empty() {
-            self.entry = None;
-            return None;
-        }
-        let next = match self.resolve_index(ids) {
-            Some(i) => i.saturating_sub(1),
-            None => ids.len() - 1,
-        };
-        self.entry = Some(EntryId(ids[next]));
-        self.entry
-    }
-
-    /// Step the focus to the next entry in `ids` order. Wraps to the first
-    /// entry when nothing is focused yet (or the focused id was pruned),
-    /// mirroring `select_next_transcript_entry`. No-op on an empty order.
-    /// Returns the resulting focused id, if any.
-    pub(crate) fn focus_next(&mut self, ids: &[u64]) -> Option<EntryId> {
-        if ids.is_empty() {
-            self.entry = None;
-            return None;
-        }
-        let next = match self.resolve_index(ids) {
-            Some(i) => (i + 1).min(ids.len() - 1),
-            None => 0,
-        };
-        self.entry = Some(EntryId(ids[next]));
-        self.entry
-    }
-}
-
-// ===========================================================================
 // Gesture recognizer
 // ===========================================================================
 
 /// A second/third press on the *same target key* within this window is treated
-/// as a double/triple click. Promoted from `lib.rs`'s `MULTI_CLICK_MS`.
+/// as a double/triple click. The card-affordance recognizer's own window; the
+/// main-text selection path keeps a separate (same-valued) `MULTI_CLICK_MS` in
+/// `lib.rs` until it is migrated onto the recognizer in a later phase.
 pub(crate) const MULTI_CLICK_MS: u128 = 400;
 
 /// A hovered target must stay hovered (same key) for at least this long before
@@ -389,6 +303,10 @@ pub(crate) struct DragState {
     pub(crate) origin: Option<TargetKey>,
     /// The key the pointer is currently over (the insertion anchor).
     pub(crate) current: Option<TargetKey>,
+    /// Whether the first Drag event has already promoted this press into a drag
+    /// (so `DragStart` fires exactly once; every later Drag is `DragExtend`,
+    /// even when the pointer stays on the origin key — e.g. sub-row jitter).
+    started: bool,
 }
 
 /// Hover-intent state: which key is hovered and when it was first hovered.
@@ -487,6 +405,7 @@ impl Recognizer {
         self.drag = Some(DragState {
             origin: target,
             current: target,
+            started: false,
         });
         self.hover = None;
         match multiplicity {
@@ -499,13 +418,14 @@ impl Recognizer {
     fn on_drag(&mut self, target: Option<TargetKey>) -> Gesture {
         match self.drag.as_mut() {
             Some(drag) => {
-                let was_origin = drag.current == drag.origin && drag.origin.is_some();
                 drag.current = target;
-                // First movement off the origin promotes the press into a drag
-                // gesture; subsequent movements extend it. We surface
-                // DragStart on the first Drag event regardless so the dispatch
-                // layer can arm its model-order insertion tracking.
-                if was_origin {
+                // The FIRST Drag event after a press promotes it into a drag
+                // (DragStart, so the dispatch layer can arm its insertion
+                // tracking); every subsequent Drag extends it — including ones
+                // that land back on the origin key (sub-row jitter on a tall
+                // row). `started` makes DragStart fire exactly once.
+                if !drag.started {
+                    drag.started = true;
                     Gesture::DragStart {
                         target: drag.origin,
                     }
@@ -515,10 +435,12 @@ impl Recognizer {
             }
             None => {
                 // A Drag with no recorded press (capture toggled mid-gesture):
-                // start tracking from here so we don't desync.
+                // start tracking from here so we don't desync. This Drag is the
+                // promotion, so `started` is already true.
                 self.drag = Some(DragState {
                     origin: target,
                     current: target,
+                    started: true,
                 });
                 Gesture::DragStart { target }
             }
@@ -583,9 +505,13 @@ impl Recognizer {
         }
     }
 
-    /// Reset all in-flight gesture state. Called when mouse capture turns off
-    /// or the surface changes out from under an in-flight gesture. Wired into
-    /// `handle_mouse`'s capture-toggle path with the drag/hover affordances.
+    /// Reset all in-flight gesture state — to be called when mouse capture
+    /// turns off or the surface changes out from under an in-flight gesture.
+    /// Not yet wired into a production path (stale recognizer state is currently
+    /// harmless: `on_press` resets multiplicity on a target-key change, and the
+    /// queue drag is gated on the separate `prompt_queue_drag` field); it lands
+    /// in `handle_mouse`'s capture-toggle path with the hover/drag-capture
+    /// affordances in a later phase. Exercised by the recognizer tests today.
     #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.last_press = None;

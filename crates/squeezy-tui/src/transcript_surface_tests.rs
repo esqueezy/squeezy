@@ -28,7 +28,6 @@ fn row(id: usize, text: &str) -> TranscriptRow {
         style_spans,
         fold_state: FoldState::Expanded,
         search_match_ranges: Vec::new(),
-        click_targets: Vec::new(),
     }
 }
 
@@ -36,6 +35,28 @@ fn row(id: usize, text: &str) -> TranscriptRow {
 fn plain_text_rejoins_spans_losslessly() {
     let line = styled_line("hello world from spans");
     assert_eq!(plain_text_of_line(&line), "hello world from spans");
+}
+
+#[test]
+fn strip_focus_caret_only_eats_a_true_column_zero_caret() {
+    // A focused header opens on the selection caret `"> "`; that chrome IS
+    // stripped so copied text is focus-invariant.
+    assert_eq!(strip_focus_caret("> answer text"), "answer text");
+    assert_eq!(strip_focus_caret(">  answer text"), "answer text");
+
+    // Load-bearing invariant guard (finding #18): content rows in this surface
+    // never begin with `"> "` at column 0 — body text and Markdown blockquotes
+    // hang under a whitespace indent. Pin that a blockquote rendered on an
+    // indented continuation row is NOT mutated, so a future renderer change that
+    // emitted `"> "` at column 0 would fail this loudly instead of silently
+    // eating the blockquote marker from copied text.
+    assert_eq!(
+        strip_focus_caret("    > quoted body"),
+        "    > quoted body",
+        "an indented blockquote must survive the caret strip untouched"
+    );
+    // A bare `>` with no following space (real content) is never eaten.
+    assert_eq!(strip_focus_caret(">no space"), ">no space");
 }
 
 #[test]
