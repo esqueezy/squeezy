@@ -110,15 +110,46 @@ impl SessionStore {
         self.root.join("calibration.json")
     }
 
-    /// Load the cross-session `TokenCalibration` if present. Missing or
-    /// malformed files yield `TokenCalibration::default()` rather than an
-    /// error: the calibration is a best-effort cache, not a source of truth.
+    /// Load the cross-session `TokenCalibration` if present. Missing files
+    /// yield `TokenCalibration::default()` silently. Malformed files also
+    /// fall back to the default, but emit a one-time diagnostic to stderr so
+    /// the user knows the warm-start cache is cold (e.g. in CI or on shared
+    /// homes where corruption is more likely to go unnoticed).
     pub fn load_global_calibration(&self) -> squeezy_llm::TokenCalibration {
+        self.load_global_calibration_inner().0
+    }
+
+    /// Like [`Self::load_global_calibration`] but also returns a hint about
+    /// where the calibration came from:
+    /// - `(cal, None)` — file was absent; `cal` is the hard-coded default.
+    /// - `(cal, Some(true))` — file existed and was parsed successfully.
+    /// - `(cal, Some(false))` — file existed but was malformed; `cal` is the
+    ///   default and a warning was emitted to stderr.
+    pub fn load_global_calibration_with_source_hint(
+        &self,
+    ) -> (squeezy_llm::TokenCalibration, Option<bool>) {
+        self.load_global_calibration_inner()
+    }
+
+    fn load_global_calibration_inner(&self) -> (squeezy_llm::TokenCalibration, Option<bool>) {
         let path = self.calibration_path();
-        if !path.exists() {
-            return squeezy_llm::TokenCalibration::default();
+        // Read directly without a separate `exists()` check to avoid TOCTOU: on
+        // NFS / shared homes the file can be deleted between the two syscalls.
+        // Pattern-match on the error kind so "not found" is silent but other
+        // failures (permission denied, I/O error, parse error) emit a diagnostic.
+        match read_json::<squeezy_llm::TokenCalibration>(&path) {
+            Ok(calibration) => (calibration, Some(true)),
+            Err(SqueezyError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                (squeezy_llm::TokenCalibration::default(), None)
+            }
+            Err(e) => {
+                let error_kind = calibration_load_error_kind(&e);
+                eprintln!(
+                    "squeezy: warning: calibration.json could not be loaded ({error_kind}); falling back to default token calibration"
+                );
+                (squeezy_llm::TokenCalibration::default(), Some(false))
+            }
         }
-        read_json(&path).unwrap_or_default()
     }
 
     /// Atomically persist the cross-session `TokenCalibration`. Errors are
@@ -3131,6 +3162,17 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(json_error)
+}
+
+fn calibration_load_error_kind(error: &SqueezyError) -> &'static str {
+    match error {
+        SqueezyError::Io(error) => match error.kind() {
+            std::io::ErrorKind::PermissionDenied => "permission denied",
+            _ => "I/O error",
+        },
+        SqueezyError::Tool(_) => "malformed JSON",
+        _ => "unexpected error",
+    }
 }
 
 /// Serde default for [`SessionMetadata::schema_version`]. Returns 0 — the

@@ -4362,6 +4362,7 @@ fn format_cost_command_renders_active_buckets() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::GlobalFile,
     };
 
     let raw = commands::format_cost_command(&snapshot);
@@ -4486,6 +4487,7 @@ fn format_cost_command_renders_by_model_drill() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::GlobalFile,
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
@@ -4728,6 +4730,7 @@ fn context_breaks_out_skills_and_mcp_sources() {
         full_history_request: estimate,
         skills,
         mcp,
+        calibration_source: squeezy_agent::CalibrationSource::HardCodedDefault,
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
@@ -8538,6 +8541,7 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::HardCodedDefault,
     };
     let body = commands::format_context_command(&snapshot);
 
@@ -14881,6 +14885,26 @@ fn status_line_item_round_trips_through_slug() {
             .unwrap_or_else(|_| panic!("slug {} should parse back to its item", item.slug()));
         assert_eq!(parsed, *item);
     }
+}
+
+#[test]
+fn status_line_narrow_linux_preset_expands_to_compact_items() {
+    use crate::status::{NARROW_LINUX_STATUS_LINE_ITEMS, StatusLineItem};
+
+    let raw = ["narrow-linux".to_string()];
+    let parsed = parse_status_line_items(Some(&raw)).expect("preset should parse");
+
+    assert_eq!(parsed.as_slice(), NARROW_LINUX_STATUS_LINE_ITEMS);
+    assert_eq!(
+        parsed,
+        vec![
+            StatusLineItem::ProviderAndModel,
+            StatusLineItem::Cost,
+            StatusLineItem::ContextRemaining,
+            StatusLineItem::Tools,
+            StatusLineItem::Budget,
+        ]
+    );
 }
 
 #[test]

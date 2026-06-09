@@ -424,6 +424,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     let notice = format_cap_unenforceable_notice(&provider, &model);
                     app.push_transcript_item(TranscriptItem::system(notice));
+                    // Persist flag so the status-line cost segment shows a
+                    // reminder until a priced cost update proves the cap is
+                    // enforceable again.
+                    app.cap_unenforceable = true;
                 }
                 AgentEvent::ShellSandboxBestEffortFallback {
                     backend,
@@ -463,6 +467,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // is current mid-turn and never blanks if the turn breaks.
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
+                    }
+                    // A non-zero micro_usd means the active model has known pricing;
+                    // clear the persistent unpriced-cap marker.
+                    if micro_usd > 0 {
+                        app.cap_unenforceable = false;
                     }
                 }
                 AgentEvent::ToolProgress {
@@ -558,6 +567,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // than a System transcript item, which rendered the off-rail
                     // `• Noted ↪ routed …` line that severed the gutter.
                     app.push_note(format!("routed `{from}` → `{to}` ({reason})"));
+                    // Do not clear cap_unenforceable here: the new model may also
+                    // be unpriced, and the broker's latch won't re-fire within this
+                    // same turn. The flag is cleared only when we observe an actual
+                    // priced round (CostUpdate with micro_usd > 0).
                 }
             }
         }

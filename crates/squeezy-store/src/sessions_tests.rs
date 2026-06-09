@@ -1161,6 +1161,75 @@ fn token_calibration_round_trips_through_metadata_and_global_file() {
 }
 
 #[test]
+fn load_global_calibration_with_source_hint_absent_file_returns_none_hint() {
+    let root = temp_root("calibration-source-absent");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert!(
+        cal.providers.is_empty(),
+        "absent file must return default calibration"
+    );
+    assert_eq!(hint, None, "absent file must return hint=None");
+}
+
+#[test]
+fn load_global_calibration_with_source_hint_valid_file_returns_some_true() {
+    let root = temp_root("calibration-source-valid");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let mut calibration = squeezy_llm::TokenCalibration::default();
+    calibration.record_sample("openai", 4500, 1000);
+    store
+        .save_global_calibration(&calibration)
+        .expect("save calibration");
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert_eq!(
+        cal, calibration,
+        "valid file must return the saved calibration"
+    );
+    assert_eq!(hint, Some(true), "valid file must return hint=Some(true)");
+}
+
+#[test]
+fn load_global_calibration_with_source_hint_corrupt_file_returns_some_false() {
+    let root = temp_root("calibration-source-corrupt");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    // The calibration file lives under the session root, not workspace_root.
+    // Ensure the directory exists, then write invalid JSON directly.
+    let cal_path = store.root().join("calibration.json");
+    fs::create_dir_all(store.root()).expect("create session root");
+    fs::write(&cal_path, b"not valid json {{{").expect("write corrupt calibration");
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert!(
+        cal.providers.is_empty(),
+        "corrupt file must fall back to default calibration"
+    );
+    assert_eq!(
+        hint,
+        Some(false),
+        "corrupt file must return hint=Some(false)"
+    );
+}
+
+#[test]
+fn calibration_load_error_kind_does_not_echo_error_payload() {
+    let error =
+        SqueezyError::Tool("session store JSON error: OPENROUTER_API_KEY=secret".to_string());
+    assert_eq!(calibration_load_error_kind(&error), "malformed JSON");
+}
+
+#[test]
 fn session_metadata_v0_file_reads_as_v1() {
     // Pre-versioning `metadata.json` files are missing the
     // `schema_version` field. The reader migration framework must treat
@@ -3879,5 +3948,53 @@ fn global_index_ignores_relative_xdg_state_home() {
         let entry = global_index_entry_for_test("home-session", 1);
         SessionStore::append_global_index_entry(&entry);
         assert!(legacy.exists(), "append should use HOME fallback");
+    });
+}
+
+#[test]
+fn rewrite_global_index_uses_pid_temp_name_not_fixed_suffix() {
+    // Guard: the temp file used by rewrite_global_index must include the
+    // process id so concurrent compactors cannot clobber each other's
+    // in-flight file (the earlier `jsonl.tmp` fixed-name bug).
+    let home = temp_root("rewrite-global-index-pid-temp");
+    with_home(&home, || {
+        let Some(path) = SessionStore::global_index_path() else {
+            panic!("HOME not set");
+        };
+        let forbidden_tmp = path.with_extension("jsonl.tmp");
+        // Write a dummy entry so the index is non-empty and compaction fires.
+        let entry = GlobalSessionIndexEntry {
+            session_id: "session-x".to_string(),
+            cwd: "/tmp/x".to_string(),
+            workspace_root: "/tmp/x".to_string(),
+            repo_root: None,
+            title: None,
+            display_name: None,
+            started_at_ms: 1,
+            last_event_at_ms: 1,
+            turn_count: 1,
+            resume_available: false,
+        };
+        // Append enough duplicates to trigger compaction (exceeds the byte
+        // threshold after enough repeated rows).
+        for _ in 0..10_000 {
+            SessionStore::append_global_index_entry(&entry);
+        }
+        // Call list_global_index which triggers rewrite_global_index.
+        let entries = SessionStore::list_global_index();
+        // Positive assertion: compaction must have deduped the 10 000 identical
+        // appends down to 1 entry, confirming rewrite_global_index actually ran.
+        assert_eq!(
+            entries.len(),
+            1,
+            "compaction must deduplicate 10_000 appends of the same session to 1 entry"
+        );
+        // Negative assertion: the fixed-suffix temp file must NOT exist after
+        // compaction — if it does, the old broken code path is still in use.
+        assert!(
+            !forbidden_tmp.exists(),
+            "rewrite_global_index must not leave a fixed-suffix .jsonl.tmp temp file; \
+             it should use a pid-scoped name to prevent cross-process clobbering"
+        );
     });
 }
