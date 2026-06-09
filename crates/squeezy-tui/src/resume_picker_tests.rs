@@ -253,6 +253,24 @@ fn picker_signals_cross_project_switch() {
 }
 
 #[test]
+fn picker_explains_branch_load_warning_for_selected_row() {
+    let mut warning = summary("warning");
+    warning.branch_load_failed = true;
+    let mut state = ResumePickerState::new(vec![warning], cwd());
+    state.dispatch(press(KeyCode::Down)); // cursor onto the warning candidate
+
+    let text = render_state_to_text(&state, 96, 18);
+    assert!(
+        text.contains('!'),
+        "branch-load failures carry an inline warning marker:\n{text}"
+    );
+    assert!(
+        text.contains("Branch data unavailable; hidden branches may not be shown"),
+        "the selected warning row explains what the marker means:\n{text}"
+    );
+}
+
+#[test]
 fn picker_ellipsises_long_labels_instead_of_hard_cropping() {
     let mut long = summary("long");
     long.first_user_task = Some("verylongsessiontitlewithnospaces".repeat(12));

@@ -27,6 +27,11 @@ static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Using a counter instead of pid-only prevents two concurrent writers
 /// inside the same process from colliding on the same temp path.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Extra rename attempts after a transient Windows sharing/lock violation.
+const WINDOWS_RENAME_RETRY_ATTEMPTS: usize = 1;
+/// Delay between Windows rename attempts; long enough for scanners/indexers to
+/// release short-lived handles without making normal writes feel sluggish.
+const WINDOWS_RENAME_RETRY_DELAY_MS: u64 = 50;
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 /// Schema version stamped onto every `RolloutEvent` emitted by
 /// [`SessionStore::bundle_rollout_trace`]. The reducer is additive over
@@ -3497,11 +3502,15 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(first) if is_windows_sharing_violation(&first) => {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            match fs::rename(from, to) {
-                Ok(()) => Ok(()),
-                Err(_) => Err(first),
+            for _ in 0..WINDOWS_RENAME_RETRY_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    WINDOWS_RENAME_RETRY_DELAY_MS,
+                ));
+                if fs::rename(from, to).is_ok() {
+                    return Ok(());
+                }
             }
+            Err(first)
         }
         Err(error) => Err(error),
     }

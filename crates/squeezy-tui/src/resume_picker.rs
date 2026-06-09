@@ -737,24 +737,34 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         );
     }
 
-    // When the highlighted row is a session from another directory, spell out
-    // that confirming will switch into that directory before resuming — the
-    // inline `↪ project` marker can be truncated on a narrow terminal, this
-    // line is not.
-    if let Some(entry) = state
+    let selected_entry = state
         .cursor
         .checked_sub(1)
-        .and_then(|idx| state.candidates.get(idx))
-        && !paths_same(&entry.summary.cwd, &cwd_str)
-    {
-        let hint = Line::from(vec![
-            Span::styled(" ↪ ", Style::default().fg(crate::render::theme::accent())),
-            Span::styled(
-                format!("Enter switches to {} and resumes there", entry.summary.cwd),
-                Style::default().fg(crate::render::theme::secondary()),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(hint), layout[4]);
+        .and_then(|idx| state.candidates.get(idx));
+    if let Some(entry) = selected_entry {
+        if entry.summary.branch_load_failed {
+            let hint = Line::from(vec![
+                Span::styled(" ! ", Style::default().fg(crate::render::theme::warn())),
+                Span::styled(
+                    "Branch data unavailable; hidden branches may not be shown",
+                    Style::default().fg(crate::render::theme::secondary()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(hint), layout[4]);
+        } else if !paths_same(&entry.summary.cwd, &cwd_str) {
+            // When the highlighted row is a session from another directory,
+            // spell out that confirming will switch into that directory before
+            // resuming — the inline `↪ project` marker can be truncated on a
+            // narrow terminal, this line is not.
+            let hint = Line::from(vec![
+                Span::styled(" ↪ ", Style::default().fg(crate::render::theme::accent())),
+                Span::styled(
+                    format!("Enter switches to {} and resumes there", entry.summary.cwd),
+                    Style::default().fg(crate::render::theme::secondary()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(hint), layout[4]);
+        }
     }
 
     let tab_hint = if state.show_all_projects {

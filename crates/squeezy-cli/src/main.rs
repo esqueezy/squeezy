@@ -2132,12 +2132,12 @@ fn confirm(prompt: &str) -> squeezy_core::Result<bool> {
 /// when the two refer to the same location so callers can skip the
 /// confirmation entirely.
 ///
-/// Kept pure (no I/O) so it round-trips cleanly in unit tests and can be
-/// reused by any future surface (e.g. TUI) that needs the same warning
-/// string. Trailing path separators are trimmed before comparison so a
-/// recorded `"/repo"` and a current `"/repo/"` are treated as equal —
-/// the message itself preserves the original strings so the operator
-/// can spot the discrepancy.
+/// Kept side-effect-free apart from the platform-aware path comparison so it
+/// round-trips cleanly in unit tests and can be reused by any future surface
+/// (e.g. TUI) that needs the same warning string. The comparison delegates to
+/// `paths_same`, so trailing separators and Windows case/separator variants
+/// do not trigger a prompt. The message itself preserves the original strings
+/// so the operator can spot the discrepancy.
 fn cross_project_resume_prompt(session_cwd: &str, current_cwd: &str) -> Option<String> {
     if paths_same(session_cwd, current_cwd) {
         return None;
