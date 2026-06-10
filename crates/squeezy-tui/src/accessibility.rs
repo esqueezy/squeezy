@@ -668,6 +668,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // a row click and the keyboard reach the same
         // `health_markers_jump_to_selected` handler.
         A::HealthMarkerSelect(_) => KeyboardPath::Always("health markers ↑↓/Enter"),
+        // Semantic Turn Outline overlay (§12.2.1) — the overlay's own key handler
+        // owns ↑↓/kj (move the node cursor) and Enter/→/l (jump to the logical
+        // transcript row behind the selected node) before the global keymap sees
+        // them, so a row click and the keyboard reach the same
+        // `turn_outline_jump_to_selected` handler.
+        A::TurnOutlineSelect(_) => KeyboardPath::Always("turn outline ↑↓/Enter"),
     })
 }
 

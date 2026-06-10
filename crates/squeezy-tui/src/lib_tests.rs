@@ -28183,3 +28183,283 @@ async fn health_markers_renders_across_resizes() {
         );
     }
 }
+
+// ---- Semantic Turn Outline (§12.2.1) ----
+
+/// Build a transcript with a full turn: a user prompt, a model reasoning
+/// segment, a successful tool, a FAILED tool, a failed subagent breadcrumb, and
+/// an assistant answer — so the outline lists several distinct, deterministically
+/// titled sections (including a failed one). Seeds a deterministic viewport so
+/// geometry is host-independent.
+fn app_with_turn_outline() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("refactor the parser".to_string()));
+    app.push_tool_result(sample_tool_result("read_file", "fn parse() {}\n"));
+    let mut failed = sample_tool_result("shell", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app.push_subagent_note("subagent research failed: could not reach host".to_string());
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Here is the refactored parser.".to_string(),
+    ));
+    app
+}
+
+#[tokio::test]
+async fn turn_outline_alt_s_opens_overlay_and_lists_sections() {
+    let mut app = app_with_turn_outline();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+s opens the turn-outline overlay");
+
+    assert!(app.turn_outline_open, "Alt+s opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Turn outline"), "header present:\n{out}");
+
+    // One node per transcript entry (user, tool, tool, subagent, assistant).
+    assert_eq!(app.turn_outline.len(), 5, "one node per entry");
+    assert_eq!(
+        app.turn_outline
+            .count_of(turn_outline::OutlineKind::UserTurn),
+        1,
+    );
+    assert_eq!(
+        app.turn_outline
+            .count_of(turn_outline::OutlineKind::ToolRun),
+        2,
+    );
+    assert_eq!(
+        app.turn_outline
+            .count_of(turn_outline::OutlineKind::Assistant),
+        1,
+    );
+    // At minimum the failed tool + failed subagent count as failures (the
+    // `entry_is_error` cross-cut may also flag the surrounding turn).
+    assert!(
+        app.turn_outline.failed_count() >= 2,
+        "failed tool + subagent both flagged: {}",
+        app.turn_outline.failed_count(),
+    );
+
+    // Deterministic titles from the entries' own text, plus the kind tags, paint.
+    assert!(
+        out.contains("refactor the parser"),
+        "user title from first line:\n{out}",
+    );
+    assert!(out.contains("[user]"), "kind tag:\n{out}");
+    assert!(out.contains("[tool]"), "tool kind tag:\n{out}");
+    assert!(out.contains("failed"), "failed status tag:\n{out}");
+}
+
+#[tokio::test]
+async fn turn_outline_keyboard_navigates_and_jumps() {
+    let mut app = app_with_turn_outline();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open outline");
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(
+        app.turn_outline_selected, 0,
+        "cursor starts at the first node"
+    );
+
+    // Down moves the cursor.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(
+        app.turn_outline_selected, 1,
+        "Down advances the node cursor"
+    );
+
+    // Up moves it back.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up moves cursor");
+    assert_eq!(app.turn_outline_selected, 0, "Up retreats the node cursor");
+
+    // Enter jumps to the node's logical row and walks the cursor forward (the
+    // "Enter for next" idiom).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert!(
+        app.status.contains("turn outline"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+    assert_eq!(
+        app.turn_outline_selected, 1,
+        "Enter walks the cursor forward to the next node",
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.turn_outline_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn turn_outline_alt_s_toggles_closed_without_leaking() {
+    let mut app = app_with_turn_outline();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.turn_outline_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.turn_outline_open, "Alt+s toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn turn_outline_mouse_click_selects_and_jumps() {
+    let mut app = app_with_turn_outline();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open outline");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for a registered node-row target — the SECOND row so the click changes
+    // the cursor off 0.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TurnOutlineRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a node row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.turn_outline_selected, 1,
+        "clicking a node row selects exactly that node (no auto-advance)",
+    );
+    assert!(
+        app.status.contains("turn outline"),
+        "click jumps and reports: {}",
+        app.status,
+    );
+    // The overlay stays open (the click jumped within it, not closed it).
+    assert!(app.turn_outline_open);
+}
+
+#[tokio::test]
+async fn turn_outline_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open outline on an empty transcript");
+
+    assert!(app.turn_outline_open);
+    assert!(app.turn_outline.is_empty());
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Turn outline"), "header still paints:\n{out}");
+    assert!(
+        out.contains("No transcript sections"),
+        "empty-state line:\n{out}",
+    );
+
+    // Enter on an empty overlay is a harmless no-op (no panic, nothing jumps).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty outline");
+    assert!(app.turn_outline.is_empty());
+}
+
+#[tokio::test]
+async fn turn_outline_renders_across_resizes() {
+    let mut app = app_with_turn_outline();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open outline");
+
+    // The selected node's logical jump target must survive a resize: capture the
+    // node's entry id before the resize, jump after, and confirm the same id is
+    // still resolvable (ids are width-independent).
+    let first_id = app.turn_outline.get(0).map(|n| n.entry_id);
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Turn outline"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+    assert_eq!(
+        app.turn_outline.get(0).map(|n| n.entry_id),
+        first_id,
+        "the first node's stable id survives every resize",
+    );
+}

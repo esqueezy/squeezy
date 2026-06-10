@@ -145,6 +145,7 @@ mod transcript_health;
 mod transcript_index;
 mod transcript_relations;
 mod transcript_surface;
+mod turn_outline;
 mod wide_block;
 // Visual Diff Dashboard (§12.10.4). `cfg(test)`-gated so the dev-only cell-grid
 // diff / HTML-artifact harness never compiles into a shipped TUI binary; every
@@ -1784,6 +1785,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.duplicate_folds_open
         || app.error_lens_open
         || app.health_markers_open
+        || app.turn_outline_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2436,6 +2438,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::HealthMarkerRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Semantic Turn Outline overlay (§12.2.1) owns the pointer while open: a
+    // left-click on a node row selects it and jumps the main view to the logical
+    // transcript row behind it; every other click is swallowed so a stray press
+    // can't fall through to the surface beneath. Hit-tested in ABSOLUTE screen
+    // coordinates against the row targets `render_turn_outline_surface` registered
+    // this frame.
+    if app.turn_outline_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TurnOutlineRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3706,6 +3727,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // dispatch, so a stray key never leaks into the composer underneath. Sits
     // beside the error-lens overlay at the front for the same reason.
     if app.health_markers_open && handle_health_markers_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Semantic Turn Outline overlay (§12.2.1) is modal while open: it owns the
+    // keyboard (↑↓/kj move the node cursor, Enter/→/l jump to the node's logical
+    // row, Esc/Alt+s close) BEFORE any selection-clear, search, chord, or keymap
+    // dispatch, so a stray key never leaks into the composer underneath. Sits
+    // beside the health-markers overlay at the front for the same reason.
+    if app.turn_outline_open && handle_turn_outline_key(app, key) {
         return Ok(false);
     }
 
@@ -5411,6 +5441,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_health_markers(app);
             true
         }
+        keymap::Action::ToggleTurnOutline => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_turn_outline(app);
+            true
+        }
     }
 }
 
@@ -6135,6 +6175,119 @@ fn health_markers_jump_to_selected(app: &mut TuiApp, advance: bool) {
         app.needs_redraw = true;
     } else {
         app.status = "health markers: could not jump".to_string();
+    }
+}
+
+/// `Alt+s`: toggle the Semantic Turn Outline overlay (§12.2.1). The overlay is a
+/// fullscreen jump-list of the session's structure — one node per transcript
+/// entry (user prompts, assistant answers, tool runs, errors, reasoning, plans,
+/// diffs, subagent breadcrumbs) with a short deterministic title and an ok/failed
+/// status. Opening it refreshes the outline (a no-op rebuild when the transcript
+/// has not changed since the last refresh, so the cost is only paid on a real
+/// change), resets the selection cursor, and confirms via the status line. Sets
+/// `needs_redraw` so the toggle paints immediately.
+fn toggle_turn_outline(app: &mut TuiApp) {
+    app.turn_outline_open = !app.turn_outline_open;
+    if app.turn_outline_open {
+        refresh_turn_outline(app);
+        app.turn_outline_selected = 0;
+        app.status = if app.turn_outline.is_empty() {
+            "turn outline (empty) — Esc to close".to_string()
+        } else {
+            format!(
+                "turn outline: {} — \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                app.turn_outline.summary(),
+            )
+        };
+    } else {
+        app.status = "turn outline closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Semantic Turn Outline overlay (§12.2.1) is open.
+/// Returns `true` when the key was consumed (so it never leaks to the composer or
+/// global keymap). Mirrors the health-markers overlay's before-the-global-keymap
+/// modal consumption: the toggle chord (`Alt+s`) and Esc close; Up/Down (and k/j)
+/// move the node cursor; Enter (and l/→) jumps the main view to the logical
+/// transcript row behind the selected node.
+fn handle_turn_outline_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.turn_outline_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+s` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleTurnOutline) {
+        app.turn_outline_open = false;
+        app.status = "turn outline closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.turn_outline.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.turn_outline_open = false;
+            app.status = "turn outline closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.turn_outline_selected = app.turn_outline_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.turn_outline_selected = (app.turn_outline_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            turn_outline_jump_to_selected(app, true);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the logical transcript row behind the turn-outline
+/// overlay's selected node (§12.2.1). Resolves the node at the cursor, scrolls to
+/// its source entry via the same `jump_to_entry_id` path the index/minimap/jump-
+/// nav use, and reports the kind/title in the status line. A no-op (status hint)
+/// when there is nothing to jump to.
+///
+/// `advance` controls the cursor afterward: the keyboard Enter verb passes `true`
+/// so a *repeated* Enter walks forward through the outline (wrapping at the end) —
+/// the "Enter for next" idiom the status line advertises; the mouse click passes
+/// `false` because a click is a precise pick that should land and stay on exactly
+/// the clicked row.
+fn turn_outline_jump_to_selected(app: &mut TuiApp, advance: bool) {
+    let Some((entry_id, kind)) = app
+        .turn_outline
+        .get(app.turn_outline_selected)
+        .map(|node| (node.entry_id, node.kind))
+    else {
+        app.status = "turn outline: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, entry_id) {
+        let position = app.turn_outline_selected + 1;
+        let total = app.turn_outline.len();
+        app.status = format!(
+            "turn outline {position}/{total} [{}] — Enter for next \u{00b7} Esc close",
+            kind.label(),
+        );
+        // Walk the cursor forward to the next node so a repeated Enter steps
+        // through the whole outline (wrapping). The mouse path skips this so a
+        // click stays put on the row it picked.
+        if advance && let Some(next) = app.turn_outline.next_index(Some(app.turn_outline_selected))
+        {
+            app.turn_outline_selected = next;
+        }
+        app.needs_redraw = true;
+    } else {
+        app.status = "turn outline: could not jump".to_string();
     }
 }
 
@@ -7173,6 +7326,93 @@ fn refresh_health_markers(app: &mut TuiApp) {
         .rebuild_if_stale(fingerprint, &candidates);
 }
 
+/// Fold one transcript entry's primary [`transcript_index::EntryCategory`] (reused
+/// via `index_category_of`, so the outline and the index stay in lock-step) onto
+/// the outline's own [`turn_outline::OutlineKind`]. The category set is a superset
+/// of the outline's kinds, so this is a total mapping.
+fn outline_kind_of(entries: &[TranscriptEntry], index: usize) -> turn_outline::OutlineKind {
+    use transcript_index::EntryCategory;
+    use turn_outline::OutlineKind;
+    match index_category_of(entries, index) {
+        EntryCategory::UserTurn => OutlineKind::UserTurn,
+        EntryCategory::Assistant => OutlineKind::Assistant,
+        EntryCategory::Reasoning => OutlineKind::Reasoning,
+        EntryCategory::ToolCall => OutlineKind::ToolRun,
+        EntryCategory::Error => OutlineKind::Error,
+        EntryCategory::Subagent => OutlineKind::Subagent,
+        EntryCategory::Plan => OutlineKind::Plan,
+        EntryCategory::Diff => OutlineKind::Diff,
+        EntryCategory::Note => OutlineKind::Note,
+    }
+}
+
+/// Derive the raw, deterministic title source for one entry's outline node — the
+/// entry's own first content line / tool name / summary, never a model-generated
+/// summary. Returns an empty string for a title-less entry; the outline model's
+/// `clean_title` then falls back to the kind label honestly. Secret-free: a tool
+/// node is titled by its tool name (and status), never by its raw output.
+fn outline_title_of(entry: &TranscriptEntry) -> String {
+    match &entry.kind {
+        TranscriptEntryKind::Message(item) => item.content.clone(),
+        TranscriptEntryKind::ToolResult(tool) => {
+            // The tool name plus a status suffix when it did not succeed, so a
+            // failed run reads as "shell (error)" — honest, output-free.
+            let name = tool.result.tool_name.clone();
+            let status = match tool.result.status {
+                ToolStatus::Success => return name,
+                ToolStatus::Error => "error",
+                ToolStatus::Denied => "denied",
+                ToolStatus::Stale => "stale",
+                ToolStatus::Cancelled => "cancelled",
+            };
+            format!("{name} ({status})")
+        }
+        TranscriptEntryKind::Reasoning(snapshot) => snapshot.display_text.clone(),
+        TranscriptEntryKind::Log(log) => log.message().to_string(),
+        TranscriptEntryKind::PlanCard(_) => "plan".to_string(),
+        TranscriptEntryKind::Diff(data) => data.summary.clone(),
+        TranscriptEntryKind::SlashEcho(echo) => {
+            if echo.args.trim().is_empty() {
+                format!("/{}", echo.cmd)
+            } else {
+                format!("/{} {}", echo.cmd, echo.args)
+            }
+        }
+    }
+}
+
+/// Build the per-entry classification slice the Semantic Turn Outline (§12.2.1)
+/// consumes from the active transcript. Each entry contributes its stable id,
+/// content revision (so a mutation re-outlines), outline kind, error cross-cut
+/// flag (`entry_is_error`, the same failure predicate the renderer/jump-nav use),
+/// and its deterministic title source. Pure over the entry slice.
+fn build_outline_entries(entries: &[TranscriptEntry]) -> Vec<turn_outline::OutlineEntry> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| turn_outline::OutlineEntry {
+            id: entry.id,
+            revision: entry.revision,
+            kind: outline_kind_of(entries, i),
+            is_error: entry_is_error(entries, i),
+            raw_title: outline_title_of(entry),
+        })
+        .collect()
+}
+
+/// Refresh the Semantic Turn Outline (§12.2.1) against the active transcript,
+/// rebuilding **only** when the entries' (id, revision, kind, error, title)
+/// fingerprint has moved since the last refresh. Called lazily — right before the
+/// outline overlay opens or renders — so an idle session that never opens the
+/// overlay pays nothing, and an open overlay re-outlines only on a real
+/// transcript change (append, stream settle, revision bump, clear, compaction,
+/// fold/filter toggle, resume) rather than every frame.
+fn refresh_turn_outline(app: &mut TuiApp) {
+    let entries = build_outline_entries(active_transcript_entries(app));
+    let fingerprint = turn_outline::OutlineIndex::fingerprint_of(entries.iter());
+    app.turn_outline.rebuild_if_stale(fingerprint, &entries);
+}
+
 /// Compact human label for an entry id used in the recent-jump status readout
 /// (`"#3 user"`, `"#5 tool"`). `None` when the id is no longer live.
 fn jump_mark_entry_label(app: &TuiApp, entry_id: u64) -> Option<String> {
@@ -8147,6 +8387,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::HealthMarkerSelect(index) => {
             app.health_markers_selected = index;
             health_markers_jump_to_selected(app, false);
+        }
+        // A click on a Semantic Turn Outline node row (§12.2.1): move the cursor
+        // onto it and jump the main view to the logical transcript row behind it —
+        // the mouse twin of ↑↓ + Enter, in one go.
+        interaction::Action::TurnOutlineSelect(index) => {
+            app.turn_outline_selected = index;
+            turn_outline_jump_to_selected(app, false);
         }
     }
 }
@@ -13677,6 +13924,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_health_markers_surface(frame, area, app);
         return;
     }
+    // The Semantic Turn Outline overlay (§12.2.1) paints as a fullscreen jump-list
+    // over everything else while open, registering its per-node row click targets
+    // every frame. Checked beside the health-markers overlay so its targets
+    // register and it owns the surface while open.
+    if app.turn_outline_open {
+        render_turn_outline_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -15009,6 +15264,129 @@ fn render_health_markers_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::HealthMarkerRow(index)),
             interaction::Action::HealthMarkerSelect(index),
+        );
+    }
+}
+
+/// Paint the Semantic Turn Outline overlay (§12.2.1) as a centered modal: a
+/// title, a one-line summary/navigation header (or an empty-state line), then one
+/// row per outline node — a `[kind]` tag, a `failed` status tag (color *and* text
+/// label, never color-only) when the node is a failure, and the node's short
+/// deterministic title. Each row is a [`interaction::ChromeKey::TurnOutlineRow`]
+/// click target so a click reaches the same `turn_outline_jump_to_selected` path
+/// as ↑↓+Enter. Reads the already-refreshed outline (kept current by the run loop
+/// while open), so painting is constant-time and does no transcript walk.
+fn render_turn_outline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Turn outline ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} jump by section ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 88, 24, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let count = app.turn_outline.len();
+    // Header: summary + navigation hint, or an empty-state line.
+    let header = if count == 0 {
+        Line::from(Span::styled(
+            "No transcript sections to outline yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                app.turn_outline.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the node count so a node that vanished (e.g. after a
+    // refresh) can never leave the cursor past the end.
+    let selected = app.turn_outline_selected.min(count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    // Scroll the node list so the selected node stays visible when the outline is
+    // taller than the available rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, node) in app
+        .turn_outline
+        .nodes()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
+        let index = offset;
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let caret = if is_selected { "\u{203a} " } else { "  " };
+        // A failed node carries a red `failed` status tag (color *and* text, no
+        // color-only meaning); an ok node leaves the tag column blank.
+        let status_span = match node.status {
+            turn_outline::OutlineStatus::Failed => Span::styled(
+                format!("{:<7} ", node.status.label()),
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            turn_outline::OutlineStatus::Ok => Span::raw(format!("{:<7} ", "")),
+        };
+        let title_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:<13} ", format!("[{}]", node.kind.label())),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            status_span,
+            Span::styled(node.title.clone(), title_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its node-list index so
+        // a click selects + jumps to exactly that node.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::TurnOutlineRow(index)),
+            interaction::Action::TurnOutlineSelect(index),
         );
     }
 }
@@ -26618,6 +26996,22 @@ pub(crate) struct TuiApp {
     /// (§12.5.7). Clamped to the marker count each render. Only meaningful while
     /// the overlay is open.
     pub(crate) health_markers_selected: usize,
+    /// Semantic Turn Outline model (§12.2.1): the navigable structural map of the
+    /// session — one node per transcript entry (user prompts, assistant answers,
+    /// tool runs, errors, reasoning, plans, diffs, subagent breadcrumbs) with a
+    /// short deterministic title and an ok/failed status. Rebuilt incrementally —
+    /// only when the entries' (id, revision) fingerprint moves — by
+    /// `refresh_turn_outline`, so an idle session pays one `u64` comparison per
+    /// refresh. Drives the outline overlay's list and quick-jump navigation.
+    pub(crate) turn_outline: turn_outline::OutlineIndex,
+    /// Whether the Semantic Turn Outline overlay (§12.2.1) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// jump-list owns key/mouse routing. Toggled by the `ToggleTurnOutline` keymap
+    /// action.
+    pub(crate) turn_outline_open: bool,
+    /// Cursor into the turn-outline overlay's list of nodes (§12.2.1). Clamped to
+    /// the node count each render. Only meaningful while the overlay is open.
+    pub(crate) turn_outline_selected: usize,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -27196,6 +27590,9 @@ impl TuiApp {
             health_markers: transcript_health::HealthMarkers::new(),
             health_markers_open: false,
             health_markers_selected: 0,
+            turn_outline: turn_outline::OutlineIndex::new(),
+            turn_outline_open: false,
+            turn_outline_selected: 0,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -29425,6 +29822,14 @@ impl TerminalGuard {
         // (this branch is skipped entirely).
         if app.health_markers_open {
             refresh_health_markers(app);
+        }
+
+        // Keep the Semantic Turn Outline (§12.2.1) current while its overlay is
+        // open, on the same no-op-when-unchanged terms: an open-but-idle overlay
+        // costs one `u64` comparison and a closed overlay costs nothing (this
+        // branch is skipped entirely).
+        if app.turn_outline_open {
+            refresh_turn_outline(app);
         }
 
         let paint = self.paint_one_frame(app);

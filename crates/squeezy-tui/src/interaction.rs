@@ -139,6 +139,10 @@ pub(crate) enum ChromeKey {
     /// keyed by its 0-based index in the detected-marker list so a click selects
     /// + jumps to the entry behind exactly that marker.
     HealthMarkerRow(usize),
+    /// A node row in the Semantic Turn Outline overlay (§12.2.1), keyed by its
+    /// 0-based index in the outline-node list so a click selects + jumps the main
+    /// view to the logical transcript row behind exactly that node.
+    TurnOutlineRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -263,6 +267,11 @@ pub(crate) enum Action {
     /// entry behind it. Mouse twin of moving the cursor with ↑↓ and pressing
     /// Enter; a click both selects and jumps in one go.
     HealthMarkerSelect(usize),
+    /// Select the given node row in the Semantic Turn Outline overlay (§12.2.1):
+    /// move the cursor onto it and jump the main view to the logical transcript
+    /// row behind it. Mouse twin of moving the cursor with ↑↓ and pressing Enter;
+    /// a click both selects and jumps in one go.
+    TurnOutlineSelect(usize),
 }
 
 impl Action {
@@ -305,6 +314,7 @@ impl Action {
         Action::DuplicateFoldSelect(0),
         Action::ErrorLensSelect(0),
         Action::HealthMarkerSelect(0),
+        Action::TurnOutlineSelect(0),
     ];
 }
 

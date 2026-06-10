@@ -237,6 +237,14 @@ pub(crate) enum Action {
     /// model rebuilds incrementally only on a transcript revision bump, so an
     /// idle session pays nothing.
     ToggleHealthMarkers,
+    /// Open / close the Semantic Turn Outline overlay (`Alt+s` default; §12.2.1).
+    /// A navigable structural map of the session — user prompts, assistant
+    /// answers, tool runs, errors, reasoning, plans, diffs, and subagent
+    /// breadcrumbs — each with a short deterministic title; keyboard/mouse
+    /// navigation jumps the main view to the logical transcript row of the
+    /// selected node. The outline rebuilds incrementally only on a transcript
+    /// revision bump, so an idle session pays nothing.
+    ToggleTurnOutline,
 }
 
 impl Action {
@@ -291,6 +299,7 @@ impl Action {
             Self::ToggleDuplicateFolds => "toggle_duplicate_folds",
             Self::ToggleErrorLens => "toggle_error_lens",
             Self::ToggleHealthMarkers => "toggle_health_markers",
+            Self::ToggleTurnOutline => "toggle_turn_outline",
         }
     }
 
@@ -344,6 +353,7 @@ impl Action {
         Action::ToggleDuplicateFolds,
         Action::ToggleErrorLens,
         Action::ToggleHealthMarkers,
+        Action::ToggleTurnOutline,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -445,6 +455,9 @@ impl Action {
             // Transcript-Health-Markers overlay toggle is `Alt+n` — the same
             // Meta/Alt encoding case as the rest of the nav/overlay family.
             | Self::ToggleHealthMarkers
+            // Semantic-Turn-Outline overlay toggle is `Alt+s` — the same Meta/Alt
+            // encoding case as the rest of the nav/overlay family.
+            | Self::ToggleTurnOutline
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -612,6 +625,9 @@ impl Action {
             // (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x) are taken; `n` is free and
             // stays clear of the composer chords.
             Self::ToggleHealthMarkers => KeyBinding::new(KeyCode::Char('n'), KeyModifiers::ALT),
+            // Semantic Turn Outline (§12.2.1). `Alt+s` ("structure"/"semantic
+            // outline"); `s` is free among the overlay Alt letters.
+            Self::ToggleTurnOutline => KeyBinding::new(KeyCode::Char('s'), KeyModifiers::ALT),
         }
     }
 }
