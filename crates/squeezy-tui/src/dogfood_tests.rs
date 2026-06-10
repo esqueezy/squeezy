@@ -257,9 +257,8 @@ fn jsonl_line_carries_the_schema_version_and_is_a_single_object() {
 fn flush_jsonl_is_a_noop_until_a_path_is_set() {
     let m = TuiMetrics::default();
     assert!(!m.jsonl_enabled(), "persistence is opt-in / off by default");
-    assert_eq!(
-        m.flush_jsonl().expect("noop flush"),
-        false,
+    assert!(
+        !m.flush_jsonl().expect("noop flush"),
         "no path → no write, no error"
     );
 }
@@ -333,7 +332,7 @@ fn emergency_teardown_counter_is_process_wide_and_monotonic() {
     record_emergency_teardown();
     let after = TuiMetrics::default().record().emergency_teardowns;
     assert!(
-        after >= before + 1,
+        after > before,
         "a recorded emergency teardown is visible in the snapshot ({before} -> {after})"
     );
 }
