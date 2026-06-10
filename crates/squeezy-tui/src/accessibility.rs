@@ -596,6 +596,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // (`jump_to_entry_id`); `JumpNextUserTurn` (Alt+Down default) is the
         // representative keyboard verb.
         A::MinimapJump(_) => KeyboardPath::Keymap(Action::JumpNextUserTurn),
+        // Large-paste confirm/cancel — the paste-preview modal's own key
+        // handler owns Enter/`y` (confirm) and Esc/`n` (cancel) before the
+        // global keymap sees them, so both reach the same `resolve_paste_preview`
+        // handler the buttons click.
+        A::ConfirmPaste => KeyboardPath::Always("paste modal Enter/y"),
+        A::CancelPaste => KeyboardPath::Always("paste modal Esc/n"),
     })
 }
 

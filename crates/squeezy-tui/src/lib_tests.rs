@@ -22601,3 +22601,359 @@ fn empty_transcript_soft_wrap_toggle_is_a_safe_noop_render() {
     let painted = render_to_string(&app, 80, 24);
     assert!(!painted.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Large Paste Preview (§11G.6)
+// ---------------------------------------------------------------------------
+
+/// A string guaranteed to trip the very-large-paste safety gate.
+fn very_large_paste_text() -> String {
+    "x".repeat(paste_preview::VERY_LARGE_PASTE_CHAR_THRESHOLD + 5_000)
+}
+
+#[tokio::test]
+async fn very_large_paste_opens_the_confirmation_modal_instead_of_inserting() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    let pasted = very_large_paste_text();
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("paste");
+
+    // The modal is parked; the composer is still empty (nothing entered yet).
+    assert!(
+        app.paste_preview.is_some(),
+        "a very large paste should open the confirmation modal"
+    );
+    assert!(
+        app.input.is_empty(),
+        "no pending text should reach the composer before confirmation"
+    );
+    assert!(
+        app.prompt_attachments.is_empty(),
+        "no attachment should be created before confirmation"
+    );
+}
+
+#[tokio::test]
+async fn merely_large_paste_skips_the_modal_and_attaches_as_before() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Over the attachment threshold but under the very-large preview gate.
+    let pasted = "y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 50);
+    assert!(!paste_preview::is_very_large_paste(&pasted));
+    handle_paste(&mut app, &mut agent, pasted)
+        .await
+        .expect("paste");
+
+    assert!(
+        app.paste_preview.is_none(),
+        "a merely-large paste must not open the preview modal"
+    );
+    assert!(
+        !app.prompt_attachments.is_empty(),
+        "a merely-large paste still becomes a [Pasted text] attachment"
+    );
+}
+
+#[tokio::test]
+async fn small_paste_types_inline_without_a_modal() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "hello world".to_string())
+        .await
+        .expect("paste");
+
+    assert!(app.paste_preview.is_none());
+    assert_eq!(app.input, "hello world");
+    assert!(app.prompt_attachments.is_empty());
+}
+
+#[tokio::test]
+async fn enter_confirms_the_large_paste_into_the_composer() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    let pasted = very_large_paste_text();
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("paste");
+    assert!(app.paste_preview.is_some());
+
+    // Keyboard confirm: the modal closes and the pending text lands (as an
+    // attachment, since it is well over the attachment threshold).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_preview.is_none(), "Enter closes the modal");
+    assert_eq!(
+        app.prompt_attachments.len(),
+        1,
+        "confirming inserts the pending text as one attachment"
+    );
+    // The attachment carries the exact pasted text verbatim.
+    match &app.prompt_attachments[0].payload {
+        PromptAttachmentPayload::Text { replacement, kind } => {
+            assert_eq!(*kind, PromptTextAttachmentKind::PastedText);
+            assert_eq!(replacement, &pasted);
+        }
+        other => panic!("expected a pasted-text attachment, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn esc_cancels_the_large_paste_and_discards_it() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+    assert!(app.paste_preview.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+
+    assert!(app.paste_preview.is_none(), "Esc closes the modal");
+    assert!(
+        app.input.is_empty() && app.prompt_attachments.is_empty(),
+        "cancelling discards the paste entirely"
+    );
+    assert_eq!(app.status, "paste discarded");
+}
+
+#[tokio::test]
+async fn stray_keys_do_not_dismiss_or_leak_through_the_paste_modal() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+    assert!(app.paste_preview.is_some());
+
+    // A normal character keystroke is swallowed: the modal stays open and the
+    // composer does NOT receive the character.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("char");
+
+    assert!(
+        app.paste_preview.is_some(),
+        "an unrelated key must not dismiss the modal"
+    );
+    assert!(
+        app.input.is_empty(),
+        "an unrelated key must not leak into the composer while the modal is open"
+    );
+}
+
+#[tokio::test]
+async fn y_and_n_shortcuts_confirm_and_cancel_the_paste() {
+    let mut agent = test_agent(SessionMode::Build);
+
+    // `y` confirms.
+    let mut app = test_app(SessionMode::Build);
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("y");
+    assert!(app.paste_preview.is_none());
+    assert_eq!(app.prompt_attachments.len(), 1, "y confirms the paste");
+
+    // `n` cancels.
+    let mut app = test_app(SessionMode::Build);
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("n");
+    assert!(app.paste_preview.is_none());
+    assert!(app.prompt_attachments.is_empty(), "n discards the paste");
+}
+
+#[tokio::test]
+async fn paste_preview_modal_renders_summary_and_buttons() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+
+    // Drive the real render() through a TestBackend and assert the modal chrome
+    // is on screen: the title, the size summary, and both buttons.
+    let painted = render_to_string(&app, 110, 30);
+    assert!(
+        painted.contains("Large paste"),
+        "the modal title should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("chars"),
+        "the size summary should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("Accept"),
+        "the accept button should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("Discard"),
+        "the discard button should paint:\n{painted}"
+    );
+}
+
+#[tokio::test]
+async fn clicking_accept_button_confirms_the_paste() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    let pasted = very_large_paste_text();
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("paste");
+
+    // Render once so the button click rects are registered for this frame.
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    // Find the Accept button's painted cell and click it. The modal is centered
+    // in a 110x30 frame; locate "Accept" in the buffer to get a real cell.
+    let buffer = terminal.backend().buffer().clone();
+    let (col, row) = find_text_cell(&buffer, "Accept").expect("Accept button on screen");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.paste_preview.is_none(),
+        "clicking Accept closes the modal"
+    );
+    assert_eq!(
+        app.prompt_attachments.len(),
+        1,
+        "clicking Accept inserts the pending text"
+    );
+}
+
+#[tokio::test]
+async fn clicking_discard_button_cancels_the_paste() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    let (col, row) = find_text_cell(&buffer, "Discard").expect("Discard button on screen");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.paste_preview.is_none(),
+        "clicking Discard closes the modal"
+    );
+    assert!(
+        app.prompt_attachments.is_empty() && app.input.is_empty(),
+        "clicking Discard drops the paste"
+    );
+}
+
+#[tokio::test]
+async fn click_outside_the_paste_buttons_is_swallowed_not_leaked() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    // Click the very top-left corner, well clear of either button: the modal
+    // owns the pointer, so the click is consumed and the modal stays open.
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the open modal must consume the click");
+    assert!(
+        app.paste_preview.is_some(),
+        "a click off the buttons leaves the decision pending"
+    );
+}
+
+#[tokio::test]
+async fn paste_preview_modal_survives_a_tiny_terminal() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, very_large_paste_text())
+        .await
+        .expect("paste");
+
+    // Render across a range of sizes, including a degenerate one, to prove the
+    // modal layout never panics on resize where the feature paints.
+    for (w, h) in [(110u16, 30u16), (40, 12), (8, 4), (1, 1)] {
+        let painted = render_to_string(&app, w, h);
+        assert!(
+            !painted.is_empty(),
+            "render must produce a frame at {w}x{h}"
+        );
+    }
+    // The modal is still pending after all those renders (rendering is pure).
+    assert!(app.paste_preview.is_some());
+}

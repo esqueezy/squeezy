@@ -91,6 +91,10 @@ pub(crate) enum ChromeKey {
     JumpToLatest,
     /// The main-view scrollbar gutter.
     ScrollbarGutter,
+    /// The "Accept" button in the large-paste confirmation modal (§11G.6).
+    PasteConfirm,
+    /// The "Discard" button in the large-paste confirmation modal (§11G.6).
+    PasteCancel,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -142,6 +146,12 @@ pub(crate) enum Action {
     /// the top of the viewport. Keyed by the cell's [`EntryId`] so a resize
     /// re-registers the same target at a fresh rail cell.
     MinimapJump(EntryId),
+    /// Confirm the pending large paste in the confirmation modal (§11G.6),
+    /// inserting it into the composer. Mouse twin of the modal's Enter/`y` key.
+    ConfirmPaste,
+    /// Cancel the pending large paste in the confirmation modal (§11G.6),
+    /// discarding it. Mouse twin of the modal's Esc/`n` key.
+    CancelPaste,
 }
 
 impl Action {
@@ -167,6 +177,8 @@ impl Action {
         Action::JumpToLatest,
         Action::ScrollbarJump,
         Action::MinimapJump(EntryId(0)),
+        Action::ConfirmPaste,
+        Action::CancelPaste,
     ];
 }
 

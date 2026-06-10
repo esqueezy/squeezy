@@ -105,6 +105,7 @@ mod minimap;
 mod modal;
 mod notification;
 mod overlay;
+mod paste_preview;
 mod prompt_history;
 mod prompt_queue;
 mod proposed_plan;
@@ -1745,6 +1746,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.config_screen.is_some()
         || app.status_line_setup.is_some()
         || app.overlay.is_some()
+        || app.paste_preview.is_some()
         || app.transcript_overlay.is_some()
     {
         return false;
@@ -2219,6 +2221,27 @@ async fn handle_input_event(
 }
 
 fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
+    // The large-paste confirmation modal (§11G.6) owns the pointer while open:
+    // a left-click on its Accept/Discard buttons resolves the decision, and any
+    // other click is swallowed so a stray press can't fall through to the
+    // transcript underneath. Hit-tested in ABSOLUTE screen coordinates (the
+    // modal paints fullscreen, not footer-relative) against the chrome targets
+    // `render_paste_preview_surface` registered this frame.
+    if app.paste_preview.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((interaction::TargetKey::Chrome(key), action)) =
+                app.click_target_at(mouse.column, mouse.row)
+            && matches!(
+                key,
+                interaction::ChromeKey::PasteConfirm | interaction::ChromeKey::PasteCancel
+            )
+        {
+            dispatch_click_action(app, action);
+        }
+        // Modal is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
     if let Some(changed) = handle_transcript_overlay_mouse(app, mouse) {
         return changed;
     }
@@ -3351,6 +3374,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
+    // The large-paste confirmation modal (§11G.6) is fully modal: while it is
+    // open it owns the keyboard outright (Enter / y confirm, Esc / n cancel)
+    // BEFORE any selection-clear, search, pin-picker, chord, or keymap dispatch
+    // can claim a key. A stray keystroke must not slip a half-confirmed paste
+    // into the composer, so this guard sits at the very front.
+    if app.paste_preview.is_some() && handle_paste_preview_key(app, key) {
+        return Ok(false);
+    }
+
     // Esc clears an active visual selection BEFORE the turn-interrupt / bare-Esc
     // no-op below: a first Esc drops the selection, only a second reaches the
     // interrupt. Selection is MAIN-view only (the overlay/statusline/queue
@@ -3869,6 +3901,25 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
         return Ok(());
     }
 
+    // Paste safety (§11G.6): a *very* large block does not silently enter the
+    // composer. Instead it parks in a confirm/cancel modal that shows a bounded
+    // preview + size stats; the user explicitly confirms (insert) or cancels
+    // (discard). Smaller pastes (including the merely-large ones that become a
+    // `[Pasted text #N]` attachment) keep flowing straight through below.
+    if paste_preview::is_very_large_paste(&normalized) {
+        open_paste_preview(app, normalized);
+        return Ok(());
+    }
+
+    commit_pasted_text(app, normalized);
+    Ok(())
+}
+
+/// Insert a paste that has cleared the safety gate into the composer: the
+/// merely-large branch becomes (or re-expands into) a `[Pasted text #N]`
+/// attachment token, everything else types inline. Shared by the immediate
+/// paste path and the paste-preview confirm path so both behave identically.
+fn commit_pasted_text(app: &mut TuiApp, normalized: String) {
     if is_large_prompt_paste(&normalized) {
         if expand_duplicate_paste_at_cursor(app, &normalized) {
             app.status = "expanded pasted text".to_string();
@@ -3879,7 +3930,68 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     } else {
         insert_input_text(app, &normalized);
     }
-    Ok(())
+}
+
+/// Park a very large paste in the confirmation modal. The text does not touch
+/// the composer until the user confirms; cancelling discards it.
+fn open_paste_preview(app: &mut TuiApp, normalized: String) {
+    let preview = paste_preview::PastePreview::new(normalized);
+    app.status = format!(
+        "large paste · {} · Enter accept · Esc discard",
+        preview.summary()
+    );
+    app.paste_preview = Some(preview);
+    app.needs_redraw = true;
+}
+
+/// Resolve the open paste-preview modal with `decision`. On confirm the pending
+/// text runs through the normal insertion path ([`commit_pasted_text`]); on
+/// cancel it is discarded. A no-op when no preview is open. Returns `true` when
+/// a modal was actually resolved (so the caller can mark the key consumed).
+fn resolve_paste_preview(app: &mut TuiApp, decision: paste_preview::PasteDecision) -> bool {
+    let Some(preview) = app.paste_preview.take() else {
+        return false;
+    };
+    match decision {
+        paste_preview::PasteDecision::Confirm => {
+            commit_pasted_text(app, preview.into_text());
+        }
+        paste_preview::PasteDecision::Cancel => {
+            app.status = "paste discarded".to_string();
+        }
+    }
+    app.needs_redraw = true;
+    true
+}
+
+/// Keyboard handler for the open large-paste confirmation modal. Enter (or `y`)
+/// confirms and inserts the pending text; Esc (or `n`) cancels and discards it.
+/// Every other key is swallowed so the modal stays fully modal — no keystroke
+/// leaks into the composer or any other surface while a paste decision is
+/// pending. Returns `true` when the key was consumed (always, while open),
+/// which is the keyboard twin of clicking the modal's two buttons.
+fn handle_paste_preview_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.paste_preview.is_none() {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            resolve_paste_preview(app, paste_preview::PasteDecision::Confirm);
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            resolve_paste_preview(app, paste_preview::PasteDecision::Confirm);
+        }
+        KeyCode::Esc => {
+            resolve_paste_preview(app, paste_preview::PasteDecision::Cancel);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            resolve_paste_preview(app, paste_preview::PasteDecision::Cancel);
+        }
+        // Hold the modal open for any other key — it must be resolved
+        // explicitly, never dismissed by a stray keystroke.
+        _ => {}
+    }
+    true
 }
 
 fn insert_pasted_image_path_token(app: &mut TuiApp, text: &str) -> Option<String> {
@@ -5371,6 +5483,15 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             if jump_to_entry_id(app, id.0) {
                 app.needs_redraw = true;
             }
+        }
+        // Large-paste confirmation modal buttons (§11G.6). Both route through
+        // the same `resolve_paste_preview` the keyboard path uses, so the
+        // mouse and Enter/Esc verbs are identical by construction.
+        interaction::Action::ConfirmPaste => {
+            resolve_paste_preview(app, paste_preview::PasteDecision::Confirm);
+        }
+        interaction::Action::CancelPaste => {
+            resolve_paste_preview(app, paste_preview::PasteDecision::Cancel);
         }
     }
 }
@@ -8691,6 +8812,7 @@ fn prompt_queue_drain_blocked(app: &TuiApp) -> bool {
         || app.status_line_setup.is_some()
         || app.transcript_overlay.is_some()
         || app.overlay.is_some()
+        || app.paste_preview.is_some()
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
         || app.pending_request_user_input.is_some()
@@ -10155,6 +10277,15 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
 fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
+    // The large-paste confirmation modal (§11G.6) wins over every other surface
+    // while it is open: a paste decision is pending and the user must resolve it
+    // before anything else. It only ever opens from the main composer (config /
+    // overlay surfaces route paste elsewhere), but checking it first keeps the
+    // contract unambiguous and registers its click targets every frame.
+    if let Some(preview) = app.paste_preview.as_ref() {
+        render_paste_preview_surface(frame, area, app, preview);
+        return;
+    }
     if app.transcript_overlay.is_some() {
         render_transcript_overlay_surface(frame, area, app);
         return;
@@ -10245,6 +10376,136 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
     render_toast_overlay(frame, area, app);
+}
+
+/// Render the large-paste confirmation modal (§11G.6) over the whole frame.
+///
+/// Lays out a centered bordered modal (via the shared [`modal::surface`])
+/// containing: a one-line summary header (chars · lines · bytes), a bounded
+/// preview body (clipped head window + "+N more lines" marker), and an
+/// `[ Accept ]` / `[ Discard ]` button row whose rects are registered as
+/// [`interaction::ChromeKey::PasteConfirm`] / `PasteCancel` click targets so the
+/// mouse path has the same reach as the Enter/Esc keyboard verbs. The button
+/// rects are registered in absolute screen coordinates because the modal paints
+/// fullscreen (not footer-relative), matching the hit-test in [`handle_mouse`].
+fn render_paste_preview_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    preview: &paste_preview::PastePreview,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Large paste ",
+            Style::default()
+                .fg(crate::render::theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "— confirm before it enters the composer ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    // Cap the modal so it stays readable on big terminals but shrinks to fit
+    // small ones (the shared `centered` clamps to the frame).
+    let inner = modal::surface(frame, area, 100, 20, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Reserve the last inner row for the button strip, the second-to-last as a
+    // gap; the rest is the header line plus the preview body. Solver-free split
+    // so a one-row terminal still degrades gracefully.
+    let body_height = inner.height.saturating_sub(2);
+    let body = Rect {
+        height: body_height,
+        ..inner
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        preview.summary(),
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::raw("")));
+    for raw in preview.preview_lines(inner.width as usize) {
+        lines.push(Line::from(Span::styled(
+            raw,
+            Style::default().fg(crate::render::theme::foreground()),
+        )));
+    }
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().fg(crate::render::theme::quiet()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, body);
+
+    render_paste_preview_buttons(frame, inner, app);
+}
+
+/// Paint the `[ Accept ]` / `[ Discard ]` button strip on the modal's bottom
+/// inner row and register each button's rect as a click target. Split out so
+/// the layout math (button labels, spacing, the registered rects) is one place
+/// the mouse hit-test and the rendered glyphs cannot drift.
+fn render_paste_preview_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
+    const ACCEPT: &str = "[ Accept (Enter) ]";
+    const DISCARD: &str = "[ Discard (Esc) ]";
+    let row = inner.y + inner.height.saturating_sub(1);
+
+    let accent = crate::render::theme::warn();
+    let quiet = crate::render::theme::quiet();
+    let strip = Line::from(vec![
+        Span::styled(
+            ACCEPT,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(DISCARD, Style::default().fg(quiet)),
+    ]);
+    let strip_rect = Rect {
+        x: inner.x,
+        y: row,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(strip), strip_rect);
+
+    // Register click rects matching where the spans landed (left-aligned at the
+    // inner-left edge). Clamp every rect to the inner width so a narrow modal
+    // never registers a target off-surface.
+    let accept_w = (ACCEPT.chars().count() as u16).min(inner.width);
+    let accept_rect = Rect {
+        x: inner.x,
+        y: row,
+        width: accept_w,
+        height: 1,
+    };
+    app.register_click(
+        accept_rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::PasteConfirm),
+        interaction::Action::ConfirmPaste,
+    );
+
+    let discard_x = inner.x.saturating_add(accept_w).saturating_add(2);
+    if discard_x < inner.x.saturating_add(inner.width) {
+        let remaining = inner
+            .x
+            .saturating_add(inner.width)
+            .saturating_sub(discard_x);
+        let discard_w = (DISCARD.chars().count() as u16).min(remaining);
+        let discard_rect = Rect {
+            x: discard_x,
+            y: row,
+            width: discard_w,
+            height: 1,
+        };
+        app.register_click(
+            discard_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::PasteCancel),
+            interaction::Action::CancelPaste,
+        );
+    }
 }
 
 /// Overlay the corner-toast stack on the top-right of `area`. Each visible
@@ -20969,6 +21230,13 @@ pub(crate) struct TuiApp {
     /// handle pattern can distinguish "my dialog is still open" from
     /// "someone else replaced my dialog".
     pub(crate) overlay_active_id: Option<u64>,
+    /// Pending very-large paste awaiting confirmation (§11G.6). `Some` while the
+    /// paste-preview modal is open: bracketed paste captured a block over
+    /// [`paste_preview::VERY_LARGE_PASTE_CHAR_THRESHOLD`] characters and is
+    /// showing it for confirm/cancel before any of it enters the composer.
+    /// `None` the rest of the time, so it is a zero-cost slot when no oversized
+    /// paste is in flight.
+    pub(crate) paste_preview: Option<paste_preview::PastePreview>,
     /// Full-screen transcript overlay (Ctrl+T) that renders every entry
     /// in its uncapped form. `None` = closed; `Some(state)` = open with
     /// a scroll offset. Acts as the escape hatch from the aggressive
@@ -21634,6 +21902,7 @@ impl TuiApp {
             overlay: None,
             overlay_next_id: 0,
             overlay_active_id: None,
+            paste_preview: None,
             transcript_overlay: None,
             transcript_overlay_scrollbar_cache: std::cell::Cell::new(None),
             transcript_overlay_render_cache: std::cell::RefCell::new(
