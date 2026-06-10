@@ -101,6 +101,7 @@ mod main_render_cache;
 mod mcp_settings_edit;
 mod mention;
 mod metrics;
+mod minimap;
 mod modal;
 mod notification;
 mod overlay;
@@ -2258,6 +2259,23 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         let (line_count, viewport_h) = active_transcript_geometry(app);
         let before = active_transcript_scroll(app);
         active_transcript_scroll_mut(app).set_from_bottom(from_bottom, line_count, viewport_h);
+        return active_transcript_scroll(app) != before;
+    }
+
+    // Minimap turn-rail cell: a left-click jumps the transcript so the entry
+    // behind the cell sits at the top. Hit-tested in ABSOLUTE screen coordinates
+    // (the rail column is not footer-relative) against the `MinimapJump` targets
+    // `render_minimap_rail` registered this frame. Handled here — BEFORE the
+    // card-affordance block below — because the rail keys its cells as
+    // `Entry(id)` and that block would otherwise route them into the
+    // fold/focus/selection path instead of a jump. The rail column sits right of
+    // the text area, so it never overlaps a card-header target.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((_key, action @ interaction::Action::MinimapJump(_))) =
+            app.click_target_at(mouse.column, mouse.row)
+    {
+        let before = active_transcript_scroll(app);
+        dispatch_click_action(app, action);
         return active_transcript_scroll(app) != before;
     }
 
@@ -4498,7 +4516,30 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             jump_to_jump_mark(app);
             true
         }
+        keymap::Action::ToggleMinimap => {
+            // Main-surface chrome; the config/setup screens own their own
+            // routing and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_minimap(app);
+            true
+        }
     }
+}
+
+/// `Alt+r`: toggle the minimap turn rail on the main view. The rail is a render
+/// element, so flipping the flag is all that is needed; the next frame paints
+/// (or stops painting) it. Sets a status confirming the new state.
+fn toggle_minimap(app: &mut TuiApp) {
+    app.show_minimap = !app.show_minimap;
+    app.status = if app.show_minimap {
+        "minimap rail on — click a tick to jump (Alt+r to hide)".to_string()
+    } else {
+        "minimap rail off".to_string()
+    };
+    app.needs_redraw = true;
 }
 
 /// The category of transcript entry a jump command targets.
@@ -5184,6 +5225,15 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // by the render paths; their handlers land with the affordances that
         // register them. Until then these arms are inert (no panic).
         interaction::Action::ScrollbarJump | interaction::Action::JumpToLatest => {}
+        // Minimap turn-rail cell click: jump so the entry behind the cell sits
+        // at the top of the viewport. Reuses the keyboard jump path
+        // (`jump_to_entry_id`), so mouse/keyboard parity holds by construction.
+        // A cell whose entry has since been dropped resolves to no-op.
+        interaction::Action::MinimapJump(id) => {
+            if jump_to_entry_id(app, id.0) {
+                app.needs_redraw = true;
+            }
+        }
     }
 }
 
@@ -10991,10 +11041,15 @@ fn register_transcript_card_targets(
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
+    // When the minimap turn rail is on, carve its 1-cell column off the right
+    // edge BEFORE the scrollbar split, so the rail sits just left of the
+    // scrollbar gutter and the text wraps one column narrower. Off (or too thin
+    // to host both a rail and a gutter) leaves the layout exactly as it was.
+    let (body_area, rail_area) = transcript_main_body_and_rail_areas(area, app.show_minimap);
     // Reserve a 1-cell right gutter for the scrollbar; the text wraps to the
     // narrower column. When the area is too thin to split, fall back to the
     // full width with no gutter.
-    let (text_area, scrollbar_area) = transcript_main_text_and_scrollbar_areas(area);
+    let (text_area, scrollbar_area) = transcript_main_text_and_scrollbar_areas(body_area);
     // Stamp the live text width so an off-frame copy/export rebuilds the row
     // model at the real painted width (see `copy_transcript_scope`).
     app.main_text_width.set(text_area.width);
@@ -11094,6 +11149,168 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     let logical_from_bottom = state.offset_from_bottom(total_rows, viewport_h);
     if logical_from_bottom > 0 {
         render_scrolled_indicator(frame, text_area, app, logical_from_bottom);
+    }
+
+    // Minimap turn rail in its reserved column (when toggled on). Painted last
+    // so it draws over the body; it registers one frame-local hit target per
+    // occupied cell so a click jumps to that turn (keyboard parity via the
+    // jump-nav keys). The window math mirrors the scrollbar/card paths so the
+    // rail's viewport band tracks what is actually on screen.
+    if let Some(rail_area) = rail_area {
+        let top_row = scroll_offset_for_from_bottom(from_bottom, total_rows, viewport_h);
+        render_minimap_rail(
+            frame,
+            rail_area,
+            app,
+            include_startup_card,
+            total_rows,
+            top_row,
+            viewport_h,
+        );
+    }
+}
+
+/// Split the transcript `area` into a body (text + scrollbar) and an optional
+/// 1-cell minimap rail column on the right edge. Returns `(body, Some(rail))`
+/// when the rail is enabled and there is room for BOTH the rail and the
+/// scrollbar gutter the body still wants (`width >= 3`); otherwise the rail is
+/// dropped and the body keeps the whole `area`. Keeping the rail off the body
+/// means the body's own text/scrollbar split is unchanged from the no-rail
+/// layout (the text simply wraps one column narrower).
+fn transcript_main_body_and_rail_areas(area: Rect, show_minimap: bool) -> (Rect, Option<Rect>) {
+    if !show_minimap || area.width < 3 || area.height == 0 {
+        return (area, None);
+    }
+    let body = Rect {
+        width: area.width - 1,
+        ..area
+    };
+    let rail = Rect {
+        x: area.x + area.width - 1,
+        y: area.y,
+        width: 1,
+        height: area.height,
+    };
+    (body, Some(rail))
+}
+
+/// Collect the per-entry rail contributions for the minimap, in transcript
+/// order. `entry_offsets[i]` is entry `i`'s wrapped-row header offset (the unit
+/// the rail projects vertically). Each entry is classified into a
+/// [`minimap::RailMarker`] reusing the SAME jump-target/error classifiers the
+/// jump-nav and overlay filters use, so the rail agrees with what those land on.
+fn minimap_rail_entries(app: &TuiApp, entry_offsets: &[usize]) -> Vec<minimap::RailEntry> {
+    let entries = active_transcript_entries(app);
+    let coalesce = app.coalesce_tool_runs;
+    let mut out = Vec::with_capacity(entry_offsets.len().min(entries.len()));
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(&row_offset) = entry_offsets.get(i) else {
+            break;
+        };
+        // Error wins the classification (a failed tool is an error first).
+        let marker = if entry_is_error(entries, i) {
+            minimap::RailMarker::Error
+        } else if entry_matches_jump_target(entries, i, JumpTarget::UserTurn, coalesce) {
+            minimap::RailMarker::UserTurn
+        } else if entry_matches_jump_target(entries, i, JumpTarget::ToolCall, coalesce) {
+            minimap::RailMarker::ToolCall
+        } else {
+            minimap::RailMarker::Other
+        };
+        out.push(minimap::RailEntry {
+            entry_id: entry.id,
+            marker,
+            row_offset,
+        });
+    }
+    out
+}
+
+/// Paint the minimap turn rail into its reserved 1-cell `rail_area` column and
+/// register a frame-local hit target per occupied cell.
+///
+/// Each occupied cell paints its marker glyph (user turn / tool call / error /
+/// other) in the marker's color; the cells inside the current viewport band are
+/// drawn bold, and every other rail row paints a quiet `│` track. A click on an
+/// occupied cell dispatches [`interaction::Action::MinimapJump`] for that cell's
+/// entry id (resolved against the live transcript at click time), so the rail is
+/// clickable when mouse capture is on and the same jump is reachable from the
+/// keyboard via the jump-nav keys.
+fn render_minimap_rail(
+    frame: &mut Frame<'_>,
+    rail_area: Rect,
+    app: &TuiApp,
+    include_startup_card: bool,
+    total_rows: usize,
+    top_row: usize,
+    viewport_h: usize,
+) {
+    if rail_area.width == 0 || rail_area.height == 0 {
+        return;
+    }
+    let (_lines, entry_offsets) =
+        transcript_lines_and_entry_offsets(app, Some(rail_area.width), include_startup_card);
+    let rail_entries = minimap_rail_entries(app, &entry_offsets);
+    let layout = minimap::build_layout(
+        &rail_entries,
+        total_rows,
+        top_row,
+        viewport_h,
+        rail_area.height,
+    );
+
+    let track_style = Style::default().fg(crate::render::theme::quiet());
+    let mut lines: Vec<Line> = Vec::with_capacity(usize::from(rail_area.height));
+    for row in 0..rail_area.height {
+        let in_viewport = layout.row_in_viewport(row);
+        let line = match layout.cell_at(row) {
+            Some(cell) => {
+                let mut style = Style::default().fg(minimap_marker_color(cell.marker));
+                if in_viewport {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                // Register the cell as a clickable jump target keyed by entry id
+                // so resize re-registers the same target at a fresh cell.
+                let id = transcript_surface::EntryId(cell.entry_id);
+                app.register_click(
+                    Rect {
+                        x: rail_area.x,
+                        y: rail_area.y + row,
+                        width: 1,
+                        height: 1,
+                    },
+                    interaction::TargetKey::Entry(id),
+                    interaction::Action::MinimapJump(id),
+                );
+                Line::from(Span::styled(cell.marker.glyph(), style))
+            }
+            None => {
+                // Quiet track; the viewport band is brightened so the user can
+                // see where they are even on a run of unmarked rows.
+                let style = if in_viewport {
+                    Style::default()
+                        .fg(crate::render::theme::accent())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    track_style
+                };
+                Line::from(Span::styled("│", style))
+            }
+        };
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), rail_area);
+}
+
+/// The accent color for a rail marker. Distinct hues reinforce the
+/// glyph-distinguished kinds, but the rail never relies on color alone (the
+/// glyphs differ too), so a monochrome terminal stays legible.
+fn minimap_marker_color(marker: minimap::RailMarker) -> Color {
+    match marker {
+        minimap::RailMarker::UserTurn => crate::render::theme::accent(),
+        minimap::RailMarker::ToolCall => crate::render::theme::quiet(),
+        minimap::RailMarker::Error => Color::Red,
+        minimap::RailMarker::Other => crate::render::theme::quiet(),
     }
 }
 
@@ -20592,6 +20809,12 @@ pub(crate) struct TuiApp {
     /// id so they survive a reflow. `Alt+m` sets a mark at the top-visible
     /// entry; `Alt+'` jumps back to the most recent one.
     pub(crate) jump_marks: jump_marks::JumpMarkStack,
+    /// Minimap turn rail (§11.2 / 11G.3): whether the compact vertical rail —
+    /// user turns, tool calls, errors, and the current viewport band — is
+    /// painted on the right of the main view. Off by default (`Alt+r` toggles)
+    /// so an idle session paints nothing extra; clickable to jump when mouse
+    /// capture is on.
+    pub(crate) show_minimap: bool,
     /// Timestamp + cell + running count of the last left press, for
     /// synthesising double/triple clicks (crossterm delivers no click-count). A
     /// press within the multi-click window at the same cell escalates word →
@@ -21223,6 +21446,7 @@ impl TuiApp {
             selection: None,
             search: None,
             jump_marks: jump_marks::JumpMarkStack::new(),
+            show_minimap: false,
             last_click: None,
             wheel_accum: 0,
             main_scroll_anim: None,

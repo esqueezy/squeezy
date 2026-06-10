@@ -143,6 +143,11 @@ pub(crate) enum Action {
     /// stack (`Alt+'` default; §11.2 / 11G.2). With no marks set, falls back to
     /// showing the recent jump history in the status line.
     JumpToMark,
+    /// Toggle the minimap turn rail (`Alt+r` default; §11.2 / 11G.3). A compact
+    /// vertical rail in the main view showing user turns, tool calls, errors,
+    /// and the current viewport band; clickable to jump when mouse capture is
+    /// on. Off by default so an idle session paints nothing extra.
+    ToggleMinimap,
 }
 
 impl Action {
@@ -182,6 +187,7 @@ impl Action {
             Self::ToggleDogfoodMetrics => "toggle_dogfood_metrics",
             Self::SetJumpMark => "set_jump_mark",
             Self::JumpToMark => "jump_to_mark",
+            Self::ToggleMinimap => "toggle_minimap",
         }
     }
 
@@ -220,6 +226,7 @@ impl Action {
         Action::ToggleDogfoodMetrics,
         Action::SetJumpMark,
         Action::JumpToMark,
+        Action::ToggleMinimap,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -282,6 +289,8 @@ impl Action {
             // tmux, and SSH as the copy / jump-nav chords above.
             | Self::SetJumpMark
             | Self::JumpToMark
+            // Minimap toggle is `Alt+r` — the same Meta/Alt encoding case.
+            | Self::ToggleMinimap
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -388,6 +397,11 @@ impl Action {
             // c/o/k/v/a/y/,/./[/] are taken; m and ' are free.
             Self::SetJumpMark => KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
             Self::JumpToMark => KeyBinding::new(KeyCode::Char('\''), KeyModifiers::ALT),
+            // Minimap turn rail (§11.2 / 11G.3). `Alt+r` ("rail") matches the
+            // navigation/copy family's `Alt`+key style. Bare `Alt` letters
+            // c/o/k/v/a/y/m/' and punctuation ,/./[/] are taken; r is free
+            // (`Ctrl+R` is the cancelled-prompt restore, a distinct chord).
+            Self::ToggleMinimap => KeyBinding::new(KeyCode::Char('r'), KeyModifiers::ALT),
         }
     }
 }

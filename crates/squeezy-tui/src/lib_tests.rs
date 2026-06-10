@@ -22126,3 +22126,214 @@ fn jump_marks_cleared_on_transcript_clear() {
         "marks must not survive a transcript rebuild",
     );
 }
+
+// ---- Minimap turn rail (§11.2 / 11G.3) ------------------------------
+
+/// Seed a transcript with mixed user turns, tool calls, and a failure so the
+/// rail has every marker kind to place, scrolled up so the viewport band is not
+/// pinned to the tail.
+fn minimap_app() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("ask {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {index}")));
+        app.push_tool_result(sample_tool_result("grep", &format!("hit {index}")));
+    }
+    let mut failed = sample_tool_result("shell", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app
+}
+
+/// Render `app` through the real fullscreen `render()` into a `TestBackend`,
+/// populating the frame-local hit registry, and return the terminal so the test
+/// can both read the painted buffer and hit-test the registered targets.
+fn render_into_terminal(app: &TuiApp, width: u16, height: u16) -> Terminal<TestBackend> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, app)).expect("draw");
+    terminal
+}
+
+/// Scan the painted buffer (and the live hit registry) for the first cell that
+/// is a registered `MinimapJump` target, returning its `(column, row)`.
+fn find_minimap_cell(app: &TuiApp, width: u16, height: u16) -> Option<(u16, u16)> {
+    for row in 0..height {
+        for col in 0..width {
+            if let Some((_key, interaction::Action::MinimapJump(_))) = app.click_target_at(col, row)
+            {
+                return Some((col, row));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn minimap_off_by_default_registers_no_rail_targets() {
+    let app = minimap_app();
+    let _ = render_into_terminal(&app, 80, 24);
+    assert!(
+        !app.show_minimap,
+        "the minimap rail is off until the user toggles it"
+    );
+    assert!(
+        find_minimap_cell(&app, 80, 24).is_none(),
+        "no rail cells register while the rail is off"
+    );
+}
+
+#[tokio::test]
+async fn alt_r_toggles_minimap_through_the_keymap() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = minimap_app();
+    assert!(!app.show_minimap);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-r toggles the minimap on");
+    assert!(app.show_minimap, "Alt+r must turn the rail on");
+    assert!(app.status.contains("minimap rail on"), "{}", app.status);
+
+    // It survives the real renderer and now registers at least one rail cell.
+    let _ = render_into_terminal(&app, 80, 24);
+    assert!(
+        find_minimap_cell(&app, 80, 24).is_some(),
+        "an enabled rail registers clickable cells through render()"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-r toggles the minimap off");
+    assert!(!app.show_minimap, "Alt+r must turn the rail off again");
+    assert!(app.status.contains("minimap rail off"), "{}", app.status);
+}
+
+#[test]
+fn minimap_rail_paints_markers_in_its_reserved_column() {
+    let mut app = minimap_app();
+    app.show_minimap = true;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(10);
+
+    let output = render_into_terminal(&app, 80, 24);
+    let buffer = output.backend().buffer();
+    // Walk the rightmost column (the rail's reserved column) and confirm at
+    // least one marker glyph painted there.
+    let rail_col = 80 - 1;
+    let marker_glyphs = ["●", "◦", "▲", "·", "│"];
+    let mut painted_marker = false;
+    for y in 0..24 {
+        let sym = buffer[(rail_col, y)].symbol();
+        if marker_glyphs.contains(&sym) {
+            painted_marker = true;
+        }
+    }
+    assert!(
+        painted_marker,
+        "the rail column must paint at least one rail/marker glyph"
+    );
+}
+
+#[test]
+fn clicking_a_rail_cell_jumps_the_transcript() {
+    let mut app = minimap_app();
+    app.show_minimap = true;
+    // Pin to the tail so a jump that lands above the tail is observable.
+    app.transcript_scroll = scroll::ScrollState::pinned();
+
+    // Render to register the rail cells, then click the first one.
+    let _ = render_into_terminal(&app, 80, 30);
+    let (col, row) =
+        find_minimap_cell(&app, 80, 30).expect("an enabled rail registers a clickable cell");
+
+    let before = app.transcript_scroll;
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "a click on a rail cell is consumed as a jump");
+    // The very first (topmost) rail cell maps to an early entry, so jumping to
+    // it moves the view off the pinned tail.
+    assert_ne!(
+        app.transcript_scroll, before,
+        "clicking the top rail cell must move the viewport"
+    );
+    // And the app stays renderable afterwards.
+    let painted = render_to_string(&app, 80, 30);
+    assert!(!painted.is_empty());
+}
+
+#[test]
+fn minimap_rail_survives_resize_and_empty_transcript() {
+    // Empty transcript: the rail must paint nothing and register no targets,
+    // never panic, across a couple of sizes.
+    let mut app = test_app(SessionMode::Build);
+    app.show_minimap = true;
+    let _ = render_into_terminal(&app, 40, 12);
+    assert!(find_minimap_cell(&app, 40, 12).is_none());
+    let _ = render_into_terminal(&app, 120, 40);
+    assert!(find_minimap_cell(&app, 120, 40).is_none());
+
+    // Now with content, paint narrow then wide — both must render and register
+    // rail cells without panicking (the rail is keyed by stable entry id, so a
+    // reflow re-registers the same targets at fresh cells).
+    let mut app = minimap_app();
+    app.show_minimap = true;
+    let narrow = render_to_string(&app, 24, 16);
+    assert!(!narrow.is_empty());
+    let _ = render_into_terminal(&app, 24, 16);
+    let narrow_cell = find_minimap_cell(&app, 24, 16);
+    let wide = render_to_string(&app, 160, 50);
+    assert!(!wide.is_empty());
+    let _ = render_into_terminal(&app, 160, 50);
+    let wide_cell = find_minimap_cell(&app, 160, 50);
+    assert!(
+        narrow_cell.is_some() && wide_cell.is_some(),
+        "the rail registers cells at both widths"
+    );
+}
+
+#[test]
+fn minimap_too_narrow_to_host_a_rail_falls_back_gracefully() {
+    // A 2-column area cannot host both a rail and the scrollbar gutter, so the
+    // rail is dropped and the body keeps the area. Must not panic.
+    let (body, rail) = transcript_main_body_and_rail_areas(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 10,
+        },
+        true,
+    );
+    assert!(rail.is_none(), "no room for a rail at width 2");
+    assert_eq!(body.width, 2, "the body keeps the whole area");
+
+    // Wide enough: the rail carves the rightmost column off the body.
+    let (body, rail) = transcript_main_body_and_rail_areas(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        },
+        true,
+    );
+    let rail = rail.expect("a rail column at width 10");
+    assert_eq!(rail.width, 1);
+    assert_eq!(rail.x, 9, "rail sits on the right edge");
+    assert_eq!(body.width, 9, "body wraps one column narrower");
+}

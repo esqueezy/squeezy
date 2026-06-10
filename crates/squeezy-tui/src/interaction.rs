@@ -101,12 +101,13 @@ pub(crate) enum ChromeKey {
 /// by construction.
 ///
 /// `ToggleQueueOverlay`, `ToggleEntryCollapsed`, `FocusEntry`, `ExpandEntry`,
-/// and the queue `QueueDelete` / `QueueReorderBegin` / `QueueUndo` actions are
-/// wired to live affordances today (real dispatch arms + registered hit
-/// targets + keyboard parity). Only `OpenEntryInDetail` (no mouse affordance
-/// registers it yet; the `Ctrl+Enter` keyboard verb goes straight through
-/// `open_focused_entry_in_detail`) and the jump/scrollbar actions remain
-/// substrate that dispatches its handlers as its registering affordances land.
+/// the queue `QueueDelete` / `QueueReorderBegin` / `QueueUndo` actions, and
+/// `MinimapJump` are wired to live affordances today (real dispatch arms +
+/// registered hit targets + keyboard parity). Only `OpenEntryInDetail` (no
+/// mouse affordance registers it yet; the `Ctrl+Enter` keyboard verb goes
+/// straight through `open_focused_entry_in_detail`) and the jump/scrollbar
+/// actions remain substrate that dispatches its handlers as its registering
+/// affordances land.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -137,6 +138,10 @@ pub(crate) enum Action {
     JumpToLatest,
     /// Jump the scrollbar thumb to the clicked gutter row.
     ScrollbarJump,
+    /// Jump the transcript so the entry behind a minimap turn-rail cell sits at
+    /// the top of the viewport. Keyed by the cell's [`EntryId`] so a resize
+    /// re-registers the same target at a fresh rail cell.
+    MinimapJump(EntryId),
 }
 
 impl Action {
@@ -161,6 +166,7 @@ impl Action {
         Action::QueueUndo,
         Action::JumpToLatest,
         Action::ScrollbarJump,
+        Action::MinimapJump(EntryId(0)),
     ];
 }
 
