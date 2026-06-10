@@ -242,6 +242,14 @@ pub(crate) enum ChromeKey {
     /// The "Reset" button in the Keybinding Editor UI (§12.7.1) — the mouse twin
     /// of the keyboard `r`/Delete verb; reverts the selected row to its default.
     KeybindingReset,
+    /// A palette-role row in the Theme Editor overlay (§12.7.2), keyed by its
+    /// 0-based index in the editor's curated role list so a click focuses exactly
+    /// that role (reseeding the working swatch from its live colour).
+    ThemeEditorRole(usize),
+    /// A channel bar (R/G/B) in the Theme Editor overlay (§12.7.2), keyed by its
+    /// 0-based channel index (0=R, 1=G, 2=B) so a click on a point along the bar
+    /// focuses that channel and sets its value to the clicked position.
+    ThemeEditorChannel(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -505,6 +513,17 @@ pub(crate) enum Action {
     /// Reset the editor's selected row to its compiled-in default (§12.7.1). Mouse
     /// twin of the editor's `r`/Delete verb / the "Reset" button.
     KeybindingReset,
+    /// Focus the given palette role (by 0-based index in the editor's role list) in
+    /// the Theme Editor overlay (§12.7.2), reseeding the working swatch from its
+    /// live colour. Mouse twin of moving the role focus with ↑↓; a click on a role
+    /// row both selects it and shows its colour in one go.
+    ThemeEditorSelectRole(usize),
+    /// Set the focused channel of the Theme Editor overlay (§12.7.2) to an absolute
+    /// value by clicking a point along its bar. Carries the channel index (0=R,
+    /// 1=G, 2=B) and the 0..=255 value the clicked column maps to. Mouse twin of
+    /// focusing a channel with ←→ and nudging it with +/- to the same value, with
+    /// the same live preview.
+    ThemeEditorSetChannel(usize, u8),
 }
 
 impl Action {
@@ -576,6 +595,11 @@ impl Action {
         Action::TemplateDelete(0),
         Action::TemplateClear,
         Action::MacroToggleRecord,
+        Action::KeybindingSelect(0),
+        Action::KeybindingRebind,
+        Action::KeybindingReset,
+        Action::ThemeEditorSelectRole(0),
+        Action::ThemeEditorSetChannel(0, 0),
     ];
 }
 

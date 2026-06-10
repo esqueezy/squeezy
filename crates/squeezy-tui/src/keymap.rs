@@ -451,6 +451,12 @@ pub(crate) enum Action {
     /// persist to `~/.squeezy/keybindings.toml` and rebuild the resolver live. The
     /// overlay does not exist until opened, so an idle session pays nothing.
     ToggleKeybindingEditor,
+    /// Theme Editor UI (§12.7.2): open / close the interactive theme color editor
+    /// (`Ctrl+Alt+E` default). A fullscreen overlay that picks/previews colors for
+    /// the active theme's semantic palette roles (accent, error, dim, selection, …)
+    /// with a live preview, persisting each committed override to the user-scope
+    /// config. Costs nothing until opened; an idle session never paints it.
+    OpenThemeEditor,
 }
 
 impl Action {
@@ -531,6 +537,7 @@ impl Action {
             Self::ToggleMacroRecord => "toggle_macro_record",
             Self::ReplayMacro => "replay_macro",
             Self::ToggleKeybindingEditor => "toggle_keybinding_editor",
+            Self::OpenThemeEditor => "open_theme_editor",
         }
     }
 
@@ -610,6 +617,7 @@ impl Action {
         Action::ToggleMacroRecord,
         Action::ReplayMacro,
         Action::ToggleKeybindingEditor,
+        Action::OpenThemeEditor,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -811,6 +819,11 @@ impl Action {
             // across Linux terminals, tmux, and SSH as the `Ctrl+Alt+K`/
             // `Ctrl+Alt+J`/`Ctrl+Alt+T` chords above.
             | Self::ToggleKeybindingEditor
+            // Theme Editor UI (§12.7.2) opens with `Ctrl+Alt+E` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+K`/`Ctrl+Alt+J` macro chords
+            // and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenThemeEditor
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1163,6 +1176,16 @@ impl Action {
             // every composer chord.
             Self::ToggleKeybindingEditor => KeyBinding::new(
                 KeyCode::Char('b'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Theme Editor UI (§12.7.2). `Ctrl+Alt+E` ("Edit theme") is a free
+            // `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/
+            // `T`/`B` are taken by the macro/debug/overlay/picker/keybinding chords
+            // above, and the bare `Alt+e` chord is the external-editor handoff verb,
+            // so the Ctrl+Alt modifier keeps the theme-editor verb distinct from both
+            // while staying clear of every composer chord.
+            Self::OpenThemeEditor => KeyBinding::new(
+                KeyCode::Char('e'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

@@ -23728,6 +23728,280 @@ async fn recording_strip_survives_narrow_resize() {
 }
 
 // =====================================================================
+// §12.7.2 Theme Editor UI.
+// End-to-end through `handle_key` (Ctrl+Alt+E open, ↑↓ role, ←→ channel,
+// +/- adjust with live preview, Enter save, Esc close), `handle_mouse`
+// (click a role row, click a channel bar), the real `render()` modal, the
+// empty/edge case (tiny frame), and a resize where the modal paints.
+// =====================================================================
+
+/// `Ctrl+Alt+E`: open / close the Theme Editor overlay.
+fn theme_editor_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Pin the user-scope settings to a scratch file and reset the process-global
+/// theme, returning the guard plus the scratch path. The caller holds the guard
+/// for the test's lifetime so the runtime-theme mutations serialise against the
+/// other theme tests.
+fn theme_editor_scratch(app: &mut TuiApp, name: &str) -> (ScopedSettingsPath, PathBuf) {
+    let dir = temp_workspace(name);
+    let settings_path = dir.join("settings.toml");
+    let guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    (guard, settings_path)
+}
+
+#[tokio::test]
+async fn theme_editor_opens_and_paints_roles_and_swatch_through_real_render() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = theme_editor_scratch(&mut app, "theme_editor_open");
+
+    // Idle: the modal is not painted.
+    let idle = render_to_string(&app, 100, 30);
+    assert!(
+        !idle.contains("Theme editor"),
+        "idle session paints no theme editor: {idle}"
+    );
+
+    // Open it.
+    handle_key(&mut app, &mut agent, theme_editor_key())
+        .await
+        .unwrap();
+    assert!(app.theme_editor.is_some(), "Ctrl+Alt+E opens the editor");
+
+    let open = render_to_string(&app, 100, 30);
+    assert!(
+        open.contains("Theme editor"),
+        "the modal title paints: {open}"
+    );
+    // The first curated role and a later one both appear in the rail.
+    assert!(open.contains("Accent"), "role rail lists Accent: {open}");
+    assert!(open.contains("Error"), "role rail lists Error: {open}");
+    // The focused role's channel bars paint with their single-letter labels.
+    assert!(
+        open.contains('R') && open.contains('G') && open.contains('B'),
+        "channel bars paint R/G/B labels: {open}"
+    );
+}
+
+#[tokio::test]
+async fn theme_editor_keyboard_adjust_live_previews_and_save_persists() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = theme_editor_scratch(&mut app, "theme_editor_save");
+
+    handle_key(&mut app, &mut agent, theme_editor_key())
+        .await
+        .unwrap();
+    // Default focus is the first role (Accent) on the Red channel.
+    let accent_token = crate::theme_editor::ROLES[0].token;
+    let before = crate::render::theme::rgb(accent_token);
+
+    // Bump the red channel up; the live preview re-applies the override to the
+    // runtime theme immediately (no save yet).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    let previewed = crate::render::theme::rgb(accent_token);
+    assert_eq!(
+        previewed[0],
+        before[0].saturating_add(1),
+        "the red channel previewed live on the runtime theme",
+    );
+
+    // Save: persists to the scratch settings file and mirrors into the agent.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.status.contains("saved"),
+        "save reports success: {}",
+        app.status
+    );
+    let written = std::fs::read_to_string(&settings_path).expect("settings written");
+    assert!(
+        written.contains("[tui.themes.default.colors]"),
+        "the override was persisted under the active theme: {written}"
+    );
+    // The agent's in-memory config carries the override too.
+    assert!(
+        agent
+            .config_snapshot()
+            .tui
+            .themes
+            .get("default")
+            .and_then(|t| t.colors.get(accent_token))
+            .is_some(),
+        "the saved override is mirrored into the agent config",
+    );
+}
+
+#[tokio::test]
+async fn theme_editor_role_and_channel_navigation_moves_focus() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = theme_editor_scratch(&mut app, "theme_editor_nav");
+
+    handle_key(&mut app, &mut agent, theme_editor_key())
+        .await
+        .unwrap();
+    assert_eq!(app.theme_editor.as_ref().unwrap().role_index(), 0);
+
+    // Down moves to the next role; the working swatch reseeds from its live color.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.theme_editor.as_ref().unwrap().role_index(), 1);
+
+    // Right moves the channel focus from Red to Green.
+    assert_eq!(
+        app.theme_editor.as_ref().unwrap().channel(),
+        crate::theme_editor::Channel::Red
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.theme_editor.as_ref().unwrap().channel(),
+        crate::theme_editor::Channel::Green
+    );
+
+    // Esc closes the overlay and reverts any uncommitted preview.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.theme_editor.is_none(), "Esc closes the editor");
+}
+
+#[tokio::test]
+async fn theme_editor_clicking_a_role_row_focuses_it() {
+    // Mouse parity: a left click on a painted role row focuses that role, the same
+    // as moving down with ↑↓.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = theme_editor_scratch(&mut app, "theme_editor_role_click");
+
+    handle_key(&mut app, &mut agent, theme_editor_key())
+        .await
+        .unwrap();
+
+    // Render so the role rows register their click targets, then resolve the third
+    // role's row rect and click it.
+    let _ = render_to_string(&app, 100, 30);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::ThemeEditorRole(2),
+        ))
+        .expect("role row 2 registered a click target");
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the click on a role row is consumed");
+    assert_eq!(
+        app.theme_editor.as_ref().unwrap().role_index(),
+        2,
+        "clicking role row 2 focused it",
+    );
+}
+
+#[tokio::test]
+async fn theme_editor_clicking_a_channel_bar_sets_its_value() {
+    // Mouse parity: a left click far along a channel bar drives that channel toward
+    // its max — the same handler the keyboard +/- path drives — and live-previews.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = theme_editor_scratch(&mut app, "theme_editor_bar_click");
+
+    handle_key(&mut app, &mut agent, theme_editor_key())
+        .await
+        .unwrap();
+
+    let _ = render_to_string(&app, 100, 30);
+    let bar = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::ThemeEditorChannel(0),
+        ))
+        .expect("the red channel bar registered a click target");
+    // Click near the far-right of the bar so the mapped value is high.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: bar.x + bar.width - 1,
+            row: bar.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    // The direct `handle_mouse` call does not run the event loop's drain, so apply
+    // the armed live-preview exactly as the loop would.
+    if let Some((token, rgb)) = app.theme_editor_preview_pending.take() {
+        theme_editor_preview(&agent, token, rgb);
+    }
+    let value = app
+        .theme_editor
+        .as_ref()
+        .unwrap()
+        .channel_value(crate::theme_editor::Channel::Red);
+    assert!(
+        value > 200,
+        "a click at the far end of the bar set a high red value, got {value}",
+    );
+}
+
+#[tokio::test]
+async fn theme_editor_survives_tiny_and_resized_frames() {
+    // Edge / resize case: the modal clamps to a tiny frame and never panics, and
+    // paints its title once it has room.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = theme_editor_scratch(&mut app, "theme_editor_resize");
+
+    handle_key(&mut app, &mut agent, theme_editor_key())
+        .await
+        .unwrap();
+    for (w, h) in [(4u16, 2u16), (12, 4), (30, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        if w >= 30 {
+            assert!(
+                out.contains("Theme editor"),
+                "title paints at {w}x{h}: {out}"
+            );
+        }
+    }
+}
+
+// =====================================================================
 // §12.1.6 Multi-Cursor-Like Transcript Selection.
 // End-to-end through `handle_key` (Alt+d add, Ctrl+Alt+Y combined copy),
 // `handle_mouse` (modifier-click add/toggle), the real `render()`

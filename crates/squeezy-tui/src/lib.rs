@@ -161,6 +161,7 @@ mod status_line_setup;
 mod streaming;
 mod streaming_patch;
 mod terminal_writer;
+mod theme_editor;
 mod toast;
 mod tool_actions;
 mod transcript_health;
@@ -1823,6 +1824,9 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.command_palette.is_some()
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
+        // The Theme Editor overlay (§12.7.2) is modal: block a quick session
+        // switch while it owns the surface, like every other overlay above.
+        || app.theme_editor.is_some()
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
@@ -2255,6 +2259,12 @@ async fn handle_input_event(
             // drain it here, where the `agent` is in scope, so a mouse run and a
             // keyboard run execute identically on the same iteration.
             drain_command_palette_run(app, agent).await?;
+            // A click on a Theme Editor (§12.7.2) channel bar arms a live-preview
+            // re-apply; drain it here, where the `agent` is in scope, so a mouse
+            // adjust previews identically to the keyboard +/- path.
+            if let Some((token, rgb)) = app.theme_editor_preview_pending.take() {
+                theme_editor_preview(agent, token, rgb);
+            }
             if consumed {
                 app.needs_redraw = true;
             } else {
@@ -2601,6 +2611,59 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             dispatch_click_action(app, action);
         }
         // Pane is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Theme Editor overlay (§12.7.2) owns the pointer while open: a left-click
+    // on a role row focuses that role (the mouse twin of ↑↓), and a click on a
+    // point along a channel bar sets that channel to the clicked value with a live
+    // preview (the mouse twin of ←→ + +/-). Every other click is swallowed so a
+    // stray press can't fall through to the surface beneath. Hit-tested in ABSOLUTE
+    // screen coordinates against the targets `render_theme_editor_surface`
+    // registered this frame.
+    if app.theme_editor.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((interaction::TargetKey::Chrome(key), action)) =
+                app.click_target_at(mouse.column, mouse.row)
+            && matches!(
+                key,
+                interaction::ChromeKey::ThemeEditorRole(_)
+                    | interaction::ChromeKey::ThemeEditorChannel(_)
+            )
+        {
+            match action {
+                interaction::Action::ThemeEditorSelectRole(index) => {
+                    if let Some(state) = app.theme_editor.as_mut() {
+                        state.focus_role(index, theme_editor_seed);
+                    }
+                    app.status = theme_editor_status(app);
+                }
+                interaction::Action::ThemeEditorSetChannel(channel_index, _) => {
+                    // Map the clicked column along the bar to a 0..=255 value. The
+                    // bar rect was registered this frame; the value baked into the
+                    // action is a placeholder — the click position is the source of
+                    // truth so a click anywhere along the bar sets that intensity.
+                    let bar = app.registered_rect_for(interaction::TargetKey::Chrome(
+                        interaction::ChromeKey::ThemeEditorChannel(channel_index),
+                    ));
+                    let value = bar
+                        .map(|rect| theme_editor_channel_value_at(rect, mouse.column))
+                        .unwrap_or(0);
+                    if let Some(state) = app.theme_editor.as_mut() {
+                        let channel = theme_editor::Channel::ALL
+                            [channel_index.min(theme_editor::Channel::ALL.len() - 1)];
+                        let rgb = state.set_channel(channel, value);
+                        let token = state.current_role().token;
+                        // The live preview re-apply needs the agent; arm it for the
+                        // run loop's drain, where the agent is in scope.
+                        app.theme_editor_preview_pending = Some((token, rgb));
+                    }
+                    app.status = theme_editor_status(app);
+                }
+                _ => {}
+            }
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -4399,6 +4462,238 @@ fn macro_replay_key_event(app: &TuiApp, action: keymap::Action) -> KeyEvent {
     KeyEvent::new(binding.code, binding.modifiers)
 }
 
+// ===========================================================================
+// Theme Editor UI (§12.7.2)
+// ===========================================================================
+
+/// `Ctrl+Alt+E`: open / close the interactive Theme Editor overlay (§12.7.2).
+/// Opening seeds the editor from the first palette role's CURRENT live color so
+/// the swatch opens on the real value; closing reverts any uncommitted live
+/// preview back to the agent's persisted config so a previewed-but-not-saved
+/// color never leaks past the overlay. Sets `needs_redraw` so the toggle paints
+/// immediately, but leaves the idle redraw cadence untouched once settled.
+fn toggle_theme_editor(app: &mut TuiApp, agent: &mut Agent) {
+    if app.theme_editor.is_some() {
+        // Closing: discard any uncommitted live preview by re-applying the
+        // persisted config, so an unsaved channel nudge does not survive the
+        // overlay.
+        app.theme_editor = None;
+        apply_theme_overrides(&agent.config_snapshot());
+        app.status = "theme editor closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let seed = render::theme::rgb(theme_editor::ROLES[0].token);
+    app.theme_editor = Some(theme_editor::ThemeEditorState::new(seed));
+    app.status = theme_editor_status(app);
+    app.needs_redraw = true;
+}
+
+/// The status line shown while the Theme Editor is open: the focused role, its
+/// working RGB, and the in-overlay verb legend.
+fn theme_editor_status(app: &TuiApp) -> String {
+    let Some(state) = app.theme_editor.as_ref() else {
+        return "theme editor closed".to_string();
+    };
+    let role = state.current_role();
+    let [r, g, b] = state.rgb();
+    format!(
+        "theme: {} #{r:02X}{g:02X}{b:02X} — ↑↓ role · ←→ channel · +/- adjust · Enter save · Bksp reset · Esc close",
+        role.label,
+    )
+}
+
+/// Resolve a theme token's CURRENT live color (as an RGB triple) for seeding the
+/// editor when the role focus moves. Reads the runtime theme registry, which the
+/// live preview keeps current.
+fn theme_editor_seed(token: &'static str) -> squeezy_core::TuiRgb {
+    render::theme::rgb(token)
+}
+
+/// Re-apply the in-progress working color to the RUNTIME theme so the whole UI
+/// behind the overlay previews the change immediately (§12.7.2 "live preview").
+/// Builds a transient config snapshot with the override layered onto the active
+/// theme and swaps the runtime palette; nothing is persisted here — a commit does
+/// that, and a close reverts to the persisted config.
+fn theme_editor_preview(agent: &Agent, token: &'static str, rgb: squeezy_core::TuiRgb) {
+    let mut snapshot = agent.config_snapshot();
+    let theme = snapshot.tui.theme.clone();
+    snapshot
+        .tui
+        .themes
+        .entry(theme)
+        .or_default()
+        .colors
+        .insert(token.to_string(), rgb);
+    apply_theme_overrides(&snapshot);
+}
+
+/// Handle a key while the Theme Editor overlay (§12.7.2) is open. Returns `true`
+/// when the key was consumed (so it never leaks to the composer or the global
+/// keymap while the overlay owns focus). The overlay is modal: its own toggle
+/// chord and Esc close; ↑/↓ move the role focus (reseeding the working color);
+/// ←/→ move the channel focus; +/-/arrows nudge the focused channel (Shift/Page
+/// for a larger step) with a live preview; Enter persists the override; Backspace
+/// resets the role to its base color.
+fn handle_theme_editor_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    if app.theme_editor.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord closes it (the same key opens and closes),
+    // routed through `toggle_theme_editor` so the close reverts an uncommitted
+    // preview.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::OpenThemeEditor) {
+        toggle_theme_editor(app, agent);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            toggle_theme_editor(app, agent);
+        }
+        KeyCode::Up => {
+            if let Some(state) = app.theme_editor.as_mut() {
+                state.focus_prev_role(theme_editor_seed);
+            }
+            app.status = theme_editor_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down => {
+            if let Some(state) = app.theme_editor.as_mut() {
+                state.focus_next_role(theme_editor_seed);
+            }
+            app.status = theme_editor_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Left => {
+            if let Some(state) = app.theme_editor.as_mut() {
+                state.focus_prev_channel();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Right => {
+            if let Some(state) = app.theme_editor.as_mut() {
+                state.focus_next_channel();
+            }
+            app.needs_redraw = true;
+        }
+        // A larger step on Shift+arrows / PageUp / PageDown; a single unit on the
+        // bare +/- and the up/down nudge via `=`/`-` so the channel is reachable
+        // without arrows colliding with role movement.
+        KeyCode::Char('+') | KeyCode::Char('=') => theme_editor_nudge(app, agent, 1),
+        KeyCode::Char('-') | KeyCode::Char('_') => theme_editor_nudge(app, agent, -1),
+        KeyCode::PageUp => theme_editor_nudge(app, agent, 16),
+        KeyCode::PageDown => theme_editor_nudge(app, agent, -16),
+        KeyCode::Enter => theme_editor_commit(app, agent),
+        KeyCode::Backspace | KeyCode::Delete => theme_editor_reset(app, agent),
+        _ => {}
+    }
+    // The overlay is modal: swallow every key so nothing leaks to the composer
+    // beneath, even keys it does not act on.
+    true
+}
+
+/// Nudge the focused channel by `delta` and live-preview the result (§12.7.2).
+fn theme_editor_nudge(app: &mut TuiApp, agent: &mut Agent, delta: i16) {
+    let Some(state) = app.theme_editor.as_mut() else {
+        return;
+    };
+    let rgb = state.adjust_channel(delta);
+    let token = state.current_role().token;
+    theme_editor_preview(agent, token, rgb);
+    app.status = theme_editor_status(app);
+    app.needs_redraw = true;
+}
+
+/// Persist the focused role's working color to the user-scope config (§12.7.2),
+/// mirroring it into the agent's in-memory config so the choice both survives a
+/// restart and stays live. Reuses the same `SetThemeColor` settings-writer edit
+/// the `/config` theme editor uses, so the on-disk shape is identical. A failure
+/// surfaces in the status line; the live preview already took effect.
+fn theme_editor_commit(app: &mut TuiApp, agent: &mut Agent) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let Some(state) = app.theme_editor.as_ref() else {
+        return;
+    };
+    let token = state.current_role().token;
+    let label = state.current_role().label;
+    let rgb = state.rgb();
+
+    let mut next = agent.config_snapshot();
+    let theme = next.tui.theme.clone();
+    next.tui
+        .themes
+        .entry(theme.clone())
+        .or_default()
+        .colors
+        .insert(token.to_string(), rgb);
+    apply_theme_overrides(&next);
+    agent.replace_config(next);
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::SetThemeColor {
+            theme: theme.clone(),
+            token: token.to_string(),
+            rgb,
+        },
+    };
+    match apply_edits(&scope_target, &[edit]) {
+        Ok(_) => {
+            let [r, g, b] = rgb;
+            app.status = format!("✓ saved {label} (#{r:02X}{g:02X}{b:02X}) to {theme}");
+        }
+        Err(err) => {
+            app.status = format!("theme color preview live, but save failed: {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Reset the focused role: clear any user override for the active theme so the
+/// role returns to its builtin/base color (§12.7.2), reverting both the live
+/// preview and the persisted config. Reuses the same `RemoveThemeColor`
+/// settings-writer edit the `/config` theme editor uses.
+fn theme_editor_reset(app: &mut TuiApp, agent: &mut Agent) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let Some(state) = app.theme_editor.as_ref() else {
+        return;
+    };
+    let token = state.current_role().token;
+    let label = state.current_role().label;
+
+    let mut next = agent.config_snapshot();
+    let theme = next.tui.theme.clone();
+    if let Some(settings) = next.tui.themes.get_mut(&theme) {
+        settings.colors.remove(token);
+    }
+    apply_theme_overrides(&next);
+    agent.replace_config(next);
+
+    // Reseed the working swatch from the now-reverted live color so the preview
+    // tracks the cleared value.
+    let reverted = render::theme::rgb(token);
+    if let Some(state) = app.theme_editor.as_mut() {
+        state.set_rgb(reverted);
+    }
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::RemoveThemeColor {
+            theme: theme.clone(),
+            token: token.to_string(),
+        },
+    };
+    let _ = apply_edits(&scope_target, &[edit]);
+    app.status = format!("reset {label} to {theme} base color");
+    app.needs_redraw = true;
+}
+
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
 /// `true` when the key was consumed (so it never leaks to the composer or the
 /// global keymap). Two modes:
@@ -5288,6 +5583,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Theme Editor overlay (§12.7.2) is modal while open: it owns the keyboard
+    // (↑↓ move role, ←→ move channel, +/-/PageUp/PageDown adjust with live preview,
+    // Enter save, Backspace reset, Esc/Ctrl+Alt+E close) BEFORE any selection-clear,
+    // search, chord, or keymap dispatch, so a stray key never leaks into the
+    // composer underneath. Sits beside the other front-of-loop overlays for the
+    // same reason.
+    if app.theme_editor.is_some() && handle_theme_editor_key(app, agent, key) {
+        return Ok(false);
+    }
+
     // The Entry Annotations overlay (§12.2.5) is modal while open: it owns the
     // keyboard (↑↓/kj/n/p move the annotation cursor, Enter jump, e edit, d/Delete
     // delete, Esc/Alt+\ close — or, in edit mode, free text compose) BEFORE any
@@ -5854,6 +6159,12 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     // instead of attaching it as transcript context when the screen is up.
     if let Some(state) = app.config_screen.as_mut() {
         config_screen::handle_paste(state, &normalized);
+        return Ok(());
+    }
+    // The Theme Editor overlay (§12.7.2) is modal and has no text field, so it
+    // swallows paste entirely rather than letting it leak into the composer
+    // beneath. The user adjusts colours with the keyboard/mouse, never by pasting.
+    if app.theme_editor.is_some() {
         return Ok(());
     }
     // The Scratchpad Pane (§12.3.3) owns text input while open: a paste lands in
@@ -7335,6 +7646,17 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_keybinding_editor(app);
+            true
+        }
+        keymap::Action::OpenThemeEditor => {
+            // §12.7.2: open / close the interactive Theme Editor overlay.
+            // Main-surface verb; the config/setup screens own their own routing,
+            // and the Ctrl+T overlay guard above already blocks this while the
+            // overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_theme_editor(app, agent);
             true
         }
     }
@@ -9681,6 +10003,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.annotations_open
         || app.breadcrumbs_open
         || app.editor_handoff.is_some()
+        || app.theme_editor.is_some()
 }
 
 /// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
@@ -13472,6 +13795,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::KeybindingReset => {
             keybinding_editor_reset_selected(app);
         }
+        // §12.7.2: the click handlers above already short-circuit the theme-editor
+        // targets (they need the agent for live preview / persistence, which this
+        // agent-free dispatcher does not carry), so these arms are unreachable in
+        // practice. They exist so every `interaction::Action` has a dispatch arm and
+        // the accessibility audit's exhaustiveness holds.
+        interaction::Action::ThemeEditorSelectRole(_)
+        | interaction::Action::ThemeEditorSetChannel(_, _) => {}
     }
 }
 
@@ -19639,6 +19969,15 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         status_line_setup::render(frame, area, state, app);
         return;
     }
+    // The Theme Editor overlay (§12.7.2) paints as a fullscreen modal over the main
+    // surface while open, registering its per-role and per-channel click targets
+    // every frame. Checked before the config screen so its targets register and it
+    // owns the surface while open; the main transcript previews live behind the
+    // dimmed backdrop so colour changes are visible in context.
+    if let Some(state) = &app.theme_editor {
+        render_theme_editor_surface(frame, area, app, state);
+        return;
+    }
     if let Some(state) = &app.config_screen {
         config_screen::render(frame, area, state);
         return;
@@ -21631,6 +21970,303 @@ fn render_scratchpad_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
         interaction::Action::ScratchpadClear,
         true,
     );
+}
+
+/// Map a click column on a Theme Editor (§12.7.2) channel bar to a 0..=255 value.
+/// The bar's `track` cells (the rect minus its leading "R " label) span the full
+/// 0..=255 range; a click left of the track reads as 0 and right of it as 255, so
+/// a click anywhere along the bar is well-defined. Pure geometry, unit-tested.
+fn theme_editor_channel_value_at(bar: Rect, column: u16) -> u8 {
+    // The first 2 cells of the bar are the "R "/"G "/"B " label; the rest is the
+    // 256-step track.
+    let track_x = bar.x.saturating_add(THEME_EDITOR_BAR_LABEL_WIDTH);
+    let track_w = bar.width.saturating_sub(THEME_EDITOR_BAR_LABEL_WIDTH);
+    if track_w == 0 {
+        return 0;
+    }
+    if column <= track_x {
+        return 0;
+    }
+    let offset = (column - track_x).min(track_w.saturating_sub(1));
+    // Spread the click offset across 0..=255 so the leftmost track cell is 0 and
+    // the rightmost is 255 (a single-cell track maps everything to 0).
+    let denom = track_w.saturating_sub(1).max(1) as u32;
+    ((offset as u32 * 255) / denom).min(255) as u8
+}
+
+/// Width of the single-letter channel label ("R ", "G ", "B ") at the head of a
+/// Theme Editor channel bar, in cells. The remaining bar width is the value track.
+const THEME_EDITOR_BAR_LABEL_WIDTH: u16 = 2;
+
+/// Paint the Theme Editor overlay (§12.7.2) as a centered modal: a left rail of
+/// the curated palette ROLES (the focused one marked) and a right panel showing
+/// the focused role's live preview swatch, its hex value, and three R/G/B channel
+/// bars (the focused channel marked). Each role row registers a
+/// [`interaction::ChromeKey::ThemeEditorRole`] click target so a click focuses it
+/// (the mouse twin of ↑↓); each channel bar registers a
+/// [`interaction::ChromeKey::ThemeEditorChannel`] target so a click along it sets
+/// that channel's value (the mouse twin of ←→ + +/-). Reads only the pure editor
+/// state, so painting is constant-time and does no transcript walk.
+fn render_theme_editor_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    state: &theme_editor::ThemeEditorState,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Theme editor ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} pick palette colours with live preview ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 78, 22, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: the in-overlay verb legend.
+    let header = Line::from(Span::styled(
+        "\u{2191}\u{2193} role \u{00b7} \u{2190}\u{2192} channel \u{00b7} +/- adjust \u{00b7} Enter save \u{00b7} Bksp reset \u{00b7} Esc close",
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    let body_top = inner.y.saturating_add(2);
+    let body_h = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(body_top);
+    if body_h == 0 {
+        return;
+    }
+
+    // Split the body: a fixed-width role rail on the left, the preview panel on
+    // the right. Fall back to rail-only when too narrow to show both.
+    let rail_w = inner.width.min(22);
+    let rail = Rect {
+        x: inner.x,
+        y: body_top,
+        width: rail_w,
+        height: body_h,
+    };
+    render_theme_editor_roles(frame, rail, app, state);
+
+    let panel_x = inner.x.saturating_add(rail_w).saturating_add(1);
+    let panel_right = inner.x.saturating_add(inner.width);
+    if panel_x < panel_right {
+        let panel = Rect {
+            x: panel_x,
+            y: body_top,
+            width: panel_right - panel_x,
+            height: body_h,
+        };
+        render_theme_editor_panel(frame, panel, app, state);
+    }
+}
+
+/// Paint the role rail (left column) of the Theme Editor (§12.7.2): one row per
+/// curated palette role, each prefixed with a small live-colour swatch and marked
+/// when focused. Every row registers a [`interaction::ChromeKey::ThemeEditorRole`]
+/// click target so a click focuses that role.
+fn render_theme_editor_roles(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    state: &theme_editor::ThemeEditorState,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let focused = state.role_index();
+    let rows = area.height as usize;
+    for (index, role) in theme_editor::ROLES.iter().enumerate().take(rows) {
+        let is_focused = index == focused;
+        let row_rect = Rect {
+            x: area.x,
+            y: area.y + index as u16,
+            width: area.width,
+            height: 1,
+        };
+        let swatch_rgb = crate::render::theme::rgb(role.token);
+        let swatch_color = Color::Rgb(swatch_rgb[0], swatch_rgb[1], swatch_rgb[2]);
+        let marker = if is_focused { "\u{203a} " } else { "  " };
+        let label_style = if is_focused {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_focused {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled("\u{25a0} ", Style::default().fg(swatch_color)),
+            Span::styled(role.label, label_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ThemeEditorRole(index)),
+            interaction::Action::ThemeEditorSelectRole(index),
+        );
+    }
+}
+
+/// Paint the preview panel (right column) of the Theme Editor (§12.7.2): the
+/// focused role's description, a large live-colour preview swatch, its hex value,
+/// and the three R/G/B channel bars. The focused channel is marked; each bar
+/// registers a [`interaction::ChromeKey::ThemeEditorChannel`] click target so a
+/// click along it sets that channel's value.
+fn render_theme_editor_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    state: &theme_editor::ThemeEditorState,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let role = state.current_role();
+    let [r, g, b] = state.rgb();
+    let preview_color = Color::Rgb(r, g, b);
+
+    let mut y = area.y;
+    let bottom = area.y.saturating_add(area.height);
+
+    // Role description line.
+    if y < bottom {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                role.description,
+                Style::default().fg(crate::render::theme::quiet()),
+            ))),
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
+        y = y.saturating_add(1);
+    }
+
+    // Preview swatch (a solid block run in the live colour) plus the hex value.
+    if y < bottom {
+        let swatch_w = area.width.min(10);
+        let swatch: String = "\u{2588}".repeat(swatch_w as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(swatch, Style::default().fg(preview_color)),
+                Span::raw("  "),
+                Span::styled(
+                    format!("#{r:02X}{g:02X}{b:02X}"),
+                    Style::default()
+                        .fg(crate::render::theme::foreground())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
+        y = y.saturating_add(2);
+    }
+
+    // One bar per channel.
+    for (channel_index, channel) in theme_editor::Channel::ALL.iter().enumerate() {
+        if y >= bottom {
+            break;
+        }
+        let is_focused = state.channel() == *channel;
+        let value = state.channel_value(*channel);
+        let bar_rect = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        render_theme_editor_bar(frame, bar_rect, *channel, value, is_focused);
+        app.register_click(
+            bar_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ThemeEditorChannel(
+                channel_index,
+            )),
+            // The value baked in is a placeholder; the mouse handler recomputes it
+            // from the clicked column against this bar's rect.
+            interaction::Action::ThemeEditorSetChannel(channel_index, value),
+        );
+        y = y.saturating_add(1);
+    }
+}
+
+/// Paint one R/G/B channel bar (§12.7.2): a single-letter label, a proportional
+/// filled track in the channel's own hue, and the numeric value. The focused
+/// channel's label is bolded so the keyboard +/- target is obvious.
+fn render_theme_editor_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    channel: theme_editor::Channel,
+    value: u8,
+    is_focused: bool,
+) {
+    if area.width <= THEME_EDITOR_BAR_LABEL_WIDTH {
+        return;
+    }
+    let channel_color = match channel {
+        theme_editor::Channel::Red => Color::Rgb(value, 40, 40),
+        theme_editor::Channel::Green => Color::Rgb(40, value, 40),
+        theme_editor::Channel::Blue => Color::Rgb(40, 40, value),
+    };
+    let label_style = if is_focused {
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(crate::render::theme::quiet())
+    };
+    // Reserve 4 trailing cells for " 255" so the value never overflows the row.
+    let track_w = area
+        .width
+        .saturating_sub(THEME_EDITOR_BAR_LABEL_WIDTH)
+        .saturating_sub(4);
+    let filled = if track_w == 0 {
+        0
+    } else {
+        ((value as u32 * track_w as u32) / 255) as u16
+    };
+    let mut spans = vec![Span::styled(format!("{} ", channel.label()), label_style)];
+    if track_w > 0 {
+        spans.push(Span::styled(
+            "\u{2588}".repeat(filled as usize),
+            Style::default().fg(channel_color),
+        ));
+        spans.push(Span::styled(
+            "\u{2591}".repeat(track_w.saturating_sub(filled) as usize),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" {value:>3}"),
+        Style::default().fg(crate::render::theme::foreground()),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Paint the Local Transcript Index overlay (§12.5.1) as a centered modal: a
@@ -36104,6 +36740,14 @@ pub(crate) struct TuiApp {
     /// exist until opened, so an idle session allocates nothing and an `is_some`
     /// check is the whole resting cost.
     pub(crate) keybinding_editor: Option<keybinding_editor::KeybindingEditorState>,
+    /// Theme Editor UI (§12.7.2): the interactive theme color editor overlay, or
+    /// `None` when closed (the resting state, which paints nothing extra and
+    /// schedules no redraw). `Some` = the fullscreen overlay owns key/mouse routing
+    /// for picking/previewing the active theme's palette-role colors. Opened by the
+    /// `OpenThemeEditor` keymap action. Live preview re-applies the in-progress
+    /// override to the runtime theme immediately; a commit persists it to the
+    /// user-scope config.
+    pub(crate) theme_editor: Option<theme_editor::ThemeEditorState>,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -36375,6 +37019,14 @@ pub(crate) struct TuiApp {
     /// mouse (click) run paths so they execute identically, and drained the same
     /// iteration, so it is `Some` for at most one loop turn.
     pub(crate) command_palette_pending: Option<command_palette::PaletteRun>,
+    /// A Theme Editor (§12.7.2) live-preview re-apply armed by a mouse click for
+    /// the run loop to drain where the `agent` (needed to build the preview config
+    /// snapshot) is in scope. `None` = nothing pending; `Some((token, rgb))` = the
+    /// next drain should re-apply that override to the runtime theme. Set by the
+    /// click path (a channel-bar click) and drained the same iteration, so it is
+    /// `Some` for at most one loop turn. The keyboard path previews inline (it
+    /// already carries the agent), so this only ever serves the mouse twin.
+    pub(crate) theme_editor_preview_pending: Option<(&'static str, squeezy_core::TuiRgb)>,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -37003,6 +37655,7 @@ impl TuiApp {
             template_card: None,
             macro_recorder: macros::MacroRecorder::new(),
             keybinding_editor: None,
+            theme_editor: None,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,
@@ -37051,6 +37704,7 @@ impl TuiApp {
             hover_preview: None,
             command_palette: None,
             command_palette_pending: None,
+            theme_editor_preview_pending: None,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,

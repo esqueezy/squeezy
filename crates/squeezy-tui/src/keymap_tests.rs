@@ -778,6 +778,44 @@ fn action_palette_default_does_not_collide_with_other_actions() {
 }
 
 #[test]
+fn open_theme_editor_round_trips_and_defaults_to_ctrl_alt_e() {
+    // §12.7.2 Theme Editor UI: slug round-trips, is registered in `ALL` (so
+    // `/keymap` and the command palette list it and overrides can target it), and
+    // defaults to the obscure `Ctrl+Alt+E` chord.
+    assert_eq!(
+        Action::from_slug("open_theme_editor"),
+        Some(Action::OpenThemeEditor),
+    );
+    assert!(Action::ALL.contains(&Action::OpenThemeEditor));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        Some(Action::OpenThemeEditor),
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent.
+    assert_eq!(
+        Action::OpenThemeEditor.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
+fn open_theme_editor_default_does_not_collide_with_other_actions() {
+    // The `Ctrl+Alt+E` default must not shadow (or be shadowed by) any existing
+    // default binding — notably the bare `Alt+e` external-editor handoff verb.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::OpenThemeEditor),
+            "theme-editor default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

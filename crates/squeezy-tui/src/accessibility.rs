@@ -785,6 +785,13 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         A::KeybindingSelect(_) => KeyboardPath::Always("keybinding editor ↑↓"),
         A::KeybindingRebind => KeyboardPath::Always("keybinding editor Enter"),
         A::KeybindingReset => KeyboardPath::Always("keybinding editor r/Delete"),
+        // Theme Editor overlay (§12.7.2) — while the overlay is open its own key
+        // handler owns ↑↓ (move the role focus) and ←→ + +/-/PageUp/PageDown (move
+        // the channel focus and adjust its value) before the global keymap sees
+        // them, so a role-row click and a channel-bar click reach the same
+        // `focus_role` / `set_channel` handlers the keyboard verbs drive.
+        A::ThemeEditorSelectRole(_) => KeyboardPath::Always("theme editor ↑↓"),
+        A::ThemeEditorSetChannel(_, _) => KeyboardPath::Always("theme editor ←→ +/-"),
     })
 }
 
