@@ -254,11 +254,19 @@ impl HintEngine {
             .find(|&&id| !self.states[Self::index(id)].seen)
         {
             let idx = Self::index(candidate);
-            // 1 hour in the past dwarfs HINT_SETTLE, so the candidate reads as
-            // long-settled at any plausible test "now".
-            self.states[idx]
-                .first_eligible
-                .set(Some(Instant::now() - Duration::from_secs(3600)));
+            // Stamp the eligibility clock far enough in the past that the candidate
+            // reads as long-settled at any plausible test "now". An hour dwarfs
+            // HINT_SETTLE, but `Instant - Duration` panics on platforms whose
+            // monotonic clock is younger than the amount we subtract (Windows CI
+            // runners boot with a tiny QPC value), so subtract via `checked_sub`
+            // and fall back to the largest clock-safe offset that still clears the
+            // settle window with margin.
+            let now = Instant::now();
+            let settled = now
+                .checked_sub(Duration::from_secs(3600))
+                .or_else(|| now.checked_sub(HINT_SETTLE * 4))
+                .unwrap_or(now);
+            self.states[idx].first_eligible.set(Some(settled));
         }
     }
 
