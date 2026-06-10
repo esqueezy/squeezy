@@ -234,6 +234,38 @@ fn toggle_dogfood_metrics_round_trips_and_defaults_to_ctrl_alt_m() {
 }
 
 #[test]
+fn toggle_hover_intent_round_trips_and_defaults_to_ctrl_alt_h() {
+    // §12.1.3 Mouse Hover Intent toggle: slug round-trips, is registered in `ALL`
+    // (so `/keymap` and the command palette list it and overrides can target it),
+    // and defaults to the `Ctrl+Alt+H` debug-style chord.
+    assert_eq!(
+        Action::from_slug("toggle_hover_intent"),
+        Some(Action::ToggleHoverIntent)
+    );
+    assert!(Action::ALL.contains(&Action::ToggleHoverIntent));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::ToggleHoverIntent),
+        KeyBinding::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+    );
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        Some(Action::ToggleHoverIntent),
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent.
+    assert_eq!(
+        Action::ToggleHoverIntent.terminal_compat_note(),
+        Some("terminal-dependent")
+    );
+}
+
+#[test]
 fn quote_selection_to_compose_round_trips_and_defaults_to_greater_than() {
     // §11.1 quote-to-compose: slug round-trips, is registered in `ALL` (so
     // `/keymap` lists it and overrides can target it), and defaults to bare `>`.

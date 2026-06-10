@@ -346,6 +346,14 @@ pub(crate) enum Action {
     /// verb only previews. Closed is the resting state, so a session that never
     /// opens it pays nothing.
     ToggleHoverPreview,
+    /// Toggle Mouse Hover Intent (`Ctrl+Alt+H` default; §12.1.3). When on (the
+    /// default), the transcript card under the pointer — or, when the terminal
+    /// reports no mouse motion, the keyboard-focused card — gains a restrained,
+    /// debounced emphasis (brighter, bolded header hint) without changing row
+    /// heights. A wheel scroll, drag, or active selection suppresses the reveal.
+    /// The verb flips the affordance off for users who prefer none; the resting
+    /// state paints nothing and schedules no redraw, so it costs nothing idle.
+    ToggleHoverIntent,
 }
 
 impl Action {
@@ -412,6 +420,7 @@ impl Action {
             Self::OpenActionPalette => "open_action_palette",
             Self::ToggleCommandPalette => "toggle_command_palette",
             Self::ToggleHoverPreview => "toggle_hover_preview",
+            Self::ToggleHoverIntent => "toggle_hover_intent",
         }
     }
 
@@ -477,6 +486,7 @@ impl Action {
         Action::OpenActionPalette,
         Action::ToggleCommandPalette,
         Action::ToggleHoverPreview,
+        Action::ToggleHoverIntent,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -620,6 +630,11 @@ impl Action {
             // same Meta/Alt encoding that is unreliable across Linux terminals,
             // tmux, and SSH as the rest of the nav/overlay family.
             | Self::ToggleHoverPreview
+            // Mouse Hover Intent toggle is `Ctrl+Alt+H` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M`/
+            // `Ctrl+Alt+P` chords above.
+            | Self::ToggleHoverIntent
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -850,6 +865,17 @@ impl Action {
             // composer chord and of the `Alt+Enter` action palette / `Ctrl+Enter`
             // detail chords.
             Self::ToggleHoverPreview => KeyBinding::new(KeyCode::Char('1'), KeyModifiers::ALT),
+            // Mouse Hover Intent toggle (§12.1.3). `Ctrl+Alt+H` — `H` recalls
+            // "Hover" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`). It is free: bare `Ctrl+H`
+            // is classically ambiguous with Backspace, and every bare `Alt`
+            // letter is already claimed by the nav/copy/overlay family, so the
+            // Ctrl+Alt modifier keeps the toggle distinct and clear of every
+            // composer chord.
+            Self::ToggleHoverIntent => KeyBinding::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
         }
     }
 }

@@ -103,6 +103,7 @@ mod events;
 mod export_destination;
 mod fuzzy;
 mod history;
+mod hover_intent;
 mod hover_preview;
 mod hyperlinks;
 mod input;
@@ -2297,6 +2298,21 @@ async fn handle_input_event(
 }
 
 fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
+    // Mouse Hover Intent (§12.1.3): a button-held drag (queue reorder, scrollbar
+    // drag, or a text-selection drag) is not a dwell — it suppresses (and hides)
+    // any in-flight hover reveal. Recorded before the per-overlay routing below so
+    // a drag anywhere on the surface settles the hover state, then released the
+    // moment the next bare move dwells again. The set+clear pattern hides the
+    // affordance for the duration of this drag event without latching it off.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+    ) {
+        app.hover_intent
+            .set_suppression(Some(hover_intent::SuppressReason::Drag));
+        app.hover_intent.set_suppression(None);
+    }
+
     // The large-paste confirmation modal (§11G.6) owns the pointer while open:
     // a left-click on its Accept/Discard buttons resolves the decision, and any
     // other click is swallowed so a stray press can't fall through to the
@@ -2786,6 +2802,11 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             let now = std::time::Instant::now();
             let hit = app.click_target_at(mouse.column, mouse.row);
             let previewable = hit.filter(|(key, _)| hover_preview::policy_for(*key).hover_preview);
+            // ONE recognizer Move drives BOTH the Hover Preview popover (§12.1.4)
+            // and the Mouse Hover Intent affordance (§12.1.3): the same debounced
+            // `HoverEnter`/`HoverLeave` gesture, so they can never disagree about
+            // what is hovered. The preview shows the popover; the hover-intent sets
+            // the restrained header emphasis.
             let gesture = app
                 .gestures
                 .recognize(interaction::Phase::Move, previewable, now);
@@ -2793,6 +2814,12 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 interaction::Gesture::HoverEnter {
                     target: interaction::TargetKey::Entry(id),
                 } => {
+                    if app
+                        .hover_intent
+                        .on_hover_enter(id.0, mouse.column, mouse.row, now)
+                    {
+                        app.needs_redraw = true;
+                    }
                     if let Some(preview) =
                         build_entry_preview(app, id.0, hover_preview::PreviewSource::Hover)
                     {
@@ -2806,10 +2833,28 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 // — an incidental mouse drift must not yank it from a keyboard-only
                 // user — so only the mouse-sourced one leaves here.
                 interaction::Gesture::HoverLeave | interaction::Gesture::HoverEnter { .. } => {
+                    if app.hover_intent.on_hover_leave(now) {
+                        app.needs_redraw = true;
+                    }
                     dismiss_mouse_hover_preview(app);
                 }
                 _ => {}
             }
+        } else {
+            // The Move is not eligible for a hover reveal — an overlay / config
+            // screen / subagent pane owns the surface, or a selection is in flight.
+            // Record the §12.1.3 suppression reason (selection vs. surface-owned),
+            // which hides any in-flight hover affordance; the reveal degrades to
+            // keyboard focus. Set+clear so the reason is honest without latching.
+            let reason = if app.selection.is_some() {
+                hover_intent::SuppressReason::Selection
+            } else {
+                hover_intent::SuppressReason::CaptureOff
+            };
+            if app.hover_intent.set_suppression(Some(reason)) {
+                app.needs_redraw = true;
+            }
+            app.hover_intent.set_suppression(None);
         }
         // A Move never falls through to the click/selection paths below.
         return app.needs_redraw;
@@ -2969,12 +3014,16 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     const WHEEL_STEP_LINES: i32 = 3;
     match mouse.kind {
         MouseEventKind::ScrollUp => {
+            // A wheel scroll is the pointer sweeping content, not dwelling on a
+            // target: §12.1.3 says it must suppress (and hide) any hover reveal.
+            hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
             app.wheel_accum = app.wheel_accum.saturating_add(WHEEL_STEP_LINES);
             apply_wheel_accumulated_scroll(app);
             active_transcript_scroll(app) != before
         }
         MouseEventKind::ScrollDown => {
+            hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
             app.wheel_accum = app.wheel_accum.saturating_sub(WHEEL_STEP_LINES);
             apply_wheel_accumulated_scroll(app);
@@ -2982,6 +3031,17 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         }
         _ => false,
     }
+}
+
+/// Suppress (and hide) any in-flight hover reveal because a wheel scroll is in
+/// flight (§12.1.3), then immediately clear the suppression so a later dwell can
+/// reveal again. Resets the recognizer's hover arm so the next move re-starts the
+/// intent clock rather than instantly re-revealing the scrolled-past target.
+fn hover_suppress_scroll(app: &mut TuiApp) {
+    app.hover_intent
+        .set_suppression(Some(hover_intent::SuppressReason::Scroll));
+    app.hover_intent.set_suppression(None);
+    app.gestures.reset();
 }
 
 /// Drain the whole-line portion of the wheel accumulator into the transcript
@@ -5933,6 +5993,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_hover_preview(app);
             true
         }
+        keymap::Action::ToggleHoverIntent => {
+            // A global display preference; the config/setup screens own their own
+            // routing, so only those gate it. Toggling on/off applies to both the
+            // mouse-hover and keyboard-focus reveal paths.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_hover_intent(app);
+            true
+        }
     }
 }
 
@@ -7505,6 +7575,21 @@ fn toggle_command_palette(app: &mut TuiApp) {
         );
         app.command_palette = Some(palette);
     }
+    app.needs_redraw = true;
+}
+
+/// `Ctrl+Alt+H`: toggle Mouse Hover Intent (§12.1.3) on/off. Flips the
+/// [`hover_intent::HoverIntentState`] enable flag (which also clears any in-flight
+/// hover target when turning off, so a stale affordance can't linger), reports the
+/// new state on the status line, and requests a redraw so the change paints
+/// immediately.
+fn toggle_hover_intent(app: &mut TuiApp) {
+    let enabled = app.hover_intent.toggle();
+    app.status = if enabled {
+        "hover intent on".to_string()
+    } else {
+        "hover intent off".to_string()
+    };
     app.needs_redraw = true;
 }
 
@@ -14737,12 +14822,24 @@ fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
             TranscriptOverlayMode::NativeSelection => TranscriptOverlayMode::ScrollbarDrag,
             TranscriptOverlayMode::ScrollbarDrag => TranscriptOverlayMode::NativeSelection,
         };
-        app.status = if state.mode.mouse_capture() {
+        let capture = state.mode.mouse_capture();
+        app.status = if capture {
             "transcript scrollbar drag on (Shift-drag selects text)"
         } else {
             "transcript native selection mode"
         }
         .to_string();
+        // Mouse Hover Intent (§12.1.3): turning capture off (native-selection
+        // mode) means the terminal stops forwarding reliable motion, so suppress
+        // (and hide) any hover reveal and reset the recognizer's hover arm. The
+        // reveal degrades to keyboard focus, exactly the spec's fallback. The
+        // set+clear records the honest reason for the transition without latching.
+        if !capture {
+            app.hover_intent
+                .set_suppression(Some(hover_intent::SuppressReason::CaptureOff));
+            app.hover_intent.set_suppression(None);
+            app.gestures.reset();
+        }
     }
 }
 
@@ -19893,7 +19990,15 @@ fn should_advance_animation_tick(app: &TuiApp) -> bool {
     // (`finalize_elapsed_settles` clears them), so an idle transcript with
     // no settling entries and no active turn returns to its prior behavior
     // and does not perpetually repaint.
-    app.focused || turn_in_progress(app) || app.has_settling_entry()
+    //
+    // Mouse Hover Intent (§12.1.3): keep one tick alive only while a hover reveal
+    // is still settling (`reveal_pending`), so the affordance paints crisply and
+    // then the state goes quiet — never a redraw loop. A settled or absent hover
+    // returns `false` here, preserving the zero-idle-cost invariant.
+    app.focused
+        || turn_in_progress(app)
+        || app.has_settling_entry()
+        || app.hover_intent.reveal_pending(std::time::Instant::now())
 }
 
 fn working_line(app: &TuiApp) -> Line<'static> {
@@ -20662,6 +20767,112 @@ fn render_entry_annotation_markers(
     }
 }
 
+/// A single fixed-width hint glyph painted at the right edge of the
+/// hover-revealed (or, when no motion is reported, keyboard-focused) transcript
+/// card's header row (§12.1.3). Restrained on purpose: one accent-bold cell that
+/// says "this card is interactive" without changing the row's height or width —
+/// the spec's "controls appear only when they add obvious value … without
+/// changing row heights".
+const HOVER_HINT_GLYPH: &str = "\u{203a}";
+
+/// Mouse Hover Intent (§12.1.3): paint the restrained hover affordance on the
+/// header row of the *revealed* entry — the one the pointer is dwelling on (after
+/// the [`interaction::HOVER_INTENT_MS`] debounce) when the terminal reports
+/// motion, else the keyboard-focused entry. The decision (which id, or none) comes
+/// entirely from [`hover_intent::HoverIntentState::reveal_target`], so the mouse
+/// and keyboard paths reveal identically.
+///
+/// FIXED SIZE / NO LAYOUT CHURN: a single glyph drawn over an existing header
+/// cell at the right edge — never an inserted row or column — so revealing or
+/// hiding it can't reflow the transcript (the spec's flicker/overlap risk).
+///
+/// ZERO IDLE COST: when the feature is off, nothing is revealed, or the revealed
+/// entry is off-screen, this returns without painting. It mirrors
+/// [`register_transcript_card_targets`]'s window/offset math so the hint lands on
+/// the same row the header paints, in both wrap and no-wrap modes.
+// Mirrors `render_entry_annotation_markers`' parameter list (the same painted-
+// window geometry); folding these into a struct would obscure that 1:1 match.
+#[allow(clippy::too_many_arguments)]
+fn render_hover_affordance(
+    frame: &mut Frame<'_>,
+    app: &TuiApp,
+    text_area: Rect,
+    build_width: Option<u16>,
+    include_startup_card: bool,
+    total_rows: usize,
+    viewport_h: usize,
+    from_bottom: usize,
+) {
+    // The single decision: which entry (if any) reveals the affordance this frame.
+    // `None` (feature off, nothing hovered, no focus) means nothing to paint.
+    let Some(reveal_id) = app.hover_intent.reveal_target(focused_entry_id(app)) else {
+        return;
+    };
+    if text_area.width == 0 || text_area.height == 0 || total_rows == 0 {
+        return;
+    }
+    let top_row = total_rows
+        .saturating_sub(viewport_h)
+        .saturating_sub(from_bottom);
+    let bottom_row = total_rows.min(top_row + viewport_h);
+
+    let (_lines, entry_offsets) =
+        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entries = active_transcript_entries(app);
+    for (i, &header_row) in entry_offsets.iter().enumerate() {
+        let Some(entry) = entries.get(i) else {
+            continue;
+        };
+        if entry.id != reveal_id {
+            continue;
+        }
+        if header_row < top_row || header_row >= bottom_row {
+            // The revealed entry has scrolled out of the window: paint nothing.
+            return;
+        }
+        // The annotation marker (§12.2.5) already occupies the right edge of an
+        // annotated entry's header and is the dominant affordance there, so skip
+        // the hover hint to avoid stacking two glyphs in one cell.
+        if app.annotations.annotated(entry.id) {
+            return;
+        }
+        let glyph_w = HOVER_HINT_GLYPH.chars().count() as u16;
+        if glyph_w >= text_area.width {
+            return;
+        }
+        let screen_y = text_area.y + (header_row - top_row) as u16;
+        let hint_x = text_area.x + text_area.width - glyph_w;
+        let hint_rect = Rect {
+            x: hint_x,
+            y: screen_y,
+            width: glyph_w,
+            height: 1,
+        };
+        frame.render_widget(ratatui::widgets::Clear, hint_rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                HOVER_HINT_GLYPH,
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            hint_rect,
+        );
+        return;
+    }
+}
+
+/// The stable id of the keyboard-focused transcript entry, or `None` when nothing
+/// is focused (or the active conversation is a subagent, which has no main-view
+/// focus). Used by the Mouse Hover Intent reveal as the keyboard-equivalent
+/// target when the terminal reports no mouse motion.
+fn focused_entry_id(app: &TuiApp) -> Option<u64> {
+    let index = active_selected_entry(app)?;
+    active_transcript_entries(app)
+        .get(index)
+        .map(|entry| entry.id)
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     // When the minimap turn rail is on, carve its 1-cell column off the right
     // edge BEFORE the scrollbar split, so the rail sits just left of the
@@ -20824,6 +21035,22 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // per-entry click targets every frame. A complete no-op when the annotation
     // store is empty, so an un-annotated session pays nothing here.
     render_entry_annotation_markers(
+        frame,
+        app,
+        text_area,
+        build_width,
+        include_startup_card,
+        total_rows,
+        viewport_h,
+        from_bottom,
+    );
+
+    // Mouse Hover Intent (§12.1.3) affordance on the hover-revealed (or keyboard-
+    // focused) entry's header row. Painted after the annotation markers so it draws
+    // on top, fixed-size so it never reflows the row. A complete no-op when the
+    // feature is off, nothing is hovered, and nothing is focused, so a resting
+    // session pays nothing here.
+    render_hover_affordance(
         frame,
         app,
         text_area,
@@ -31650,6 +31877,16 @@ pub(crate) struct TuiApp {
     /// until the main-selection path is migrated onto the recognizer in a later
     /// phase.
     pub(crate) gestures: interaction::Recognizer,
+    /// Mouse Hover Intent (§12.1.3): the debounced hover-reveal state — which
+    /// stable entry id the pointer is dwelling on (post-[`interaction::
+    /// HOVER_INTENT_MS`] debounce), its suppression reason, and the last pointer
+    /// cell. The render path asks it (via [`hover_intent::HoverIntentState::
+    /// reveal_target`]) which header to give a restrained hover emphasis, falling
+    /// back to the keyboard-focused entry when the terminal reports no motion
+    /// (the resting `?1000h` capture mode). The resting state is "enabled / no
+    /// target / not suppressed", which paints nothing and schedules no tick, so an
+    /// un-hovered session pays zero idle cost.
+    pub(crate) hover_intent: hover_intent::HoverIntentState,
     /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
     /// `<workspace>/.squeezy/prompts/`. Consulted by
     /// [`handle_slash_command`] when the typed head isn't a built-in
@@ -32154,6 +32391,7 @@ impl TuiApp {
             pending_chord: None,
             clickables: std::cell::RefCell::new(interaction::Registry::new()),
             gestures: interaction::Recognizer::new(),
+            hover_intent: hover_intent::HoverIntentState::default(),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,
             settings_path_override: None,

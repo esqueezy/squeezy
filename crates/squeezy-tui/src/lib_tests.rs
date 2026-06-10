@@ -32048,3 +32048,229 @@ async fn annotation_survives_appends_and_resize() {
         "the note still lands on its original entry after appends",
     );
 }
+
+// ===========================================================================
+// Mouse Hover Intent (§12.1.3) — integration tests driving the real render()
+// and handle_mouse() / handle_key() paths.
+// ===========================================================================
+
+/// The hover-affordance hint glyph (`›`) the §12.1.3 renderer paints on the
+/// revealed/focused card header. Mirrors `HOVER_HINT_GLYPH` in `lib.rs`.
+const HOVER_HINT_GLYPH_TEST: &str = "\u{203a}";
+
+/// A small main-transcript app whose first entry is visible at the top of the
+/// viewport, so a focus/hover reveal lands inside the painted window. Built like
+/// the annotatable fixture but pinned to the head.
+fn app_with_hoverable_transcript() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    for i in 0..4 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {i}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {i}")));
+    }
+    app
+}
+
+/// Pin the painted view to the entry with stable `id` and settle the ease so the
+/// header is the painted top row.
+fn pin_view_to_entry(app: &mut TuiApp, id: u64) {
+    assert!(jump_to_entry_id(app, id), "view pins to the entry");
+    cancel_main_scroll_anim(app);
+}
+
+#[test]
+fn hover_intent_keyboard_focus_reveals_affordance_on_focused_header() {
+    // The keyboard-equivalent path: with NO mouse motion (the resting `?1000h`
+    // capture mode), focusing an entry reveals the restrained hint on its header.
+    let mut app = app_with_hoverable_transcript();
+    let top_id = active_transcript_entries(&app).first().expect("entry").id;
+    pin_view_to_entry(&mut app, top_id);
+
+    // Nothing focused yet ⇒ no hint painted (zero idle cost).
+    app.selected_entry = None;
+    let before = render_to_string(&app, 80, 24);
+    assert!(
+        !before.contains(HOVER_HINT_GLYPH_TEST),
+        "no hover hint with nothing focused and nothing hovered:\n{before}"
+    );
+
+    // Focus the top (visible) entry ⇒ the hint reveals on its header.
+    app.selected_entry = Some(0);
+    let after = render_to_string(&app, 80, 24);
+    assert!(
+        after.contains(HOVER_HINT_GLYPH_TEST),
+        "the hover affordance reveals on the keyboard-focused header:\n{after}"
+    );
+}
+
+#[test]
+fn hover_intent_disabled_paints_nothing_even_when_focused() {
+    // Turning the feature off silences both the mouse and keyboard-focus reveal.
+    let mut app = app_with_hoverable_transcript();
+    let top_id = active_transcript_entries(&app).first().expect("entry").id;
+    pin_view_to_entry(&mut app, top_id);
+    app.selected_entry = Some(0);
+
+    // On (default) ⇒ hint paints.
+    assert!(
+        render_to_string(&app, 80, 24).contains(HOVER_HINT_GLYPH_TEST),
+        "hint paints while enabled"
+    );
+
+    // Toggle off via the pure model and re-render ⇒ no hint.
+    assert!(!app.hover_intent.toggle(), "toggled off");
+    let off = render_to_string(&app, 80, 24);
+    assert!(
+        !off.contains(HOVER_HINT_GLYPH_TEST),
+        "no hover hint while the feature is disabled:\n{off}"
+    );
+}
+
+#[tokio::test]
+async fn hover_intent_toggle_key_flips_state_and_status() {
+    // The `Ctrl+Alt+H` verb flips the feature and reports it on the status line.
+    let mut app = app_with_hoverable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(app.hover_intent.is_enabled(), "enabled by default");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+H toggles hover intent");
+    assert!(!app.hover_intent.is_enabled(), "first press turns it off");
+    assert!(
+        app.status.contains("hover intent off"),
+        "status reflects off: {}",
+        app.status
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+H toggles back");
+    assert!(app.hover_intent.is_enabled(), "second press turns it on");
+    assert!(
+        app.status.contains("hover intent on"),
+        "status reflects on: {}",
+        app.status
+    );
+}
+
+#[test]
+fn hover_intent_mouse_move_reveals_after_dwell_and_leave_hides() {
+    // The mouse path: render so the card targets register, find a header cell,
+    // then drive two Move events on the same key far enough apart that the
+    // recognizer's HOVER_INTENT_MS debounce elapses and the reveal arms.
+    let mut app = app_with_hoverable_transcript();
+    let top_id = active_transcript_entries(&app).first().expect("entry").id;
+    pin_view_to_entry(&mut app, top_id);
+    app.selected_entry = None; // isolate the MOUSE path from the focus fallback
+
+    // Paint so the Entry hit targets register this frame.
+    let _ = render_to_string(&app, 80, 24);
+    let mut header_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((interaction::TargetKey::Entry(id), _)) = app.click_target_at(col, row)
+                && id.0 == top_id
+            {
+                header_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = header_cell.expect("the top entry registers a header hit target");
+
+    // First move onto the header arms the intent clock but does not yet reveal
+    // (the recognizer waits out HOVER_INTENT_MS on the same key).
+    let moved = |c: u16, r: u16| crossterm::event::MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: c,
+        row: r,
+        modifiers: KeyModifiers::NONE,
+    };
+    handle_mouse(&mut app, moved(col, row));
+    // A second move on the same cell after the debounce window reveals it.
+    std::thread::sleep(Duration::from_millis(
+        (interaction::HOVER_INTENT_MS as u64) + 20,
+    ));
+    handle_mouse(&mut app, moved(col, row));
+    assert_eq!(
+        app.hover_intent.hovered_target(),
+        Some(top_id),
+        "a dwell on the header reveals it"
+    );
+    let hovered = render_to_string(&app, 80, 24);
+    assert!(
+        hovered.contains(HOVER_HINT_GLYPH_TEST),
+        "the affordance paints on the hovered header:\n{hovered}"
+    );
+
+    // Moving off every target (to empty space well below the transcript) hides it.
+    handle_mouse(&mut app, moved(0, 23));
+    assert_eq!(
+        app.hover_intent.hovered_target(),
+        None,
+        "leaving every target hides the reveal"
+    );
+}
+
+#[test]
+fn hover_intent_scroll_suppresses_an_in_flight_reveal() {
+    // Wheel scroll must suppress the hover reveal (§12.1.3): the pointer is
+    // sweeping content, not dwelling.
+    let mut app = app_with_hoverable_transcript();
+    let top_id = active_transcript_entries(&app).first().expect("entry").id;
+    pin_view_to_entry(&mut app, top_id);
+    app.selected_entry = None;
+
+    // Force a revealed mouse hover directly through the model, then scroll.
+    app.hover_intent
+        .on_hover_enter(top_id, 1, 1, std::time::Instant::now());
+    assert_eq!(app.hover_intent.hovered_target(), Some(top_id));
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.hover_intent.hovered_target(),
+        None,
+        "a wheel scroll hides the in-flight hover reveal"
+    );
+}
+
+#[test]
+fn hover_intent_resize_keeps_reveal_on_the_same_entry() {
+    // The reveal is anchored by stable id, so a resize that reflows the transcript
+    // still paints the hint on the same focused entry's header. Focus the LAST
+    // entry, which the tail-following view keeps visible at every size, so the
+    // assertion isolates the resize behavior from scroll clamping.
+    let mut app = app_with_hoverable_transcript();
+    let last_index = active_transcript_entries(&app).len() - 1;
+    app.selected_entry = Some(last_index);
+
+    for (w, h) in [(80u16, 24u16), (60, 18), (100, 30)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains(HOVER_HINT_GLYPH_TEST),
+            "the hover hint follows its entry across resize at {w}x{h}:\n{out}"
+        );
+    }
+}
