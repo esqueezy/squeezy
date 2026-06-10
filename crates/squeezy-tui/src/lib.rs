@@ -104,6 +104,7 @@ mod interaction;
 mod jump_marks;
 mod keymap;
 mod keymap_config;
+mod lane_fold;
 mod latency;
 mod logical_scroll;
 mod main_render_cache;
@@ -1786,6 +1787,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.error_lens_open
         || app.health_markers_open
         || app.turn_outline_open
+        || app.lane_fold_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2457,6 +2459,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::TurnOutlineRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Collapsible Reasoning/Tool Lanes overlay (§12.2.2) owns the pointer
+    // while open: a left-click on a lane row selects it and toggles that lane's
+    // collapsed state; every other click is swallowed so a stray press can't fall
+    // through to the surface beneath. Hit-tested in ABSOLUTE screen coordinates
+    // against the row targets `render_lane_fold_surface` registered this frame.
+    if app.lane_fold_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::LaneFoldRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3736,6 +3756,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // dispatch, so a stray key never leaks into the composer underneath. Sits
     // beside the health-markers overlay at the front for the same reason.
     if app.turn_outline_open && handle_turn_outline_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Collapsible Reasoning/Tool Lanes overlay (§12.2.2) is modal while open:
+    // it owns the keyboard (↑↓/kj move the lane cursor, Enter/Space toggle the
+    // selected lane's collapse, c/o collapse/expand all, Esc/Alt+z close) BEFORE
+    // any selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.lane_fold_open && handle_lane_fold_key(app, key) {
         return Ok(false);
     }
 
@@ -5451,6 +5481,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_turn_outline(app);
             true
         }
+        keymap::Action::ToggleLaneFold => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_lane_fold(app);
+            true
+        }
     }
 }
 
@@ -6289,6 +6329,140 @@ fn turn_outline_jump_to_selected(app: &mut TuiApp, advance: bool) {
     } else {
         app.status = "turn outline: could not jump".to_string();
     }
+}
+
+/// `Alt+z`: toggle the Collapsible Reasoning/Tool Lanes overlay (§12.2.2). The
+/// overlay is a per-entry panel that splits the focused transcript entry into
+/// foldable lanes (reasoning, assistant text, tool input/output, system notice,
+/// approval, error, plan), each with a collapse toggle so whole lanes can be
+/// folded away. Opening it refreshes the lane panel for the focused entry (a
+/// no-op rebuild when neither the entry nor the collapse state changed since the
+/// last refresh, so the cost is only paid on a real change), resets the lane
+/// cursor, and confirms via the status line. Sets `needs_redraw` so the toggle
+/// paints immediately.
+fn toggle_lane_fold(app: &mut TuiApp) {
+    app.lane_fold_open = !app.lane_fold_open;
+    if app.lane_fold_open {
+        refresh_lane_fold(app);
+        app.lane_fold_selected = 0;
+        app.status = if app.lane_panel.is_empty() {
+            "lane folds (no entry to fold) — Esc to close".to_string()
+        } else {
+            format!(
+                "lane folds: {} — \u{2191}\u{2193} select \u{00b7} Enter fold \u{00b7} Esc close",
+                app.lane_panel.summary(),
+            )
+        };
+    } else {
+        app.status = "lane folds closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Collapsible Reasoning/Tool Lanes overlay (§12.2.2) is
+/// open. Returns `true` when the key was consumed (so it never leaks to the
+/// composer or global keymap). Mirrors the other overlays'
+/// before-the-global-keymap modal consumption: the toggle chord (`Alt+z`) and
+/// Esc close; Up/Down (and k/j) move the lane cursor; Enter/Space toggle the
+/// selected lane's collapsed state; `c` collapses every lane and `o` expands
+/// every lane (the bulk verbs the status line advertises).
+fn handle_lane_fold_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.lane_fold_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+z` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleLaneFold) {
+        app.lane_fold_open = false;
+        app.status = "lane folds closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.lane_panel.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.lane_fold_open = false;
+            app.status = "lane folds closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.lane_fold_selected = app.lane_fold_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.lane_fold_selected = (app.lane_fold_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            lane_fold_toggle_selected(app);
+        }
+        // Collapse every lane / expand every lane in one go.
+        KeyCode::Char('c') => lane_fold_set_all(app, true),
+        KeyCode::Char('o') => lane_fold_set_all(app, false),
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Toggle the collapsed state of the lane the overlay cursor is on (§12.2.2).
+/// Resolves the lane at the cursor, flips its `(entry_id, lane_id)` entry in the
+/// persisted [`lane_fold::LaneFoldStore`], refreshes the panel so the new state
+/// is reflected, and reports the lane/state in the status line. A no-op (status
+/// hint) when there is nothing to toggle.
+fn lane_fold_toggle_selected(app: &mut TuiApp) {
+    let Some((key, lane_id)) = app
+        .lane_panel
+        .get(app.lane_fold_selected)
+        .map(|lane| (lane.key, lane.id()))
+    else {
+        app.status = "lane folds: nothing to fold".to_string();
+        return;
+    };
+    let now_collapsed = app.lane_folds.toggle(key);
+    // The toggle bumped the store generation, so the panel fingerprint moved;
+    // refresh re-projects with the new collapse state.
+    refresh_lane_fold(app);
+    let position = app.lane_fold_selected + 1;
+    let total = app.lane_panel.len();
+    let verb = if now_collapsed {
+        "collapsed"
+    } else {
+        "expanded"
+    };
+    app.status = format!(
+        "lane folds {position}/{total} [{}] {verb} — Esc close",
+        lane_id.label(),
+    );
+    app.needs_redraw = true;
+}
+
+/// Collapse (`collapse = true`) or expand (`collapse = false`) every lane of the
+/// focused entry in one pass (§12.2.2) — the overlay's `c`/`o` bulk verbs. Mutates
+/// the persisted store once, refreshes the panel, and reports the result.
+fn lane_fold_set_all(app: &mut TuiApp, collapse: bool) {
+    let keys = app.lane_panel.keys();
+    if keys.is_empty() {
+        app.status = "lane folds: nothing to fold".to_string();
+        return;
+    }
+    if collapse {
+        app.lane_folds.collapse_all(keys);
+    } else {
+        app.lane_folds.expand_all(keys);
+    }
+    refresh_lane_fold(app);
+    let verb = if collapse {
+        "collapsed all lanes"
+    } else {
+        "expanded all lanes"
+    };
+    app.status = format!("lane folds: {verb} — Esc close");
+    app.needs_redraw = true;
 }
 
 /// Re-copy the picker's selected entry back to the clipboard through the same
@@ -7413,6 +7587,198 @@ fn refresh_turn_outline(app: &mut TuiApp) {
     app.turn_outline.rebuild_if_stale(fingerprint, &entries);
 }
 
+/// Count the non-blank lines in a text blob — the body row count a lane header
+/// advertises ("tool output (12 lines)"). Bounded by counting only what is
+/// present; an empty/blank blob yields 0.
+fn lane_line_count(text: &str) -> usize {
+    text.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+/// Pull the human-visible output text of a tool result (stdout/output/text/
+/// message, falling back to the serialized content blob), reusing the same field
+/// order the duplicate-fold model scans. Used for the tool-output lane's line
+/// count + preview.
+fn lane_tool_output_text(tool: &ToolTranscript) -> String {
+    let content = &tool.result.content;
+    for key in ["stdout", "output", "text", "message"] {
+        if let Some(text) = content.get(key).and_then(|v| v.as_str())
+            && !text.trim().is_empty()
+        {
+            return text.to_string();
+        }
+    }
+    content.to_string()
+}
+
+/// Decompose one transcript entry into its foldable lanes (§12.2.2). The lane set
+/// is derived from the entry's kind, reusing the same `TranscriptEntryKind` /
+/// `ToolStatus` / `is_failure_log` predicates the renderer uses, so the lanes the
+/// user folds match what the renderer painted. `is_error` is the entry-level
+/// failure cross-cut so the relevant lane keeps its always-visible header. Pure
+/// over the entry.
+fn build_lane_entries(entry: &TranscriptEntry, is_error: bool) -> Vec<lane_fold::LaneEntry> {
+    use lane_fold::{LaneEntry, LaneId};
+    let mut lanes: Vec<LaneEntry> = Vec::new();
+    match &entry.kind {
+        TranscriptEntryKind::Message(item) => {
+            // An assistant message may carry an attached reasoning summary; it
+            // becomes its own foldable reasoning lane ahead of the prose.
+            if let Some(reasoning) = &item.reasoning {
+                let text = reasoning.display_text.clone();
+                lanes.push(LaneEntry {
+                    id: LaneId::Reasoning,
+                    line_count: lane_line_count(&text),
+                    is_error: false,
+                    preview: text,
+                });
+            }
+            lanes.push(LaneEntry {
+                id: LaneId::AssistantText,
+                line_count: lane_line_count(&item.content),
+                is_error,
+                preview: item.content.clone(),
+            });
+        }
+        TranscriptEntryKind::ToolResult(tool) => {
+            // Tool input lane: the call name + its serialized arguments (never the
+            // raw output, so a folded input stays secret-light).
+            if let Some(call) = &tool.call {
+                let input = if call.arguments.is_null() {
+                    call.name.clone()
+                } else {
+                    format!("{} {}", call.name, call.arguments)
+                };
+                lanes.push(LaneEntry {
+                    id: LaneId::ToolInput,
+                    line_count: 1,
+                    is_error: false,
+                    preview: input,
+                });
+            }
+            // A denied tool call is an approval *decision*: it gets its own
+            // foldable approval lane so the user can collapse the denial rationale
+            // while still seeing the lane header. (Denials are surfaced as the
+            // tool's content, never the raw output, so a folded approval stays
+            // legible.)
+            if tool.result.status == ToolStatus::Denied {
+                lanes.push(LaneEntry {
+                    id: LaneId::Approval,
+                    line_count: 1,
+                    is_error: false,
+                    preview: format!("{} (denied)", tool.result.tool_name),
+                });
+            }
+            // Tool output lane: the human-visible result body. An errored tool
+            // tags this lane so its header always paints (failures never hide).
+            let output = lane_tool_output_text(tool);
+            lanes.push(LaneEntry {
+                id: LaneId::ToolOutput,
+                line_count: lane_line_count(&output),
+                is_error,
+                preview: output,
+            });
+        }
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            let text = snapshot.display_text.clone();
+            lanes.push(LaneEntry {
+                id: LaneId::Reasoning,
+                line_count: lane_line_count(&text),
+                is_error: false,
+                preview: text,
+            });
+        }
+        TranscriptEntryKind::Log(log) => {
+            // A failure log is an error lane (always-visible header); any other
+            // log is a system-notice lane.
+            let message = log.message().to_string();
+            let lane_id = if is_error || is_failure_log(&message) {
+                LaneId::Error
+            } else {
+                LaneId::SystemNotice
+            };
+            lanes.push(LaneEntry {
+                id: lane_id,
+                line_count: lane_line_count(&message),
+                is_error: is_error || matches!(lane_id, LaneId::Error),
+                preview: message,
+            });
+        }
+        TranscriptEntryKind::PlanCard(_) => {
+            lanes.push(LaneEntry {
+                id: LaneId::Plan,
+                line_count: 1,
+                is_error: false,
+                preview: "plan".to_string(),
+            });
+        }
+        TranscriptEntryKind::Diff(data) => {
+            // A `/diff` snapshot reads as a system-notice lane (operational
+            // breadcrumb), titled by its summary.
+            lanes.push(LaneEntry {
+                id: LaneId::SystemNotice,
+                line_count: data.lines.len(),
+                is_error: false,
+                preview: data.summary.clone(),
+            });
+        }
+        TranscriptEntryKind::SlashEcho(echo) => {
+            let preview = if echo.args.trim().is_empty() {
+                format!("/{}", echo.cmd)
+            } else {
+                format!("/{} {}", echo.cmd, echo.args)
+            };
+            lanes.push(LaneEntry {
+                id: LaneId::SystemNotice,
+                line_count: 1,
+                is_error: false,
+                preview,
+            });
+        }
+    }
+    lanes
+}
+
+/// The entry id whose lanes the Collapsible Reasoning/Tool Lanes overlay
+/// (§12.2.2) folds: the focused entry when one is focused, else the latest (tail)
+/// entry, so opening the overlay without first focusing still has a sensible
+/// target. `None` only on an empty transcript.
+fn lane_fold_anchor_id(app: &TuiApp) -> Option<u64> {
+    let entries = active_transcript_entries(app);
+    if let Some(index) = active_selected_entry(app)
+        && let Some(entry) = entries.get(index)
+    {
+        return Some(entry.id);
+    }
+    entries.last().map(|entry| entry.id)
+}
+
+/// Refresh the Collapsible Reasoning/Tool Lanes panel (§12.2.2) for the focused
+/// entry, rebuilding **only** when the (entry id, lane sources, fold-store
+/// generation) fingerprint has moved since the last refresh. Called lazily —
+/// right before the lane overlay opens or renders — so an idle session that never
+/// opens the overlay pays nothing, and an open overlay re-projects only on a real
+/// change (focus move, entry revision bump, or a collapse toggle) rather than
+/// every frame.
+fn refresh_lane_fold(app: &mut TuiApp) {
+    let entries = active_transcript_entries(app);
+    let (entry_id, lanes) = match lane_fold_anchor_id(app).and_then(|id| {
+        entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .map(|i| (id, i))
+    }) {
+        Some((id, index)) => {
+            let is_error = entry_is_error(entries, index);
+            (Some(id), build_lane_entries(&entries[index], is_error))
+        }
+        None => (None, Vec::new()),
+    };
+    let fingerprint =
+        lane_fold::LanePanel::fingerprint_of(entry_id, &lanes, app.lane_folds.generation());
+    app.lane_panel
+        .rebuild_if_stale(fingerprint, entry_id, &lanes, &app.lane_folds);
+}
+
 /// Compact human label for an entry id used in the recent-jump status readout
 /// (`"#3 user"`, `"#5 tool"`). `None` when the id is no longer live.
 fn jump_mark_entry_label(app: &TuiApp, entry_id: u64) -> Option<String> {
@@ -8394,6 +8760,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::TurnOutlineSelect(index) => {
             app.turn_outline_selected = index;
             turn_outline_jump_to_selected(app, false);
+        }
+        // A click on a Collapsible Reasoning/Tool Lanes row (§12.2.2): move the
+        // cursor onto it and toggle that lane's collapsed state — the mouse twin
+        // of ↑↓ + Enter/Space, in one go.
+        interaction::Action::LaneFoldToggle(index) => {
+            app.lane_fold_selected = index;
+            lane_fold_toggle_selected(app);
         }
     }
 }
@@ -13932,6 +14305,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_turn_outline_surface(frame, area, app);
         return;
     }
+    // The Collapsible Reasoning/Tool Lanes overlay (§12.2.2) paints as a
+    // fullscreen lane panel over everything else while open, registering its
+    // per-lane row click targets every frame. Checked beside the turn-outline
+    // overlay so its targets register and it owns the surface while open.
+    if app.lane_fold_open {
+        render_lane_fold_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -15387,6 +15768,174 @@ fn render_turn_outline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::TurnOutlineRow(index)),
             interaction::Action::TurnOutlineSelect(index),
+        );
+    }
+}
+
+/// Paint the Collapsible Reasoning/Tool Lanes overlay (§12.2.2) as a centered
+/// modal: a title, a one-line summary/navigation header (or an empty-state line),
+/// then one row per lane of the focused entry — a disclosure glyph (`\u{25b6}`
+/// collapsed / `\u{25bc}` expanded), the lane label, its body line count, an
+/// `error` tag (color *and* text label, never color-only) for an error lane, and
+/// the lane's short deterministic preview. An errored lane's header always paints
+/// regardless of collapse state, so a failure is never hidden. Each row is a
+/// [`interaction::ChromeKey::LaneFoldRow`] click target so a click reaches the
+/// same `lane_fold_toggle_selected` path as ↑↓+Enter/Space. Reads the
+/// already-refreshed lane panel (kept current by the run loop while open), so
+/// painting is constant-time and does no transcript walk.
+fn render_lane_fold_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Lane folds ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} collapse/expand lanes ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 88, 24, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let count = app.lane_panel.len();
+    // Header: summary + navigation hint, or an empty-state line.
+    let header = if count == 0 {
+        Line::from(Span::styled(
+            "No entry to fold into lanes yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter fold \u{00b7} c/o all \u{00b7} Esc close",
+                app.lane_panel.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the lane count so a lane that vanished (e.g. after a
+    // focus change) can never leave the cursor past the end.
+    let selected = app.lane_fold_selected.min(count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    // Scroll the lane list so the selected lane stays visible when the panel is
+    // taller than the available rows — the list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, lane) in app
+        .lane_panel
+        .lanes()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
+        let index = offset;
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        // The lane's header always paints regardless of collapse state, so a
+        // failure is never hidden — the spec's "errored lanes keep visible
+        // headers" invariant, asserted here at the paint site.
+        if !lane.always_visible() {
+            continue;
+        }
+        let body_shown = lane.body_visible();
+        let caret = if is_selected { "\u{203a} " } else { "  " };
+        // The disclosure glyph (▼ expanded / ▶ collapsed) doubles with the
+        // textual "(hidden)" tag below so the fold state never relies on the glyph
+        // (or its color) alone. Both glyphs are in the accessibility chrome-glyph
+        // allow-list.
+        let disclosure = if body_shown {
+            Span::styled(
+                "\u{25bc} ",
+                Style::default().fg(crate::render::theme::secondary()),
+            )
+        } else {
+            Span::styled(
+                "\u{25b6} ",
+                Style::default().fg(crate::render::theme::quiet()),
+            )
+        };
+        // An error lane carries a red `error` tag (color *and* text, no
+        // color-only meaning); a non-error lane leaves the tag column blank.
+        let status_span = if lane.is_error {
+            Span::styled(
+                format!("{:<6} ", "error"),
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(format!("{:<6} ", ""))
+        };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        // The lane's body line count, shown so a collapsed lane still tells the
+        // user how much is hidden under it. A collapsed lane is tagged "hidden" in
+        // text (never color-only) so the fold state reads without relying on the
+        // glyph color.
+        let line_word = if lane.line_count == 1 {
+            "line"
+        } else {
+            "lines"
+        };
+        let count_text = if body_shown {
+            format!("{:>4} {line_word}  ", lane.line_count)
+        } else {
+            format!("{:>4} {line_word} (hidden)  ", lane.line_count)
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            disclosure,
+            Span::styled(format!("{:<15} ", lane.id().label()), label_style),
+            status_span,
+            Span::styled(
+                count_text,
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(
+                lane.preview.clone(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its lane-list index so
+        // a click selects + toggles exactly that lane.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::LaneFoldRow(index)),
+            interaction::Action::LaneFoldToggle(index),
         );
     }
 }
@@ -27012,6 +27561,29 @@ pub(crate) struct TuiApp {
     /// Cursor into the turn-outline overlay's list of nodes (§12.2.1). Clamped to
     /// the node count each render. Only meaningful while the overlay is open.
     pub(crate) turn_outline_selected: usize,
+    /// Persisted lane collapse state for Collapsible Reasoning/Tool Lanes
+    /// (§12.2.2): the set of `(entry_id, lane_id)` lanes the user has folded. Lives
+    /// here (not recomputed from terminal cells) so a folded lane survives every
+    /// redraw, resize, scroll, and stream tick. The resting state is an empty set,
+    /// so a session with no collapsed lanes costs nothing. Mutated by the lane
+    /// overlay's toggle / collapse-all / expand-all verbs.
+    pub(crate) lane_folds: lane_fold::LaneFoldStore,
+    /// Projected lane panel for the focused entry (§12.2.2): one foldable lane per
+    /// section of the focused transcript entry (reasoning, assistant text, tool
+    /// input/output, system notice, approval, error, plan), each carrying its
+    /// resolved collapse state read from `lane_folds`. Rebuilt incrementally — only
+    /// when the (entry id, lane sources, fold generation) fingerprint moves — by
+    /// `refresh_lane_fold`, so an idle session pays one `u64` comparison per
+    /// refresh. Drives the lane overlay's list.
+    pub(crate) lane_panel: lane_fold::LanePanel,
+    /// Whether the Collapsible Reasoning/Tool Lanes overlay (§12.2.2) is open.
+    /// `false` = closed (the resting state, paints nothing extra); `true` = the
+    /// fullscreen lane panel owns key/mouse routing. Toggled by the
+    /// `ToggleLaneFold` keymap action.
+    pub(crate) lane_fold_open: bool,
+    /// Cursor into the lane overlay's list of lanes (§12.2.2). Clamped to the lane
+    /// count each render. Only meaningful while the overlay is open.
+    pub(crate) lane_fold_selected: usize,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -27593,6 +28165,10 @@ impl TuiApp {
             turn_outline: turn_outline::OutlineIndex::new(),
             turn_outline_open: false,
             turn_outline_selected: 0,
+            lane_folds: lane_fold::LaneFoldStore::new(),
+            lane_panel: lane_fold::LanePanel::new(),
+            lane_fold_open: false,
+            lane_fold_selected: 0,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -29830,6 +30406,14 @@ impl TerminalGuard {
         // branch is skipped entirely).
         if app.turn_outline_open {
             refresh_turn_outline(app);
+        }
+
+        // Keep the Collapsible Reasoning/Tool Lanes panel (§12.2.2) current while
+        // its overlay is open, on the same no-op-when-unchanged terms: an
+        // open-but-idle overlay costs one `u64` comparison and a closed overlay
+        // costs nothing (this branch is skipped entirely).
+        if app.lane_fold_open {
+            refresh_lane_fold(app);
         }
 
         let paint = self.paint_one_frame(app);

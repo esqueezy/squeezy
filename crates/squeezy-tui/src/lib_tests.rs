@@ -28463,3 +28463,343 @@ async fn turn_outline_renders_across_resizes() {
         "the first node's stable id survives every resize",
     );
 }
+
+// ---- Collapsible Reasoning/Tool Lanes (§12.2.2) ----
+
+/// Build a transcript whose tail is a tool result carrying a call (so it
+/// decomposes into a tool-input lane and a tool-output lane). Seeds a
+/// deterministic viewport so geometry is host-independent.
+fn app_with_lane_fold_tool() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("run the tests".to_string()));
+    let call = ToolCall {
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({ "cmd": "cargo test" }),
+    };
+    app.push_tool_result_with_call(
+        sample_tool_result("shell", "running 12 tests\ntest result: ok\n"),
+        Some(call),
+    );
+    app
+}
+
+#[tokio::test]
+async fn lane_fold_alt_z_opens_overlay_and_lists_lanes() {
+    let mut app = app_with_lane_fold_tool();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+z opens the lane-fold overlay");
+
+    assert!(app.lane_fold_open, "Alt+z opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Lane folds"), "header present:\n{out}");
+
+    // The tail tool entry decomposes into a tool-input and a tool-output lane.
+    assert_eq!(
+        app.lane_panel.len(),
+        2,
+        "tool entry has input + output lanes"
+    );
+    assert!(out.contains("tool input"), "tool input lane label:\n{out}");
+    assert!(
+        out.contains("tool output"),
+        "tool output lane label:\n{out}"
+    );
+    // The line-count column tells the user how much each lane holds.
+    assert!(out.contains("lines"), "line count column:\n{out}");
+}
+
+#[tokio::test]
+async fn lane_fold_keyboard_toggles_and_persists_across_redraws() {
+    let mut app = app_with_lane_fold_tool();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lanes");
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(app.lane_fold_selected, 0, "cursor starts at the first lane");
+    assert_eq!(app.lane_folds.collapsed_count(), 0, "nothing collapsed yet");
+
+    // Down moves the cursor onto the second (tool-output) lane.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(app.lane_fold_selected, 1, "Down advances the lane cursor");
+
+    // The collapsed `(entry_id, lane_id)` key we expect to flip.
+    let key = lane_fold::LaneKey::new(
+        app.lane_panel.get(1).unwrap().key.entry_id,
+        lane_fold::LaneId::ToolOutput,
+    );
+
+    // Enter folds the selected lane.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter toggles fold");
+    assert!(
+        app.lane_folds.is_collapsed(key),
+        "Enter collapses the selected lane's (entry_id, lane_id) key",
+    );
+    assert!(
+        app.status.contains("collapsed"),
+        "status reflects the collapse: {}",
+        app.status,
+    );
+
+    // The collapse state PERSISTS across an arbitrary number of redraws (it lives
+    // in app state, not recomputed from cells): paint a few frames and confirm the
+    // panel still reports it collapsed and the overlay shows the "hidden" tag.
+    for _ in 0..3 {
+        let out = render_to_string(&app, 80, 24);
+        assert!(
+            out.contains("hidden"),
+            "collapsed lane reads 'hidden':\n{out}"
+        );
+    }
+    assert!(
+        app.lane_panel.get(1).unwrap().collapsed,
+        "the panel still reflects the persisted collapse after redraws",
+    );
+
+    // A second Enter expands it again (Space is the alternate toggle key).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .expect("space toggles fold back");
+    assert!(
+        !app.lane_folds.is_collapsed(key),
+        "Space re-expands the lane"
+    );
+
+    // Esc closes the overlay; the collapse state survives the close/reopen.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.lane_fold_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn lane_fold_collapse_all_and_expand_all() {
+    let mut app = app_with_lane_fold_tool();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lanes");
+    let _ = render_to_string(&app, 80, 24);
+    let lane_count = app.lane_panel.len();
+    assert!(lane_count >= 2);
+
+    // `c` collapses every lane of the focused entry in one go.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("collapse all");
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(
+        app.lane_panel.collapsed_count(),
+        lane_count,
+        "c collapses every lane",
+    );
+
+    // `o` expands them all again.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("expand all");
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(app.lane_panel.collapsed_count(), 0, "o expands every lane");
+}
+
+#[tokio::test]
+async fn lane_fold_alt_z_toggles_closed_without_leaking() {
+    let mut app = app_with_lane_fold_tool();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.lane_fold_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.lane_fold_open, "Alt+z toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn lane_fold_mouse_click_selects_and_toggles() {
+    let mut app = app_with_lane_fold_tool();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lanes");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for a registered lane-row target — the SECOND row so the click changes
+    // the cursor off 0.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::LaneFoldRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a lane row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.lane_fold_selected, 1,
+        "clicking a lane row selects exactly that lane",
+    );
+    assert!(
+        app.lane_panel.get(1).unwrap().collapsed,
+        "the click toggled that lane collapsed",
+    );
+    // The overlay stays open (the click folded within it, not closed it).
+    assert!(app.lane_fold_open);
+}
+
+#[tokio::test]
+async fn lane_fold_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lanes on an empty transcript");
+
+    assert!(app.lane_fold_open);
+    assert!(app.lane_panel.is_empty());
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Lane folds"), "header still paints:\n{out}");
+    assert!(out.contains("No entry to fold"), "empty-state line:\n{out}");
+
+    // Enter / collapse-all on an empty overlay are harmless no-ops (no panic).
+    for code in [KeyCode::Enter, KeyCode::Char('c'), KeyCode::Char('o')] {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(code, KeyModifiers::NONE),
+        )
+        .await
+        .expect("key on empty overlay");
+    }
+    assert!(app.lane_panel.is_empty());
+    assert_eq!(app.lane_folds.collapsed_count(), 0);
+}
+
+#[tokio::test]
+async fn lane_fold_errored_lane_keeps_visible_header_across_resizes() {
+    // A failed tool's output lane stays visible (with an `error` tag) even when
+    // collapsed, across every width — the spec's "errored lanes keep visible
+    // headers" risk mitigation, end-to-end through the real render().
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+    let mut failed = sample_tool_result("shell", "error[E0425]: cannot find value `x`\n");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lanes");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Collapse every lane, then confirm the error tag + header survive at several
+    // sizes (the failure is never hidden by the fold).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("collapse all");
+    assert!(
+        app.lane_panel.error_count() >= 1,
+        "the failed tool tags an error lane"
+    );
+
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Lane folds"),
+            "header paints at {w}x{h}:\n{out}"
+        );
+        assert!(
+            out.contains("error"),
+            "the collapsed error lane keeps its visible 'error' tag at {w}x{h}:\n{out}",
+        );
+        assert!(
+            out.contains("hidden"),
+            "the collapsed lane is marked hidden at {w}x{h}:\n{out}",
+        );
+    }
+}

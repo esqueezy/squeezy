@@ -143,6 +143,10 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the outline-node list so a click selects + jumps the main
     /// view to the logical transcript row behind exactly that node.
     TurnOutlineRow(usize),
+    /// A lane row in the Collapsible Reasoning/Tool Lanes overlay (§12.2.2), keyed
+    /// by its 0-based index in the focused entry's lane list so a click selects +
+    /// toggles the collapse state of exactly that lane.
+    LaneFoldRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -272,6 +276,11 @@ pub(crate) enum Action {
     /// row behind it. Mouse twin of moving the cursor with ↑↓ and pressing Enter;
     /// a click both selects and jumps in one go.
     TurnOutlineSelect(usize),
+    /// Select the given lane row in the Collapsible Reasoning/Tool Lanes overlay
+    /// (§12.2.2): move the cursor onto it and toggle that lane's collapsed state.
+    /// Mouse twin of moving the cursor with ↑↓ and pressing Enter/Space; a click
+    /// both selects and folds/unfolds the lane in one go.
+    LaneFoldToggle(usize),
 }
 
 impl Action {
@@ -315,6 +324,7 @@ impl Action {
         Action::ErrorLensSelect(0),
         Action::HealthMarkerSelect(0),
         Action::TurnOutlineSelect(0),
+        Action::LaneFoldToggle(0),
     ];
 }
 

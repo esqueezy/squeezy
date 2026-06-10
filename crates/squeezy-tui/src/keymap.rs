@@ -245,6 +245,17 @@ pub(crate) enum Action {
     /// selected node. The outline rebuilds incrementally only on a transcript
     /// revision bump, so an idle session pays nothing.
     ToggleTurnOutline,
+    /// Open / close the Collapsible Reasoning/Tool Lanes overlay (`Alt+z`
+    /// default; §12.2.2). A per-entry panel that splits the focused transcript
+    /// entry into foldable lanes — reasoning, assistant text, tool input, tool
+    /// output, system notice, approval, error, and plan — each with a collapse
+    /// toggle so whole lanes can be folded away to read the transcript at a
+    /// higher altitude. Collapse state is persisted by `(entry_id, lane_id)` in
+    /// app state, so a folded lane survives every redraw and resize; an errored
+    /// lane always keeps its visible header. The panel rebuilds incrementally
+    /// only on a focused-entry / revision / collapse change, so an idle session
+    /// pays nothing.
+    ToggleLaneFold,
 }
 
 impl Action {
@@ -300,6 +311,7 @@ impl Action {
             Self::ToggleErrorLens => "toggle_error_lens",
             Self::ToggleHealthMarkers => "toggle_health_markers",
             Self::ToggleTurnOutline => "toggle_turn_outline",
+            Self::ToggleLaneFold => "toggle_lane_fold",
         }
     }
 
@@ -354,6 +366,7 @@ impl Action {
         Action::ToggleErrorLens,
         Action::ToggleHealthMarkers,
         Action::ToggleTurnOutline,
+        Action::ToggleLaneFold,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -458,6 +471,9 @@ impl Action {
             // Semantic-Turn-Outline overlay toggle is `Alt+s` — the same Meta/Alt
             // encoding case as the rest of the nav/overlay family.
             | Self::ToggleTurnOutline
+            // Collapsible-Reasoning/Tool-Lanes overlay toggle is `Alt+z` — the
+            // same Meta/Alt encoding case as the rest of the nav/overlay family.
+            | Self::ToggleLaneFold
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -628,6 +644,10 @@ impl Action {
             // Semantic Turn Outline (§12.2.1). `Alt+s` ("structure"/"semantic
             // outline"); `s` is free among the overlay Alt letters.
             Self::ToggleTurnOutline => KeyBinding::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            // Collapsible Reasoning/Tool Lanes (§12.2.2). `Alt+z` ("zoom out" to a
+            // higher reading altitude by collapsing lanes); `z` is free among the
+            // overlay Alt letters.
+            Self::ToggleLaneFold => KeyBinding::new(KeyCode::Char('z'), KeyModifiers::ALT),
         }
     }
 }

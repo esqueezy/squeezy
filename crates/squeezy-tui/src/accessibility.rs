@@ -674,6 +674,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // them, so a row click and the keyboard reach the same
         // `turn_outline_jump_to_selected` handler.
         A::TurnOutlineSelect(_) => KeyboardPath::Always("turn outline ↑↓/Enter"),
+        // Collapsible Reasoning/Tool Lanes overlay (§12.2.2) — the overlay's own
+        // key handler owns ↑↓/kj (move the lane cursor) and Enter/Space (toggle
+        // the selected lane's collapse) before the global keymap sees them, so a
+        // row click and the keyboard reach the same `lane_fold_toggle_selected`
+        // handler.
+        A::LaneFoldToggle(_) => KeyboardPath::Always("lane folds ↑↓/Enter"),
     })
 }
 
