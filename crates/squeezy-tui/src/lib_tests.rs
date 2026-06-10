@@ -21911,6 +21911,259 @@ async fn edit_save_lands_on_the_right_item_after_a_front_drain() {
     assert_eq!(queue_index_for_id(&app, id_b), Some(0));
 }
 
+// ===========================================================================
+// Multi-select queued prompts (§11G.7): group tag / delete / move / merge,
+// driven through the real overlay key + mouse paths and the real render().
+// ===========================================================================
+
+/// Open the queue overlay (already done by `queue_app`) and tag the items at
+/// `indices` via the production Space-toggle key path. Returns the app.
+async fn queue_app_with_tags(items: &[&str], indices: &[usize]) -> (TuiApp, Agent) {
+    let mut app = queue_app(items);
+    let mut agent = test_agent(SessionMode::Build);
+    for &idx in indices {
+        if let Some(state) = app.prompt_queue_overlay.as_mut() {
+            state.selected = idx;
+        }
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .await
+        .expect("space toggles tag");
+    }
+    (app, agent)
+}
+
+#[tokio::test]
+async fn space_toggles_multiselect_membership() {
+    let mut app = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let id0 = queue_id_at(&app, 0);
+    // Space tags the focused (index 0) item.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .expect("space");
+    assert!(app.prompt_queue_multiselect.contains(id0));
+    assert_eq!(app.prompt_queue_multiselect.len(), 1);
+    assert!(app.status.contains("1 in group"));
+    // Space again peels it back out; the composer never sees the space.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .expect("space");
+    assert!(!app.prompt_queue_multiselect.contains(id0));
+    assert!(app.prompt_queue_multiselect.is_empty());
+    assert!(app.input.is_empty(), "space must not leak into composer");
+}
+
+#[tokio::test]
+async fn select_all_then_group_delete_clears_queue() {
+    let mut app = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // `a` selects all.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("select all");
+    assert_eq!(app.prompt_queue_multiselect.len(), 3);
+    // Delete the whole group at once.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("group delete");
+    assert!(queue_texts(&app).is_empty());
+    assert!(app.prompt_queue_multiselect.is_empty());
+    assert!(app.status.contains("deleted 3 queued prompts"));
+    // Group delete pauses the auto-drain (an explicit user edit).
+    assert!(!app.auto_drain_queue);
+}
+
+#[tokio::test]
+async fn group_delete_is_undoable_item_by_item() {
+    let (mut app, _agent) = queue_app_with_tags(&["a", "b", "c", "d"], &[1, 3]).await;
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("group delete");
+    assert_eq!(queue_texts(&app), vec!["a", "c"]);
+    // Two undos restore both removed items at their original slots.
+    assert!(queue_undo(&mut app));
+    assert!(queue_undo(&mut app));
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c", "d"]);
+}
+
+#[tokio::test]
+async fn group_move_shifts_block_and_keeps_single_item_unchanged() {
+    // Tag b and c (indices 1,2) and move the block up one with Shift+Up.
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c", "d"], &[1, 2]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("group move up");
+    assert_eq!(queue_texts(&app), vec!["b", "c", "a", "d"]);
+    assert!(app.status.contains("moved 2 queued prompts up"));
+    // A block move is a single undoable step that restores the exact order.
+    assert!(queue_undo(&mut app));
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c", "d"]);
+    assert!(app.status.contains("undid group move"));
+}
+
+#[tokio::test]
+async fn group_move_blocked_at_boundary_is_noop() {
+    // Tag the front item; Shift+Up is blocked (already at the top).
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c"], &[0]).await;
+    let undo_before = app.prompt_queue_undo.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("blocked move");
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c"]);
+    // No undo recorded for a no-op.
+    assert_eq!(app.prompt_queue_undo.len(), undo_before);
+}
+
+#[tokio::test]
+async fn group_move_undo_restores_survivor_order_after_front_drain() {
+    // A block-move snapshot restores the pre-move order of whatever ids are
+    // still live, so a front-drain between the move and its undo leaves a
+    // coherent result (the survivors' original relative order) rather than a
+    // panic or a mangled queue.
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c", "d"], &[1, 2]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("group move down");
+    assert_eq!(queue_texts(&app), vec!["a", "d", "b", "c"]);
+    // Drain the front item (a turn ran), shrinking the queue.
+    app.prompt_queue.pop_front();
+    app.prompt_queue_ids.pop_front();
+    assert!(queue_undo(&mut app));
+    // The survivors return to their pre-move relative order: b, c, d.
+    assert_eq!(queue_texts(&app), vec!["b", "c", "d"]);
+    assert!(app.status.contains("undid group move"));
+}
+
+#[tokio::test]
+async fn group_move_undo_refuses_when_queue_grew() {
+    // If the queue grew (a fresh enqueue) after the move, the snapshot can no
+    // longer describe the whole queue; undo refuses rather than dropping the
+    // new item.
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c"], &[0, 1]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("group move down");
+    assert_eq!(queue_texts(&app), vec!["c", "a", "b"]);
+    // A new prompt is queued while the overlay sits open.
+    app.prompt_queue.push_back("d".to_string());
+    enqueue_queue_id(&mut app);
+    assert!(!queue_undo(&mut app));
+    assert_eq!(app.status, "nothing to undo");
+    // The queue is untouched by the refused undo.
+    assert_eq!(queue_texts(&app), vec!["c", "a", "b", "d"]);
+}
+
+#[tokio::test]
+async fn empty_group_falls_through_to_single_item_verbs() {
+    // With nothing tagged, Delete deletes only the focused row (the base
+    // overlay behaviour is preserved).
+    let mut app = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("single delete");
+    assert_eq!(queue_texts(&app), vec!["a", "c"]);
+}
+
+#[tokio::test]
+async fn merge_pulls_group_into_composer_and_closes_overlay() {
+    let (mut app, mut agent) = queue_app_with_tags(&["first", "second", "third"], &[0, 2]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("merge");
+    // The two tagged prompts land in the composer in queue order, the untagged
+    // one stays queued, and the overlay closes.
+    assert_eq!(app.input, "first\n\nthird");
+    assert_eq!(queue_texts(&app), vec!["second"]);
+    assert!(app.prompt_queue_overlay.is_none());
+    assert!(app.status.contains("merged 2 queued prompts"));
+}
+
+#[tokio::test]
+async fn merge_with_no_group_uses_focused_row() {
+    let mut app = queue_app(&["only-a", "only-b"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1; // focus "only-b"
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("merge focused");
+    assert_eq!(app.input, "only-b");
+    assert_eq!(queue_texts(&app), vec!["only-a"]);
+}
+
+#[tokio::test]
+async fn merge_preserves_existing_composer_draft() {
+    let (mut app, mut agent) = queue_app_with_tags(&["queued-one"], &[0]).await;
+    app.input = "my draft".to_string();
+    app.input_cursor = app.input.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("merge");
+    assert_eq!(app.input, "my draft\n\nqueued-one");
+}
+
 #[tokio::test]
 async fn edit_of_a_vanished_item_falls_back_to_a_fresh_enqueue() {
     // The edited item drains/runs while it sits in the composer: saving can't
@@ -22061,6 +22314,102 @@ fn queue_overlay_paints_the_edit_hint_across_a_resize() {
             "edit affordance must be visible at {w}x{h}: {rendered}"
         );
     }
+}
+
+#[tokio::test]
+async fn ctrl_click_toggles_multiselect_via_mouse() {
+    // Render so the per-item hit targets register, then Ctrl-click "beta".
+    let mut app = queue_app(&["alpha", "beta", "gamma"]);
+    let width = 100u16;
+    let height = 20u16;
+    let _ = render_to_string(&app, width, height);
+    let id_beta = queue_id_at(&app, 1);
+    let cell = {
+        let registry = app.clickables.borrow();
+        let mut found = None;
+        'outer: for y in 0..height {
+            for x in 0..width {
+                if let Some((key, _)) = registry.hit_test(x, y)
+                    && key == interaction::TargetKey::QueueItem(id_beta)
+                {
+                    found = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        found
+    };
+    let (col, row) = cell.expect("beta hit target registered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::CONTROL,
+        },
+    );
+    // The Ctrl-click tags beta (and seats the focus there) WITHOUT deleting or
+    // reordering it — the queue is untouched.
+    assert!(app.prompt_queue_multiselect.contains(id_beta));
+    assert_eq!(queue_texts(&app), vec!["alpha", "beta", "gamma"]);
+    assert!(app.prompt_queue_drag.is_none(), "tag must not arm a drag");
+}
+
+#[tokio::test]
+async fn keyboard_and_mouse_tag_reach_the_same_group() {
+    // Keyboard Space on index 1 and Ctrl-click on index 1 must produce the
+    // identical group membership — keyboard/mouse parity.
+    let (kb, _a) = queue_app_with_tags(&["a", "b", "c"], &[1]).await;
+    let kb_id = queue_id_at(&kb, 1);
+
+    let mut ms = queue_app(&["a", "b", "c"]);
+    let _ = render_to_string(&ms, 100, 20);
+    let id1 = queue_id_at(&ms, 1);
+    queue_toggle_id_multiselect(&mut ms, id1);
+
+    assert!(kb.prompt_queue_multiselect.contains(kb_id));
+    assert!(ms.prompt_queue_multiselect.contains(id1));
+    assert_eq!(
+        kb.prompt_queue_multiselect.len(),
+        ms.prompt_queue_multiselect.len()
+    );
+}
+
+#[tokio::test]
+async fn render_shows_checkbox_for_tagged_rows_and_survives_resize() {
+    let (app, _agent) = queue_app_with_tags(&["alpha", "beta", "gamma"], &[1]).await;
+    // Wide layout: the tagged row paints a filled checkbox, the others empty.
+    let wide = render_to_string(&app, 120, 24);
+    assert!(wide.contains("[x]"), "tagged row checkbox missing:\n{wide}");
+    assert!(
+        wide.contains("[ ]"),
+        "untagged row checkbox missing:\n{wide}"
+    );
+    // Re-rendering at a narrow width must not panic and still paints the
+    // overlay rows (rects recompute from the live geometry).
+    let narrow = render_to_string(&app, 48, 24);
+    assert!(
+        narrow.contains("[x]"),
+        "checkbox lost after resize:\n{narrow}"
+    );
+}
+
+#[tokio::test]
+async fn closing_overlay_clears_the_multiselect_group() {
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b"], &[0, 1]).await;
+    assert_eq!(app.prompt_queue_multiselect.len(), 2);
+    // Esc closes the overlay (Enter now opens the focused prompt for editing,
+    // §11G.8); the group must not survive into the next open.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("close overlay");
+    assert!(app.prompt_queue_overlay.is_none());
+    assert!(app.prompt_queue_multiselect.is_empty());
 }
 
 #[test]

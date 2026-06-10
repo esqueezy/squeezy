@@ -127,8 +127,40 @@ fn indicator_line_present_when_queue_non_empty() {
 fn render_lines_includes_header_and_empty_marker() {
     let state = PromptQueueState::new();
     let queue: VecDeque<String> = VecDeque::new();
-    let lines = render_lines(&state, &queue);
+    let lines = render_lines(&state, &queue, None);
     assert!(lines.len() >= 2);
+}
+
+#[test]
+fn render_lines_paints_multiselect_checkbox() {
+    let state = PromptQueueState::new();
+    let queue = queue_of(&["alpha", "beta", "gamma"]);
+    // Tag the middle item only.
+    let tagged = [false, true, false];
+    let lines = render_lines(&state, &queue, Some(&tagged));
+    let text: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect();
+    // The tagged row shows the filled checkbox; an untagged row the empty one.
+    assert!(text.contains("[x]"), "tagged row must show [x]: {text}");
+    assert!(text.contains("[ ]"), "untagged rows must show [ ]: {text}");
+    // The header switches to the multi-select cheatsheet once a group is active.
+    assert!(
+        text.contains("delete group"),
+        "active-group header hint missing: {text}"
+    );
+}
+
+#[test]
+fn render_lines_header_is_base_hint_with_no_group() {
+    let state = PromptQueueState::new();
+    let queue = queue_of(&["alpha"]);
+    let lines = render_lines(&state, &queue, Some(&[false]));
+    let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(header.contains("reorder"), "base header hint: {header}");
+    assert!(!header.contains("delete group"));
 }
 
 // ---- visible_window: the single-source-of-truth overlay windowing ----------

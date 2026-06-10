@@ -109,6 +109,7 @@ mod overlay;
 mod paste_preview;
 mod prompt_history;
 mod prompt_queue;
+mod prompt_queue_multiselect;
 mod proposed_plan;
 mod queue_edit;
 mod quote_compose;
@@ -5195,6 +5196,13 @@ pub(crate) enum QueueMutation {
     /// both ids to live indices and re-inserts `id` right after `prev` (or at
     /// the front), no-opping if either id has since drained out.
     Reordered { id: u64, prev: Option<u64> },
+    /// A multi-select group move (§11G.7) reordered several items at once.
+    /// A per-item `Reordered` record can't reverse a block move coherently
+    /// (each record references the post-move order), so the group move snapshots
+    /// the *entire* id order from before the move; undo restores exactly that
+    /// order via `apply_queue_id_order`. Ids that have since drained out are
+    /// dropped on restore, so the snapshot survives a front-drain gracefully.
+    BlockReordered { order: Vec<u64> },
 }
 
 /// In-flight mouse drag-reorder. Records which item id is being dragged and
@@ -5385,6 +5393,24 @@ fn queue_undo(app: &mut TuiApp) -> bool {
             }
             app.status = "undid reorder".to_string();
         }
+        QueueMutation::BlockReordered { order } => {
+            // Restore the snapshotted id order, filtered to ids still live (a
+            // drained id silently drops). If nothing of the snapshot survives,
+            // report "nothing to undo" instead of clearing the queue.
+            let live: Vec<u64> = order
+                .into_iter()
+                .filter(|id| queue_index_for_id(app, *id).is_some())
+                .collect();
+            if live.len() != app.prompt_queue.len() {
+                // The queue drifted (a drain/enqueue) past what the snapshot can
+                // faithfully restore; refuse rather than mangle the order.
+                app.status = "nothing to undo".to_string();
+                app.needs_redraw = true;
+                return false;
+            }
+            apply_queue_id_order(app, &live);
+            app.status = "undid group move".to_string();
+        }
     }
     clamp_queue_focus(app);
     app.needs_redraw = true;
@@ -5402,6 +5428,254 @@ fn clamp_queue_focus(app: &mut TuiApp) {
             state.selected = len - 1;
         }
     }
+}
+
+// ===========================================================================
+// Multi-select queued prompts (§11G.7)
+//
+// The reorder overlay's single focus cursor (`PromptQueueState::selected`) is
+// joined by a *group* selection (`TuiApp::prompt_queue_multiselect`) keyed by
+// stable ids. The group verbs — toggle, select-all, group delete, group move,
+// merge-to-composer — all resolve their ids to live indices at action time, so
+// a concurrent front-drain or reorder can never make them touch the wrong row.
+// These are the shared handlers the overlay's keyboard path and the per-item
+// mouse toggle both dispatch through, so keyboard/mouse parity holds by
+// construction.
+// ===========================================================================
+
+/// The live queue id sidecar as an ordered slice (front-to-back). The single
+/// place the multi-select math reads queue order from, so it always matches
+/// what the overlay paints.
+fn queue_live_ids(app: &TuiApp) -> Vec<u64> {
+    app.prompt_queue_ids.iter().copied().collect()
+}
+
+/// Toggle the focused queue item in/out of the multi-select group. No-op on an
+/// empty queue. Sets a status reflecting the new group size.
+fn queue_toggle_focused_multiselect(app: &mut TuiApp) {
+    sync_queue_ids(app);
+    // Drop any ids that drained/deleted out from under the overlay so the
+    // reported group size stays truthful.
+    app.prompt_queue_multiselect
+        .retain_live(&queue_live_ids(app));
+    let Some(state) = app.prompt_queue_overlay.as_ref() else {
+        return;
+    };
+    let Some(&id) = app.prompt_queue_ids.get(state.selected) else {
+        return;
+    };
+    let added = app.prompt_queue_multiselect.toggle(id);
+    let n = app.prompt_queue_multiselect.len();
+    app.status = if added {
+        format!("selected queued prompt ({n} in group)")
+    } else if n == 0 {
+        "selection cleared".to_string()
+    } else {
+        format!("deselected queued prompt ({n} in group)")
+    };
+    app.needs_redraw = true;
+}
+
+/// Toggle a specific queue item (by stable id) in/out of the group. The mouse
+/// twin of [`queue_toggle_focused_multiselect`]; also seats the focus cursor on
+/// the toggled row so a subsequent keyboard verb acts on the same item. No-op if
+/// the id has drained out.
+fn queue_toggle_id_multiselect(app: &mut TuiApp, id: u64) {
+    sync_queue_ids(app);
+    app.prompt_queue_multiselect
+        .retain_live(&queue_live_ids(app));
+    let Some(index) = queue_index_for_id(app, id) else {
+        return;
+    };
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = index;
+    }
+    let added = app.prompt_queue_multiselect.toggle(id);
+    let n = app.prompt_queue_multiselect.len();
+    app.status = if added {
+        format!("selected queued prompt ({n} in group)")
+    } else if n == 0 {
+        "selection cleared".to_string()
+    } else {
+        format!("deselected queued prompt ({n} in group)")
+    };
+    app.needs_redraw = true;
+}
+
+/// Tag every queued prompt (select-all). A subsequent toggle on a tagged row
+/// peels it back out. No-op on an empty queue.
+fn queue_select_all_multiselect(app: &mut TuiApp) {
+    sync_queue_ids(app);
+    let ids = queue_live_ids(app);
+    if ids.is_empty() {
+        return;
+    }
+    app.prompt_queue_multiselect.select_all(&ids);
+    app.status = format!("selected all queued prompts ({} in group)", ids.len());
+    app.needs_redraw = true;
+}
+
+/// Delete every prompt in the multi-select group as one batch. Each removal is
+/// recorded on the undo stack (via `queue_delete_by_id`, resolved by id so the
+/// shifting indices never matter), so an undo peels them back one at a time.
+/// Returns `true` if anything was deleted. The group is cleared afterwards.
+fn queue_group_delete(app: &mut TuiApp) -> bool {
+    sync_queue_ids(app);
+    let ids = app
+        .prompt_queue_multiselect
+        .ids_in_queue_order(&queue_live_ids(app));
+    if ids.is_empty() {
+        return false;
+    }
+    let mut removed = 0usize;
+    for id in ids {
+        if queue_delete_by_id(app, id) {
+            removed += 1;
+        }
+    }
+    app.prompt_queue_multiselect.clear();
+    if removed > 0 {
+        app.auto_drain_queue = false;
+        app.status = format!(
+            "deleted {removed} queued prompts ({} left)",
+            app.prompt_queue.len()
+        );
+        app.needs_redraw = true;
+    }
+    removed > 0
+}
+
+/// Move the multi-select group one step up or down as a contiguous block.
+/// Computed by stable id over the live order (`move_group`), then applied by
+/// rebuilding the queue + id sidecar in the new id order, so a scattered or
+/// already-contiguous group both move coherently. Records one `Reordered` undo
+/// per shifted item. Returns `true` if it moved anything (blocked at the
+/// boundary is a no-op). Keeps the focus cursor on the same item.
+fn queue_group_move(app: &mut TuiApp, dir: prompt_queue_multiselect::MoveDir) -> bool {
+    sync_queue_ids(app);
+    let before = queue_live_ids(app);
+    let Some(after) =
+        prompt_queue_multiselect::move_group(&before, app.prompt_queue_multiselect.set(), dir)
+    else {
+        return false;
+    };
+    if after == before {
+        return false;
+    }
+    // The focused id, so the cursor follows its row through the reshuffle.
+    let focus_id = app
+        .prompt_queue_overlay
+        .as_ref()
+        .and_then(|state| before.get(state.selected).copied());
+    apply_queue_id_order(app, &after);
+    // A block move is one undoable step: snapshot the pre-move id order so undo
+    // restores it exactly (a per-item `Reordered` chain can't reverse a block
+    // move coherently).
+    push_queue_undo(app, QueueMutation::BlockReordered { order: before });
+    // Re-seat the focus cursor onto the same item it was on.
+    if let (Some(focus_id), Some(state)) = (focus_id, app.prompt_queue_overlay.as_mut())
+        && let Some(pos) = after.iter().position(|x| *x == focus_id)
+    {
+        state.selected = pos;
+    }
+    let dir_word = match dir {
+        prompt_queue_multiselect::MoveDir::Up => "up",
+        prompt_queue_multiselect::MoveDir::Down => "down",
+    };
+    app.status = format!(
+        "moved {} queued prompts {dir_word}",
+        app.prompt_queue_multiselect.len()
+    );
+    app.needs_redraw = true;
+    true
+}
+
+/// Reorder BOTH the queue and its id sidecar so the ids line up with `order`
+/// (a permutation of the current ids). Rebuilds via a text lookup keyed by id,
+/// so the prompt text rides with its id. Used by the group-move primitive,
+/// which computes a new id order purely.
+fn apply_queue_id_order(app: &mut TuiApp, order: &[u64]) {
+    debug_assert_eq!(order.len(), app.prompt_queue.len());
+    // Snapshot id -> text so we can re-emit in the target order.
+    let by_id: std::collections::HashMap<u64, String> = app
+        .prompt_queue_ids
+        .iter()
+        .copied()
+        .zip(app.prompt_queue.iter().cloned())
+        .collect();
+    let mut new_queue: VecDeque<String> = VecDeque::with_capacity(order.len());
+    let mut new_ids: VecDeque<u64> = VecDeque::with_capacity(order.len());
+    for &id in order {
+        if let Some(text) = by_id.get(&id) {
+            new_queue.push_back(text.clone());
+            new_ids.push_back(id);
+        }
+    }
+    app.prompt_queue = new_queue;
+    app.prompt_queue_ids = new_ids;
+}
+
+/// Merge the selected queued prompts (or, when nothing is tagged, the single
+/// focused prompt) into the composer, removing them from the queue. The merged
+/// text is concatenated in queue order with a blank line between prompts, and
+/// appended after any existing composer draft (blank-line separated) so a
+/// half-typed message isn't destroyed. Each pulled prompt records a `Deleted`
+/// undo so the queue side of the merge is reversible. Closes the overlay.
+/// Returns `true` if anything merged.
+fn queue_merge_to_composer(app: &mut TuiApp) -> bool {
+    if app.turn_rx.is_some() {
+        app.status = "cannot merge while a turn is running".to_string();
+        return false;
+    }
+    sync_queue_ids(app);
+    let mut ids = app
+        .prompt_queue_multiselect
+        .ids_in_queue_order(&queue_live_ids(app));
+    if ids.is_empty() {
+        // No group: fall back to the single focused row.
+        if let Some(state) = app.prompt_queue_overlay.as_ref()
+            && let Some(&id) = app.prompt_queue_ids.get(state.selected)
+        {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return false;
+    }
+    // Collect the text in queue order BEFORE deleting (deletes shift the queue).
+    let mut parts: Vec<String> = Vec::with_capacity(ids.len());
+    for &id in &ids {
+        if let Some(index) = queue_index_for_id(app, id)
+            && let Some(text) = app.prompt_queue.get(index)
+        {
+            parts.push(text.clone());
+        }
+    }
+    if parts.is_empty() {
+        return false;
+    }
+    // Remove the merged items (records per-item undo, resolves by id).
+    for &id in &ids {
+        queue_delete_by_id(app, id);
+    }
+    app.prompt_queue_multiselect.clear();
+    let merged = parts.join("\n\n");
+    let combined = if app.input.trim().is_empty() {
+        merged
+    } else {
+        format!("{}\n\n{merged}", app.input)
+    };
+    input::set_input(app, combined);
+    // Close the overlay so focus returns to the composer the text landed in.
+    app.prompt_queue_overlay = None;
+    app.prompt_queue_drag = None;
+    app.status = format!(
+        "merged {} queued prompt{} into the composer",
+        parts.len(),
+        if parts.len() == 1 { "" } else { "s" }
+    );
+    app.needs_redraw = true;
+    true
 }
 
 /// Toggle the prompt-queue reorder overlay. Hard-coded as a chord
@@ -5423,13 +5697,16 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
         sync_queue_ids(app);
         Some(prompt_queue::PromptQueueState::new())
     };
+    // A multi-selection never survives an open/close cycle: tags are scoped to
+    // one overlay session so a stale group can't act on a re-opened queue.
+    app.prompt_queue_multiselect.clear();
     if app.prompt_queue_overlay.is_none() {
         // Closing also abandons any in-flight reorder drag.
         app.prompt_queue_drag = None;
     }
     app.status = if app.prompt_queue_overlay.is_some() {
         format!(
-            "prompt queue ({} queued) · ↑↓ focus · Shift+↑↓ move · Enter/e edit · Del remove · u undo · Esc close",
+            "prompt queue ({} queued) · ↑↓ focus · Space tag · Enter/e edit · m merge · Del remove · u undo · Esc close",
             app.prompt_queue.len()
         )
     } else {
@@ -7065,6 +7342,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.prompt_queue_drag = None;
                 app.prompt_queue_overlay = None;
                 app.editing_queue_id = None;
+                app.prompt_queue_multiselect.clear();
                 app.auto_drain_queue = false;
                 app.transcript_overlay = None;
                 app.transcript_overlay_scrollbar_cache.set(None);
@@ -8645,6 +8923,64 @@ fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
     }
 }
 
+/// Consume a multi-select verb (§11G.7) while the reorder overlay is open.
+///
+/// Returns `true` when the key was a group verb (so the caller stops). The
+/// bindings, all modal to the overlay:
+///   - `Space` / `x` — toggle the focused prompt in/out of the group.
+///   - `a` — select all queued prompts.
+///   - `Esc`-adjacent: `c` clears the group without closing the overlay.
+///   - `m` — merge the group (or the focused prompt) into the composer.
+///   - `Delete` / `Backspace` — when the group is non-empty, delete the group;
+///     an empty group falls through to the single-item delete.
+///   - `Shift+Up` / `Shift+Down` — when the group is non-empty, move the group;
+///     an empty group falls through to the single-item swap.
+///
+/// All bindings are plain or shifted printable keys (no Ctrl/Alt chord), so
+/// none collide with the global keymap (`dispatch_keymap_action` runs first but
+/// has no binding for these) and the overlay keeps owning them.
+fn handle_queue_multiselect_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let group_active = !app.prompt_queue_multiselect.is_empty();
+    match key.code {
+        KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Char('X') => {
+            queue_toggle_focused_multiselect(app);
+            true
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            queue_select_all_multiselect(app);
+            true
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') if group_active => {
+            app.prompt_queue_multiselect.clear();
+            app.status = "selection cleared".to_string();
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            queue_merge_to_composer(app);
+            true
+        }
+        // Group delete / move only claim the key when a group is active; an
+        // empty group falls through to `PromptQueueState::dispatch` so the
+        // single-row Delete / Shift+arrow semantics are unchanged.
+        KeyCode::Delete | KeyCode::Backspace if group_active => {
+            queue_group_delete(app);
+            true
+        }
+        KeyCode::Up if shift && group_active => {
+            queue_group_move(app, prompt_queue_multiselect::MoveDir::Up);
+            true
+        }
+        KeyCode::Down if shift && group_active => {
+            queue_group_move(app, prompt_queue_multiselect::MoveDir::Down);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Handle a key while the prompt-queue reorder overlay is open.
 ///
 /// The overlay keeps the established "consume keys before the global keymap"
@@ -8663,6 +8999,16 @@ fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
 fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.prompt_queue_overlay.is_none() {
         return false;
+    }
+    // Multi-select verbs (§11G.7) are consumed here, before the pure
+    // `PromptQueueState::dispatch`. They follow the same "modal, before the
+    // global keymap" pattern as the rest of the overlay's keys. When the group
+    // is empty the group-aware bindings (Delete / Shift+Up/Down) fall through to
+    // the single-item dispatch below, so the base overlay is unchanged. None of
+    // these keys (Space / a / c / m / group Delete / Shift+arrow) overlap the
+    // edit verbs below, so the two interceptors compose cleanly.
+    if handle_queue_multiselect_key(app, key) {
+        return true;
     }
     // Edit Queued Prompt (§11G.8): Enter or `e` on the focused queued prompt
     // opens it in the composer for editing. Intercepted ahead of the pure-state
@@ -8717,6 +9063,8 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         prompt_queue::QueueDispatch::Close => {
             app.prompt_queue_overlay = None;
             app.prompt_queue_drag = None;
+            // A multi-selection is scoped to the open overlay; closing drops it.
+            app.prompt_queue_multiselect.clear();
             app.status = "prompt queue closed".to_string();
         }
         prompt_queue::QueueDispatch::Handled => {
@@ -8827,6 +9175,15 @@ fn handle_queue_overlay_mouse(
         let row = mouse.row.checked_sub(app.footer_origin)?;
         app.click_target_at(mouse.column, row)
     };
+    use crossterm::event::KeyModifiers;
+    // A modified press (Ctrl or Shift) toggles multi-select instead of
+    // arming a drag/delete — the mouse twin of the keyboard Space toggle
+    // (§11G.7). Crossterm only reports mouse modifiers when key-modifier
+    // capture is on, so the keyboard Space path remains the always-available
+    // equivalent.
+    let multiselect_chord = mouse
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let hit = hit_test(app, &mouse);
@@ -8834,6 +9191,15 @@ fn handle_queue_overlay_mouse(
             // (e.g. the indicator strip, handled by the footer arm, or empty
             // space) falls through.
             match hit {
+                Some((interaction::TargetKey::QueueItem(id), _)) if multiselect_chord => {
+                    // Ctrl/Shift-click toggles the row's group membership
+                    // (§11G.7) — checked before the plain-click delete/reorder/
+                    // double-click-edit logic so a modified click never deletes
+                    // or arms a drag.
+                    app.gestures.recognize(interaction::Phase::Press, hit, now);
+                    queue_toggle_id_multiselect(app, id);
+                    Some(true)
+                }
                 Some((interaction::TargetKey::QueueItem(id), action)) => {
                     let gesture = app.gestures.recognize(interaction::Phase::Press, hit, now);
                     // A double-click on a queue row opens it in the composer for
@@ -19382,7 +19748,9 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
     let queue_overlay_lines = app
         .prompt_queue_overlay
         .as_ref()
-        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue).len())
+        // Group markers never change the line count, so the height calc can
+        // skip computing them (`None`).
+        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue, None).len())
         .unwrap_or(0);
     let overlay_lines = if queue_overlay_lines > 0 {
         0
@@ -19791,10 +20159,17 @@ fn visible_slash_suggestions(suggestions: &[SlashCommand], selected: usize) -> &
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    // Per-item multi-select flags (§11G.7), one per queue slot in queue order,
+    // so the overlay paints a `[x]` next to each tagged prompt.
+    let queue_tagged: Vec<bool> = app
+        .prompt_queue_ids
+        .iter()
+        .map(|id| app.prompt_queue_multiselect.contains(*id))
+        .collect();
     let queue_overlay_lines: Vec<Line<'static>> = app
         .prompt_queue_overlay
         .as_ref()
-        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue))
+        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue, Some(&queue_tagged)))
         .unwrap_or_default();
     let queue_open = !queue_overlay_lines.is_empty();
     let overlay_lines = if queue_open {
@@ -21815,6 +22190,13 @@ pub(crate) struct TuiApp {
     /// on any path that abandons the composer draft (clear, cancel restore,
     /// `/clear`) so a later submit never mistakes a fresh prompt for an edit.
     pub(crate) editing_queue_id: Option<u64>,
+    /// Multi-select set for the open reorder overlay (§11G.7): the queued
+    /// prompts tagged for a group delete / move / merge, addressed by their
+    /// stable ids so a reorder or front-drain can't shift the group. Cleared
+    /// whenever the overlay opens or closes; lives next to (not inside) the
+    /// pure `PromptQueueState` because the tagging is id-keyed and only lib.rs
+    /// owns the id sidecar.
+    pub(crate) prompt_queue_multiselect: prompt_queue_multiselect::MultiSelect,
     /// Set true when a turn just completed (success, cancel, or fail)
     /// and the queue is non-empty. The main loop reads this immediately
     /// after `drain_agent_events` returns, pops the next prompt, and
@@ -22250,6 +22632,7 @@ impl TuiApp {
             prompt_queue_drag: None,
             prompt_queue_overlay: None,
             editing_queue_id: None,
+            prompt_queue_multiselect: prompt_queue_multiselect::MultiSelect::new(),
             auto_drain_queue: false,
             pending_chord: None,
             clickables: std::cell::RefCell::new(interaction::Registry::new()),

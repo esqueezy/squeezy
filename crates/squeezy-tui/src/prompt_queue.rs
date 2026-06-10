@@ -151,10 +151,22 @@ fn preview(text: &str) -> String {
 
 /// Render lines for the reorder overlay. Mirrors `SelectOverlay::render`
 /// but reads the live queue from `TuiApp::prompt_queue`.
+///
+/// `tagged` is a per-item multi-select flag (§11G.7), one bool per queue slot
+/// in queue order; `None` (or a shorter slice) renders the base overlay with no
+/// group markers. A tagged row gets a `[x]` checkbox in the accent colour; the
+/// header hint switches to the multi-select cheatsheet while a group is active.
 pub(crate) fn render_lines(
     state: &PromptQueueState,
     queue: &VecDeque<String>,
+    tagged: Option<&[bool]>,
 ) -> Vec<Line<'static>> {
+    let group_active = tagged.is_some_and(|t| t.iter().any(|&b| b));
+    let hint = if group_active {
+        "  Space tag · a all · Del delete group · Shift+↑↓ move group · m merge · c clear"
+    } else {
+        "  ↑↓ select · Space tag · Shift+↑↓ reorder · Enter/e edit · Del remove · m merge · Esc close"
+    };
     let header = Line::from(vec![
         Span::styled(
             "Queued prompts",
@@ -162,10 +174,7 @@ pub(crate) fn render_lines(
                 .fg(crate::render::theme::secondary())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "  ↑↓ select · Shift+↑↓ reorder · Enter/e edit · Del remove · Esc close",
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
+        Span::styled(hint, Style::default().fg(crate::render::theme::quiet())),
     ]);
     let mut lines = vec![header];
     if queue.is_empty() {
@@ -180,6 +189,7 @@ pub(crate) fn render_lines(
     for (rel, item) in queue.iter().skip(start).take(count).enumerate() {
         let index = start + rel;
         let is_selected = index == state.selected;
+        let is_tagged = tagged.and_then(|t| t.get(index)).copied().unwrap_or(false);
         let marker = if is_selected { "› " } else { "  " };
         let style = if is_selected {
             Style::default()
@@ -198,6 +208,8 @@ pub(crate) fn render_lines(
                     crate::render::theme::quiet()
                 }),
             ),
+            crate::prompt_queue_multiselect::marker_span(is_tagged),
+            Span::raw(" "),
             Span::styled(body, style),
         ]));
     }
