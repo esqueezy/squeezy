@@ -741,6 +741,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         A::SnippetEnqueue(_) => KeyboardPath::Always("snippets q"),
         A::SnippetDelete(_) => KeyboardPath::Always("snippets d"),
         A::SnippetClear => KeyboardPath::Always("snippets c"),
+        // Actionable Tool Outputs overlay (§12.3.1) — the overlay's own key handler
+        // owns ↑↓/k (move the item cursor), Enter/c (copy the matched element), and
+        // j/→/l (jump to the source tool result) before the global keymap sees them,
+        // so a row click and the keyboard reach the same `tool_actions_copy_selected`
+        // handler.
+        A::ToolActionRun(_) => KeyboardPath::Always("tool actions ↑↓/Enter"),
     })
 }
 

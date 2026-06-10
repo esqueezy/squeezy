@@ -29030,6 +29030,325 @@ async fn error_lens_renders_across_resizes() {
     }
 }
 
+// ===========================================================================
+// Actionable Tool Outputs (§12.3.1) — integration tests driving the real
+// `render()` / `handle_key` / `handle_mouse` paths through the TestBackend.
+// ===========================================================================
+
+/// The multi-kind tool output body shared by the Actionable Tool Outputs tests:
+/// one of every actionable kind — a URL, an absolute file path, an error line, a
+/// diff hunk header, and a `$ ` command echo — plus a plain prose line that must
+/// not light up.
+const ACTIONABLE_TOOL_BODY: &str = "see https://example.test/docs for help\n\
+     writing /home/user/out/result.rs\n\
+     error: could not compile `crate`\n\
+     @@ -1,2 +1,3 @@\n\
+     $ cargo build --release\n\
+     plain unremarkable prose line";
+
+/// Push a focused tool result carrying [`ACTIONABLE_TOOL_BODY`] onto `app`,
+/// seeding a deterministic viewport and focusing the tool result so the overlay
+/// opens on it.
+fn seed_actionable_tool_output(app: &mut TuiApp) {
+    app.set_test_frame_size(100, 28);
+    app.push_transcript_item(TranscriptItem::user("run the thing".to_string()));
+    let mut result = sample_tool_result("shell", ACTIONABLE_TOOL_BODY);
+    result.content = serde_json::json!({ "output": ACTIONABLE_TOOL_BODY });
+    app.push_tool_result(result);
+    let tool_index = app
+        .transcript
+        .iter()
+        .position(|e| matches!(&e.kind, TranscriptEntryKind::ToolResult(_)))
+        .expect("a tool entry was pushed");
+    app.selected_entry = Some(tool_index);
+}
+
+/// Build an app whose focused entry is a tool result with one of every actionable
+/// kind. Uses the no-op clipboard (the navigation tests don't inspect copies).
+fn app_with_actionable_tool_output() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    seed_actionable_tool_output(&mut app);
+    app
+}
+
+/// The `Ctrl+Alt+A` toggle chord for the Actionable Tool Outputs overlay.
+fn tool_actions_chord() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+#[tokio::test]
+async fn tool_actions_chord_opens_overlay_and_lists_every_kind() {
+    let mut app = app_with_actionable_tool_output();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("Ctrl+Alt+A opens the tool-actions overlay");
+
+    assert!(app.tool_actions.is_some(), "the overlay opened");
+    let out = render_to_string(&app, 100, 28);
+    assert!(out.contains("Tool actions"), "header present:\n{out}");
+    // One of every kind tag is painted.
+    for tag in ["[path]", "[url]", "[error]", "[diff]", "[command]"] {
+        assert!(out.contains(tag), "{tag} row present:\n{out}");
+    }
+    // The matched elements appear in the painted rows.
+    assert!(
+        out.contains("https://example.test/docs"),
+        "url text:\n{out}"
+    );
+    assert!(
+        out.contains("/home/user/out/result.rs"),
+        "path text:\n{out}",
+    );
+    // The affordance hint advertises copy/jump.
+    assert!(out.contains("copy/jump"), "affordance hint:\n{out}");
+}
+
+#[tokio::test]
+async fn tool_actions_enter_copies_the_selected_element() {
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    seed_actionable_tool_output(&mut app);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("open overlay");
+    let _ = render_to_string(&app, 100, 28);
+    assert_eq!(
+        app.tool_actions.as_ref().unwrap().selected(),
+        0,
+        "cursor starts on the first item",
+    );
+
+    // The first item is the URL (it appears first in the output). Enter copies it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter copies");
+
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        ["https://example.test/docs"],
+        "Enter copies the selected URL through the deliver_copy funnel",
+    );
+    // The overlay stays open so the user can copy more elements.
+    assert!(app.tool_actions.is_some(), "copy keeps the overlay open");
+}
+
+#[tokio::test]
+async fn tool_actions_keyboard_navigates_and_j_jumps_to_source() {
+    let mut app = app_with_actionable_tool_output();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("open overlay");
+    let _ = render_to_string(&app, 100, 28);
+
+    // Down advances the cursor; `k`/Up retreats it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(app.tool_actions.as_ref().unwrap().selected(), 1);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("k moves cursor up");
+    assert_eq!(app.tool_actions.as_ref().unwrap().selected(), 0);
+
+    // `j` jumps the main view to the source tool result and closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("j jumps to source");
+    assert!(
+        app.tool_actions.is_none(),
+        "jumping closes the one-shot overlay",
+    );
+    assert!(
+        app.status.contains("tool result") || app.status.contains("could not"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+}
+
+#[tokio::test]
+async fn tool_actions_chord_toggles_closed_without_leaking() {
+    let mut app = app_with_actionable_tool_output();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("open");
+    assert!(app.tool_actions.is_some());
+    let _ = render_to_string(&app, 100, 28);
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("close");
+    assert!(app.tool_actions.is_none(), "Ctrl+Alt+A toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn tool_actions_mouse_click_selects_and_copies() {
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    seed_actionable_tool_output(&mut app);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("open overlay");
+    let _ = render_to_string(&app, 100, 28);
+
+    // Scan for the SECOND registered item-row target (the path), so the click
+    // changes the cursor off 0 and copies a different element than Enter-at-0 would.
+    let mut hit_cell = None;
+    'scan: for row in 0..28u16 {
+        for col in 0..100u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ToolActionsRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("an item row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.tool_actions.as_ref().unwrap().selected(),
+        1,
+        "clicking an item row selects exactly that item",
+    );
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        ["/home/user/out/result.rs"],
+        "the click copied the clicked (path) element",
+    );
+    assert!(
+        app.tool_actions.is_some(),
+        "the click kept the overlay open"
+    );
+}
+
+#[tokio::test]
+async fn tool_actions_on_non_tool_entry_reports_and_opens_nothing() {
+    // Focus is on a plain user message, not a tool result: the overlay must not
+    // open and the status must say so.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 28);
+    app.push_transcript_item(TranscriptItem::user("just a question".to_string()));
+    app.selected_entry = Some(0);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("chord on a non-tool entry");
+    assert!(app.tool_actions.is_none(), "no overlay opens for prose");
+    assert!(
+        app.status.contains("tool result"),
+        "status explains the requirement: {}",
+        app.status,
+    );
+}
+
+#[tokio::test]
+async fn tool_actions_empty_output_shows_empty_state() {
+    // A focused tool result whose output carries nothing actionable opens the
+    // overlay onto an honest empty state rather than failing to open.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 28);
+    let body = "all good\nnothing to see here\n";
+    let mut result = sample_tool_result("shell", body);
+    result.content = serde_json::json!({ "output": body });
+    app.push_tool_result(result);
+    app.selected_entry = Some(0);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("open on empty-actionable output");
+    assert!(app.tool_actions.is_some(), "the overlay still opens");
+    assert!(app.tool_actions.as_ref().unwrap().is_empty());
+    let out = render_to_string(&app, 100, 28);
+    assert!(out.contains("Tool actions"), "header still paints:\n{out}");
+    assert!(
+        out.contains("No actionable elements"),
+        "empty-state line:\n{out}",
+    );
+
+    // Enter on an empty overlay is a harmless no-op (no panic, nothing copied).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty overlay");
+    assert!(app.tool_actions.as_ref().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tool_actions_renders_across_resizes() {
+    let mut app = app_with_actionable_tool_output();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, tool_actions_chord())
+        .await
+        .expect("open overlay");
+
+    for (w, h) in [(100u16, 28u16), (140, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Tool actions"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+}
+
 // ---- Transcript Health Markers (§12.5.7) ----
 
 /// Build a transcript with several health-worthy entries: a FAILED tool (an

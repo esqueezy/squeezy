@@ -199,6 +199,10 @@ pub(crate) enum ChromeKey {
     SnippetDelete,
     /// The "Clear all" button in the Prompt Snippets picker (§12.3.2).
     SnippetClear,
+    /// An item row in the Actionable Tool Outputs overlay (§12.3.1), keyed by its
+    /// 0-based index in the detected-item list so a click selects + runs the item's
+    /// primary action (copy) on exactly that element.
+    ToolActionsRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -403,6 +407,11 @@ pub(crate) enum Action {
     /// Clear every saved snippet (§12.3.2). Mouse twin of the picker's `c` verb /
     /// the "Clear all" button.
     SnippetClear,
+    /// Select the given item row in the Actionable Tool Outputs overlay (§12.3.1)
+    /// and run its primary action (copy the matched element to the clipboard). Mouse
+    /// twin of moving the cursor with ↑↓ and pressing Enter; a click both selects and
+    /// copies in one go. The index is into the detected-item list.
+    ToolActionRun(usize),
 }
 
 impl Action {
@@ -462,6 +471,7 @@ impl Action {
         Action::SnippetEnqueue(0),
         Action::SnippetDelete(0),
         Action::SnippetClear,
+        Action::ToolActionRun(0),
     ];
 }
 

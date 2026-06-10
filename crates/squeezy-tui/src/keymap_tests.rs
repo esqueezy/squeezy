@@ -266,6 +266,44 @@ fn toggle_hover_intent_round_trips_and_defaults_to_ctrl_alt_h() {
 }
 
 #[test]
+fn toggle_tool_actions_round_trips_and_defaults_to_ctrl_alt_a() {
+    // §12.3.1 Actionable Tool Outputs toggle: slug round-trips, is registered in
+    // `ALL` (so `/keymap` and the command palette list it and overrides can target
+    // it), and defaults to the `Ctrl+Alt+A` debug-style chord.
+    assert_eq!(
+        Action::from_slug("toggle_tool_actions"),
+        Some(Action::ToggleToolActions)
+    );
+    assert!(Action::ALL.contains(&Action::ToggleToolActions));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::ToggleToolActions),
+        KeyBinding::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+    );
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        Some(Action::ToggleToolActions),
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent.
+    assert_eq!(
+        Action::ToggleToolActions.terminal_compat_note(),
+        Some("terminal-dependent")
+    );
+    // Distinct from the bare `Alt+a` full-transcript copy: the Ctrl modifier
+    // disambiguates the two.
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('a'), KeyModifiers::ALT),
+        Some(Action::CopyFullTranscript),
+    );
+}
+
+#[test]
 fn quote_selection_to_compose_round_trips_and_defaults_to_greater_than() {
     // §11.1 quote-to-compose: slug round-trips, is registered in `ALL` (so
     // `/keymap` lists it and overrides can target it), and defaults to bare `>`.

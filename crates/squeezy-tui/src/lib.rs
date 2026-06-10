@@ -156,6 +156,7 @@ mod streaming;
 mod streaming_patch;
 mod terminal_writer;
 mod toast;
+mod tool_actions;
 mod transcript_health;
 mod transcript_index;
 mod transcript_relations;
@@ -1810,6 +1811,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.annotations_open
         || app.changes_since_open
         || app.action_palette.is_some()
+        || app.tool_actions.is_some()
         || app.command_palette.is_some()
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
@@ -2682,6 +2684,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::ActionPaletteRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Actionable Tool Outputs overlay (§12.3.1) owns the pointer while open: a
+    // left-click on an item row selects it and runs its primary action (copy the
+    // matched element); every other click is swallowed so a stray press can't fall
+    // through to the surface beneath. Hit-tested in ABSOLUTE screen coordinates
+    // against the row targets `render_tool_actions_surface` registered this frame.
+    if app.tool_actions.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ToolActionsRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -4556,6 +4576,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // dispatch, so a stray key never leaks into the composer underneath. Sits
     // beside the other front-of-loop overlays for the same reason.
     if app.action_palette.is_some() && handle_action_palette_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Actionable Tool Outputs overlay (§12.3.1) is modal while open: it owns
+    // the keyboard (↑↓/kj move the item cursor, Enter/c copy the matched element,
+    // j/→/l jump to the source result, Esc/Ctrl+Alt+A close) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.tool_actions.is_some() && handle_tool_actions_key(app, key) {
         return Ok(false);
     }
 
@@ -6490,6 +6520,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             }
             dismiss_first_run_hint(app)
         }
+        keymap::Action::ToggleToolActions => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_tool_actions(app);
+            true
+        }
     }
 }
 
@@ -8168,6 +8208,213 @@ fn run_selected_action_palette_action(app: &mut TuiApp) {
     app.needs_redraw = true;
 }
 
+// ---- Actionable Tool Outputs (§12.3.1) ----
+
+/// Largest number of characters of a tool result's output we scan for actionable
+/// elements. A huge output (a multi-megabyte log dump) is bounded here so the
+/// one-shot detection stays cheap; the actionable head is overwhelmingly where the
+/// paths/errors/commands live.
+const TOOL_ACTIONS_SCAN_CAP: usize = 64 * 1024;
+
+/// Extract the human-visible output text of a tool result entry for actionable-
+/// element detection (§12.3.1), or `None` when the entry is not a tool result.
+/// Joins the common output channels (stdout, stderr, error, message, output, text)
+/// the way the renderer surfaces them, falling back to the canonical content blob
+/// for a structured-only payload — so a path/url/error printed on any channel is
+/// scanned. Bounded by [`TOOL_ACTIONS_SCAN_CAP`].
+fn tool_actions_output_text(entry: &TranscriptEntry) -> Option<String> {
+    let TranscriptEntryKind::ToolResult(tool) = &entry.kind else {
+        return None;
+    };
+    let content = &tool.result.content;
+    let mut parts: Vec<String> = Vec::new();
+    for key in ["stdout", "output", "text", "stderr", "error", "message"] {
+        if let Some(text) = content.get(key).and_then(|v| v.as_str())
+            && !text.trim().is_empty()
+        {
+            parts.push(text.to_string());
+        }
+    }
+    let joined = if parts.is_empty() {
+        // Structured-only result: scan the canonical content blob so an
+        // `{"error": ...}`-shaped payload still surfaces.
+        content.to_string()
+    } else {
+        parts.join("\n")
+    };
+    if joined.len() > TOOL_ACTIONS_SCAN_CAP {
+        // Keep the actionable head on a char boundary.
+        let mut end = TOOL_ACTIONS_SCAN_CAP;
+        while !joined.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(joined[..end].to_string())
+    } else {
+        Some(joined)
+    }
+}
+
+/// A short, bounded, secret-free title for the focused tool result the overlay
+/// acts on — its tool name. Falls back to a generic noun when the name is empty.
+fn tool_actions_title(entry: &TranscriptEntry) -> String {
+    let TranscriptEntryKind::ToolResult(tool) = &entry.kind else {
+        return "tool result".to_string();
+    };
+    let name = tool.result.tool_name.trim();
+    if name.is_empty() {
+        "tool result".to_string()
+    } else {
+        let capped: String = name.chars().take(ACTION_PALETTE_TITLE_CAP).collect();
+        capped
+    }
+}
+
+/// `Ctrl+Alt+A`: open / close the Actionable Tool Outputs overlay (§12.3.1) for the
+/// focused (or top-visible) tool result. On open it resolves the focused entry, and
+/// — when that entry is a tool result — scans its output once into actionable items
+/// (file paths, URLs, errors, diffs, commands) and opens the list parked on the
+/// first item. When the focused entry is not a tool result (or the transcript is
+/// empty) it reports an honest status hint and opens nothing. The items are a
+/// one-shot snapshot, so there is no per-frame rebuild and an idle session pays
+/// nothing.
+fn toggle_tool_actions(app: &mut TuiApp) {
+    if app.tool_actions.is_some() {
+        app.tool_actions = None;
+        app.status = "tool actions closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let Some(entry_id) = annotation_target_entry_id(app) else {
+        app.status = "no transcript entry — nothing to act on".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let entries = active_transcript_entries(app);
+    let Some(entry) = entries.iter().find(|entry| entry.id == entry_id) else {
+        app.status = "no transcript entry — nothing to act on".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let Some(text) = tool_actions_output_text(entry) else {
+        app.status = "tool actions: focus a tool result first".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let title = tool_actions_title(entry);
+    let items = tool_actions::detect_actionable_items(entry_id, &text);
+    let overlay = tool_actions::ToolActions::open(entry_id, title.clone(), items);
+    app.status = if overlay.is_empty() {
+        format!("tool actions for {title} (none detected) — Esc to close")
+    } else {
+        format!(
+            "tool actions: {} — \u{2191}\u{2193} select \u{00b7} Enter copy \u{00b7} j jump \u{00b7} Esc close",
+            overlay.summary(),
+        )
+    };
+    app.tool_actions = Some(overlay);
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Actionable Tool Outputs overlay (§12.3.1) is open.
+/// Returns `true` when the key was consumed (so it never leaks to the composer or
+/// global keymap). The overlay's own toggle chord (`Ctrl+Alt+A`) and Esc close;
+/// Up/Down (and k/j... wait — `j` is the jump verb here, so only `k`/Up move up and
+/// only Down moves down) move the item cursor; Enter (and `c`) copies the selected
+/// element; `j`/→/`l` jumps the main view to the source tool result.
+fn handle_tool_actions_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.tool_actions.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord closes it, so the same key both opens and
+    // closes — without leaking to the global keymap, which the modal swallows.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleToolActions) {
+        app.tool_actions = None;
+        app.status = "tool actions closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.tool_actions = None;
+            app.status = "tool actions closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(actions) = app.tool_actions.as_mut() {
+                actions.move_up();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Down => {
+            if let Some(actions) = app.tool_actions.as_mut() {
+                actions.move_down();
+            }
+            app.needs_redraw = true;
+        }
+        // Enter / `c` copy the matched element — the primary, always-available verb.
+        KeyCode::Enter | KeyCode::Char('c') => {
+            tool_actions_copy_selected(app);
+        }
+        // `j` / → / `l` jump the main view to the source tool result.
+        KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
+            tool_actions_jump_to_source(app);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke cannot
+        // leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Copy the selected actionable item's matched element to the clipboard (§12.3.1),
+/// routing through the single `deliver_copy` funnel so the copy lands, is recorded
+/// in the in-app clipboard history, and toasts exactly like every other copy verb.
+/// A no-op status hint when there is nothing selected (an empty detection). The
+/// overlay stays open so the user can copy several elements in a row.
+fn tool_actions_copy_selected(app: &mut TuiApp) {
+    let Some((kind, text, primary)) = app
+        .tool_actions
+        .as_ref()
+        .and_then(|a| a.selected_item())
+        .map(|item| (item.kind, item.text.clone(), item.primary_action()))
+    else {
+        app.status = "tool actions: nothing to copy".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    // The item's primary (Enter / click) action; copy today, but routed through the
+    // model so a future primary verb lands here without a new dispatch site.
+    match primary {
+        tool_actions::WorkflowAction::Copy => {
+            deliver_copy(app, &text, &format!("{} (tool action)", kind.label()));
+        }
+        tool_actions::WorkflowAction::Jump => {
+            tool_actions_jump_to_source(app);
+            return;
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Jump the main view to the tool result the selected actionable item came from
+/// (§12.3.1) and close the overlay, reusing the same `jump_to_entry_id` path the
+/// index / minimap / error-lens jumps use. A no-op status hint when there is
+/// nothing selected or the source entry has dropped out of the transcript.
+fn tool_actions_jump_to_source(app: &mut TuiApp) {
+    let Some(entry_id) = app.tool_actions.as_ref().map(|a| a.entry_id()) else {
+        app.status = "tool actions: nothing to jump to".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    app.tool_actions = None;
+    if jump_to_entry_id(app, entry_id) {
+        app.status = "jumped to tool result".to_string();
+    } else {
+        app.status = "tool actions: could not jump".to_string();
+    }
+    app.needs_redraw = true;
+}
+
 /// Resolve a stable transcript entry id to its current index in the active
 /// transcript, or `None` when the id is no longer present. Identity is the stable
 /// id; the position is derived on demand so a concurrent rebuild cannot stale it.
@@ -8310,6 +8557,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.transcript_overlay.is_some()
         || app.command_palette.is_some()
         || app.action_palette.is_some()
+        || app.tool_actions.is_some()
         || app.paste_preview.is_some()
         || app.paste_transform.is_some()
         || app.paste_staging.is_some()
@@ -11816,6 +12064,15 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // seen so it never returns.
         interaction::Action::DismissFirstRunHint => {
             dismiss_first_run_hint(app);
+        }
+        // A click on an Actionable Tool Outputs item row (§12.3.1): move the cursor
+        // onto it and run its primary action (copy the matched element) — the mouse
+        // twin of ↑↓ + Enter, in one go.
+        interaction::Action::ToolActionRun(index) => {
+            if let Some(actions) = app.tool_actions.as_mut() {
+                actions.select(index);
+            }
+            tool_actions_copy_selected(app);
         }
     }
 }
@@ -17793,6 +18050,15 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_action_palette_surface(frame, area, app);
         return;
     }
+    // The Actionable Tool Outputs overlay (§12.3.1) paints as a centered list of the
+    // focused tool result's actionable elements over everything else while open,
+    // registering its per-item row click targets every frame. Checked beside the
+    // action-palette overlay so its targets register and it owns the surface while
+    // open.
+    if app.tool_actions.is_some() {
+        render_tool_actions_surface(frame, area, app);
+        return;
+    }
     // The Entry Annotations overlay (§12.2.5) paints as a fullscreen jump-list /
     // composer over everything else while open, registering its per-annotation row
     // click targets every frame. Checked beside the bookmarks overlay so its
@@ -20037,6 +20303,135 @@ fn render_action_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::ActionPaletteRow(offset)),
             interaction::Action::PaletteActionRun(offset),
+        );
+    }
+}
+
+/// Paint the Actionable Tool Outputs overlay (§12.3.1) as a centered list: a title
+/// naming the focused tool result, a one-line summary/navigation header (or an
+/// empty-state line), then one selectable row per detected actionable element — a
+/// caret on the selected row, the `[kind]` tag (color + text label, never
+/// color-only), the matched element text, and the offered-affordance hint. Each row
+/// is an [`interaction::ChromeKey::ToolActionsRow`] click target keyed by its index
+/// so a click reaches the same `tool_actions_copy_selected` path as ↑↓+Enter. Reads
+/// the already-detected item list off the overlay state (a one-shot snapshot), so
+/// painting is constant-time and does no transcript walk.
+fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(actions) = app.tool_actions.as_ref() else {
+        return;
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " Tool actions ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("\u{2014} {} ", actions.title()),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 88, 20, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let count = actions.len();
+    // Header: summary + navigation hint, or an empty-state line.
+    let header = if count == 0 {
+        Line::from(Span::styled(
+            "No actionable elements detected in this tool output.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter copy \u{00b7} j jump \u{00b7} Esc close",
+                actions.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if count == 0 {
+        return;
+    }
+
+    let selected = actions.selected();
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+    if rows == 0 {
+        return;
+    }
+    // Scroll so the selected row stays visible when the list is taller than the
+    // available rows (a narrow terminal).
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+
+    for (offset, item) in actions.items().iter().enumerate().skip(first).take(rows) {
+        let is_selected = offset == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_selected { "\u{203a} " } else { "  " };
+        // The kind tag carries a distinct color *and* a text label so meaning never
+        // depends on color alone.
+        let kind_color = match item.kind {
+            tool_actions::ActionableKind::Error => crate::render::theme::red(),
+            tool_actions::ActionableKind::Diff => crate::render::theme::warn(),
+            tool_actions::ActionableKind::Url => crate::render::theme::accent(),
+            tool_actions::ActionableKind::Path => crate::render::theme::secondary(),
+            tool_actions::ActionableKind::Command => crate::render::theme::foreground(),
+        };
+        let text_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        // The offered affordances (copy / jump), so the row doubles as a
+        // discoverability hint of what Enter and `j` will do.
+        let affordances = item
+            .actions()
+            .iter()
+            .map(|a| a.label())
+            .collect::<Vec<_>>()
+            .join("/");
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:<9} ", format!("[{}]", item.kind.label())),
+                Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(item.text.clone(), text_style),
+            Span::styled(
+                format!("  ({affordances})"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole item row as a click target keyed by its index so a
+        // click selects + copies exactly that element.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ToolActionsRow(offset)),
+            interaction::Action::ToolActionRun(offset),
         );
     }
 }
@@ -33344,6 +33739,14 @@ pub(crate) struct TuiApp {
     /// `OpenActionPalette` (`Alt+Enter`); a session that never opens it costs
     /// nothing.
     pub(crate) action_palette: Option<action_palette::ActionPalette>,
+    /// The open Actionable Tool Outputs overlay (§12.3.1), or `None` when closed
+    /// (the resting state, paints nothing extra). `Some` holds the focused tool
+    /// result's stable id, its name, and the detected actionable items (paths,
+    /// URLs, errors, diffs, commands) + a cursor; the overlay owns key/mouse routing
+    /// while open. Built fresh each time it opens via `ToggleToolActions`
+    /// (`Ctrl+Alt+A`) as a one-shot snapshot, so a session that never opens it costs
+    /// nothing and an idle session pays nothing (no per-frame rebuild).
+    pub(crate) tool_actions: Option<tool_actions::ToolActions>,
     /// The live Hover Preview popover (§12.1.4), or `None` when none is showing
     /// (the resting state, paints nothing extra and costs nothing idle). `Some`
     /// holds the previewed unit's stable id, kind, bounded title/body, and the
@@ -34004,6 +34407,7 @@ impl TuiApp {
             changes_since_open: false,
             changes_since_selected: 0,
             action_palette: None,
+            tool_actions: None,
             hover_preview: None,
             command_palette: None,
             command_palette_pending: None,

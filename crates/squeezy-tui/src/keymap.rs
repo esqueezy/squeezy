@@ -394,6 +394,16 @@ pub(crate) enum Action {
     /// a key from the composer or transcript. Once every hint is seen the feature is
     /// quiet and this verb does nothing, costing nothing idle.
     DismissFirstRunHint,
+    /// Open / close the Actionable Tool Outputs overlay (`Ctrl+Alt+A` default;
+    /// §12.3.1) for the focused (or top-visible) tool result. It scans that result's
+    /// output for actionable elements — file paths, URLs, error lines, diff hunks,
+    /// and shell commands — and lists each as a row offering safe copy/jump
+    /// affordances (copy the element to the clipboard, or jump the main view to the
+    /// source result). Keyboard (↑↓ select, Enter copy, j jump, Esc close) and mouse
+    /// (click a row to copy). Retry/run degrade to copy so nothing bypasses a sandbox
+    /// or an approval gate. The items are a one-shot snapshot taken on open, so the
+    /// resting state stores nothing and an idle session pays nothing.
+    ToggleToolActions,
 }
 
 impl Action {
@@ -468,6 +478,7 @@ impl Action {
             Self::ToggleBreadcrumbs => "toggle_breadcrumbs",
             Self::RenameFocusedEntry => "rename_focused_entry",
             Self::DismissFirstRunHint => "dismiss_first_run_hint",
+            Self::ToggleToolActions => "toggle_tool_actions",
         }
     }
 
@@ -541,6 +552,7 @@ impl Action {
         Action::ToggleBreadcrumbs,
         Action::RenameFocusedEntry,
         Action::DismissFirstRunHint,
+        Action::ToggleToolActions,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -716,6 +728,11 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P` chords
             // above.
             | Self::DismissFirstRunHint
+            // Actionable Tool Outputs overlay toggle is `Ctrl+Alt+A` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P`/
+            // `Ctrl+Alt+R`/`Ctrl+Alt+N` chords above.
+            | Self::ToggleToolActions
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1010,6 +1027,17 @@ impl Action {
             // steals a key from the surface beneath.
             Self::DismissFirstRunHint => KeyBinding::new(
                 KeyCode::Char('n'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Actionable Tool Outputs (§12.3.1). `Ctrl+Alt+A` — `A` recalls
+            // "Actions" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`/`Ctrl+Alt+R`/
+            // `Ctrl+Alt+N`). It is free: bare `Alt+a` is the full-transcript copy
+            // and every other bare `Alt` letter in the nav/copy/overlay family is
+            // taken, so the Ctrl+Alt modifier keeps the verb distinct and clear of
+            // every composer chord and of the `Alt+Enter`/`Ctrl+Enter` chords.
+            Self::ToggleToolActions => KeyBinding::new(
+                KeyCode::Char('a'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }
