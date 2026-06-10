@@ -8937,6 +8937,182 @@ async fn latency_overlay_renders_on_a_tiny_terminal_without_panicking() {
     );
 }
 
+// ---- Dogfood telemetry counters (§12.10.3) ----
+
+#[test]
+fn resolve_dogfood_metrics_is_opt_in() {
+    use std::ffi::OsString;
+    // Same opt-in contract as the render-metrics HUD: unset / empty / "0" off.
+    assert!(!resolve_dogfood_metrics(|_| None));
+    assert!(!resolve_dogfood_metrics(|_| Some(OsString::from(""))));
+    assert!(!resolve_dogfood_metrics(|_| Some(OsString::from("0"))));
+    assert!(resolve_dogfood_metrics(|_| Some(OsString::from("1"))));
+    assert!(resolve_dogfood_metrics(|_| Some(OsString::from("on"))));
+}
+
+#[test]
+fn build_dogfood_metrics_sets_bounded_profile_and_opt_in_jsonl() {
+    // The collector built at startup carries a bounded terminal profile and only
+    // opts into JSONL persistence when the path var is set and non-empty.
+    let no_jsonl = build_dogfood_metrics(|key| match key {
+        "TERM_PROGRAM" => Some("iTerm.app".to_string()),
+        _ => None,
+    });
+    assert!(
+        !no_jsonl.jsonl_enabled(),
+        "persistence stays off without a path var"
+    );
+
+    let with_jsonl = build_dogfood_metrics(|key| match key {
+        "SQUEEZY_DOGFOOD_METRICS_JSONL" => Some("/tmp/does-not-matter.jsonl".to_string()),
+        _ => None,
+    });
+    assert!(
+        with_jsonl.jsonl_enabled(),
+        "a non-empty path var opts into persistence"
+    );
+    // An empty path must NOT enable persistence.
+    let empty_jsonl = build_dogfood_metrics(|key| match key {
+        "SQUEEZY_DOGFOOD_METRICS_JSONL" => Some(String::new()),
+        _ => None,
+    });
+    assert!(!empty_jsonl.jsonl_enabled(), "empty path stays off");
+}
+
+#[test]
+fn dogfood_overlay_off_by_default_and_toggle_forces_hud_visible() {
+    let mut app = test_app(SessionMode::Build);
+    app.needs_redraw = false;
+    assert!(!app.show_dogfood_metrics, "overlay is off by default");
+    app.toggle_dogfood_metrics();
+    assert!(app.show_dogfood_metrics, "toggle turns the overlay on");
+    assert!(
+        app.show_render_metrics,
+        "turning on the dogfood panel forces the host HUD visible"
+    );
+    assert!(app.needs_redraw, "toggling requests a repaint");
+    app.toggle_dogfood_metrics();
+    assert!(!app.show_dogfood_metrics, "toggle turns it back off");
+}
+
+#[tokio::test]
+async fn dogfood_overlay_keymap_chord_toggles_through_dispatch() {
+    // Keyboard path: the Ctrl+Alt+M keymap action drives the toggle through the
+    // real dispatch, the same routing a rebound key would take.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(!app.show_dogfood_metrics);
+    let chord = KeyEvent::new(
+        KeyCode::Char('m'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, chord);
+    assert!(consumed, "the chord is consumed by the keymap dispatch");
+    assert!(
+        app.show_dogfood_metrics,
+        "Ctrl+Alt+M toggles the dogfood overlay on"
+    );
+}
+
+#[tokio::test]
+async fn keypress_through_event_loop_increments_dogfood_input_counter() {
+    // End to end: a key event flows through the real `dispatch_input_events`,
+    // which bumps the dogfood key-input counter, and the subsequent painted
+    // `draw_app` records a frame into the collector.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert_eq!(
+        app.dogfood_metrics.record().key_inputs,
+        0,
+        "nothing recorded yet"
+    );
+
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ))],
+    )
+    .await
+    .expect("dispatch typed key");
+    assert_eq!(
+        app.dogfood_metrics.record().key_inputs,
+        1,
+        "typing a key bumps the dogfood key-input counter"
+    );
+
+    let frames_before = app.dogfood_metrics.record().frames;
+    let (mut guard, _sink) = TerminalGuard::for_capture_test(120, 40);
+    guard.draw_app(&mut app).expect("paint after keypress");
+    assert_eq!(
+        app.dogfood_metrics.record().frames,
+        frames_before + 1,
+        "a painted frame is accumulated into the dogfood collector"
+    );
+}
+
+#[tokio::test]
+async fn idle_paint_records_a_frame_but_no_input_in_dogfood() {
+    // The zero-idle-cost contract: an idle paint (no input event) still counts
+    // as a painted frame for the dogfood frame budget, but touches no input
+    // counter — there was no input.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello"));
+
+    let (mut guard, _sink) = TerminalGuard::for_capture_test(120, 40);
+    guard.draw_app(&mut app).expect("idle paint");
+    let r = app.dogfood_metrics.record();
+    assert_eq!(r.frames, 1, "the idle paint counts as a frame");
+    assert_eq!(r.key_inputs, 0, "an idle paint records no input");
+    assert_eq!(r.mouse_inputs, 0);
+}
+
+#[tokio::test]
+async fn dogfood_overlay_paints_snapshot_only_when_toggled_on() {
+    // The overlay's header only paints once toggled on — asserted on the
+    // captured glyph stream through the real `render()` path.
+    let mut app = test_app(SessionMode::Build);
+
+    // Off by default: no dogfood header.
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
+    guard.draw_app(&mut app).expect("draw with overlay off");
+    let plain_off = strip_ansi(&sink_to_string(&sink));
+    assert!(
+        !plain_off.contains("dogfood telemetry"),
+        "the dogfood panel is hidden by default: {plain_off:?}"
+    );
+
+    // Toggle on, then assert the snapshot paints.
+    app.toggle_dogfood_metrics();
+    let (mut guard2, sink2) = TerminalGuard::for_capture_test(120, 40);
+    guard2.draw_app(&mut app).expect("draw with overlay on");
+    let plain_on = strip_ansi(&sink_to_string(&sink2));
+    assert!(
+        plain_on.contains("dogfood telemetry"),
+        "the dogfood panel paints once toggled on: {plain_on:?}"
+    );
+}
+
+#[tokio::test]
+async fn dogfood_overlay_renders_on_a_tiny_terminal_without_panicking() {
+    // Resize / edge coverage where the panel paints: a terminal too small for
+    // the box must clip cleanly (the HUD early-returns under 3 rows / 12 cols)
+    // rather than panic, exactly like the frame-budget HUD.
+    let mut app = test_app(SessionMode::Build);
+    app.toggle_dogfood_metrics();
+
+    // A 10x2 terminal is below the HUD's minimums; rendering must not panic.
+    let _ = render_to_string(&app, 10, 2);
+    // And a normal small-but-valid size paints the panel header.
+    let out = render_to_string(&app, 80, 30);
+    assert!(
+        out.contains("dogfood"),
+        "panel header present at 80x30:\n{out}"
+    );
+}
+
 #[test]
 fn emergency_teardown_leaves_alt_screen_and_restores_modes_without_mirror() {
     let mut bytes = Vec::new();

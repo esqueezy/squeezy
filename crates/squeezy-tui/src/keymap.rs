@@ -124,6 +124,12 @@ pub(crate) enum Action {
     /// panel for keypress echo, scroll, page jumps, queue drag, paste preview,
     /// copy ack, search jump, and resize redraw. Off in a normal session.
     ToggleLatencyOverlay,
+    /// Toggle the hidden dogfood-telemetry `/metrics` snapshot overlay
+    /// (`Ctrl+Alt+M` default; §12.10.3). Like the latency overlay, a
+    /// deliberately obscure debug chord: it forces the render-metrics HUD
+    /// visible and adds a session-long counter snapshot (frames/bytes/cache/
+    /// input/storms/copy/terminal-profile/a11y/teardown). Off by default.
+    ToggleDogfoodMetrics,
 }
 
 impl Action {
@@ -159,6 +165,7 @@ impl Action {
             Self::OpenFocusedInDetail => "open_focused_in_detail",
             Self::QueueUndo => "queue_undo",
             Self::ToggleLatencyOverlay => "toggle_latency_overlay",
+            Self::ToggleDogfoodMetrics => "toggle_dogfood_metrics",
         }
     }
 
@@ -193,6 +200,7 @@ impl Action {
         Action::OpenFocusedInDetail,
         Action::QueueUndo,
         Action::ToggleLatencyOverlay,
+        Action::ToggleDogfoodMetrics,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -245,9 +253,11 @@ impl Action {
             | Self::JumpNextError
             | Self::FocusPrevEntry
             | Self::FocusNextEntry
-            // Ctrl+Alt+L is a Ctrl+Alt (Meta) chord — Alt encoding is the
-            // classically unreliable case across Linux terminals, tmux, and SSH.
+            // Ctrl+Alt+L and Ctrl+Alt+M are Ctrl+Alt (Meta) chords — Alt
+            // encoding is the classically unreliable case across Linux
+            // terminals, tmux, and SSH.
             | Self::ToggleLatencyOverlay
+            | Self::ToggleDogfoodMetrics
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords.
             Self::OpenSearch
@@ -323,6 +333,17 @@ impl Action {
             // env opt-in).
             Self::ToggleLatencyOverlay => KeyBinding::new(
                 KeyCode::Char('l'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Hidden dogfood-telemetry overlay toggle. `Ctrl+Alt+M` is a
+            // deliberately obscure debug chord — never a normal composer
+            // keystroke — so the `/metrics` snapshot stays out of the way while
+            // remaining reachable at runtime (alongside the
+            // `SQUEEZY_DOGFOOD_METRICS` env opt-in). `m` (not the Enter-
+            // colliding bare `Ctrl+M`) carries the explicit Alt modifier, so it
+            // is distinct from carriage return.
+            Self::ToggleDogfoodMetrics => KeyBinding::new(
+                KeyCode::Char('m'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

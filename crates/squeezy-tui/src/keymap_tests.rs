@@ -176,6 +176,37 @@ fn toggle_latency_overlay_round_trips_and_defaults_to_ctrl_alt_l() {
 }
 
 #[test]
+fn toggle_dogfood_metrics_round_trips_and_defaults_to_ctrl_alt_m() {
+    // §12.10.3 dogfood `/metrics` overlay toggle: slug round-trips, is
+    // registered in `ALL`, and defaults to the obscure debug chord Ctrl+Alt+M.
+    assert_eq!(
+        Action::from_slug("toggle_dogfood_metrics"),
+        Some(Action::ToggleDogfoodMetrics)
+    );
+    assert!(Action::ALL.contains(&Action::ToggleDogfoodMetrics));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::ToggleDogfoodMetrics),
+        KeyBinding::new(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+    );
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        Some(Action::ToggleDogfoodMetrics),
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent.
+    assert_eq!(
+        Action::ToggleDogfoodMetrics.terminal_compat_note(),
+        Some("terminal-dependent")
+    );
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

@@ -80,6 +80,7 @@ mod commands;
 mod commands_style;
 mod config_screen;
 mod copy;
+mod dogfood;
 mod events;
 mod fuzzy;
 mod history;
@@ -990,6 +991,13 @@ async fn run_inner_with_terminal(
         // 60 FPS so bursts of events do not produce a draw storm.
         let wants_draw = app.needs_redraw || app.pending_resize || app.has_active_animation();
         let now = Instant::now();
+        if wants_draw && !frame_limiter.allow(now) {
+            // The frame limiter held this redraw back — it will be emitted on a
+            // later iteration once the rate gate opens, coalescing the requests
+            // into one paint. Count the deferral as a skipped frame for the
+            // §12.10.3 dogfood "skipped frames" counter (zero-cost otherwise).
+            app.dogfood_metrics.record_skipped_frame();
+        }
         if wants_draw && frame_limiter.allow(now) {
             terminal.draw_app(&mut app)?;
             app.needs_redraw = false;
@@ -2009,6 +2017,31 @@ fn tag_interaction(app: &mut TuiApp, kind: Option<latency::InteractionKind>) {
     }
 }
 
+/// A monotonic millisecond timestamp for the §12.10.3 dogfood storm detection
+/// (rapid scroll / resize bursts). Measured from a process-lifetime epoch so the
+/// value is purely relative — it carries no wall-clock / timezone information
+/// that could identify a user. `OnceLock` so the epoch is fixed on first use and
+/// the path stays allocation-free thereafter.
+fn dogfood_now_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Collapse a clipboard [`clipboard::ClipboardProviderKind`] to the bounded
+/// dogfood [`dogfood::CopyProvider`] histogram bucket (§12.10.3). The platform
+/// label (`pbcopy` / `wl-copy` / …) is dropped: only the *kind* is counted, so
+/// the copy histogram can never carry a command name.
+fn dogfood_copy_provider(kind: clipboard::ClipboardProviderKind) -> dogfood::CopyProvider {
+    match kind {
+        clipboard::ClipboardProviderKind::Osc52 => dogfood::CopyProvider::Osc52,
+        clipboard::ClipboardProviderKind::Platform(_) => dogfood::CopyProvider::Platform,
+        clipboard::ClipboardProviderKind::TempFile => dogfood::CopyProvider::TempFile,
+    }
+}
+
 /// Classify a key event into the latency-budget interaction it drives. Derived
 /// from the resolved keymap action and the active surface so a rebound key still
 /// classifies correctly:
@@ -2083,6 +2116,8 @@ async fn handle_input_event(
             // action (scroll / page-jump / search / copy) and falling back to
             // keypress-echo for plain composer input.
             tag_interaction(app, classify_key_interaction(app, key));
+            // Dogfood telemetry (§12.10.3): count the key input.
+            app.dogfood_metrics.record_key_input();
             let quit = handle_key(app, agent, key).await?;
             let unchanged_overlay_scroll =
                 overlay_scroll_key && app.transcript_overlay == before_overlay;
@@ -2094,6 +2129,15 @@ async fn handle_input_event(
             // (clicks, hover) rides the default keypress-class budget only when
             // it actually paints, so leave it untagged otherwise.
             tag_interaction(app, classify_mouse_interaction(app, &mouse));
+            // Dogfood telemetry (§12.10.3): count the mouse input, and for wheel
+            // scroll accumulate the (unit) delta and detect scroll storms.
+            app.dogfood_metrics.record_mouse_input();
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                app.dogfood_metrics.record_scroll(1, dogfood_now_ms());
+            }
             if handle_mouse(app, mouse) {
                 app.needs_redraw = true;
             } else {
@@ -2103,12 +2147,18 @@ async fn handle_input_event(
         }
         Event::Paste(text) => {
             tag_interaction(app, Some(latency::InteractionKind::PastePreview));
+            // Dogfood telemetry (§12.10.3): count the paste input (the count
+            // only — never the pasted text).
+            app.dogfood_metrics.record_paste_input();
             handle_paste(app, agent, text).await?;
             app.needs_redraw = true;
             Ok(false)
         }
         Event::Resize(_, _) => {
             tag_interaction(app, Some(latency::InteractionKind::ResizeRedraw));
+            // Dogfood telemetry (§12.10.3): count the resize input and detect
+            // resize storms (a rapid burst of resizes during a window drag).
+            app.dogfood_metrics.record_resize_input(dogfood_now_ms());
             app.pending_resize = true;
             app.needs_redraw = true;
             // A live (following) view re-pins to the tail; a scrolled-up view
@@ -4087,6 +4137,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
         && action != keymap::Action::ToggleTranscriptOverlay
         && action != keymap::Action::OpenSearch
         && action != keymap::Action::ToggleLatencyOverlay
+        && action != keymap::Action::ToggleDogfoodMetrics
     {
         return false;
     }
@@ -4356,6 +4407,12 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             // Hidden debug surface (§12.10.1): reachable from every surface,
             // including the Ctrl+T overlay (allowed past the guard above).
             app.toggle_latency_overlay();
+            true
+        }
+        keymap::Action::ToggleDogfoodMetrics => {
+            // Hidden debug surface (§12.10.3): the `/metrics` snapshot overlay,
+            // reachable from every surface including the Ctrl+T overlay.
+            app.toggle_dogfood_metrics();
             true
         }
     }
@@ -7364,11 +7421,18 @@ fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
             let outcome = app.clipboard_chain.copy(&request);
             let (toast_msg, variant) = outcome.toast();
             match &outcome {
-                clipboard::CopyOutcome::Copied { .. } => {
+                clipboard::CopyOutcome::Copied { provider, .. } => {
                     app.status = format!("copied {label} ({chars} chars)");
+                    // Dogfood telemetry (§12.10.3): bucket the copy by the
+                    // bounded provider kind that serviced it (never the bytes).
+                    app.dogfood_metrics
+                        .record_copy(dogfood_copy_provider(*provider));
                 }
                 clipboard::CopyOutcome::WroteTempFile { .. } => {
                     app.status = toast_msg.clone();
+                    // The temp-file fallback is itself a (degraded) copy outcome.
+                    app.dogfood_metrics
+                        .record_copy(dogfood::CopyProvider::TempFile);
                 }
                 _ => {
                     // Even the fallback chain failed: surface the original
@@ -9840,6 +9904,14 @@ fn render_metrics_hud(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             lines.push(String::new());
             lines.extend(latency_lines);
         }
+    }
+    // Dogfood telemetry counters (§12.10.3): when the dogfood overlay is toggled
+    // on, append the session-long `/metrics` snapshot below the other panels.
+    // The snapshot always has content (it starts at all-zero), so it paints as
+    // soon as the overlay is on.
+    if app.show_dogfood_metrics {
+        lines.push(String::new());
+        lines.extend(app.dogfood_metrics.snapshot_lines());
     }
     if lines.is_empty() || area.height < 3 || area.width < 12 {
         return;
@@ -20477,6 +20549,17 @@ pub(crate) struct TuiApp {
     /// `SQUEEZY_LATENCY_OVERLAY` at startup and flipped at runtime by the
     /// `toggle_latency_overlay` keymap action. A normal session never shows it.
     pub(crate) show_latency_overlay: bool,
+    /// Dogfood telemetry counters (§12.10.3): a session-long, privacy-preserving
+    /// collector of numeric / bounded-enum renderer-quality counters. Recorded
+    /// at points that already do real work (painted frames, input events,
+    /// copies, resizes) so idle frames churn nothing. Surfaced in the hidden
+    /// `/metrics` overlay and optionally persisted to append-only JSONL.
+    pub(crate) dogfood_metrics: dogfood::TuiMetrics,
+    /// When set, the hidden render-metrics overlay also paints the dogfood
+    /// `/metrics` snapshot panel. Off by default; seeded from
+    /// `SQUEEZY_DOGFOOD_METRICS` at startup and flipped at runtime by the
+    /// `toggle_dogfood_metrics` keymap action. A normal session never shows it.
+    pub(crate) show_dogfood_metrics: bool,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
     /// Elapsed time on the currently-running tool, sourced from the
@@ -20987,6 +21070,12 @@ impl TuiApp {
             // is set to a non-empty, non-`0` value. Runtime-toggleable via the
             // `toggle_latency_overlay` keymap action.
             show_latency_overlay: resolve_latency_overlay(|key| std::env::var_os(key)),
+            // Dogfood telemetry (§12.10.3): build the collector with the bounded
+            // terminal profile and any opt-in JSONL persistence path resolved
+            // from the environment. The overlay is off unless
+            // `SQUEEZY_DOGFOOD_METRICS` is set to a non-empty, non-`0` value.
+            dogfood_metrics: build_dogfood_metrics(|key| std::env::var(key).ok()),
+            show_dogfood_metrics: resolve_dogfood_metrics(|key| std::env::var_os(key)),
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             active_tool_elapsed_ms: None,
@@ -21276,6 +21365,21 @@ impl TuiApp {
             // The latency panel only paints inside the render-metrics HUD, so
             // turning it on implies turning the HUD on; otherwise the toggle
             // would silently do nothing visible.
+            self.show_render_metrics = true;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Flip the hidden dogfood `/metrics` snapshot overlay on/off and request a
+    /// repaint so the change shows immediately. Like the latency panel it rides
+    /// inside the render-metrics HUD (which it forces visible when toggled on)
+    /// so a single top-right box holds the frame budget, the latency budgets,
+    /// and the dogfood counters.
+    pub(crate) fn toggle_dogfood_metrics(&mut self) {
+        self.show_dogfood_metrics = !self.show_dogfood_metrics;
+        if self.show_dogfood_metrics {
+            // The dogfood panel only paints inside the render-metrics HUD, so
+            // turning it on implies turning the HUD on.
             self.show_render_metrics = true;
         }
         self.needs_redraw = true;
@@ -22492,6 +22596,66 @@ where
         .unwrap_or(false)
 }
 
+/// Resolve the initial state of the hidden dogfood `/metrics` overlay
+/// (§12.10.3) from the environment. `SQUEEZY_DOGFOOD_METRICS=1` (or any
+/// non-empty, non-`0` value) shows the dogfood snapshot panel from the first
+/// frame; default OFF. Runtime-toggleable thereafter via the
+/// `toggle_dogfood_metrics` keymap action. Injected `env_get` keeps it testable
+/// without process-env mutation.
+fn resolve_dogfood_metrics<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    env_get("SQUEEZY_DOGFOOD_METRICS")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Build the dogfood telemetry collector (§12.10.3) from the environment: detect
+/// the bounded terminal profile, and opt in to append-only JSONL persistence
+/// when `SQUEEZY_DOGFOOD_METRICS_JSONL` names a path. The `env_get` returns the
+/// decoded `String` value of a var (or `None`), injected so the whole mapping is
+/// testable without mutating process env. Only bounded-enum / path-control
+/// values are read — no raw env value is ever stored in the collector.
+fn build_dogfood_metrics<F>(env_get: F) -> dogfood::TuiMetrics
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut metrics = dogfood::TuiMetrics::default();
+    let profile =
+        dogfood::TerminalProfile::detect_from(dogfood::OsFamily::current(), |key| env_get(key));
+    metrics.set_terminal_profile(profile);
+    // Accessibility signals (a11y): reduced-motion mirrors the instant-scroll
+    // switch; high-contrast is detected from the same env preference the theme
+    // honours. Both are recorded as bounded booleans, never the theme name.
+    metrics.set_accessibility(reduced_motion_requested(), high_contrast_requested());
+    if let Some(path) = env_get("SQUEEZY_DOGFOOD_METRICS_JSONL")
+        && !path.is_empty()
+    {
+        metrics.set_jsonl_path(std::path::PathBuf::from(path));
+    }
+    metrics
+}
+
+/// True when the environment asks for a high-contrast presentation: either an
+/// explicit `SQUEEZY_HIGH_CONTRAST` opt-in or the active theme being the
+/// built-in `high-contrast` slug. A bounded accessibility signal for the
+/// dogfood counters — only the resulting boolean is recorded, never the theme.
+fn high_contrast_requested() -> bool {
+    if std::env::var("SQUEEZY_HIGH_CONTRAST").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
+        return true;
+    }
+    std::env::var("SQUEEZY_THEME")
+        .ok()
+        .and_then(|name| squeezy_core::normalize_tui_theme_name(&name))
+        .is_some_and(|slug| slug == "high-contrast")
+}
+
 /// Emit the terminal startup setup sequence into `writer`: the keyboard
 /// enhancement flags, the fullscreen alt-screen entry, and finally mouse capture
 /// when enabled. This is the byte-emitting half of [`TerminalGuard::enter`],
@@ -22834,6 +22998,12 @@ impl TerminalGuard {
         if !self.alt_screen_active {
             return Ok(());
         }
+        // Dogfood telemetry (§12.10.3): on a clean exit, append the session's
+        // final counter snapshot as one JSONL line when persistence is opted in.
+        // Best-effort: a disk error here never blocks the terminal restore.
+        if app.dogfood_metrics.jsonl_enabled() {
+            let _ = app.dogfood_metrics.flush_jsonl();
+        }
         // Width from the live terminal, with a conservative 80-column fallback
         // when the size is unavailable (piped stdout / detached TTY). Reusing
         // `size_source` keeps this testable with no real TTY.
@@ -23068,6 +23238,24 @@ impl TerminalGuard {
                 violation.frame,
             );
         }
+
+        // ---- Dogfood telemetry counters (§12.10.3) ----
+        // Accumulate THIS painted frame's budget into the session-long dogfood
+        // collector, reusing the very numbers the render-budget HUD just
+        // stamped. This only runs on a painted frame (this method is the redraw-
+        // gated chokepoint), so an idle frame records nothing — preserving the
+        // zero-idle-work contract. Every field is a plain counter; no payload.
+        app.dogfood_metrics.record_frame(dogfood::FrameSample {
+            render_time: snapshot.render_time,
+            bytes: snapshot.bytes_emitted,
+            cache_hits: snapshot.cache_hits,
+            cache_misses: snapshot.cache_misses,
+            longest_wrap: snapshot.longest_entry_wrap,
+            // The redraw gate coalesces multiple requests into one paint upstream
+            // of this chokepoint, so a painted frame is never itself a skip; the
+            // loop reports coalesced skips separately via `record_skipped_frame`.
+            coalesced_skip: false,
+        });
 
         paint
     }
@@ -23396,6 +23584,13 @@ impl Drop for TerminalGuard {
             return;
         };
         {
+            // Dogfood telemetry (§12.10.3): a Drop that still finds the alternate
+            // screen active means the clean-exit `finish_fullscreen` never ran —
+            // i.e. an emergency (panic / abnormal) teardown. A clean exit clears
+            // the flag first, so this never double-counts a normal shutdown.
+            if self.alt_screen_active {
+                dogfood::record_emergency_teardown();
+            }
             let backend = terminal.backend_mut();
             // Single-source the teardown bytes through the shared free helper so
             // a test asserts the exact `LeaveAlternateScreen` + mode-restore
