@@ -5373,7 +5373,6 @@ fn open_composer_in_editor(app: &mut TuiApp) {
     #[cfg(not(unix))]
     {
         app.status = "external editor handoff is only available on Unix builds".to_string();
-        return;
     }
     #[cfg(unix)]
     {
