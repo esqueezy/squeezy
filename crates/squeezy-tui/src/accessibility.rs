@@ -96,6 +96,10 @@ const ALLOWED_CHROME_GLYPHS: &[char] = &[
 /// terminal's real background is app-controlled and not queryable from inside a
 /// terminal session (the spec's platform-notes requirement).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Each variant is a distinct dark-terminal reference profile; the shared `Dark`
+// suffix is meaningful (every reference background the gate pins is dark), not a
+// naming smell.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum TerminalProfile {
     /// A macOS-style dark terminal (Terminal.app / iTerm2 default near-black).
     MacosDark,
@@ -256,7 +260,6 @@ impl AuditCell {
 pub(crate) struct AuditSurface {
     pub(crate) surface: Surface,
     pub(crate) profile: TerminalProfile,
-    pub(crate) width: u16,
     pub(crate) height: u16,
     pub(crate) cells: Vec<AuditCell>,
 }
@@ -296,7 +299,6 @@ impl AuditSurface {
         AuditSurface {
             surface,
             profile,
-            width,
             height,
             cells: cells_from_buffer(&buffer),
         }
@@ -396,8 +398,6 @@ pub(crate) struct Violation {
 /// a pass.
 #[derive(Clone, Debug)]
 pub(crate) struct AuditReport {
-    pub(crate) surface: Surface,
-    pub(crate) profile: TerminalProfile,
     pub(crate) violations: Vec<Violation>,
 }
 
@@ -444,11 +444,7 @@ pub(crate) fn audit_surface(captured: &AuditSurface) -> AuditReport {
     screen_reader_gate(captured, &mut violations);
     minimal_glyph_gate(captured, &mut violations);
     keyboard_reachability_gate(&mut violations);
-    AuditReport {
-        surface: captured.surface,
-        profile: captured.profile,
-        violations,
-    }
+    AuditReport { violations }
 }
 
 /// Contrast gate: every painted (non-blank) glyph must clear [`MIN_CONTRAST_RATIO`]

@@ -142,5 +142,5 @@ fn status_hint_tracks_mode_and_position() {
 fn step_constant_is_a_sensible_nudge() {
     // Guard the documented invariant: one notch is a small precise step, not a
     // full-screen jump.
-    assert!(HORIZONTAL_STEP_COLUMNS > 0 && HORIZONTAL_STEP_COLUMNS <= 16);
+    const { assert!(HORIZONTAL_STEP_COLUMNS > 0 && HORIZONTAL_STEP_COLUMNS <= 16) };
 }
