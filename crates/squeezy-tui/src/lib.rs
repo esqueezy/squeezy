@@ -114,6 +114,12 @@ mod streaming_patch;
 mod terminal_writer;
 mod toast;
 mod transcript_surface;
+// Visual Diff Dashboard (§12.10.4). `cfg(test)`-gated so the dev-only cell-grid
+// diff / HTML-artifact harness never compiles into a shipped TUI binary; every
+// item is exercised by its sibling `visual_diff_tests.rs`, so the module
+// carries no dead code (and adds no keybinding, dispatch arm, or idle redraw).
+#[cfg(test)]
+mod visual_diff;
 pub use render::markdown::render_markdown;
 pub use startup_model_picker::{
     StartupModelPickerModel, StartupModelPickerProvider, StartupModelPickerResult,
