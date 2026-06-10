@@ -127,6 +127,10 @@ pub(crate) enum ChromeKey {
     /// its 0-based index in the focused entry's ranked relation list so a click
     /// selects + jumps to exactly that related entry.
     RelatedLinkRow(usize),
+    /// A fold-span row in the Duplicate-Output Folds overlay (§12.5.4), keyed by
+    /// its 0-based index in the span list so a click selects (and a second click
+    /// jumps to / expands) exactly that fold.
+    DuplicateFoldRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -236,6 +240,11 @@ pub(crate) enum Action {
     /// (§12.5.3) and jump the main view to it. Mouse twin of moving the cursor
     /// with ↑↓ and pressing Enter; a click both selects and jumps in one go.
     RelatedLinkSelect(usize),
+    /// Select the given fold-span row in the Duplicate-Output Folds overlay
+    /// (§12.5.4): move the cursor onto it, jump the main view to its lead, and
+    /// toggle the span expanded/collapsed. Mouse twin of moving the cursor with
+    /// ↑↓ and pressing Enter; a click selects, jumps, and toggles in one go.
+    DuplicateFoldSelect(usize),
 }
 
 impl Action {
@@ -275,6 +284,7 @@ impl Action {
         Action::CycleSemanticFilter,
         Action::TranscriptIndexSelect(0),
         Action::RelatedLinkSelect(0),
+        Action::DuplicateFoldSelect(0),
     ];
 }
 

@@ -27209,3 +27209,235 @@ async fn related_links_renders_across_resizes() {
         );
     }
 }
+
+// ===========================================================================
+// Duplicate-Output Folding (§12.5.4) — integration tests driving the real
+// `render()` / `handle_key` / `handle_mouse` paths through the TestBackend.
+// ===========================================================================
+
+/// Build an app whose transcript has a run of three identical tool outputs (a
+/// foldable duplicate run), a distinct output, and a failed tool with the same
+/// text as the duplicates (which must NOT fold — errors stay visible). Seeds a
+/// deterministic viewport so geometry is host-independent.
+fn app_with_duplicate_outputs() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("run the checks".to_string()));
+    app.push_tool_result(sample_tool_result("shell", "all 42 tests passed"));
+    app.push_tool_result(sample_tool_result("shell", "all 42 tests passed"));
+    app.push_tool_result(sample_tool_result("shell", "all 42 tests passed"));
+    app.push_tool_result(sample_tool_result("shell", "a unique line"));
+    let mut failed = sample_tool_result("shell", "all 42 tests passed");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app
+}
+
+#[tokio::test]
+async fn duplicate_folds_alt_u_opens_overlay_and_lists_folds() {
+    let mut app = app_with_duplicate_outputs();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+u opens the duplicate-folds overlay");
+
+    assert!(app.duplicate_folds_open, "Alt+u opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Duplicate folds"), "header present:\n{out}");
+    // The three identical successful outputs fold into ONE span of count 3; the
+    // unique line and the failed tool do not fold.
+    assert_eq!(app.duplicate_folds.span_count(), 1, "one fold span");
+    assert_eq!(app.duplicate_folds.spans()[0].count(), 3, "three members");
+    assert_eq!(app.duplicate_folds.hidden_count(), 2, "two hidden");
+    // The summary appears in the header and a row shows the fold count.
+    assert!(out.contains("x3 output"), "fold count row:\n{out}");
+}
+
+#[tokio::test]
+async fn duplicate_folds_keyboard_jumps_and_toggles() {
+    let mut app = app_with_duplicate_outputs();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open folds");
+    let _ = render_to_string(&app, 80, 24);
+
+    let lead = app.duplicate_folds.spans()[0].lead_id;
+    assert!(!app.duplicate_folds.is_expanded(lead), "starts collapsed");
+
+    // Enter on the selected fold jumps to its lead and expands it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter expands");
+    assert!(
+        app.duplicate_folds.is_expanded(lead),
+        "Enter expands the span"
+    );
+    assert!(
+        app.status.contains("duplicate fold"),
+        "status reflects the toggle: {}",
+        app.status,
+    );
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("[-]"), "expanded marker shows:\n{out}");
+
+    // A second Enter collapses it again.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter collapses");
+    assert!(
+        !app.duplicate_folds.is_expanded(lead),
+        "Enter toggles closed"
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.duplicate_folds_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn duplicate_folds_alt_u_toggles_closed_without_leaking() {
+    let mut app = app_with_duplicate_outputs();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.duplicate_folds_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.duplicate_folds_open, "Alt+u toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn duplicate_folds_mouse_click_selects_and_toggles() {
+    let mut app = app_with_duplicate_outputs();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open folds");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for a registered fold-span row target.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::DuplicateFoldRow(_)),
+                _,
+            )) = app.click_target_at(col, row)
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a fold-span row target is registered");
+    let lead = app.duplicate_folds.spans()[0].lead_id;
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.duplicate_folds.is_expanded(lead),
+        "clicking a fold row jumps and toggles it expanded",
+    );
+    // The overlay stays open (the click toggled within it, not closed it).
+    assert!(app.duplicate_folds_open);
+}
+
+#[tokio::test]
+async fn duplicate_folds_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open folds on an empty transcript");
+
+    assert!(app.duplicate_folds_open);
+    assert_eq!(app.duplicate_folds.span_count(), 0);
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("Duplicate folds"),
+        "header still paints:\n{out}"
+    );
+    assert!(
+        out.contains("No repeated tool outputs"),
+        "empty-state line:\n{out}",
+    );
+
+    // Enter on an empty overlay is a harmless no-op (no panic, nothing expanded).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty folds");
+    assert_eq!(app.duplicate_folds.span_count(), 0);
+}
+
+#[tokio::test]
+async fn duplicate_folds_renders_across_resizes() {
+    let mut app = app_with_duplicate_outputs();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open folds");
+
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Duplicate folds"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+}

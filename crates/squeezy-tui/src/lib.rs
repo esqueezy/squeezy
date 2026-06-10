@@ -90,6 +90,7 @@ mod config_screen;
 mod copy;
 mod diff_detail_pane;
 mod dogfood;
+mod duplicate_fold;
 mod editor_handoff;
 mod events;
 mod export_destination;
@@ -1777,6 +1778,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.clipboard_history_open
         || app.transcript_index_open
         || app.related_links_open
+        || app.duplicate_folds_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2372,6 +2374,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::RelatedLinkRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Duplicate-Output Folds overlay (§12.5.4) owns the pointer while open: a
+    // left-click on a fold-span row selects it, jumps to its lead, and toggles
+    // the span expanded; every other click is swallowed so a stray press can't
+    // fall through to the surface beneath. Hit-tested in ABSOLUTE screen
+    // coordinates against the row targets `render_duplicate_folds_surface`
+    // registered this frame.
+    if app.duplicate_folds_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::DuplicateFoldRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3615,6 +3636,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // key never leaks into the composer underneath. Sits beside the transcript-
     // index picker at the front for the same reason.
     if app.related_links_open && handle_related_links_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Duplicate-Output Folds overlay (§12.5.4) is modal while open: it owns
+    // the keyboard (↑↓/kj move fold, Enter/→/l jump+toggle, Esc/Alt+u close)
+    // BEFORE any selection-clear, search, chord, or keymap dispatch, so a stray
+    // key never leaks into the composer underneath. Sits beside the transcript
+    // index at the front for the same reason.
+    if app.duplicate_folds_open && handle_duplicate_folds_key(app, key) {
         return Ok(false);
     }
 
@@ -5281,6 +5311,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_related_links(app);
             true
         }
+        keymap::Action::ToggleDuplicateFolds => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_duplicate_folds(app);
+            true
+        }
     }
 }
 
@@ -5584,6 +5624,33 @@ fn toggle_related_links(app: &mut TuiApp) {
     app.needs_redraw = true;
 }
 
+/// `Alt+u`: toggle the Duplicate-Output Folds overlay (§12.5.4). The overlay is a
+/// fullscreen list of detected runs of repeated / near-duplicate tool outputs,
+/// each collapsed to its lead with a count. Opening it refreshes the fold model
+/// (a no-op rebuild when the transcript has not changed since the last refresh,
+/// so the cost is only paid on a real change), resets the selection cursor, and
+/// confirms via the status line. Sets `needs_redraw` so the toggle paints
+/// immediately.
+fn toggle_duplicate_folds(app: &mut TuiApp) {
+    app.duplicate_folds_open = !app.duplicate_folds_open;
+    if app.duplicate_folds_open {
+        refresh_duplicate_folds(app);
+        app.duplicate_folds_selected = 0;
+        let spans = app.duplicate_folds.span_count();
+        app.status = if spans == 0 {
+            "duplicate folds (none) — Esc to close".to_string()
+        } else {
+            format!(
+                "duplicate folds: {} — \u{2191}\u{2193} fold \u{00b7} Enter jump/expand \u{00b7} Esc close",
+                app.duplicate_folds.summary(),
+            )
+        };
+    } else {
+        app.status = "duplicate folds closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
 /// Pluralized "N related" / "1 related" label for the related-links readout.
 fn count_label_related(count: usize) -> String {
     if count == 1 {
@@ -5670,6 +5737,84 @@ fn related_links_jump_to_selected(app: &mut TuiApp) {
     } else {
         app.status = "related links: could not jump".to_string();
     }
+}
+
+/// Handle a key while the Duplicate-Output Folds overlay (§12.5.4) is open.
+/// Returns `true` when the key was consumed (so it never leaks to the composer or
+/// global keymap). Mirrors the transcript-index picker's before-the-global-keymap
+/// modal consumption: the toggle chord (`Alt+u`) and Esc close; Up/Down (and k/j)
+/// move the fold cursor; Enter (and l/→) jumps the main view to the selected
+/// fold's lead and toggles the span expanded/collapsed.
+fn handle_duplicate_folds_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.duplicate_folds_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+u` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleDuplicateFolds) {
+        app.duplicate_folds_open = false;
+        app.status = "duplicate folds closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let span_count = app.duplicate_folds.span_count();
+    match key.code {
+        KeyCode::Esc => {
+            app.duplicate_folds_open = false;
+            app.status = "duplicate folds closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.duplicate_folds_selected = app.duplicate_folds_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if span_count > 0 {
+                let last = span_count - 1;
+                app.duplicate_folds_selected = (app.duplicate_folds_selected + 1).min(last);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            duplicate_fold_activate_selected(app);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Activate the duplicate-fold overlay's selected span (§12.5.4): jump the main
+/// view to its lead entry (so the user lands on the fold), then toggle the span
+/// expanded/collapsed so its retained raw members reveal/hide in place. Resolves
+/// the span from the cursor; a no-op (status hint) when there are no folds.
+/// Reuses the same `jump_to_entry_id` path the minimap/jump-nav use.
+fn duplicate_fold_activate_selected(app: &mut TuiApp) {
+    let lead = {
+        let spans = app.duplicate_folds.spans();
+        let Some(span) = spans.get(app.duplicate_folds_selected) else {
+            app.status = "duplicate folds: nothing to expand".to_string();
+            return;
+        };
+        span.lead_id
+    };
+    let count = app
+        .duplicate_folds
+        .span_for_lead(lead)
+        .map_or(0, duplicate_fold::FoldSpan::count);
+    // Land on the fold's lead in the main view (best-effort: an off-screen lead
+    // still toggles, so the count is reflected even when the jump cannot scroll).
+    let _ = jump_to_entry_id(app, lead);
+    let expanded = app.duplicate_folds.toggle_expanded(lead).unwrap_or(false);
+    let position = app.duplicate_folds_selected + 1;
+    let span_count = app.duplicate_folds.span_count();
+    let verb = if expanded { "expanded" } else { "collapsed" };
+    app.status = format!(
+        "duplicate fold {position}/{span_count} {verb} ({count} outputs) — Enter toggle \u{00b7} Esc close",
+    );
+    app.needs_redraw = true;
 }
 
 /// Re-copy the picker's selected entry back to the clipboard through the same
@@ -6436,6 +6581,50 @@ fn build_relation_entries(entries: &[TranscriptEntry]) -> Vec<transcript_relatio
         .collect()
 }
 
+/// The comparison text for a tool-result entry used by Duplicate-Output Folding
+/// (§12.5.4). Prefers a textual `stdout`/`output`/`text` field of the result
+/// content (the human-visible output a `shell`/`verify` style tool emits), and
+/// otherwise falls back to the serialized content blob, so two structurally
+/// identical results still fingerprint equal. `None` for a non-tool entry — only
+/// tool outputs participate in output folding.
+fn fold_output_text(entry: &TranscriptEntry) -> Option<String> {
+    let TranscriptEntryKind::ToolResult(tool) = &entry.kind else {
+        return None;
+    };
+    let content = &tool.result.content;
+    for key in ["stdout", "output", "text", "message"] {
+        if let Some(text) = content.get(key).and_then(|v| v.as_str())
+            && !text.trim().is_empty()
+        {
+            return Some(text.to_string());
+        }
+    }
+    // Structured-only result: fall back to the canonical content blob so two
+    // identical structured results still fold together.
+    Some(content.to_string())
+}
+
+/// Build the per-entry fold-candidate slice the duplicate-fold model consumes
+/// from the active transcript. Only tool-result entries contribute (the only
+/// outputs that can repeat); each carries its stable id, content revision (so a
+/// mutation recomputes), normalized output fingerprint, and error flag (an error
+/// is never folded). Pure over the entry slice.
+fn build_fold_candidates(entries: &[TranscriptEntry]) -> Vec<duplicate_fold::FoldableOutput> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| {
+            let text = fold_output_text(entry)?;
+            Some(duplicate_fold::FoldableOutput {
+                id: entry.id,
+                revision: entry.revision,
+                output: duplicate_fold::output_fingerprint(&text),
+                is_error: entry_is_error(entries, i),
+            })
+        })
+        .collect()
+}
+
 /// Refresh the Related-Entry Links graph (§12.5.3) against the active transcript,
 /// rebuilding **only** when the transcript's (id, revision, kind, error, tool)
 /// fingerprint has moved since the last refresh. Called lazily — right before the
@@ -6459,6 +6648,19 @@ fn related_links_anchor_id(app: &TuiApp) -> Option<u64> {
         return Some(entry.id);
     }
     entries.last().map(|entry| entry.id)
+}
+
+/// Refresh the Duplicate-Output Folds model (§12.5.4) against the active
+/// transcript, recomputing **only** when the candidates' (id, revision, output,
+/// error) fingerprint has moved since the last refresh. Called lazily — right
+/// before the fold overlay opens or renders — so an idle session that never opens
+/// the overlay pays nothing, and an open overlay re-folds only on a real
+/// transcript change rather than every frame.
+fn refresh_duplicate_folds(app: &mut TuiApp) {
+    let candidates = build_fold_candidates(active_transcript_entries(app));
+    let fingerprint = duplicate_fold::DuplicateFolds::fingerprint_of(candidates.iter());
+    app.duplicate_folds
+        .rebuild_if_stale(fingerprint, &candidates);
 }
 
 /// Compact human label for an entry id used in the recent-jump status readout
@@ -7414,6 +7616,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::RelatedLinkSelect(index) => {
             app.related_links_selected = index;
             related_links_jump_to_selected(app);
+        }
+        // A click on a Duplicate-Output Folds row (§12.5.4): move the cursor onto
+        // it, jump the main view to its lead, and toggle the span expanded — the
+        // mouse twin of ↑↓ + Enter, in one go.
+        interaction::Action::DuplicateFoldSelect(index) => {
+            app.duplicate_folds_selected = index;
+            duplicate_fold_activate_selected(app);
         }
     }
 }
@@ -12880,6 +13089,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_related_links_surface(frame, area, app);
         return;
     }
+    // The Duplicate-Output Folds overlay (§12.5.4) paints as a fullscreen list
+    // over everything else while open, registering its per-span row click targets
+    // every frame. Checked beside the transcript index so its targets register and
+    // it owns the surface while open.
+    if app.duplicate_folds_open {
+        render_duplicate_folds_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -13871,6 +14088,113 @@ fn render_related_links_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
                 Style::default().fg(crate::render::theme::quiet()),
             ))),
             footer_rect,
+        );
+    }
+}
+
+/// Paint the Duplicate-Output Folds overlay (§12.5.4) as a centered modal: a
+/// header with the fold summary, then one selectable row per detected fold span
+/// showing its count, expand state, and a one-line preview of the repeated
+/// output. The selected row is marked; each row is registered as an
+/// [`interaction::ChromeKey::DuplicateFoldRow`] click target so a click reaches
+/// the same `duplicate_fold_activate_selected` path as ↑↓+Enter. Reads the
+/// already-refreshed fold model (kept current by `draw_app` while open), so
+/// painting is constant-time and does no transcript walk.
+fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Duplicate folds ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} fold repeated output ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 72, 18, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let span_count = app.duplicate_folds.span_count();
+    // Header: summary + navigation hint, or an empty-state line.
+    let header = if span_count == 0 {
+        Line::from(Span::styled(
+            "No repeated tool outputs to fold yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} fold \u{00b7} Enter jump/expand \u{00b7} Esc close",
+                app.duplicate_folds.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if span_count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the span count so a fold that broke up (e.g. after a
+    // clear) can never leave the cursor past the end.
+    let selected = app.duplicate_folds_selected.min(span_count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    for (index, span) in app.duplicate_folds.spans().iter().enumerate().take(rows) {
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + index as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_selected { "\u{203a} " } else { "  " };
+        let expanded = app.duplicate_folds.is_expanded(span.lead_id);
+        // A folder glyph stand-in: open vs collapsed, ASCII-only to match chrome.
+        let state = if expanded { "[-]" } else { "[+]" };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{state} "), label_style),
+            Span::styled(
+                format!("{:<18}", format!("x{} output", span.count())),
+                label_style,
+            ),
+            Span::styled(
+                format!("#{}", span.lead_id),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its span-list index
+        // so a click selects + jumps + toggles exactly that fold.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::DuplicateFoldRow(index)),
+            interaction::Action::DuplicateFoldSelect(index),
         );
     }
 }
@@ -25432,6 +25756,21 @@ pub(crate) struct TuiApp {
     /// the overlay opens so a later scroll/focus change does not re-pivot the open
     /// overlay. `None` until the first open.
     pub(crate) related_links_anchor: Option<u64>,
+    /// Duplicate-Output Folding model (§12.5.4): the detected runs of repeated /
+    /// near-duplicate tool outputs, each collapsed to its lead with a count and
+    /// retaining every member's raw content for expand. Rebuilt incrementally —
+    /// only when the candidates' (id, revision, output, error) fingerprint moves
+    /// — by `refresh_duplicate_folds`, so an idle session pays one `u64`
+    /// comparison per refresh. Drives the fold overlay's list and navigation.
+    pub(crate) duplicate_folds: duplicate_fold::DuplicateFolds,
+    /// Whether the Duplicate-Output Folds overlay (§12.5.4) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// list owns key/mouse routing. Toggled by the `ToggleDuplicateFolds` keymap
+    /// action.
+    pub(crate) duplicate_folds_open: bool,
+    /// Cursor into the fold overlay's list of detected spans (§12.5.4). Clamped
+    /// to the span count each render. Only meaningful while the overlay is open.
+    pub(crate) duplicate_folds_selected: usize,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -26001,6 +26340,9 @@ impl TuiApp {
             related_links_open: false,
             related_links_selected: 0,
             related_links_anchor: None,
+            duplicate_folds: duplicate_fold::DuplicateFolds::new(),
+            duplicate_folds_open: false,
+            duplicate_folds_selected: 0,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -28206,6 +28548,14 @@ impl TerminalGuard {
         // costs nothing.
         if app.related_links_open {
             refresh_related_links(app);
+        }
+
+        // Keep the Duplicate-Output Folds model (§12.5.4) current while its
+        // overlay is open, on the same no-op-when-unchanged terms: an
+        // open-but-idle overlay costs one `u64` comparison and a closed overlay
+        // costs nothing (this branch is skipped entirely).
+        if app.duplicate_folds_open {
+            refresh_duplicate_folds(app);
         }
 
         let paint = self.paint_one_frame(app);

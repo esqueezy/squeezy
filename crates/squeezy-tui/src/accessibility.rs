@@ -650,6 +650,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // click and the keyboard reach the same `related_links_jump_to_selected`
         // handler.
         A::RelatedLinkSelect(_) => KeyboardPath::Always("related links ↑↓/Enter"),
+        // Duplicate-Output Folds overlay (§12.5.4) — the overlay's own key
+        // handler owns ↑↓/kj (move the fold cursor) and Enter/→/l (jump to the
+        // selected fold's lead and toggle it expanded) before the global keymap
+        // sees them, so a row click and the keyboard reach the same
+        // `duplicate_fold_activate_selected` handler.
+        A::DuplicateFoldSelect(_) => KeyboardPath::Always("duplicate folds ↑↓/Enter"),
     })
 }
 

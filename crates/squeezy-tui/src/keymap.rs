@@ -208,6 +208,14 @@ pub(crate) enum Action {
     /// incrementally only on a transcript revision bump, so an idle session pays
     /// nothing.
     ToggleRelatedLinks,
+    /// Open / close the Duplicate-Output Folds overlay (`Alt+u` default;
+    /// §12.5.4). A fullscreen list of detected runs of repeated / near-duplicate
+    /// tool outputs, each collapsed to its first member with a count; the raw
+    /// content of every folded output is retained for expand, search, and copy.
+    /// Keyboard/mouse navigation jumps the main view to the next fold lead and
+    /// toggles a span open. The fold model rebuilds incrementally only on a
+    /// transcript revision bump, so an idle session pays nothing.
+    ToggleDuplicateFolds,
 }
 
 impl Action {
@@ -258,6 +266,7 @@ impl Action {
             Self::CycleSemanticFilter => "cycle_semantic_filter",
             Self::ToggleTranscriptIndex => "toggle_transcript_index",
             Self::ToggleRelatedLinks => "toggle_related_links",
+            Self::ToggleDuplicateFolds => "toggle_duplicate_folds",
         }
     }
 
@@ -307,6 +316,7 @@ impl Action {
         Action::CycleSemanticFilter,
         Action::ToggleTranscriptIndex,
         Action::ToggleRelatedLinks,
+        Action::ToggleDuplicateFolds,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -395,6 +405,9 @@ impl Action {
             // Related-Entry Links overlay toggle is `Alt+g` — the same Meta/Alt
             // encoding case.
             | Self::ToggleRelatedLinks
+            // Duplicate-fold overlay toggle is `Alt+u` — the same Meta/Alt
+            // encoding that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleDuplicateFolds
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -543,6 +556,12 @@ impl Action {
             // "go to related". Bare `Alt` letters in the nav/copy family
             // (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i) are taken; `g` is free.
             Self::ToggleRelatedLinks => KeyBinding::new(KeyCode::Char('g'), KeyModifiers::ALT),
+            // Duplicate-Output Folds (§12.5.4). `Alt+u` — `Alt+d` is the
+            // composer's delete-word-forward shortcut and `Alt+g` is the
+            // Related-Entry Links toggle; bare `Alt` letters in the nav/copy
+            // family (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g) are taken, so `u` is the
+            // free letter that stays clear of the composer chords.
+            Self::ToggleDuplicateFolds => KeyBinding::new(KeyCode::Char('u'), KeyModifiers::ALT),
         }
     }
 }
