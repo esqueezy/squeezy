@@ -713,6 +713,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // the focused unit) before the global keymap sees them, so a row click and
         // the keyboard reach the same `run_selected_action_palette_action` handler.
         A::PaletteActionRun(_) => KeyboardPath::Always("action palette ↑↓/Enter"),
+        // Universal Command Palette overlay (§12.1.1) — the overlay's own key handler
+        // owns the fuzzy query (type/Backspace), ↑↓/Ctrl+P/Ctrl+N (move the command
+        // cursor), and Enter (run the highlighted command) before the global keymap
+        // sees them, so a row click and the keyboard reach the same
+        // `command_palette_run_selected` handler.
+        A::CommandPaletteRun(_) => KeyboardPath::Always("command palette ↑↓/Enter"),
     })
 }
 

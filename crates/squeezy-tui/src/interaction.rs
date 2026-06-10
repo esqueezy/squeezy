@@ -171,6 +171,10 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the gathered action list so a click selects + runs exactly
     /// that contextual action on the focused unit.
     ActionPaletteRow(usize),
+    /// A command row in the Universal Command Palette overlay (§12.1.1), keyed by
+    /// its 0-based index in the *visible* (fuzzy-filtered) command list so a click
+    /// selects + runs exactly that command.
+    CommandPaletteRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -338,6 +342,11 @@ pub(crate) enum Action {
     /// selects and runs the action in one go. The index is into the gathered
     /// action list.
     PaletteActionRun(usize),
+    /// Select the given command row in the Universal Command Palette overlay
+    /// (§12.1.1) and run it. Mouse twin of moving the cursor with ↑↓ and pressing
+    /// Enter; a click both selects and runs the command in one go. The index is into
+    /// the *visible* (fuzzy-filtered) command list.
+    CommandPaletteRun(usize),
 }
 
 impl Action {
@@ -388,6 +397,7 @@ impl Action {
         Action::OpenAnnotationsForEntry(EntryId(0)),
         Action::ChangeSinceSelectJump(0),
         Action::PaletteActionRun(0),
+        Action::CommandPaletteRun(0),
     ];
 }
 

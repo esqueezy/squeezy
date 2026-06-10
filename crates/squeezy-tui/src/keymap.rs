@@ -329,6 +329,14 @@ pub(crate) enum Action {
     /// never introduces new behavior. Closed is the resting state, so a session
     /// that never opens it pays nothing.
     OpenActionPalette,
+    /// Open / close the Universal Command Palette (`Ctrl+Alt+P` default; §12.1.1).
+    /// One discoverable, fuzzy-searchable modal that lists every app command — the
+    /// rebindable keymap actions plus the slash-command help table — with the
+    /// current binding and a short description, and runs the highlighted command
+    /// with Enter (keyboard) or a click (mouse). Slash commands that take a
+    /// parameter are handed back to the composer as a second step. The palette is
+    /// built only on open, so an unopened session pays nothing.
+    ToggleCommandPalette,
 }
 
 impl Action {
@@ -393,6 +401,7 @@ impl Action {
             Self::ToggleAnnotations => "toggle_annotations",
             Self::ToggleChangesSince => "toggle_changes_since",
             Self::OpenActionPalette => "open_action_palette",
+            Self::ToggleCommandPalette => "toggle_command_palette",
         }
     }
 
@@ -456,6 +465,7 @@ impl Action {
         Action::ToggleAnnotations,
         Action::ToggleChangesSince,
         Action::OpenActionPalette,
+        Action::ToggleCommandPalette,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -590,6 +600,11 @@ impl Action {
             // terminal-dependent case (Linux terminals / tmux / SSH may swallow or
             // remap it) the renderer plan flags for Alt chords.
             | Self::OpenActionPalette
+            // Universal Command Palette toggle is `Ctrl+Alt+P` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M` debug
+            // chords above.
+            | Self::ToggleCommandPalette
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -803,6 +818,16 @@ impl Action {
             // punctuation already claimed by the nav/copy/overlay family. Mnemonic
             // and unambiguous: a context menu for what is under focus.
             Self::OpenActionPalette => KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
+            // Universal Command Palette (§12.1.1). `Ctrl+Alt+P` — `P` recalls
+            // "Palette" and follows the existing `Ctrl+Alt+letter` debug-chord
+            // style (`Ctrl+Alt+L`/`Ctrl+Alt+M`). It is free: bare `Ctrl+P` is the
+            // task-panel toggle and bare `Alt+p` is the clipboard-history picker,
+            // so the Ctrl+Alt modifier keeps the palette distinct from both while
+            // staying clear of every composer chord.
+            Self::ToggleCommandPalette => KeyBinding::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
         }
     }
 }

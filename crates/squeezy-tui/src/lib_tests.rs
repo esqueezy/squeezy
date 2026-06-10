@@ -29205,6 +29205,352 @@ async fn session_timeline_renders_across_resizes() {
     );
 }
 
+// ---- Universal Command Palette (§12.1.1) ----
+
+/// Open the Universal Command Palette via its `Ctrl+Alt+P` default chord. Returns a
+/// freshly built app + agent with the palette open and rendered once.
+async fn open_command_palette(app: &mut TuiApp, agent: &mut Agent) {
+    handle_key(
+        app,
+        agent,
+        KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+P opens the command palette");
+}
+
+#[tokio::test]
+async fn command_palette_opens_and_lists_commands() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(
+        app.command_palette.is_none(),
+        "the palette is closed (zero cost) until opened",
+    );
+    open_command_palette(&mut app, &mut agent).await;
+    assert!(
+        app.command_palette.is_some(),
+        "Ctrl+Alt+P opens the palette"
+    );
+
+    let out = render_to_string(&app, 100, 30);
+    assert!(out.contains("Command palette"), "header present:\n{out}");
+    assert!(out.contains("Enter run"), "navigation hint present:\n{out}");
+    // The full registry is listed: every keymap action (minus the palette's own
+    // toggle) plus every slash command.
+    let expected = keymap::Action::ALL.len() - 1 + SLASH_COMMANDS.len();
+    assert_eq!(
+        app.command_palette.as_ref().unwrap().len(),
+        expected,
+        "the palette sources both the keymap registry and the slash table",
+    );
+    // The first page shows humanized keymap-action labels with their current
+    // binding — proving the keymap registry is the source.
+    assert!(
+        out.contains("Toggle config screen"),
+        "a humanized keymap action with its binding is listed:\n{out}",
+    );
+    assert!(
+        out.contains("[F11]"),
+        "the current binding is shown:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn command_palette_toggle_chord_closes_it() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    assert!(app.command_palette.is_some());
+    // The same chord closes it (the front-of-loop handler swallows it).
+    open_command_palette(&mut app, &mut agent).await;
+    assert!(
+        app.command_palette.is_none(),
+        "a second Ctrl+Alt+P closes the palette",
+    );
+}
+
+#[tokio::test]
+async fn command_palette_typing_fuzzy_filters_the_list() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    let full = app.command_palette.as_ref().unwrap().len();
+
+    for ch in "timeline".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type into the palette query");
+    }
+    let palette = app.command_palette.as_ref().unwrap();
+    assert_eq!(palette.query(), "timeline");
+    assert!(
+        palette.visible_len() < full,
+        "the query narrows the list ({} of {full})",
+        palette.visible_len(),
+    );
+
+    let out = render_to_string(&app, 100, 30);
+    assert!(
+        out.contains("Toggle session timeline"),
+        "match shown:\n{out}"
+    );
+    assert!(
+        !out.contains("Toggle config screen"),
+        "a non-matching command is filtered out:\n{out}",
+    );
+
+    // Backspace widens the list back out.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    )
+    .await
+    .expect("backspace edits the query");
+    assert_eq!(app.command_palette.as_ref().unwrap().query(), "timelin");
+}
+
+#[tokio::test]
+async fn command_palette_enter_runs_a_keymap_action() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    // Filter down to the session-timeline command and run it with Enter.
+    for ch in "session timeline".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let _ = render_to_string(&app, 100, 30);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter runs the highlighted command");
+    // The palette closed and armed the command; drain it as the run loop would.
+    assert!(
+        app.command_palette.is_none(),
+        "running a command closes the palette",
+    );
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the armed command");
+    // The drained keymap action opened the session-timeline overlay — the exact
+    // effect Alt+9 would have had, proving the palette routes through the same path.
+    assert!(
+        app.session_timeline_open,
+        "the palette ran the session-timeline toggle, opening its overlay",
+    );
+}
+
+#[tokio::test]
+async fn command_palette_enter_runs_a_slash_command_into_the_composer() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    // `/help` takes a parameter, so running it parks the command in the composer
+    // with a trailing space for the user to complete (the spec's second step).
+    for ch in "/help".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let _ = render_to_string(&app, 100, 30);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter runs the highlighted slash command");
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the armed slash command");
+
+    assert!(app.command_palette.is_none(), "palette closed");
+    assert_eq!(
+        app.input, "/help ",
+        "a parameter slash command is seeded into the composer with a trailing space",
+    );
+    assert_eq!(app.input_cursor, app.input.len());
+}
+
+#[tokio::test]
+async fn command_palette_mouse_click_runs_a_command() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    // Narrow to a single, unambiguous keymap-action row.
+    for ch in "session timeline".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let _ = render_to_string(&app, 100, 30);
+
+    // Scan for the first registered command-row target and click it.
+    let mut hit_cell = None;
+    'scan: for row in 0..30u16 {
+        for col in 0..100u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::CommandPaletteRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 0
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a command row target is registered");
+
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the open palette consumes the click");
+    // The click closed the palette and armed the same run the keyboard would; drain
+    // it as the run loop does after a mouse event.
+    assert!(
+        app.command_palette.is_none(),
+        "clicking a row runs + closes"
+    );
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the click-armed command");
+    assert!(
+        app.session_timeline_open,
+        "clicking the session-timeline row ran the same toggle the keyboard does",
+    );
+}
+
+#[tokio::test]
+async fn command_palette_no_match_shows_empty_state_and_enter_is_a_noop() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    for ch in "zzqqxx".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type a non-matching query");
+    }
+    assert_eq!(app.command_palette.as_ref().unwrap().visible_len(), 0);
+    let out = render_to_string(&app, 100, 30);
+    assert!(out.contains("No command matches"), "empty state:\n{out}");
+
+    // Enter on an empty filtered list is a harmless no-op: it reports, and the
+    // palette stays open with nothing armed.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on an empty palette");
+    assert!(
+        app.command_palette.is_some(),
+        "enter on no-match keeps the palette open",
+    );
+    assert!(app.command_palette_pending.is_none(), "nothing armed");
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain is a no-op");
+    assert!(app.command_palette.is_some());
+}
+
+#[tokio::test]
+async fn command_palette_esc_closes_without_running() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes the palette");
+    assert!(app.command_palette.is_none(), "Esc closes the palette");
+    assert!(
+        app.command_palette_pending.is_none(),
+        "nothing armed by Esc"
+    );
+    // Esc never leaked into the composer.
+    assert!(app.input.is_empty());
+}
+
+#[tokio::test]
+async fn command_palette_renders_across_resizes() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    open_command_palette(&mut app, &mut agent).await;
+    // The palette header paints at narrow, normal, and wide sizes — and a tiny size
+    // that shrinks the modal away does not panic.
+    for (w, h) in [(60u16, 16u16), (100, 30), (160, 48)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Command palette"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+    // A degenerate size must not panic (the modal clamps to nothing).
+    let _ = render_to_string(&app, 4, 3);
+    assert!(
+        app.command_palette.is_some(),
+        "the palette survives resizes"
+    );
+}
+
 // ---- What Changed Since Here? (§12.2.7) ----
 
 /// Build a transcript whose changes happen after the first prompt, so marking the

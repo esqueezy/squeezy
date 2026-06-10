@@ -88,6 +88,7 @@ mod bookmarks;
 mod change_summary;
 mod clipboard;
 mod clipboard_history;
+mod command_palette;
 mod commands;
 mod commands_style;
 mod config_screen;
@@ -1801,6 +1802,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.annotations_open
         || app.changes_since_open
         || app.action_palette.is_some()
+        || app.command_palette.is_some()
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2197,6 +2199,12 @@ async fn handle_input_event(
             // Dogfood telemetry (§12.10.3): count the key input.
             app.dogfood_metrics.record_key_input();
             let quit = handle_key(app, agent, key).await?;
+            // The Universal Command Palette (§12.1.1) arms a command for the run
+            // loop to execute (it owns the `agent`, so a keymap-action run can
+            // re-dispatch through the exact path its keybinding uses). Drain it here,
+            // after the key was handled, so an Enter inside the palette runs the
+            // highlighted command on this same iteration.
+            drain_command_palette_run(app, agent).await?;
             let unchanged_overlay_scroll =
                 overlay_scroll_key && app.transcript_overlay == before_overlay;
             app.needs_redraw = was_dirty || app.needs_redraw || !unchanged_overlay_scroll;
@@ -2216,7 +2224,12 @@ async fn handle_input_event(
             ) {
                 app.dogfood_metrics.record_scroll(1, dogfood_now_ms());
             }
-            if handle_mouse(app, mouse) {
+            let consumed = handle_mouse(app, mouse);
+            // A click on a Universal Command Palette (§12.1.1) row arms a command;
+            // drain it here, where the `agent` is in scope, so a mouse run and a
+            // keyboard run execute identically on the same iteration.
+            drain_command_palette_run(app, agent).await?;
+            if consumed {
                 app.needs_redraw = true;
             } else {
                 app.needs_redraw = was_dirty || app.needs_redraw;
@@ -2593,6 +2606,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::AnnotationRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Universal Command Palette (§12.1.1) owns the pointer while open: a
+    // left-click on a command row selects it and runs it; every other click is
+    // swallowed so a stray press can't fall through to the surface beneath.
+    // Hit-tested in ABSOLUTE screen coordinates against the row targets
+    // `render_command_palette_surface` registered this frame.
+    if app.command_palette.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::CommandPaletteRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3987,6 +4018,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
     if app.annotations_open && handle_annotations_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Universal Command Palette (§12.1.1) is modal while open: it owns the
+    // keyboard (type to filter, ↑↓/Ctrl+P/Ctrl+N move the cursor, Backspace edits
+    // the query, Enter runs the highlighted command, Esc/Ctrl+Alt+P close) BEFORE
+    // any selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.command_palette.is_some() && handle_command_palette_key(app, key) {
         return Ok(false);
     }
 
@@ -5797,6 +5838,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             open_action_palette(app);
             true
         }
+        keymap::Action::ToggleCommandPalette => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_command_palette(app);
+            true
+        }
     }
 }
 
@@ -7218,6 +7269,190 @@ fn quote_entry_to_compose(app: &mut TuiApp, entry_id: u64) {
     } else {
         format!("quoted entry ({lines} lines) into composer")
     };
+}
+
+// ---- Universal Command Palette (§12.1.1) ----
+
+/// `Ctrl+Alt+P`: toggle the Universal Command Palette (§12.1.1). Opening it builds
+/// the command list fresh from the keymap action registry + the slash-command help
+/// table (so an unopened session pays nothing), parks the cursor at the top, and
+/// confirms via the status line; closing it drops the model entirely. Sets
+/// `needs_redraw` so the toggle paints immediately.
+fn toggle_command_palette(app: &mut TuiApp) {
+    if app.command_palette.is_some() {
+        app.command_palette = None;
+        app.status = "command palette closed".to_string();
+    } else {
+        let palette = command_palette::CommandPalette::build(&app.keymap, app.turn_rx.is_some());
+        app.status = format!(
+            "command palette: {} commands \u{00b7} type to filter \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter run \u{00b7} Esc close",
+            palette.len(),
+        );
+        app.command_palette = Some(palette);
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or global
+/// keymap). The toggle chord (`Ctrl+Alt+P`) and Esc close; Up/Down (and Ctrl+P/
+/// Ctrl+N) move the cursor over the *visible* (filtered) list; Backspace edits the
+/// query; a printable char types into the query (so a query containing 'k'/'j'/'n'
+/// is never mistaken for a list verb — the list is fuzzy-filtered as you type);
+/// Enter arms the highlighted command for the run loop to execute.
+fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.command_palette.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord (`Ctrl+Alt+P` by default) closes it, so the
+    // same key both opens and closes — without leaking to the global keymap, which
+    // the modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleCommandPalette) {
+        app.command_palette = None;
+        app.status = "command palette closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.command_palette = None;
+            app.status = "command palette closed".to_string();
+            app.needs_redraw = true;
+        }
+        // Ctrl+P/Ctrl+N mirror the Up/Down cursor (the readline / editor idiom for
+        // a filter list) so a hand on the home row can move without the arrows.
+        KeyCode::Up | KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.move_up();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.move_down();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Backspace => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.pop_char();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => command_palette_run_selected(app),
+        // A printable character (no Ctrl/Alt) types into the fuzzy query.
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.push_char(ch);
+            }
+            app.needs_redraw = true;
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke cannot
+        // leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Run the highlighted command in the Universal Command Palette (§12.1.1). The
+/// mouse twin (a row click → [`command_palette_select_run`]) routes here too via a
+/// resolved visible index. A disabled command reports its reason and stays open; an
+/// available command closes the palette and arms `command_palette_pending` for the
+/// run loop to execute (the loop owns the `agent`, so a keymap action re-dispatches
+/// through exactly the path its keybinding uses, and a slash command is handed to
+/// the composer). A no-op (status hint) on an empty filtered list.
+fn command_palette_run_selected(app: &mut TuiApp) {
+    let Some(entry) = app
+        .command_palette
+        .as_ref()
+        .and_then(|palette| palette.selected_entry())
+    else {
+        app.status = "command palette: no command matches".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    arm_command_palette_run(app, entry);
+}
+
+/// Resolve a *visible* command row (the click path) and run it (§12.1.1). Keeps the
+/// mouse and keyboard run paths on one body so they can never diverge.
+fn command_palette_select_run(app: &mut TuiApp, index: usize) {
+    let Some(entry) = app
+        .command_palette
+        .as_ref()
+        .and_then(|palette| palette.entry_at(index))
+    else {
+        app.status = "command palette: no command there".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    arm_command_palette_run(app, entry);
+}
+
+/// Shared tail for both palette run paths: a disabled command reports its reason and
+/// stays open; an available one closes the palette and arms the pending run.
+fn arm_command_palette_run(app: &mut TuiApp, entry: command_palette::CommandEntry) {
+    if let Some(reason) = entry.disabled_reason {
+        app.status = format!("{} {reason}", entry.label);
+        app.needs_redraw = true;
+        return;
+    }
+    app.command_palette = None;
+    app.command_palette_pending = Some(entry.run);
+    app.needs_redraw = true;
+}
+
+/// Drain a command armed by the Universal Command Palette (§12.1.1). Called from
+/// the run loop after a key / mouse event, where the `agent` is in scope. A keymap
+/// action is re-dispatched through `dispatch_keymap_action` — the exact path its
+/// keybinding uses, so the palette can never diverge from the bound key — by
+/// synthesizing the action's resolved `KeyEvent`. A slash command is handed back to
+/// the composer: a parameter command is pre-seeded with a trailing space and parks
+/// the user in the composer (the spec's "second step"), and a parameterless command
+/// is filled in ready to send. A no-op when nothing is pending.
+async fn drain_command_palette_run(app: &mut TuiApp, agent: &mut Agent) -> Result<()> {
+    let Some(run) = app.command_palette_pending.take() else {
+        return Ok(());
+    };
+    match run {
+        command_palette::PaletteRun::Action(action) => {
+            let binding = app.keymap.binding(action);
+            let key = KeyEvent::new(binding.code, binding.modifiers);
+            // Re-enter the SAME dispatch the keybinding uses, so a palette run and a
+            // pressed key are byte-identical. A guard that blocks the action in the
+            // current context (e.g. a foreground config screen) makes this a no-op,
+            // exactly as pressing the key would.
+            let _ = dispatch_keymap_action(app, agent, key);
+            app.needs_redraw = true;
+        }
+        command_palette::PaletteRun::Slash {
+            name,
+            has_parameter,
+        } => {
+            // Hand the command to the composer through the same `set_input` path the
+            // rest of the TUI uses (it clears stale prompt attachments and clamps the
+            // slash-menu / cursor invariants). A parameter command leaves a trailing
+            // space and parks the user there to complete it; a parameterless command
+            // is filled in ready to send with Enter.
+            let text = if has_parameter {
+                format!("{name} ")
+            } else {
+                name.to_string()
+            };
+            input::set_input(app, text);
+            app.status = if has_parameter {
+                format!("{name} — add arguments, then Enter to send")
+            } else {
+                format!("{name} — Enter to send")
+            };
+            app.needs_redraw = true;
+        }
+    }
+    Ok(())
 }
 
 /// `Alt+z`: toggle the Collapsible Reasoning/Tool Lanes overlay (§12.2.2). The
@@ -10383,6 +10618,11 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 palette.select(index);
             }
             run_selected_action_palette_action(app);
+        }
+        interaction::Action::CommandPaletteRun(index) => {
+            // A click on a command row both selects and runs it — the same path
+            // ↑↓+Enter takes — keyed by the visible (filtered) index.
+            command_palette_select_run(app, index);
         }
     }
 }
@@ -16325,6 +16565,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_annotations_surface(frame, area, app);
         return;
     }
+    // The Universal Command Palette (§12.1.1) paints as a fullscreen fuzzy-filtered
+    // command list over everything else while open, registering its per-command row
+    // click targets every frame. Checked beside the other overlays so its targets
+    // register and it owns the surface while open.
+    if app.command_palette.is_some() {
+        render_command_palette_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -18560,6 +18808,166 @@ fn render_bookmarks_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::BookmarkRow(index)),
             interaction::Action::BookmarkSelectJump(index),
+        );
+    }
+}
+
+/// Paint the Universal Command Palette (§12.1.1) as a centered modal: a title, a
+/// query-input line (the live fuzzy filter), a one-line count/navigation header (or
+/// an honest empty-state line when nothing matches), then one row per *visible*
+/// (fuzzy-filtered) command — a cursor caret on the highlighted row, the command
+/// label, its current binding right-aligned, and either a short description or a
+/// dimmed `disabled` tag (color *and* text, never color-only) carrying the reason.
+/// Each row is an [`interaction::ChromeKey::CommandPaletteRow`] click target so a
+/// click reaches the same `command_palette_select_run` path as ↑↓+Enter. Reads the
+/// already-built palette, so painting is constant-time over the visible list.
+fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(palette) = app.command_palette.as_ref() else {
+        return;
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " Command palette ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} run any command ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 92, 26, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Query-input line: a `>` prompt + the live filter text + a block cursor, so the
+    // user can see exactly what they are typing against.
+    let query_line = Line::from(vec![
+        Span::styled(
+            "\u{203a} ",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+        Span::styled(
+            palette.query().to_string(),
+            Style::default().fg(crate::render::theme::foreground()),
+        ),
+        Span::styled(
+            "\u{2588}",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(query_line), Rect { height: 1, ..inner });
+
+    let visible = palette.visible();
+    let visible_count = visible.len();
+    let total = palette.len();
+
+    // Header: count + navigation hint, or an honest empty-state line when the query
+    // filtered everything away.
+    let header = if visible_count == 0 {
+        Line::from(Span::styled(
+            "No command matches \u{00b7} Backspace to widen \u{00b7} Esc close",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{visible_count}/{total} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter run \u{00b7} Esc close",
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(
+        Paragraph::new(header),
+        Rect {
+            y: inner.y.saturating_add(1),
+            height: 1,
+            ..inner
+        },
+    );
+
+    if visible_count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the visible count so a command that vanished (e.g. after a
+    // query change) can never leave the cursor past the end.
+    let selected = palette.selected().min(visible_count - 1);
+    let list_top = inner.y.saturating_add(3);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+    if rows == 0 {
+        return;
+    }
+
+    // Scroll the list so the selected command stays visible when there are more
+    // matches than rows — the list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, entry) in visible.iter().enumerate().skip(first).take(rows) {
+        let index = offset;
+        let is_selected = index == selected;
+        let disabled = entry.disabled_reason.is_some();
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let caret = if is_selected { "\u{203a} " } else { "  " };
+        let label_style = if disabled {
+            Style::default().fg(crate::render::theme::quiet())
+        } else if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        // The detail column: a `disabled (reason)` tag (color *and* text) when the
+        // command can't run, otherwise the binding + short description.
+        let detail_span = match entry.disabled_reason.as_deref() {
+            Some(reason) => Span::styled(
+                format!("disabled \u{00b7} {reason}"),
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None => {
+                let binding = if entry.binding.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}] ", entry.binding)
+                };
+                Span::styled(
+                    format!("{binding}{}", entry.description),
+                    Style::default().fg(crate::render::theme::quiet()),
+                )
+            }
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{:<32} ", entry.label), label_style),
+            detail_span,
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its VISIBLE index so a
+        // click selects + runs exactly that command (matching the cursor model).
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::CommandPaletteRow(index)),
+            interaction::Action::CommandPaletteRun(index),
         );
     }
 }
@@ -30760,6 +31168,19 @@ pub(crate) struct TuiApp {
     /// `OpenActionPalette` (`Alt+Enter`); a session that never opens it costs
     /// nothing.
     pub(crate) action_palette: Option<action_palette::ActionPalette>,
+    /// Universal Command Palette model (§12.1.1). `None` = closed (the resting
+    /// state, paints and allocates nothing — zero idle cost); `Some` = the
+    /// fullscreen fuzzy-searchable command list owns key/mouse routing. Built fresh
+    /// from the keymap action registry + the slash-command help table each time the
+    /// `ToggleCommandPalette` action opens it.
+    pub(crate) command_palette: Option<command_palette::CommandPalette>,
+    /// A command the palette (§12.1.1) selected for the run loop to execute. `None`
+    /// = nothing pending; `Some` = the loop's next drain should run the keymap
+    /// action (re-dispatched through the same path the keybinding uses) or hand the
+    /// slash command back to the composer. Set by both the keyboard (Enter) and
+    /// mouse (click) run paths so they execute identically, and drained the same
+    /// iteration, so it is `Some` for at most one loop turn.
+    pub(crate) command_palette_pending: Option<command_palette::PaletteRun>,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -31363,6 +31784,8 @@ impl TuiApp {
             changes_since_open: false,
             changes_since_selected: 0,
             action_palette: None,
+            command_palette: None,
+            command_palette_pending: None,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
