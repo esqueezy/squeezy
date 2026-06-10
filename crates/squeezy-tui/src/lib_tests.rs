@@ -29435,6 +29435,346 @@ async fn breadcrumbs_render_across_resizes_with_middle_truncation() {
     assert!(app.breadcrumbs_open);
 }
 
+// ---- Inline Rename Labels (§12.1.7) ----
+
+/// Build a transcript with several distinct turns (so there are stable entry ids
+/// to label) and a deterministic viewport so the badge's row geometry is
+/// host-independent.
+fn app_with_labelable_transcript() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    for i in 0..6 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {i}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("reply {i}")));
+    }
+    app
+}
+
+/// The stable entry id at list position `index`.
+fn label_test_entry_id(app: &TuiApp, index: usize) -> u64 {
+    active_transcript_entries(app)
+        .get(index)
+        .map(|entry| entry.id)
+        .expect("an entry exists at the requested index")
+}
+
+/// The `Ctrl+Alt+R` rename chord.
+fn rename_chord() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Type a string into the active inline editor.
+async fn rename_type(app: &mut TuiApp, agent: &mut Agent, text: &str) {
+    for ch in text.chars() {
+        handle_key(
+            app,
+            agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type a char");
+    }
+}
+
+#[tokio::test]
+async fn rename_chord_opens_editor_types_and_saves_a_label() {
+    let mut app = app_with_labelable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    app.selected_entry = Some(0);
+    let entry_id = label_test_entry_id(&app, 0);
+
+    // Ctrl+Alt+R opens the inline editor on the focused entry.
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("Ctrl+Alt+R opens the rename editor");
+    assert!(app.rename_edit.is_some(), "editor is active");
+
+    // Typed text paints in the editor box and lands in the buffer.
+    rename_type(&mut app, &mut agent, "the auth refactor").await;
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("rename label"), "editor title paints:\n{out}");
+    assert!(
+        out.contains("the auth refactor"),
+        "typed label is visible in the editor:\n{out}"
+    );
+
+    // Enter saves the label; the editor closes and the label is stored.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Enter saves the label");
+    assert!(app.rename_edit.is_none(), "editor closes on save");
+    assert_eq!(
+        app.rename_labels
+            .label_for(rename_labels::LabelTargetId::Entry(entry_id)),
+        Some("the auth refactor"),
+        "the label is stored against the focused entry's stable id",
+    );
+    // The label is UI metadata only — it must NOT enter the model transcript.
+    let entry_text = active_transcript_entries(&app)
+        .iter()
+        .find(|e| e.id == entry_id)
+        .map(|e| format!("{e:?}"))
+        .unwrap_or_default();
+    assert!(
+        !entry_text.contains("the auth refactor"),
+        "the label never enters the transcript entry: {entry_text}",
+    );
+}
+
+#[tokio::test]
+async fn rename_esc_cancels_without_storing() {
+    let mut app = app_with_labelable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    app.selected_entry = Some(0);
+    let entry_id = label_test_entry_id(&app, 0);
+
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("open editor");
+    rename_type(&mut app, &mut agent, "discard me").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Esc cancels");
+    assert!(app.rename_edit.is_none(), "editor closes on cancel");
+    assert!(
+        !app.rename_labels
+            .has_label(rename_labels::LabelTargetId::Entry(entry_id)),
+        "a cancelled rename stores nothing",
+    );
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn rename_typing_is_modal_and_does_not_leak_to_the_composer() {
+    // While the editor is active it owns EVERY key: a character that is also a
+    // global chord letter (e.g. a plain 'a') must go to the label, not the
+    // composer, and a global overlay chord must not fire.
+    let mut app = app_with_labelable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    app.selected_entry = Some(0);
+
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("open editor");
+    rename_type(&mut app, &mut agent, "abc").await;
+    // The label captured the keys; the composer is untouched.
+    assert!(app.input.is_empty(), "no typed key reached the composer");
+    assert_eq!(
+        app.rename_edit.as_ref().map(|e| e.buffer.as_str()),
+        Some("abc"),
+        "the editor buffer captured the keys",
+    );
+    // A global overlay chord (Alt+\ annotations) must NOT open its overlay while
+    // the rename editor owns the keyboard.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("chord while editing");
+    assert!(
+        !app.annotations_open,
+        "a global chord is swallowed by the modal rename editor",
+    );
+    assert!(app.rename_edit.is_some(), "the editor is still active");
+}
+
+#[tokio::test]
+async fn rename_blank_save_clears_an_existing_label() {
+    let mut app = app_with_labelable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    app.selected_entry = Some(0);
+    let entry_id = label_test_entry_id(&app, 0);
+    let target = rename_labels::LabelTargetId::Entry(entry_id);
+
+    // First, store a label.
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("open editor");
+    rename_type(&mut app, &mut agent, "temporary").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+    assert!(app.rename_labels.has_label(target));
+
+    // Re-open the editor: it is seeded with the existing label; clear it and save.
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("re-open editor");
+    assert_eq!(
+        app.rename_edit.as_ref().map(|e| e.buffer.as_str()),
+        Some("temporary"),
+        "the editor is seeded with the existing label",
+    );
+    // Backspace the whole buffer.
+    for _ in 0.."temporary".len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await
+        .expect("backspace");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("blank save");
+    assert!(
+        !app.rename_labels.has_label(target),
+        "a blank save clears the existing label",
+    );
+}
+
+#[tokio::test]
+async fn rename_badge_paints_on_labelled_entry_and_click_opens_editor() {
+    let mut app = app_with_labelable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    // Label the LAST entry while the view sits at the live tail, so the labelled
+    // entry's header row is in the visible window AND there is no "scrolled vs
+    // live" indicator competing for the right edge of that row.
+    let last = active_transcript_entries(&app).len() - 1;
+    app.selected_entry = Some(last);
+    let entry_id = label_test_entry_id(&app, last);
+
+    // Before any label, the badge bracket is not painted (zero idle cost).
+    let before = render_to_string(&app, 80, 24);
+    assert!(
+        !before.contains("[shipit]"),
+        "no badge before a label:\n{before}"
+    );
+
+    // Label the focused (last) entry.
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("open editor");
+    rename_type(&mut app, &mut agent, "shipit").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+
+    // Settle any ease and paint so the badge + its click target register.
+    cancel_main_scroll_anim(&mut app);
+    let after = render_to_string(&app, 80, 24);
+    assert!(
+        after.contains("[shipit]"),
+        "the inline label badge paints after a label:\n{after}"
+    );
+
+    // Locate the badge's click target and click it; the inline editor re-opens on
+    // that entry seeded with its label.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::RenameLabel(id)),
+                _,
+            )) = app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("the label badge registers a click target");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.rename_edit.is_some(),
+        "clicking the badge opens the inline rename editor"
+    );
+    assert_eq!(
+        app.rename_edit.as_ref().map(|e| e.target),
+        Some(rename_labels::LabelTargetId::Entry(entry_id)),
+        "the editor targets exactly the clicked entry's label",
+    );
+}
+
+#[tokio::test]
+async fn rename_empty_transcript_is_a_no_op() {
+    // No transcript: the rename chord reports nothing to rename and opens no editor.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("Ctrl+Alt+R on an empty transcript");
+    assert!(
+        app.rename_edit.is_none(),
+        "no editor opens with nothing to rename"
+    );
+    assert!(
+        app.status.contains("no transcript entry"),
+        "a status hint explains the no-op: {}",
+        app.status,
+    );
+    // The frame still paints without panicking.
+    let _ = render_to_string(&app, 80, 24);
+}
+
+#[tokio::test]
+async fn rename_editor_paints_across_resizes() {
+    // The small editor modal paints at a range of widths/heights without panicking,
+    // and clamps itself away on a frame too small to host it.
+    let mut app = app_with_labelable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    app.selected_entry = Some(0);
+
+    handle_key(&mut app, &mut agent, rename_chord())
+        .await
+        .expect("open editor");
+    rename_type(&mut app, &mut agent, "wide and narrow").await;
+
+    for (w, h) in [(120u16, 40u16), (80, 24), (40, 10)] {
+        let out = render_to_string(&app, w, h);
+        // On hostable frames the editor title paints; on every size it never panics.
+        if w >= 6 && h >= 3 {
+            assert!(
+                out.contains("rename label"),
+                "editor paints at {w}x{h}:\n{out}",
+            );
+        }
+    }
+    // A frame too small to host the box paints nothing extra and does not panic.
+    let _ = render_to_string(&app, 5, 2);
+    assert!(
+        app.rename_edit.is_some(),
+        "the editor state survives a tiny frame"
+    );
+}
+
 // ---- Session Timeline (§12.2.6) ----
 
 /// Build a transcript spanning two turns with a full set of high-signal events:

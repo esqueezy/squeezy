@@ -135,6 +135,7 @@ mod proposed_plan;
 mod queue_edit;
 mod queue_run_next;
 mod quote_compose;
+mod rename_labels;
 mod render;
 mod resume_picker;
 mod scroll;
@@ -2787,6 +2788,23 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         return true;
     }
 
+    // Main-view inline rename-label badge (§12.1.7): a left-click on a labelled
+    // entry's badge opens the inline rename editor on that entry's label — the
+    // mouse twin of focusing the entry and pressing `Ctrl+Alt+R`. The badge is a
+    // dedicated non-text affordance on the entry's header row, so (like the
+    // annotation marker above) it is hit-tested in ABSOLUTE coordinates here,
+    // BEFORE the card-affordance / selection arms, so a click on it never doubles
+    // as a card focus or a transcript selection.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::RenameLabel(_)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
     // Prompt-queue reorder overlay: per-item delete + drag-reorder. Gated on
     // the overlay being open — a state none of the other arms consult — so it
     // can never interfere with the scrollbar drag (own state:
@@ -4174,6 +4192,17 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // dispatch, so a stray key never leaks into the composer underneath. Sits
     // beside the health-markers overlay at the front for the same reason.
     if app.turn_outline_open && handle_turn_outline_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Inline Rename Labels editor (§12.1.7) is MODAL while active: the user is
+    // typing a label in place, so the editor owns EVERY key (printable → buffer,
+    // Backspace deletes, Enter saves, Esc cancels) BEFORE any selection-clear,
+    // chord, or keymap dispatch, so no keystroke leaks into the composer or the
+    // global keymap mid-rename. The resting state (`rename_edit == None`) skips
+    // this entirely, so normal input is unaffected.
+    if app.rename_edit.is_some() {
+        handle_rename_edit_key(app, key);
         return Ok(false);
     }
 
@@ -6140,6 +6169,15 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             toggle_breadcrumbs(app);
+            true
+        }
+        keymap::Action::RenameFocusedEntry => {
+            // Main-surface inline editor; the config/setup screens own their own
+            // routing, so the rename verb is a no-op there (falls through).
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            rename_focused_entry(app);
             true
         }
     }
@@ -8765,6 +8803,110 @@ fn open_annotations_for_entry(app: &mut TuiApp, entry_id: u64) {
     app.needs_redraw = true;
 }
 
+// ---- Inline Rename Labels (§12.1.7) ----
+
+/// `Ctrl+Alt+R`: open the inline rename editor on the focused (or, when nothing is
+/// focused, the top-visible) transcript entry (§12.1.7). Seeds the editor with the
+/// entry's current label (empty for a fresh one) and enters in-place text-input
+/// mode; the label is UI-only metadata that paints as a small badge and never
+/// enters the model transcript. A no-op (status hint) on an empty transcript.
+fn rename_focused_entry(app: &mut TuiApp) {
+    let Some(entry_id) = annotation_target_entry_id(app) else {
+        app.status = "no transcript entry to rename".to_string();
+        return;
+    };
+    begin_rename_for_entry(app, entry_id);
+}
+
+/// Open the inline rename editor for the transcript entry with stable id
+/// `entry_id` (§12.1.7) — the shared handler behind both the `Ctrl+Alt+R` verb and
+/// a click on the entry's label badge. Seeds the editor buffer with the entry's
+/// existing label (so a tweak is one keystroke away) and records whether this is a
+/// brand-new label (so a blank save cancels a creation rather than deleting).
+fn begin_rename_for_entry(app: &mut TuiApp, entry_id: u64) {
+    let target = rename_labels::LabelTargetId::Entry(entry_id);
+    let is_new = !app.rename_labels.has_label(target);
+    let seed = app
+        .rename_labels
+        .label_for(target)
+        .unwrap_or_default()
+        .to_string();
+    app.rename_edit = Some(rename_labels::InlineEditState::new(target, seed, is_new));
+    let what = jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"));
+    app.status = if is_new {
+        format!("rename {what}: type a label \u{00b7} Enter save \u{00b7} Esc cancel")
+    } else {
+        format!("edit label for {what}: Enter save \u{00b7} Esc cancel (blank clears)")
+    };
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the inline rename editor (§12.1.7) is active. The editor is
+/// modal — it owns every key while present: Enter commits the typed label (a blank
+/// commit clears an existing label or cancels a brand-new one), Esc cancels without
+/// changing anything, Backspace deletes a char, and a printable char is appended
+/// (clamped to the label limit). Everything else is swallowed so no key leaks to
+/// the composer or global keymap mid-rename.
+fn handle_rename_edit_key(app: &mut TuiApp, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => rename_commit_edit(app),
+        KeyCode::Esc => {
+            app.rename_edit = None;
+            app.status = "rename cancelled".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Backspace => {
+            if let Some(edit) = app.rename_edit.as_mut() {
+                edit.backspace();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Char(ch) => {
+            if let Some(edit) = app.rename_edit.as_mut() {
+                edit.push(ch);
+            }
+            app.needs_redraw = true;
+        }
+        // Swallow every other key: the editor is modal while active.
+        _ => {}
+    }
+}
+
+/// Commit the inline rename editor buffer (§12.1.7). For a brand-new label a blank
+/// commit cancels (adds nothing); otherwise the label is stored. For an edit of an
+/// existing label a blank commit clears it, otherwise the text is replaced. Closes
+/// the editor and reports the outcome in the status line.
+fn rename_commit_edit(app: &mut TuiApp) {
+    let Some(edit) = app.rename_edit.take() else {
+        return;
+    };
+    let target = edit.target;
+    let stored = app.rename_labels.set(target, &edit.buffer);
+    let what = match target {
+        rename_labels::LabelTargetId::Entry(entry_id) => {
+            jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"))
+        }
+        rename_labels::LabelTargetId::QueueItem(index) => format!("queued #{}", index + 1),
+    };
+    app.status = if stored {
+        let label = app.rename_labels.label_for(target).unwrap_or_default();
+        format!(
+            "labelled {what}: \u{201c}{label}\u{201d} ({} label{} total)",
+            app.rename_labels.len(),
+            if app.rename_labels.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+    } else if edit.is_new {
+        "empty label — nothing added".to_string()
+    } else {
+        format!("label cleared from {what}")
+    };
+    app.needs_redraw = true;
+}
+
 /// Re-copy the picker's selected entry back to the clipboard through the same
 /// `deliver_copy` service every copy uses (so it re-records, re-toasts, and lands
 /// via the provider chain identically). A no-op on an empty history. Resolves the
@@ -11233,6 +11375,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::BreadcrumbActivate(index) => {
             app.breadcrumbs_focus = index;
             breadcrumbs_activate_focused(app);
+        }
+        // A click on an entry's inline rename-label badge (§12.1.7): open the inline
+        // rename editor on that entry's label — the mouse twin of focusing the entry
+        // and pressing `Ctrl+Alt+R`.
+        interaction::Action::OpenRenameForEntry(id) => {
+            begin_rename_for_entry(app, id.0);
         }
     }
 }
@@ -17324,6 +17472,78 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // height/width and never steals focus. Off (and zero-cost) unless a hover /
     // `Alt+1` reveal set it.
     render_hover_preview_popover(frame, area, app);
+    // The Inline Rename Labels editor (§12.1.7) is a small modal painted LAST on the
+    // main surface (only — every fullscreen overlay returns earlier and never
+    // reaches here, so the editor never leaks over another modal). A one-line
+    // bordered box centered near the top of the frame; off (and zero-cost) unless a
+    // rename is in progress.
+    render_rename_editor(frame, area, app);
+}
+
+/// Render the Inline Rename Labels editor (§12.1.7) as a small one-line modal box
+/// near the top of `area` while a rename is active. Shows the editor buffer with a
+/// trailing cursor block so the in-place edit reads as live text input; clamped
+/// inside `area` so it never paints off-surface on a narrow/short frame. A complete
+/// no-op when no rename is in progress (`rename_edit == None`).
+fn render_rename_editor(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(edit) = app.rename_edit.as_ref() else {
+        return;
+    };
+    if area.width < 6 || area.height < 3 {
+        return;
+    }
+    // A bordered box up to 48 cells wide (plus borders), centered horizontally and
+    // parked two rows down from the top so it sits over the transcript, not the
+    // composer.
+    let inner_w = (area.width.saturating_sub(4)).min(rename_labels::LABEL_TEXT_LIMIT as u16 + 2);
+    let box_w = inner_w + 2;
+    let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
+    let box_y = area.y + 1;
+    let rect = Rect {
+        x: box_x,
+        y: box_y,
+        width: box_w,
+        height: 3,
+    };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(crate::render::theme::accent()))
+        .title(Span::styled(
+            " rename label ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    // The buffer text, clamped to the inner width with a trailing cursor block so
+    // the empty editor still shows where typing lands.
+    let avail = inner.width.saturating_sub(1) as usize;
+    let shown: String = if edit.buffer.chars().count() > avail {
+        // Keep the TAIL visible (where the cursor is) on overflow.
+        edit.buffer
+            .chars()
+            .rev()
+            .take(avail)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    } else {
+        edit.buffer.clone()
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            shown,
+            Style::default().fg(crate::render::theme::foreground()),
+        ),
+        Span::styled(
+            "\u{2588}",
+            Style::default().fg(crate::render::theme::accent()),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), inner);
 }
 
 /// Render the large-paste confirmation modal (§11G.6) over the whole frame.
@@ -21077,6 +21297,122 @@ fn render_entry_annotation_markers(
     }
 }
 
+/// Paint the small inline rename-label badges (§12.1.7) on the header rows of the
+/// currently-visible transcript entries that carry a label, and register each as a
+/// [`interaction::ChromeKey::RenameLabel`] click target (opening the inline rename
+/// editor on that entry's label). The badge is a quiet bracketed label
+/// (`[the auth refactor]`) drawn at the right edge of the header row, shifted left
+/// of the annotation marker when an entry carries both so the two never collide.
+///
+/// ZERO IDLE COST: the resting empty store makes `has_label` return immediately, so
+/// an un-labelled session paints nothing and registers nothing. Mirrors
+/// [`render_entry_annotation_markers`]' painted-window geometry so the badge lands
+/// on the same row the header paints, in both wrap and no-wrap modes.
+// Mirrors `render_entry_annotation_markers`' parameter list (the same painted-
+// window geometry), plus the `frame` it paints into; folding these into a struct
+// would obscure the 1:1 correspondence with that sibling.
+#[allow(clippy::too_many_arguments)]
+fn render_entry_rename_labels(
+    frame: &mut Frame<'_>,
+    app: &TuiApp,
+    text_area: Rect,
+    build_width: Option<u16>,
+    include_startup_card: bool,
+    total_rows: usize,
+    viewport_h: usize,
+    from_bottom: usize,
+) {
+    // The resting state: no labels means nothing to paint and nothing to register,
+    // so the per-frame cost of this feature is exactly zero.
+    if app.rename_labels.is_empty()
+        || text_area.width == 0
+        || text_area.height == 0
+        || total_rows == 0
+    {
+        return;
+    }
+    let top_row = total_rows
+        .saturating_sub(viewport_h)
+        .saturating_sub(from_bottom);
+    let bottom_row = total_rows.min(top_row + viewport_h);
+
+    let (_lines, entry_offsets) =
+        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entries = active_transcript_entries(app);
+    for (i, &header_row) in entry_offsets.iter().enumerate() {
+        let Some(entry) = entries.get(i) else {
+            continue;
+        };
+        if header_row < top_row || header_row >= bottom_row {
+            continue;
+        }
+        let target = rename_labels::LabelTargetId::Entry(entry.id);
+        let Some(label) = app.rename_labels.label_for(target) else {
+            continue;
+        };
+        // The annotation marker (§12.2.5) already claims the right edge of an
+        // annotated entry's header; carve its width off so the two never overlap.
+        let annotation_w = if app.annotations.annotated(entry.id) {
+            let extra = app.annotations.count_for_entry(entry.id);
+            if extra > 1 {
+                format!("\u{270e}+{}", extra - 1).chars().count() as u16
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        // Leave a one-cell gap before the annotation marker when both are present.
+        let reserved = if annotation_w > 0 {
+            annotation_w + 1
+        } else {
+            0
+        };
+        let avail = text_area.width.saturating_sub(reserved);
+        if avail <= 2 {
+            continue;
+        }
+        // Bracketed, truncated to the available width (minus the two brackets).
+        let preview = rename_labels::badge_preview(label, avail.saturating_sub(2) as usize);
+        if preview.is_empty() {
+            continue;
+        }
+        let badge = format!("[{preview}]");
+        let badge_w = badge.chars().count() as u16;
+        if badge_w >= avail {
+            continue;
+        }
+        let screen_y = text_area.y + (header_row - top_row) as u16;
+        let badge_x = text_area.x + text_area.width - reserved - badge_w;
+        let badge_rect = Rect {
+            x: badge_x,
+            y: screen_y,
+            width: badge_w,
+            height: 1,
+        };
+        frame.render_widget(ratatui::widgets::Clear, badge_rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                badge,
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            badge_rect,
+        );
+        // Register the badge as a click target keyed by the entry's stable id, so a
+        // click opens the inline rename editor. Registered after the card header
+        // targets so the registry's reverse hit-test routes a click here rather than
+        // to a card focus.
+        let id = transcript_surface::EntryId(entry.id);
+        app.register_click(
+            badge_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::RenameLabel(id)),
+            interaction::Action::OpenRenameForEntry(id),
+        );
+    }
+}
+
 /// A single fixed-width hint glyph painted at the right edge of the
 /// hover-revealed (or, when no motion is reported, keyboard-focused) transcript
 /// card's header row (§12.1.3). Restrained on purpose: one accent-bold cell that
@@ -21144,6 +21480,15 @@ fn render_hover_affordance(
         // annotated entry's header and is the dominant affordance there, so skip
         // the hover hint to avoid stacking two glyphs in one cell.
         if app.annotations.annotated(entry.id) {
+            return;
+        }
+        // Likewise the Inline Rename Label badge (§12.1.7) occupies the right edge
+        // of a labelled entry's header; skip the hover hint so the badge isn't
+        // overwritten by the affordance glyph.
+        if app
+            .rename_labels
+            .has_label(rename_labels::LabelTargetId::Entry(entry.id))
+        {
             return;
         }
         let glyph_w = HOVER_HINT_GLYPH.chars().count() as u16;
@@ -21358,6 +21703,22 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // per-entry click targets every frame. A complete no-op when the annotation
     // store is empty, so an un-annotated session pays nothing here.
     render_entry_annotation_markers(
+        frame,
+        app,
+        text_area,
+        build_width,
+        include_startup_card,
+        total_rows,
+        viewport_h,
+        from_bottom,
+    );
+
+    // Inline Rename Labels (§12.1.7) badges on labelled entries' header rows.
+    // Painted after the annotation markers (so it lays out left of them when an
+    // entry carries both) and registered as per-entry click targets every frame. A
+    // complete no-op when the label store is empty, so an un-labelled session pays
+    // nothing here.
+    render_entry_rename_labels(
         frame,
         app,
         text_area,
@@ -32162,6 +32523,17 @@ pub(crate) struct TuiApp {
     /// existing annotation (the commit replaces the selected one) or while not
     /// composing.
     pub(crate) annotation_edit_new_entry: Option<u64>,
+    /// Inline Rename Labels store (§12.1.7): the short user-pinned labels for
+    /// transcript entries and queued prompts, keyed by stable
+    /// [`rename_labels::LabelTargetId`]. UI metadata only — never enters the model
+    /// transcript. The resting state is an empty store, so an un-labelled session
+    /// costs nothing. Mutated by the rename verb and the inline editor commit.
+    pub(crate) rename_labels: rename_labels::LabelStore,
+    /// Active inline rename editor (§12.1.7). `None` = no editor (the resting
+    /// state); `Some(state)` = the user is typing/editing a label in place (Enter
+    /// saves, Esc cancels, a blank save clears). Reuses the composer-edit primitive
+    /// in [`rename_labels::InlineEditState`]. Owns key/mouse routing while present.
+    pub(crate) rename_edit: Option<rename_labels::InlineEditState>,
     /// What Changed Since Here? model (§12.2.7): the marked "since here" anchor
     /// plus the summarized delta of changes observed after it — file edits,
     /// commands/tests, errors, checkpoints, approval decisions, and other tool
@@ -32830,6 +33202,8 @@ impl TuiApp {
             annotations_selected: 0,
             annotation_edit: None,
             annotation_edit_new_entry: None,
+            rename_labels: rename_labels::LabelStore::new(),
+            rename_edit: None,
             change_summary: change_summary::ChangeSummary::new(),
             changes_since_open: false,
             changes_since_selected: 0,

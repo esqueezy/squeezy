@@ -370,6 +370,14 @@ pub(crate) enum Action {
     /// click target; while hidden it paints nothing and schedules no redraw, so it
     /// costs nothing idle.
     ToggleBreadcrumbs,
+    /// Rename / label the focused (or top-visible) transcript entry inline
+    /// (`Ctrl+Alt+R` default; §12.1.7). Opens a small in-place editor seeded with the
+    /// entry's current label (empty for a fresh one); typing edits it, Enter saves,
+    /// Esc cancels, a blank save clears it. The label is UI-only metadata that
+    /// paints as a small badge on the row and never enters the model transcript.
+    /// The resting state stores nothing and paints nothing, so it costs nothing
+    /// idle.
+    RenameFocusedEntry,
 }
 
 impl Action {
@@ -440,6 +448,7 @@ impl Action {
             Self::ToggleHoverPreview => "toggle_hover_preview",
             Self::ToggleHoverIntent => "toggle_hover_intent",
             Self::ToggleBreadcrumbs => "toggle_breadcrumbs",
+            Self::RenameFocusedEntry => "rename_focused_entry",
         }
     }
 
@@ -509,6 +518,7 @@ impl Action {
         Action::ToggleHoverPreview,
         Action::ToggleHoverIntent,
         Action::ToggleBreadcrumbs,
+        Action::RenameFocusedEntry,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -667,6 +677,11 @@ impl Action {
             // the same Meta/Alt encoding that is unreliable across Linux
             // terminals, tmux, and SSH as the rest of the nav/overlay family.
             | Self::ToggleBreadcrumbs
+            // Inline Rename Labels editor is `Ctrl+Alt+R` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M`/
+            // `Ctrl+Alt+P`/`Ctrl+Alt+H` chords.
+            | Self::RenameFocusedEntry
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -925,6 +940,17 @@ impl Action {
             // "level-2 / where am I"; it stays clear of every composer chord and of
             // the `Alt+Enter` action-palette / `Ctrl+Enter` detail chords.
             Self::ToggleBreadcrumbs => KeyBinding::new(KeyCode::Char('2'), KeyModifiers::ALT),
+            // Inline Rename Labels (§12.1.7). `Ctrl+Alt+R` — `R` recalls "Rename"
+            // and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`). It is free:
+            // bare `Alt+R` is already the minimap toggle and every other bare `Alt`
+            // letter in the nav/copy/overlay family is taken, so the Ctrl+Alt
+            // modifier keeps the rename verb distinct and clear of every composer
+            // chord and of the `Alt+Enter`/`Ctrl+Enter` chords.
+            Self::RenameFocusedEntry => KeyBinding::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
         }
     }
 }

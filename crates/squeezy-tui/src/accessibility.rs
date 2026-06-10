@@ -724,6 +724,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // focused crumb) before the global keymap sees them, so a crumb click and
         // the keyboard reach the same `breadcrumbs_activate_focused` handler.
         A::BreadcrumbActivate(_) => KeyboardPath::Always("breadcrumbs ←→/Enter"),
+        // The inline rename-label badge (§12.1.7) opens the inline editor on that
+        // entry's label; the keyboard twin is `Ctrl+Alt+R`, which opens the same
+        // editor on the focused (or top-visible) entry. Reachable without a mouse.
+        A::OpenRenameForEntry(_) => KeyboardPath::Always("rename label Ctrl+Alt+R"),
     })
 }
 

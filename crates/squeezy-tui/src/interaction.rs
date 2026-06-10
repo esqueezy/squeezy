@@ -179,6 +179,10 @@ pub(crate) enum ChromeKey {
     /// index in the trail (root-first) so a click focuses + activates exactly that
     /// crumb's navigation target.
     BreadcrumbCrumb(usize),
+    /// The small inline rename-label badge painted on a transcript entry's header
+    /// row (§12.1.7), keyed by the entry's stable [`EntryId`] so a click opens the
+    /// inline rename editor on that entry's label.
+    RenameLabel(EntryId),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -357,6 +361,11 @@ pub(crate) enum Action {
     /// click both focuses and jumps in one go. The index is into the trail
     /// (root-first).
     BreadcrumbActivate(usize),
+    /// Open the inline rename editor for the given transcript entry (§12.1.7),
+    /// seeded with its current label. Mouse twin of focusing the entry and pressing
+    /// the rename chord; a click on the entry's label badge both targets it and
+    /// opens the editor in one go.
+    OpenRenameForEntry(EntryId),
 }
 
 impl Action {
@@ -409,6 +418,7 @@ impl Action {
         Action::PaletteActionRun(0),
         Action::CommandPaletteRun(0),
         Action::BreadcrumbActivate(0),
+        Action::OpenRenameForEntry(EntryId(0)),
     ];
 }
 
