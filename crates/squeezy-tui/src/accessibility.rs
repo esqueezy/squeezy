@@ -797,6 +797,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // keymap sees them, so a field-row click reaches the same `focus_field`
         // handler the keyboard verbs drive.
         A::WorkspaceProfileSelectField(_) => KeyboardPath::Always("workspace profile ↑↓"),
+        // Per-Terminal Profiles overlay (§12.7.3) — while the overlay is open its
+        // own key handler owns ↑↓ (move the field focus) and ←→/Space (cycle the
+        // focused field's value) before the global keymap sees them, so a field-row
+        // click reaches the same focus/cycle handlers the keyboard verbs drive.
+        A::TerminalProfileCycleField(_) => KeyboardPath::Always("terminal profile ↑↓ ←→"),
     })
 }
 

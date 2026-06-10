@@ -24339,6 +24339,302 @@ async fn workspace_profile_survives_tiny_and_resized_frames() {
 }
 
 // =====================================================================
+// §12.7.3 Per-Terminal Profiles.
+// End-to-end through `handle_key` (Ctrl+Alt+G open, ↑↓ field, ←→/Space
+// cycle, Enter save, r reset, Esc close), `handle_mouse` (click a field
+// row), the real `render()`, and the persist round-trip to a scratch
+// settings file.
+// =====================================================================
+
+/// `Ctrl+Alt+G`: open / close the Per-Terminal Profiles overlay.
+fn terminal_profile_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Pin the user-scope settings to a scratch file so the persist round-trip is
+/// isolated, returning the guard plus the scratch path.
+fn terminal_profile_scratch(app: &mut TuiApp, name: &str) -> (ScopedSettingsPath, PathBuf) {
+    let dir = temp_workspace(name);
+    let settings_path = dir.join("settings.toml");
+    let guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    (guard, settings_path)
+}
+
+#[tokio::test]
+async fn terminal_profile_opens_and_paints_detected_terminal_and_fields() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = terminal_profile_scratch(&mut app, "terminal_profile_open");
+
+    // Idle: the modal is not painted.
+    let idle = render_to_string(&app, 100, 30);
+    assert!(
+        !idle.contains("Terminal profile"),
+        "idle session paints no terminal-profile overlay: {idle}"
+    );
+
+    // Open it.
+    handle_key(&mut app, &mut agent, terminal_profile_key())
+        .await
+        .unwrap();
+    assert!(
+        app.terminal_profile_editor.is_some(),
+        "Ctrl+Alt+G opens the overlay"
+    );
+
+    let open = render_to_string(&app, 100, 30);
+    assert!(
+        open.contains("Terminal profile"),
+        "the modal title paints: {open}"
+    );
+    // The detected-terminal context line and every editable field row paint.
+    assert!(open.contains("detected:"), "detected line paints: {open}");
+    assert!(open.contains("Glyph set"), "glyph field paints: {open}");
+    assert!(open.contains("Mouse mode"), "mouse field paints: {open}");
+    assert!(open.contains("Color depth"), "color field paints: {open}");
+}
+
+#[tokio::test]
+async fn terminal_profile_keyboard_cycle_and_save_persists() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = terminal_profile_scratch(&mut app, "terminal_profile_save");
+
+    handle_key(&mut app, &mut agent, terminal_profile_key())
+        .await
+        .unwrap();
+    // Default focus is the first field (glyph set).
+    let before = app.terminal_profile_editor.as_ref().unwrap().working();
+    assert_eq!(
+        app.terminal_profile_editor
+            .as_ref()
+            .unwrap()
+            .focused_field(),
+        crate::terminal_profile::ProfileField::Glyphs
+    );
+
+    // Space cycles the focused field's value (a manual override).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    let after = app.terminal_profile_editor.as_ref().unwrap().working();
+    assert_ne!(after.glyphs, before.glyphs, "Space cycled the glyph set");
+    assert!(
+        app.terminal_profile_editor
+            .as_ref()
+            .unwrap()
+            .is_overridden(),
+        "cycling marks the profile overridden"
+    );
+
+    // Save: persists the override under the per-terminal table in the scratch file.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.status.contains("saved"),
+        "save reports success: {}",
+        app.status
+    );
+    let written = std::fs::read_to_string(&settings_path).expect("settings written");
+    assert!(
+        written.contains("[tui.terminal_profiles."),
+        "the override was persisted under a per-terminal table: {written}"
+    );
+    assert!(
+        written.contains("glyphs ="),
+        "the glyph-set field was persisted: {written}"
+    );
+    // The committed override is cached so a reopen seeds from it.
+    assert_eq!(
+        app.terminal_profile_override,
+        Some(after),
+        "the committed override is cached on the app",
+    );
+
+    // Persistence round-trip: simulate a fresh session by dropping the in-session
+    // cache and closing the overlay, then reopen. The editor must re-seed from the
+    // override persisted to the scratch settings file (read back through
+    // `read_persisted_terminal_profile`), so the pin survives a restart.
+    app.terminal_profile_override = None;
+    handle_key(&mut app, &mut agent, terminal_profile_key())
+        .await
+        .unwrap();
+    assert!(
+        app.terminal_profile_editor.is_none(),
+        "the toggle chord closed the overlay"
+    );
+    handle_key(&mut app, &mut agent, terminal_profile_key())
+        .await
+        .unwrap();
+    let reopened = app.terminal_profile_editor.as_ref().unwrap();
+    assert_eq!(
+        reopened.working(),
+        after,
+        "the persisted override was read back from disk on reopen",
+    );
+    assert!(
+        reopened.is_overridden(),
+        "the read-back profile is still flagged as a manual override",
+    );
+}
+
+#[tokio::test]
+async fn terminal_profile_field_navigation_and_reset() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = terminal_profile_scratch(&mut app, "terminal_profile_nav");
+
+    handle_key(&mut app, &mut agent, terminal_profile_key())
+        .await
+        .unwrap();
+    let default_profile = app.terminal_profile_editor.as_ref().unwrap().working();
+
+    // Down moves field focus to the mouse row, then cycle it to create an override.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.terminal_profile_editor
+            .as_ref()
+            .unwrap()
+            .focused_field(),
+        crate::terminal_profile::ProfileField::Mouse
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.terminal_profile_editor
+            .as_ref()
+            .unwrap()
+            .is_overridden()
+    );
+
+    // `r` resets the working profile back to the detected terminal's default.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.terminal_profile_editor.as_ref().unwrap().working(),
+        default_profile,
+        "r restores the built-in default",
+    );
+    assert!(
+        app.terminal_profile_override.is_none(),
+        "reset clears the cache"
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.terminal_profile_editor.is_none(),
+        "Esc closes the overlay"
+    );
+}
+
+#[tokio::test]
+async fn terminal_profile_clicking_a_field_row_cycles_it() {
+    // Mouse parity: a left click on a painted field row focuses that field and
+    // cycles its value — the same path as ↑↓ + ←→/Space.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = terminal_profile_scratch(&mut app, "terminal_profile_click");
+
+    handle_key(&mut app, &mut agent, terminal_profile_key())
+        .await
+        .unwrap();
+    let before = app
+        .terminal_profile_editor
+        .as_ref()
+        .unwrap()
+        .working()
+        .color;
+
+    // Render so the field rows register their click targets, then resolve the color
+    // field's row rect (index 2) and click it.
+    let _ = render_to_string(&app, 100, 30);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::TerminalProfileField(2),
+        ))
+        .expect("color field row registered a click target");
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the click on a field row is consumed");
+    let editor = app.terminal_profile_editor.as_ref().unwrap();
+    assert_eq!(
+        editor.focused_field(),
+        crate::terminal_profile::ProfileField::Color,
+        "clicking the color row focused it",
+    );
+    assert_ne!(
+        editor.working().color,
+        before,
+        "clicking the color row cycled its value",
+    );
+}
+
+#[tokio::test]
+async fn terminal_profile_survives_tiny_and_resized_frames() {
+    // Edge / resize case: the modal clamps to a tiny frame and never panics, and
+    // paints its title once it has room.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = terminal_profile_scratch(&mut app, "terminal_profile_resize");
+
+    handle_key(&mut app, &mut agent, terminal_profile_key())
+        .await
+        .unwrap();
+    for (w, h) in [(4u16, 2u16), (12, 4), (30, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        if w >= 30 {
+            assert!(
+                out.contains("Terminal profile"),
+                "title paints at {w}x{h}: {out}"
+            );
+        }
+    }
+}
+
+// =====================================================================
 // §12.1.6 Multi-Cursor-Like Transcript Selection.
 // End-to-end through `handle_key` (Alt+d add, Ctrl+Alt+Y combined copy),
 // `handle_mouse` (modifier-click add/toggle), the real `render()`

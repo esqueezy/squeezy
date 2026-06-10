@@ -160,6 +160,7 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod terminal_profile;
 mod terminal_writer;
 mod theme_editor;
 mod toast;
@@ -1838,6 +1839,9 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         // The Per-Workspace UI Profile overlay (§12.7.4) is modal: block a quick
         // session switch while it owns the surface, like every other overlay above.
         || app.workspace_profile.is_some()
+        // The Per-Terminal Profiles overlay (§12.7.3) is modal: block the switch
+        // like every other overlay above.
+        || app.terminal_profile_editor.is_some()
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
@@ -2695,6 +2699,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 }
                 _ => {}
             }
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Per-Terminal Profiles overlay (§12.7.3) owns the pointer while open: a
+    // left-click on a field row focuses that field and cycles its value (the mouse
+    // twin of ↑↓ + ←→/Space). Every other click is swallowed so a stray press can't
+    // fall through to the surface beneath. Hit-tested in ABSOLUTE screen
+    // coordinates against the targets `render_terminal_profile_surface` registered
+    // this frame.
+    if app.terminal_profile_editor.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TerminalProfileField(_)),
+                interaction::Action::TerminalProfileCycleField(index),
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            terminal_profile_cycle_field(app, index);
         }
         // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
@@ -4927,6 +4950,197 @@ fn workspace_profile_reset(app: &mut TuiApp) {
     app.needs_redraw = true;
 }
 
+/// Open / close the Per-Terminal Profiles overlay (§12.7.3). On open it detects
+/// the terminal's capabilities from the live environment (reusing the §12.10.3
+/// capability-probe classifier) and seeds the editor from the in-session override
+/// pin, if any, falling back to the built-in default for the detected terminal. On
+/// close it discards nothing — a commit already persisted — so the overlay is a
+/// pure view/editor over the model.
+fn toggle_terminal_profile_editor(app: &mut TuiApp) {
+    if app.terminal_profile_editor.is_some() {
+        app.terminal_profile_editor = None;
+        app.status = "terminal profile closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let caps = terminal_profile::TerminalCapabilities::detect();
+    // Seed from the in-session override first (a commit/reset this session), then
+    // fall back to any override persisted to the user-scope config in a prior
+    // session, then to the built-in default. Reading the persisted pin back here is
+    // what makes the override survive a restart.
+    let seed = app
+        .terminal_profile_override
+        .or_else(|| read_persisted_terminal_profile(app, caps));
+    let editor = terminal_profile::TerminalProfileEditor::new(caps, seed);
+    app.terminal_profile_editor = Some(editor);
+    app.status = terminal_profile_status(app);
+    app.needs_redraw = true;
+}
+
+/// Read the persisted per-terminal profile override for the detected terminal from
+/// the user-scope settings TOML, if any (§12.7.3). The override lives under
+/// `[tui.terminal_profiles.<terminal_kind>]` keyed by the bounded terminal-kind
+/// label; an absent file / table / field collapses to `None` so the editor falls
+/// back to the built-in default. Best-effort: a parse error is treated as "no
+/// override" rather than surfaced, since the editor can always re-derive the
+/// default via [`terminal_profile::TerminalProfileEditor::default_profile`]. Pure
+/// read — touches nothing — so it is safe to call on every open.
+fn read_persisted_terminal_profile(
+    app: &TuiApp,
+    caps: terminal_profile::TerminalCapabilities,
+) -> Option<terminal_profile::TerminalProfile> {
+    let fallback = terminal_profile::TerminalProfile::resolve(caps);
+    let kind = caps.kind.as_str();
+    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let table = doc
+        .get("tui")?
+        .as_table()?
+        .get("terminal_profiles")?
+        .as_table()?
+        .get(kind)?
+        .as_table()?;
+    terminal_profile::TerminalProfile::from_config_lookup(fallback, |key| {
+        table.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    })
+}
+
+/// The status line shown while the Per-Terminal Profiles overlay is open: the
+/// detected terminal, the focused field + value, and the in-overlay verb legend.
+fn terminal_profile_status(app: &TuiApp) -> String {
+    let Some(editor) = app.terminal_profile_editor.as_ref() else {
+        return "terminal profile closed".to_string();
+    };
+    let field = editor.focused_field();
+    let value = field.value_label(editor.working());
+    let kind = editor.capabilities().kind.as_str();
+    format!(
+        "terminal {kind}: {} = {value}{} — ↑↓ field · ←→/Space cycle · Enter save · r reset · Esc close",
+        field.label(),
+        if editor.is_overridden() {
+            " (overridden)"
+        } else {
+            ""
+        },
+    )
+}
+
+/// Handle a key while the Per-Terminal Profiles overlay (§12.7.3) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or the
+/// global keymap while the overlay owns focus). The overlay is modal: its own
+/// toggle chord and Esc close; ↑/↓ move the field focus; ←/→/Space cycle the
+/// focused field's value; Enter persists the working profile to the user-scope
+/// config; `r`/Delete resets to the detected terminal's built-in default.
+fn handle_terminal_profile_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    if app.terminal_profile_editor.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord closes it (the same key opens and closes).
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::OpenTerminalProfile) {
+        toggle_terminal_profile_editor(app);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            toggle_terminal_profile_editor(app);
+        }
+        KeyCode::Up => {
+            if let Some(editor) = app.terminal_profile_editor.as_mut() {
+                editor.focus_prev_field();
+            }
+            app.status = terminal_profile_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down => {
+            if let Some(editor) = app.terminal_profile_editor.as_mut() {
+                editor.focus_next_field();
+            }
+            app.status = terminal_profile_status(app);
+            app.needs_redraw = true;
+        }
+        // ←/→ and Space all cycle the focused field's value (a two/three-way
+        // toggle), so the field is adjustable without arrows colliding with field
+        // movement.
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+            if let Some(editor) = app.terminal_profile_editor.as_mut() {
+                editor.cycle_focused();
+            }
+            app.status = terminal_profile_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => terminal_profile_commit(app, agent),
+        KeyCode::Char('r') | KeyCode::Backspace | KeyCode::Delete => {
+            if let Some(editor) = app.terminal_profile_editor.as_mut() {
+                editor.reset_to_default();
+            }
+            app.terminal_profile_override = None;
+            app.status = terminal_profile_status(app);
+            app.needs_redraw = true;
+        }
+        _ => {}
+    }
+    // The overlay is modal: swallow every key so nothing leaks to the composer
+    // beneath, even keys it does not act on.
+    true
+}
+
+/// Cycle the focused profile field (the mouse twin of ←→/Space, fed by a click on
+/// a field row). Refreshes the status line and requests a redraw.
+fn terminal_profile_cycle_field(app: &mut TuiApp, index: usize) {
+    if let Some(editor) = app.terminal_profile_editor.as_mut() {
+        editor.focus_field(index);
+        editor.cycle_focused();
+    }
+    app.status = terminal_profile_status(app);
+    app.needs_redraw = true;
+}
+
+/// Persist the working terminal profile to the user-scope config (§12.7.3) as a
+/// per-terminal override under `[tui.terminal_profiles.<terminal_kind>]`, keyed by
+/// the bounded terminal-kind label so each terminal carries its own pin. Caches the
+/// override on the app so a reopen in the same session shows the committed value. A
+/// failure surfaces in the status line; the working value already took effect in
+/// the editor.
+fn terminal_profile_commit(app: &mut TuiApp, _agent: &mut Agent) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let Some(editor) = app.terminal_profile_editor.as_ref() else {
+        return;
+    };
+    let working = editor.working();
+    let kind = editor.capabilities().kind.as_str();
+    let [(glyph_k, glyph_v), (mouse_k, mouse_v), (color_k, color_v)] = working.as_config_pairs();
+
+    // Cache the committed override so a reopen in the same session seeds from it.
+    app.terminal_profile_override = Some(working);
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::SetTableEntry {
+            table_path: &["tui", "terminal_profiles"],
+            key: kind.to_string(),
+            fields: vec![
+                (glyph_k, EditOp::SetString(glyph_v.to_string())),
+                (mouse_k, EditOp::SetString(mouse_v.to_string())),
+                (color_k, EditOp::SetString(color_v.to_string())),
+            ],
+        },
+    };
+    match apply_edits(&scope_target, &[edit]) {
+        Ok(_) => {
+            app.status = format!(
+                "✓ saved terminal profile for {kind} (glyphs {glyph_v} · mouse {mouse_v} · color {color_v})"
+            );
+        }
+        Err(err) => {
+            app.status = format!("terminal profile set, but save failed: {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
 /// `true` when the key was consumed (so it never leaks to the composer or the
 /// global keymap). Two modes:
@@ -5832,6 +6046,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // chord, or keymap dispatch, so a stray key never leaks into the composer
     // underneath. Sits beside the other front-of-loop overlays for the same reason.
     if app.workspace_profile.is_some() && handle_workspace_profile_key(app, agent, key) {
+        return Ok(false);
+    }
+
+    // The Per-Terminal Profiles overlay (§12.7.3) is modal while open: it owns the
+    // keyboard (↑↓ move field, ←→/Space cycle value, Enter save, r/Delete reset,
+    // Esc/Ctrl+Alt+G close) BEFORE any selection-clear, search, chord, or keymap
+    // dispatch, so a stray key never leaks into the composer underneath. Sits
+    // beside the other front-of-loop overlays for the same reason.
+    if app.terminal_profile_editor.is_some() && handle_terminal_profile_key(app, agent, key) {
         return Ok(false);
     }
 
@@ -7916,6 +8139,15 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_workspace_profile(app);
+            true
+        }
+        keymap::Action::OpenTerminalProfile => {
+            // §12.7.3: open / close the Per-Terminal Profiles overlay.
+            // Main-surface verb; the config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_terminal_profile_editor(app);
             true
         }
     }
@@ -14068,6 +14300,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // `interaction::Action` has a dispatch arm and the accessibility audit's
         // exhaustiveness holds.
         interaction::Action::WorkspaceProfileSelectField(_) => {}
+        // §12.7.3: the click handler in `handle_mouse` already short-circuits the
+        // terminal-profile targets (it needs the agent for persistence, which this
+        // agent-free dispatcher does not carry), so this arm is unreachable in
+        // practice. It exists so every `interaction::Action` has a dispatch arm and
+        // the accessibility audit's exhaustiveness holds.
+        interaction::Action::TerminalProfileCycleField(_) => {}
     }
 }
 
@@ -20252,6 +20490,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_workspace_profile_surface(frame, area, app, state);
         return;
     }
+    // The Per-Terminal Profiles overlay (§12.7.3) paints as a fullscreen modal over
+    // the main surface while open, registering its per-field click targets every
+    // frame. Checked before the config screen so its targets register and it owns
+    // the surface while open.
+    if let Some(editor) = &app.terminal_profile_editor {
+        render_terminal_profile_surface(frame, area, app, editor);
+        return;
+    }
     if let Some(state) = &app.config_screen {
         config_screen::render(frame, area, state);
         return;
@@ -22687,6 +22933,175 @@ fn render_theme_editor_bar(
         Style::default().fg(crate::render::theme::foreground()),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Paint the Per-Terminal Profiles overlay (§12.7.3) as a centered modal: a verb
+/// legend, a read-only line describing the detected terminal + capabilities, then
+/// one selectable row per editable profile field (glyph set, mouse mode, color
+/// depth) showing the field label, its current value, and a one-line description.
+/// The focused row is marked; each row registers a
+/// [`interaction::ChromeKey::TerminalProfileField`] click target so a click reaches
+/// the same focus+cycle path as ↑↓ + ←→/Space.
+fn render_terminal_profile_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    editor: &terminal_profile::TerminalProfileEditor,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Terminal profile ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} adapt UX policy to this terminal ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 72, 16, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: the in-overlay verb legend.
+    let header = Line::from(Span::styled(
+        "\u{2191}\u{2193} field \u{00b7} \u{2190}\u{2192}/Space cycle \u{00b7} Enter save \u{00b7} r reset \u{00b7} Esc close",
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    // Read-only detected-terminal context line: the bounded terminal kind plus the
+    // probed capability hints (truecolor / SSH / multiplexer). Detection is
+    // probabilistic, so the line makes the basis for the defaults visible and the
+    // override honest.
+    let caps = editor.capabilities();
+    let mut hints: Vec<&str> = Vec::new();
+    if caps.truecolor_env {
+        hints.push("truecolor");
+    }
+    if caps.no_color {
+        hints.push("no-color");
+    }
+    if caps.over_ssh {
+        hints.push("ssh");
+    }
+    if caps.inside_multiplexer {
+        hints.push("mux");
+    }
+    let hint_str = if hints.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", hints.join(" "))
+    };
+    let context_y = inner.y.saturating_add(1);
+    if context_y < inner.y.saturating_add(inner.height) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "detected: ",
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+                Span::styled(
+                    caps.kind.as_str(),
+                    Style::default()
+                        .fg(crate::render::theme::foreground())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(hint_str, Style::default().fg(crate::render::theme::quiet())),
+            ])),
+            Rect {
+                x: inner.x,
+                y: context_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    let working = editor.working();
+    let focused = editor.field_index();
+    let body_top = inner.y.saturating_add(3);
+    let bottom = inner.y.saturating_add(inner.height);
+    for (index, field) in terminal_profile::ProfileField::ALL.iter().enumerate() {
+        let y = body_top.saturating_add(index as u16);
+        if y >= bottom {
+            break;
+        }
+        let is_focused = index == focused;
+        let row_rect = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_focused { "\u{203a} " } else { "  " };
+        let value_style = if is_focused {
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_focused {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:<12}", field.label()),
+                Style::default().fg(crate::render::theme::foreground()),
+            ),
+            Span::styled(format!("{:<11}", field.value_label(working)), value_style),
+            Span::styled(
+                field.description(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::TerminalProfileField(index)),
+            interaction::Action::TerminalProfileCycleField(index),
+        );
+    }
+
+    // Footer: whether a manual override is in effect (vs the built-in default). When
+    // overridden, name the focused field's built-in default value so the user can
+    // see what `r` (reset) will restore.
+    let footer_y = body_top.saturating_add(terminal_profile::ProfileField::ALL.len() as u16 + 1);
+    if footer_y < bottom {
+        let (text, color) = if editor.is_overridden() {
+            let default_value = editor.focused_field().value_label(editor.default_profile());
+            (
+                format!(
+                    "manual override \u{00b7} default {default_value} \u{00b7} Enter save \u{00b7} r reset"
+                ),
+                crate::render::theme::secondary(),
+            )
+        } else {
+            (
+                "showing built-in defaults for this terminal".to_string(),
+                crate::render::theme::quiet(),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+            Rect {
+                x: inner.x,
+                y: footer_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
 }
 
 /// Paint the Local Transcript Index overlay (§12.5.1) as a centered modal: a
@@ -37177,6 +37592,21 @@ pub(crate) struct TuiApp {
     /// profile itself is persisted under the Squeezy projects state dir, keyed by
     /// the resolved workspace root, never inside the repo.
     pub(crate) workspace_profile: Option<workspace_profile::WorkspaceProfileState>,
+    /// Per-Terminal Profiles (§12.7.3): the interactive terminal-profile editor
+    /// overlay, or `None` when closed (the resting state, which paints nothing
+    /// extra and schedules no redraw). `Some` = the fullscreen overlay owns
+    /// key/mouse routing for adapting the per-terminal UX policy (glyph set, mouse
+    /// mode, color depth) to the detected terminal. Opened by the
+    /// `OpenTerminalProfile` keymap action; a commit persists the override to the
+    /// user-scope config.
+    pub(crate) terminal_profile_editor: Option<terminal_profile::TerminalProfileEditor>,
+    /// The in-session per-terminal profile override (§12.7.3): the last committed
+    /// or reset working profile, used to re-seed the editor when it reopens. `None`
+    /// = no manual override in this session (the editor falls back to the built-in
+    /// default for the detected terminal). A committed value is also persisted to
+    /// the user-scope config; this cache keeps the live editor consistent without a
+    /// config round-trip mid-session.
+    pub(crate) terminal_profile_override: Option<terminal_profile::TerminalProfile>,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -38086,6 +38516,8 @@ impl TuiApp {
             keybinding_editor: None,
             theme_editor: None,
             workspace_profile: None,
+            terminal_profile_editor: None,
+            terminal_profile_override: None,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

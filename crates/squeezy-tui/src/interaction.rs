@@ -254,6 +254,10 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the overlay's field list so a click focuses exactly that
     /// row (the mouse twin of ↑↓).
     WorkspaceProfileField(usize),
+    /// A profile-field row in the Per-Terminal Profiles overlay (§12.7.3), keyed by
+    /// its 0-based index in the editor's field list (0=glyphs, 1=mouse, 2=color) so
+    /// a click focuses that field and cycles its value.
+    TerminalProfileField(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -532,6 +536,11 @@ pub(crate) enum Action {
     /// the Per-Workspace UI Profile overlay (§12.7.4). Mouse twin of moving the
     /// field focus with ↑↓; a click on a row selects it.
     WorkspaceProfileSelectField(usize),
+    /// Focus + cycle the given profile field (by 0-based index in the editor's
+    /// field list) in the Per-Terminal Profiles overlay (§12.7.3). Mouse twin of
+    /// moving the field focus with ↑↓ and cycling its value with ←→/Space; a click
+    /// on a field row both focuses it and advances its value in one go.
+    TerminalProfileCycleField(usize),
 }
 
 impl Action {
@@ -609,6 +618,7 @@ impl Action {
         Action::ThemeEditorSelectRole(0),
         Action::ThemeEditorSetChannel(0, 0),
         Action::WorkspaceProfileSelectField(0),
+        Action::TerminalProfileCycleField(0),
     ];
 }
 

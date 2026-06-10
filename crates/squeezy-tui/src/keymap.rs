@@ -464,6 +464,13 @@ pub(crate) enum Action {
     /// saved ones, or reset them — persisting per workspace path outside the repo.
     /// Costs nothing until opened; an idle session never paints it.
     OpenWorkspaceProfile,
+    /// Per-Terminal Profiles (§12.7.3): open / close the terminal-profile editor
+    /// (`Ctrl+Alt+G` default). A fullscreen overlay that shows the detected
+    /// terminal capabilities and lets the user adapt the per-terminal UX policy
+    /// (glyph set, mouse mode, color depth) — built-in defaults per detected
+    /// terminal, user-overridable, persisted to the user-scope config. Costs
+    /// nothing until opened; an idle session never paints it.
+    OpenTerminalProfile,
 }
 
 impl Action {
@@ -546,6 +553,7 @@ impl Action {
             Self::ToggleKeybindingEditor => "toggle_keybinding_editor",
             Self::OpenThemeEditor => "open_theme_editor",
             Self::OpenWorkspaceProfile => "open_workspace_profile",
+            Self::OpenTerminalProfile => "open_terminal_profile",
         }
     }
 
@@ -627,6 +635,7 @@ impl Action {
         Action::ToggleKeybindingEditor,
         Action::OpenThemeEditor,
         Action::OpenWorkspaceProfile,
+        Action::OpenTerminalProfile,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -838,6 +847,11 @@ impl Action {
             // across Linux terminals, tmux, and SSH as the `Ctrl+Alt+E` theme
             // editor and the rest of the Ctrl+Alt overlay/picker family above.
             | Self::OpenWorkspaceProfile
+            // Per-Terminal Profiles (§12.7.3) opens with `Ctrl+Alt+G` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+E`/`Ctrl+Alt+B` editor
+            // chords and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenTerminalProfile
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1211,6 +1225,15 @@ impl Action {
             // composer chord.
             Self::OpenWorkspaceProfile => KeyBinding::new(
                 KeyCode::Char('w'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Per-Terminal Profiles (§12.7.3). `Ctrl+Alt+G` is a free `Ctrl+Alt`
+            // letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/`T`/`B`/`E`/
+            // `W`/`Y` are taken by the macro/debug/overlay/picker/editor/workspace
+            // chords above, so the Ctrl+Alt modifier keeps the terminal-profile
+            // verb distinct while staying clear of every composer chord.
+            Self::OpenTerminalProfile => KeyBinding::new(
+                KeyCode::Char('g'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }
