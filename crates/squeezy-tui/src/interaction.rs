@@ -280,6 +280,13 @@ pub(crate) enum Action {
     /// starts immediately, or — when a turn is running — let the drain-on-finish
     /// path run it next ahead of the rest of the queue.
     QueueRunNext(u64),
+    /// Cycle the given queue item's run-condition (§12.3.5) to the next one in the
+    /// editor sequence. The mouse twin of the keyboard `v` verb; both route
+    /// through the same `queue_cycle_condition_by_id`, so the paths stay identical
+    /// by construction. Fed by a Ctrl+Right-click on a queue-item row (the
+    /// always-available equivalent is the keyboard `v`, since crossterm only
+    /// reports mouse modifiers when key-modifier capture is on).
+    QueueCycleCondition(u64),
     /// Jump the transcript to the latest (tail) row.
     JumpToLatest,
     /// Jump the scrollbar thumb to the clicked gutter row.
@@ -489,6 +496,7 @@ impl Action {
         Action::QueueUndo,
         Action::QueueEdit(0),
         Action::QueueRunNext(0),
+        Action::QueueCycleCondition(0),
         Action::JumpToLatest,
         Action::ScrollbarJump,
         Action::MinimapJump(EntryId(0)),

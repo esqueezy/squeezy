@@ -162,20 +162,33 @@ fn preview(text: &str) -> String {
 /// tag reflecting running/paused state) or `None` for a loose prompt (painted as
 /// aligning blanks). A shorter / absent slice paints every row loose. Markers are
 /// inline prefixes, so they never change the row count the height calc relies on.
+///
+/// `conditions` is a per-item Conditional-Queue-Items marker (§12.3.5), one entry
+/// per queue slot in queue order: each is the item's [`QueueCondition`] (defaulting
+/// to `Always`, painted as aligning blanks) tinted by its evaluation against the
+/// latest `outcome` so a skip-bound / blocked row reads at a glance. A shorter /
+/// absent slice paints every row unconditional. Like the group marker it is an
+/// inline prefix, so it never changes the row count the height calc relies on.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_lines(
     state: &PromptQueueState,
     queue: &VecDeque<String>,
     tagged: Option<&[bool]>,
     groups: Option<&[Option<&crate::queue_groups::QueueGroup>]>,
+    conditions: Option<&[crate::queue_conditions::QueueCondition]>,
+    outcome: Option<crate::queue_conditions::TurnOutcome>,
 ) -> Vec<Line<'static>> {
     let group_active = tagged.is_some_and(|t| t.iter().any(|&b| b));
     let any_group = groups.is_some_and(|g| g.iter().any(|m| m.is_some()));
+    let any_condition = conditions.is_some_and(|c| c.iter().any(|cond| !cond.is_always()));
     let hint = if group_active {
         "  Space tag · g group · Del delete group · Shift+↑↓ move group · m merge · c clear"
     } else if any_group {
-        "  ↑↓ select · g group · z fold · p pause · G dissolve · r run next · Del remove · Esc close"
+        "  ↑↓ select · g group · z fold · p pause · G dissolve · v cond · r run next · Del remove · Esc"
+    } else if any_condition {
+        "  ↑↓ select · v condition · g group · Shift+↑↓ reorder · Enter/e edit · r run next · Del remove · Esc"
     } else {
-        "  ↑↓ select · Space tag · g group · Shift+↑↓ reorder · Enter/e edit · r run next · Del remove · Esc close"
+        "  ↑↓ select · Space tag · g group · v cond · Shift+↑↓ reorder · Enter/e edit · r run next · Del · Esc"
     };
     let header = Line::from(vec![
         Span::styled(
@@ -201,6 +214,10 @@ pub(crate) fn render_lines(
         let is_selected = index == state.selected;
         let is_tagged = tagged.and_then(|t| t.get(index)).copied().unwrap_or(false);
         let group = groups.and_then(|g| g.get(index)).copied().flatten();
+        let condition = conditions
+            .and_then(|c| c.get(index))
+            .copied()
+            .unwrap_or_default();
         let marker = if is_selected { "› " } else { "  " };
         let style = if is_selected {
             Style::default()
@@ -228,6 +245,7 @@ pub(crate) fn render_lines(
             ),
             crate::prompt_queue_multiselect::marker_span(is_tagged),
             crate::queue_groups::group_marker_span(group),
+            crate::queue_conditions::condition_marker_span(condition, outcome),
             Span::raw(" "),
             Span::styled(body, style),
         ]));

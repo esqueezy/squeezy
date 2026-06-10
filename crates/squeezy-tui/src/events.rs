@@ -388,6 +388,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_estimate = context_estimate;
                     app.clear_status_context_request_tokens();
                     app.cancelled_prompt = None;
+                    // Conditional Queue Items (§12.3.5): capture this turn's
+                    // outcome before `last_turn_had_edits` is cleared below, so the
+                    // drain gate can evaluate the next queued prompt's condition
+                    // against it.
+                    app.record_turn_outcome(true);
                     if app.last_turn_had_edits {
                         app.push_status(format!("turn complete · {}", edit_recovery_hint(app)));
                         app.last_turn_had_edits = false;
@@ -541,6 +546,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.status = message;
                     app.turn_visual = TurnVisualState::Cancelled;
                     app.push_warn("turn cancelled".to_string());
+                    // §12.3.5: a cancelled turn counts as not-succeeded for the
+                    // queue-condition gate. Capture before the edits flag clears.
+                    app.record_turn_outcome(false);
                     if app.last_turn_had_edits {
                         app.push_log(edit_recovery_hint(app).to_string());
                         app.last_turn_had_edits = false;
@@ -576,6 +584,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.cost = session_cost;
                     }
                     app.clear_status_context_request_tokens();
+                    // §12.3.5: record the failure for the queue-condition gate
+                    // before the edits flag is cleared below.
+                    app.record_turn_outcome(false);
                     let mut status = format_error_status(&error);
                     if app.last_turn_had_edits {
                         append_edit_recovery_hint(&mut status, app);

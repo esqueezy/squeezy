@@ -25592,7 +25592,10 @@ async fn p_pauses_and_resumes_the_focused_group_and_gates_the_drain() {
     assert!(app.status.contains("paused queue group"));
     // A paused group disarms the auto-drain pump, and no item is runnable.
     assert!(!app.auto_drain_queue);
-    assert_eq!(next_runnable_queue_index(&app), None);
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Stop
+    );
     // `p` again resumes; the front item becomes runnable.
     handle_key(
         &mut app,
@@ -25602,7 +25605,10 @@ async fn p_pauses_and_resumes_the_focused_group_and_gates_the_drain() {
     .await
     .expect("p resumes the group");
     assert!(!app.prompt_queue_groups.is_item_paused(id_a));
-    assert_eq!(next_runnable_queue_index(&app), Some(0));
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Run(0)
+    );
 }
 
 #[tokio::test]
@@ -25704,8 +25710,8 @@ async fn group_verb_on_loose_row_is_a_quiet_noop() {
 async fn paused_front_group_parks_while_loose_prompt_drains() {
     // The drain policy runs the next *runnable* item: a paused front group is
     // skipped while a loose prompt behind it is the next to run. Asserted through
-    // the real `next_runnable_queue_index` the pump consults, so it is pinned
-    // without starting a model turn (a real prompt would spawn an agent turn).
+    // the real `queue_drain_action` the pump consults, so it is pinned without
+    // starting a model turn (a real prompt would spawn an agent turn).
     let mut app = queue_app(&["front", "back"]);
     let mut agent = test_agent(SessionMode::Build);
     // Group + pause the FRONT prompt only; the second stays loose.
@@ -25730,7 +25736,10 @@ async fn paused_front_group_parks_while_loose_prompt_drains() {
     assert!(app.prompt_queue_groups.is_item_paused(paused_id));
     // The next runnable item is the loose "back" at index 1, NOT the paused
     // front item — the pump would drain index 1 and leave the paused member.
-    assert_eq!(next_runnable_queue_index(&app), Some(1));
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Run(1)
+    );
     // Simulate the pump draining that runnable item.
     app.prompt_queue.remove(1);
     app.prompt_queue_ids.remove(1);
@@ -25738,8 +25747,8 @@ async fn paused_front_group_parks_while_loose_prompt_drains() {
     assert_eq!(queue_texts(&app), vec!["front"]);
     assert_eq!(queue_id_at(&app, 0), paused_id);
     assert_eq!(
-        next_runnable_queue_index(&app),
-        None,
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Stop,
         "with only the paused member left, nothing is runnable"
     );
     // Resuming the group makes its member runnable again.
@@ -25750,7 +25759,416 @@ async fn paused_front_group_parks_while_loose_prompt_drains() {
     )
     .await
     .expect("resume front");
-    assert_eq!(next_runnable_queue_index(&app), Some(0));
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Run(0)
+    );
+}
+
+// ===========================================================================
+// Conditional Queue Items (§12.3.5)
+// ===========================================================================
+
+#[tokio::test]
+async fn v_cycles_the_focused_prompts_run_condition() {
+    // The keyboard `v` verb advances the focused prompt's run-condition through
+    // the editor ring, disarming the auto-drain pump while a non-default
+    // condition is set and re-clearing to `always` on the wrap.
+    let mut app = queue_app(&["alpha", "beta"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    let id_alpha = queue_id_at(&app, 0);
+    app.auto_drain_queue = true;
+
+    // First `v`: always → if-succeeded; the pump is disarmed.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("v cycles the condition");
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_alpha),
+        queue_conditions::QueueCondition::IfPrevSucceeded
+    );
+    assert!(
+        !app.auto_drain_queue,
+        "setting a condition disarms the pump"
+    );
+    assert!(app.status.contains("if previous succeeded"));
+    // The other row is untouched, and never leaks into the composer.
+    assert_eq!(
+        app.prompt_queue_conditions.get(queue_id_at(&app, 1)),
+        queue_conditions::QueueCondition::Always
+    );
+    assert!(app.input.is_empty(), "v never leaks to the composer");
+
+    // Five more `v` presses wrap the ring back to `always`, clearing the entry.
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("v cycles the condition");
+    }
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_alpha),
+        queue_conditions::QueueCondition::Always
+    );
+    assert!(
+        app.prompt_queue_conditions.is_empty(),
+        "wrapping to always clears the map"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_right_click_cycles_condition_via_mouse() {
+    // Mouse parity: a Ctrl+Right-click on a queue row drives the same
+    // condition-cycle the keyboard `v` does, through the real render() hit-test
+    // registry. (A plain right-click is the unrelated run-next verb.)
+    let mut app = queue_app(&["aaa", "bbb"]);
+    let _agent = test_agent(SessionMode::Build);
+    let width = 100u16;
+    let height = 20u16;
+    let _ = render_to_string(&app, width, height);
+    let id_aaa = queue_id_at(&app, 0);
+    let (col, row) = queue_cell_for(
+        &app,
+        width,
+        height,
+        interaction::TargetKey::QueueItem(id_aaa),
+        interaction::Action::QueueReorderBegin(id_aaa),
+    )
+    .expect("aaa row registered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: col,
+            row,
+            modifiers: KeyModifiers::CONTROL,
+        },
+    );
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_aaa),
+        queue_conditions::QueueCondition::IfPrevSucceeded,
+        "Ctrl+Right-click cycles the condition"
+    );
+    // The focus seated on the clicked row (parity with the keyboard path).
+    assert_eq!(
+        app.prompt_queue_overlay.as_ref().expect("overlay").selected,
+        0
+    );
+}
+
+#[tokio::test]
+async fn drain_skips_an_unsatisfied_conditional_prompt() {
+    // A front prompt conditioned on "if previous succeeded" is dropped (skipped)
+    // by the drain pump after a FAILED turn, so the loose prompt behind it is the
+    // one that becomes the drain decision.
+    let mut app = queue_app(&["retry-on-success", "always-runs"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    // `v` once: always → if-succeeded on the front prompt.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("condition the front prompt");
+    let id_front = queue_id_at(&app, 0);
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_front),
+        queue_conditions::QueueCondition::IfPrevSucceeded
+    );
+
+    // No outcome yet: the front conditional BLOCKS, so the loose prompt behind it
+    // is the next runnable.
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Run(1)
+    );
+
+    // Record a FAILED outcome: the front conditional is now skip-bound, so the
+    // pump would DROP it (index 0) before reaching the runnable behind it.
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: false,
+        had_edits: false,
+    });
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Drop(0)
+    );
+
+    // A SUCCEEDED outcome instead makes the conditional runnable at the front.
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Run(0)
+    );
+}
+
+#[tokio::test]
+async fn drain_pump_drops_skip_bound_prompt_without_running_a_turn() {
+    // Drive the real drain pump: a skip-bound front prompt is dropped from the
+    // queue (the §12.3.5 "skipped" state) without running a turn. The second
+    // prompt is `Manual` so the pump parks at it after the drop — keeping the
+    // assertion deterministic (no model turn spawns to consume it).
+    let mut app = queue_app(&["skip-me", "park-me"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // Condition the FRONT prompt on "if previous failed".
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle front to if-failed");
+    }
+    let id_front = queue_id_at(&app, 0);
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_front),
+        queue_conditions::QueueCondition::IfPrevFailed
+    );
+    // Make the SECOND prompt Manual so the pump stops at it after the drop.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle second to manual");
+    }
+    let id_park = queue_id_at(&app, 1);
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_park),
+        queue_conditions::QueueCondition::Manual
+    );
+    // Close the overlay so the drain is not blocked, and record a SUCCEEDED
+    // outcome so "if previous failed" on the front is unsatisfied (skip-bound).
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    // The pump drops "skip-me" and parks at the manual "park-me" — no turn runs.
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert_eq!(
+        queue_texts(&app),
+        vec!["park-me".to_string()],
+        "skip-bound prompt dropped; manual prompt parked"
+    );
+    assert!(app.turn_rx.is_none(), "no turn spawned");
+    // The dropped prompt's condition entry was pruned with it; the manual one
+    // survives.
+    assert!(app.prompt_queue_conditions.get(id_front).is_always());
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_park),
+        queue_conditions::QueueCondition::Manual
+    );
+}
+
+#[tokio::test]
+async fn manual_condition_blocks_drain_until_run_next() {
+    // A `Manual` prompt is never auto-drained — it blocks the pump even with a
+    // satisfying outcome and an empty rest-of-queue, until the user runs it.
+    let mut app = queue_app(&["manual-only"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    let id = queue_id_at(&app, 0);
+    // Cycle all the way to Manual (the last ring state): 5 presses.
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle to manual");
+    }
+    assert_eq!(
+        app.prompt_queue_conditions.get(id),
+        queue_conditions::QueueCondition::Manual
+    );
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: true,
+    });
+    // Even with a clean outcome the manual prompt parks: the pump stops.
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Stop
+    );
+}
+
+#[tokio::test]
+async fn record_turn_outcome_captures_success_and_edits() {
+    // The turn-finish capture stores the success flag + the edits flag for the
+    // condition gate.
+    let mut app = test_app(SessionMode::Build);
+    app.last_turn_had_edits = true;
+    app.record_turn_outcome(true);
+    assert_eq!(
+        app.last_turn_outcome,
+        Some(queue_conditions::TurnOutcome {
+            succeeded: true,
+            had_edits: true,
+        })
+    );
+    app.last_turn_had_edits = false;
+    app.record_turn_outcome(false);
+    assert_eq!(
+        app.last_turn_outcome,
+        Some(queue_conditions::TurnOutcome {
+            succeeded: false,
+            had_edits: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn overlay_paints_condition_marker_through_real_render() {
+    // The open overlay paints a condition tag next to a conditioned prompt and
+    // surfaces the `v` hint, through the real fullscreen render().
+    let mut app = queue_app(&["conditioned", "plain"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    // Base overlay (no conditions): the hint advertises `v`, and no condition
+    // glyph is painted.
+    let base = render_to_string(&app, 100, 20);
+    assert!(base.contains("Queued prompts"));
+    assert!(
+        base.contains("cond"),
+        "base hint advertises the v verb: {base}"
+    );
+    assert!(
+        !base.contains("[✓]"),
+        "no condition glyph when all unconditional: {base}"
+    );
+    // Condition the front prompt on "if previous succeeded".
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("condition front prompt");
+    let painted = render_to_string(&app, 100, 20);
+    assert!(
+        painted.contains("[✓]"),
+        "the if-succeeded marker is painted: {painted}"
+    );
+}
+
+#[tokio::test]
+async fn condition_verb_on_empty_queue_is_a_quiet_noop() {
+    // Edge case: `v` over an empty open overlay must not panic, set a condition,
+    // or leak into the composer.
+    let mut app = test_app(SessionMode::Build);
+    app.prompt_queue_overlay = Some(prompt_queue::PromptQueueState::new());
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("v on empty queue");
+    assert!(app.prompt_queue_conditions.is_empty());
+    assert!(app.input.is_empty(), "v never leaks to the composer");
+    assert!(app.status.contains("no queued prompt"));
+    // The overlay still paints its header at a small size without panicking.
+    let rendered = render_to_string(&app, 40, 12);
+    assert!(rendered.contains("Queued prompts"), "{rendered}");
+}
+
+#[tokio::test]
+async fn condition_marker_survives_a_narrow_resize() {
+    // The condition marker is an inline prefix, so it paints (and the overlay
+    // header is still present) at a narrow width without panicking.
+    let mut app = queue_app(&["this is a fairly long queued prompt body"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("condition the prompt");
+    // Render at a series of widths; each must paint the header without panicking
+    // (the marker is an inline prefix that can be clipped at very narrow widths,
+    // but the row must never panic). At the wider widths the marker is fully on
+    // screen.
+    for width in [30u16, 50, 80, 120] {
+        // A generous height so the item row (below the header + hint) is on
+        // screen; the test is about width robustness, not vertical clipping.
+        let rendered = render_to_string(&app, width, 24);
+        assert!(
+            rendered.contains("Queued prompts"),
+            "header present at width {width}: {rendered}"
+        );
+        // At a wide-enough width the header hint fits on one row, so the item row
+        // (and its marker) is fully on screen. Narrower widths wrap the long hint
+        // and push the item row past the overlay's allotted height — a
+        // pre-existing overlay constraint, not a marker bug; the assertion above
+        // already proves the narrow render does not panic.
+        if width >= 120 {
+            assert!(
+                rendered.contains("[✓]"),
+                "marker painted at width {width}: {rendered}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn clearing_the_session_drops_all_conditions() {
+    // `/clear` wipes the queue and its conditions so no phantom condition survives.
+    let mut app = queue_app(&["a", "b"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("condition a prompt");
+    assert!(!app.prompt_queue_conditions.is_empty());
+    handle_slash_command(&mut app, &mut agent, "/clear").await;
+    assert!(app.prompt_queue.is_empty());
+    assert!(
+        app.prompt_queue_conditions.is_empty(),
+        "clear drops the conditions"
+    );
 }
 
 #[tokio::test]

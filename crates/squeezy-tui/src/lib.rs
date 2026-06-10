@@ -134,6 +134,7 @@ mod prompt_queue;
 mod prompt_queue_multiselect;
 mod prompt_template;
 mod proposed_plan;
+mod queue_conditions;
 mod queue_edit;
 mod queue_groups;
 mod queue_run_next;
@@ -12261,6 +12262,52 @@ fn queue_group_dissolve_focused(app: &mut TuiApp) -> bool {
     true
 }
 
+/// The stable id of the focused queued prompt, or `None` on an empty queue / a
+/// stale cursor. The shared lookup the condition-cycle verb and its mouse twin
+/// resolve their target through, so both act on the exact focused row.
+fn focused_queue_id(app: &TuiApp) -> Option<u64> {
+    let state = app.prompt_queue_overlay.as_ref()?;
+    app.prompt_queue_ids.get(state.selected).copied()
+}
+
+/// Conditional Queue Items (§12.3.5): cycle the focused queued prompt's
+/// run-condition to the next one in the editor sequence. The single source of
+/// truth the keyboard `v` verb and the mouse twin share. A quiet no-op on an
+/// empty queue / stale cursor. Returns `true` if a condition changed.
+fn queue_cycle_condition_focused(app: &mut TuiApp) -> bool {
+    sync_queue_ids(app);
+    let Some(id) = focused_queue_id(app) else {
+        app.status = "no queued prompt to set a condition on".to_string();
+        app.needs_redraw = true;
+        return false;
+    };
+    queue_cycle_condition_by_id(app, id)
+}
+
+/// Cycle the run-condition of the queued prompt with `id` (§12.3.5). The id-keyed
+/// primitive the focused-keyboard verb and the mouse twin both route through, so
+/// the two stay identical by construction. Pausing/skip policy is evaluated later
+/// by the drain pump; this only edits the stored condition. Returns `true` (the
+/// condition always advances — `always` cycles back to itself only by wrapping
+/// through every other state).
+fn queue_cycle_condition_by_id(app: &mut TuiApp, id: u64) -> bool {
+    let now = app.prompt_queue_conditions.cycle(id);
+    // Setting an explicit run-condition is a deliberate "hold this back unless…"
+    // edit, so — like pausing a group — it disarms the auto-drain pump while the
+    // user is mid-edit. Returning to `always` re-arms nothing on its own; the next
+    // turn-finish drains as usual.
+    if !now.is_always() {
+        app.auto_drain_queue = false;
+    }
+    app.status = if now.is_always() {
+        "queued prompt runs always (condition cleared)".to_string()
+    } else {
+        format!("queued prompt runs {} (§ condition)", now.label())
+    };
+    app.needs_redraw = true;
+    true
+}
+
 /// Run Selected Queued Next (§11G.9): promote the focused queued prompt to the
 /// front so it runs before everything else still waiting. When idle (no turn
 /// running) the prompt is moved to the front and the auto-drain pump is armed, so
@@ -12555,6 +12602,20 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                     state.selected = index;
                 }
                 queue_run_selected_next(app);
+            }
+        }
+        // Cycle a queued prompt's run-condition (§12.3.5). Mouse twin of the
+        // keyboard `v` verb; both seat the overlay focus on the clicked row and
+        // route through the same `queue_cycle_condition_by_id`, so the paths stay
+        // identical by construction. A click on a row that has since drained out
+        // resolves to a no-op.
+        interaction::Action::QueueCycleCondition(id) => {
+            sync_queue_ids(app);
+            if let Some(index) = queue_index_for_id(app, id) {
+                if let Some(state) = app.prompt_queue_overlay.as_mut() {
+                    state.selected = index;
+                }
+                queue_cycle_condition_by_id(app, id);
             }
         }
         // Scrollbar-jump and jump-to-latest are not yet registered as targets
@@ -14787,6 +14848,10 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 // that are all gone now, so drop them too rather than leave them
                 // naming vanished prompts.
                 app.prompt_queue_groups = queue_groups::QueueGroups::new();
+                // Conditional Queue Items (§12.3.5) are keyed by the same
+                // now-gone item ids; drop them so no phantom condition survives a
+                // clear.
+                app.prompt_queue_conditions = queue_conditions::QueueConditions::new();
                 app.auto_drain_queue = false;
                 app.transcript_overlay = None;
                 app.transcript_overlay_scrollbar_cache.set(None);
@@ -16822,6 +16887,15 @@ fn handle_queue_multiselect_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             queue_group_toggle_pause_focused(app);
             true
         }
+        // Conditional Queue Items (§12.3.5). `v` cycles the focused prompt's
+        // run-condition (always → if-succeeded → if-failed → if-edited →
+        // if-no-edits → manual → always). A plain printable key not used by any
+        // other overlay verb, so it keeps the "consume before the global keymap"
+        // pattern without colliding.
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            queue_cycle_condition_focused(app);
+            true
+        }
         // Group delete / move only claim the key when a group is active; an
         // empty group falls through to `PromptQueueState::dispatch` so the
         // single-row Delete / Shift+arrow semantics are unchanged.
@@ -17107,9 +17181,18 @@ fn handle_queue_overlay_mouse(
         // zone), so run-next rides the right button rather than crowding a third
         // left-click zone. Routes through the same `QueueRunNext` dispatch the
         // keyboard verb shares. A press off any queue item falls through.
+        //
+        // A Ctrl+Right-click instead cycles the row's run-condition (§12.3.5) —
+        // the mouse twin of the keyboard `v` verb. Crossterm only reports mouse
+        // modifiers when key-modifier capture is on, so the keyboard `v` remains
+        // the always-available equivalent; this is the convenience overlay.
         MouseEventKind::Down(MouseButton::Right) => match hit_test(app, &mouse) {
             Some((interaction::TargetKey::QueueItem(id), _)) => {
-                dispatch_click_action(app, interaction::Action::QueueRunNext(id));
+                if mouse.modifiers.intersects(KeyModifiers::CONTROL) {
+                    dispatch_click_action(app, interaction::Action::QueueCycleCondition(id));
+                } else {
+                    dispatch_click_action(app, interaction::Action::QueueRunNext(id));
+                }
                 Some(true)
             }
             _ => None,
@@ -17237,38 +17320,67 @@ fn queue_input_behind_running_turn(app: &mut TuiApp, input: String) {
     app.status = format!("queued ({})", app.prompt_queue.len());
 }
 
-/// The index of the front-most queued prompt that is *runnable*: not a member of
-/// a paused queue group (§12.3.4). Returns `None` when the queue is empty or
-/// every remaining prompt is held back by a paused group. The drain pump drains
-/// this item rather than blindly popping the front, so a paused batch parks its
-/// prompts while loose prompts and running groups keep flowing. Pure over the
-/// id sidecar + group model, so the policy is pinned by tests without a pump.
-fn next_runnable_queue_index(app: &TuiApp) -> Option<usize> {
-    app.prompt_queue_ids
+/// The Conditional Queue Items (§12.3.5) + Queue Groups (§12.3.4) drain decision
+/// for the current front of the queue, computed from the live id sidecar and the
+/// two state maps. Pure-state lives in `queue_conditions::plan_drain`; this just
+/// materialises the per-item facts (paused flag + condition) in queue order and
+/// hands them over. Assumes `sync_queue_ids` + `retain_live` ran so the sidecar
+/// and maps are aligned with the live queue.
+fn queue_drain_action(app: &TuiApp) -> queue_conditions::DrainAction {
+    let items: Vec<queue_conditions::DrainItem> = app
+        .prompt_queue_ids
         .iter()
-        .position(|id| !app.prompt_queue_groups.is_item_paused(*id))
+        .map(|id| queue_conditions::DrainItem {
+            paused: app.prompt_queue_groups.is_item_paused(*id),
+            condition: app.prompt_queue_conditions.get(*id),
+        })
+        .collect();
+    queue_conditions::plan_drain(&items, app.last_turn_outcome)
 }
 
 async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
     while app.turn_rx.is_none() && !prompt_queue_drain_blocked(app) {
-        // Keep the id sidecar aligned before consulting the group model so a
-        // front-drain since the last tick can't stale the pause lookup.
+        // Keep the id sidecar aligned before consulting the group/condition models
+        // so a front-drain since the last tick can't stale the pause / condition
+        // lookup. Prune conditions for any drained id too, so the gate never reads
+        // a phantom condition.
         sync_queue_ids(app);
-        let Some(index) = next_runnable_queue_index(app) else {
-            return;
-        };
-        let Some(next) = app.prompt_queue.remove(index) else {
-            return;
-        };
-        // Carry the id sidecar with the removed slot so the two stay aligned.
-        app.prompt_queue_ids.remove(index);
-        let remaining = app.prompt_queue.len();
-        app.status = if remaining == 0 {
-            "running queued prompt".to_string()
-        } else {
-            format!("running queued prompt ({remaining} more queued)")
-        };
-        submit_queued_input(app, agent, next).await;
+        let live_ids = queue_live_ids(app);
+        app.prompt_queue_conditions.retain_live(&live_ids);
+        match queue_drain_action(app) {
+            queue_conditions::DrainAction::Run(index) => {
+                let Some(next) = app.prompt_queue.remove(index) else {
+                    return;
+                };
+                // Carry the id sidecar with the removed slot so the two stay aligned.
+                app.prompt_queue_ids.remove(index);
+                let remaining = app.prompt_queue.len();
+                app.status = if remaining == 0 {
+                    "running queued prompt".to_string()
+                } else {
+                    format!("running queued prompt ({remaining} more queued)")
+                };
+                submit_queued_input(app, agent, next).await;
+            }
+            queue_conditions::DrainAction::Drop(index) => {
+                // The item's "if previous X" condition can't be satisfied by this
+                // outcome: drop it (the §12.3.5 "skipped" state) and re-plan. We
+                // carry the id sidecar with the slot and loop without running a
+                // turn, so a run of skip-bound prompts clears in order.
+                let skipped = app.prompt_queue.remove(index);
+                app.prompt_queue_ids.remove(index);
+                if let Some(text) = skipped {
+                    let preview = text.lines().next().unwrap_or("").trim();
+                    app.push_log(format!(
+                        "skipped queued prompt (condition not met): {preview}"
+                    ));
+                }
+                app.status = format!("skipped queued prompt ({} left)", app.prompt_queue.len());
+                app.needs_redraw = true;
+                // Loop: re-plan against the now-shorter queue.
+            }
+            queue_conditions::DrainAction::Stop => return,
+        }
     }
 }
 
@@ -32458,10 +32570,12 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
     let queue_overlay_lines = app
         .prompt_queue_overlay
         .as_ref()
-        // Multi-select / Queue-Group markers are inline prefixes that never
-        // change the line count, so the height calc can skip computing them
+        // Multi-select / Queue-Group / condition markers are inline prefixes that
+        // never change the line count, so the height calc can skip computing them
         // (`None`).
-        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue, None, None).len())
+        .map(|state| {
+            prompt_queue::render_lines(state, &app.prompt_queue, None, None, None, None).len()
+        })
         .unwrap_or(0);
     let overlay_lines = if queue_overlay_lines > 0 {
         0
@@ -32884,6 +32998,14 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .iter()
         .map(|id| app.prompt_queue_groups.group_of_item(*id))
         .collect();
+    // Per-item Conditional-Queue-Items marker (§12.3.5), one per queue slot in
+    // queue order, so the overlay paints a condition tag (tinted by its evaluation
+    // against the latest turn outcome) next to each conditional prompt.
+    let queue_conditions: Vec<queue_conditions::QueueCondition> = app
+        .prompt_queue_ids
+        .iter()
+        .map(|id| app.prompt_queue_conditions.get(*id))
+        .collect();
     let queue_overlay_lines: Vec<Line<'static>> = app
         .prompt_queue_overlay
         .as_ref()
@@ -32893,6 +33015,8 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 &app.prompt_queue,
                 Some(&queue_tagged),
                 Some(&queue_groups),
+                Some(&queue_conditions),
+                app.last_turn_outcome,
             )
         })
         .unwrap_or_default();
@@ -35475,6 +35599,22 @@ pub(crate) struct TuiApp {
     /// the queue, not a transient selection — and are pruned of drained members
     /// by `retain_live` whenever the queue may have shifted.
     pub(crate) prompt_queue_groups: queue_groups::QueueGroups,
+    /// Conditional Queue Items (§12.3.5): per-item run-conditions layered over the
+    /// flat prompt queue, addressed by the same stable item ids. A conditional
+    /// prompt only dispatches when its condition is satisfied by the latest turn
+    /// outcome (`last_turn_outcome`); an unsatisfied "if previous X" prompt is
+    /// skipped (dropped) and a `Manual` prompt is held until the user runs it by
+    /// hand. Empty means every queued prompt is unconditional and the queue
+    /// behaves as a flat list. Pruned of drained items by `retain_live`. Consulted
+    /// only by the drain pump (never the render path beyond labelling), so idle
+    /// cost stays zero.
+    pub(crate) prompt_queue_conditions: queue_conditions::QueueConditions,
+    /// The outcome of the most recently finished turn (success + whether it edited
+    /// files), captured at turn-finish so the drain gate can evaluate a queued
+    /// prompt's condition (§12.3.5) against it. `None` until the first turn of the
+    /// session finishes — a previous-turn condition then *blocks* (waits) rather
+    /// than matching blindly.
+    pub(crate) last_turn_outcome: Option<queue_conditions::TurnOutcome>,
     /// Set true when a turn just completed (success, cancel, or fail)
     /// and the queue is non-empty. The main loop reads this immediately
     /// after `drain_agent_events` returns, pops the next prompt, and
@@ -36039,6 +36179,8 @@ impl TuiApp {
             editing_queue_id: None,
             prompt_queue_multiselect: prompt_queue_multiselect::MultiSelect::new(),
             prompt_queue_groups: queue_groups::QueueGroups::new(),
+            prompt_queue_conditions: queue_conditions::QueueConditions::new(),
+            last_turn_outcome: None,
             auto_drain_queue: false,
             pending_chord: None,
             clickables: std::cell::RefCell::new(interaction::Registry::new()),
@@ -36201,6 +36343,19 @@ impl TuiApp {
     /// need the elapsed-ms refresh from the 1Hz heartbeat.
     pub(crate) fn note_active_tool_progress(&mut self, _tool_name: &str, elapsed_ms: u64) {
         self.active_tool_elapsed_ms = Some(elapsed_ms);
+    }
+
+    /// Capture the just-finished turn's outcome for the Conditional Queue Items
+    /// gate (§12.3.5). Called from the turn-finish event arms BEFORE
+    /// `last_turn_had_edits` is cleared, so the edits flag is still the truth of
+    /// the turn that ran. `succeeded` is `true` only for a clean completion; an
+    /// error or a cancel passes `false`. The drain pump reads `last_turn_outcome`
+    /// to decide whether the next conditional prompt runs, skips, or waits.
+    pub(crate) fn record_turn_outcome(&mut self, succeeded: bool) {
+        self.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+            succeeded,
+            had_edits: self.last_turn_had_edits,
+        });
     }
 
     pub(crate) fn note_turn_finished(&mut self) {

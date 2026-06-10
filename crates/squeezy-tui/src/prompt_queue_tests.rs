@@ -134,7 +134,7 @@ fn indicator_line_present_when_queue_non_empty() {
 fn render_lines_includes_header_and_empty_marker() {
     let state = PromptQueueState::new();
     let queue: VecDeque<String> = VecDeque::new();
-    let lines = render_lines(&state, &queue, None, None);
+    let lines = render_lines(&state, &queue, None, None, None, None);
     assert!(lines.len() >= 2);
 }
 
@@ -144,7 +144,7 @@ fn render_lines_paints_multiselect_checkbox() {
     let queue = queue_of(&["alpha", "beta", "gamma"]);
     // Tag the middle item only.
     let tagged = [false, true, false];
-    let lines = render_lines(&state, &queue, Some(&tagged), None);
+    let lines = render_lines(&state, &queue, Some(&tagged), None, None, None);
     let text: String = lines
         .iter()
         .flat_map(|l| l.spans.iter())
@@ -164,7 +164,7 @@ fn render_lines_paints_multiselect_checkbox() {
 fn render_lines_header_is_base_hint_with_no_group() {
     let state = PromptQueueState::new();
     let queue = queue_of(&["alpha"]);
-    let lines = render_lines(&state, &queue, Some(&[false]), None);
+    let lines = render_lines(&state, &queue, Some(&[false]), None, None, None);
     let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(header.contains("reorder"), "base header hint: {header}");
     assert!(!header.contains("delete group"));
