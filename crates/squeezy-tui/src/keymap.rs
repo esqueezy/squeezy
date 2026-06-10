@@ -228,6 +228,15 @@ pub(crate) enum Action {
     /// failing entry. The lens model rebuilds incrementally only on a transcript
     /// revision bump, so an idle session pays nothing.
     ToggleErrorLens,
+    /// Open / close the Transcript Health Markers overlay (`Alt+n` default;
+    /// §12.5.7). A fullscreen list of the health/status markers detected on the
+    /// transcript — a failed tool, a failed subagent, a failed turn, output
+    /// elided to a preview, or a large output blob — each carrying its short
+    /// message and severity, with keyboard/mouse navigation that jumps the main
+    /// view to the marked entry so the user can see what was hidden. The marker
+    /// model rebuilds incrementally only on a transcript revision bump, so an
+    /// idle session pays nothing.
+    ToggleHealthMarkers,
 }
 
 impl Action {
@@ -281,6 +290,7 @@ impl Action {
             Self::ToggleRelatedLinks => "toggle_related_links",
             Self::ToggleDuplicateFolds => "toggle_duplicate_folds",
             Self::ToggleErrorLens => "toggle_error_lens",
+            Self::ToggleHealthMarkers => "toggle_health_markers",
         }
     }
 
@@ -333,6 +343,7 @@ impl Action {
         Action::ToggleRelatedLinks,
         Action::ToggleDuplicateFolds,
         Action::ToggleErrorLens,
+        Action::ToggleHealthMarkers,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -431,6 +442,9 @@ impl Action {
             // Error-Lens overlay toggle is `Alt+x` — the same Meta/Alt encoding
             // that is unreliable across Linux terminals, tmux, and SSH.
             | Self::ToggleErrorLens
+            // Transcript-Health-Markers overlay toggle is `Alt+n` — the same
+            // Meta/Alt encoding case as the rest of the nav/overlay family.
+            | Self::ToggleHealthMarkers
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -593,6 +607,11 @@ impl Action {
             // b/e/f/i/g/u) are taken; `x` is free and stays clear of the composer
             // chords.
             Self::ToggleErrorLens => KeyBinding::new(KeyCode::Char('x'), KeyModifiers::ALT),
+            // Transcript Health Markers (§12.5.7). `Alt+n` — `n` recalls
+            // "notices" / "health". Bare `Alt` letters in the nav/copy family
+            // (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x) are taken; `n` is free and
+            // stays clear of the composer chords.
+            Self::ToggleHealthMarkers => KeyBinding::new(KeyCode::Char('n'), KeyModifiers::ALT),
         }
     }
 }

@@ -141,6 +141,7 @@ mod streaming;
 mod streaming_patch;
 mod terminal_writer;
 mod toast;
+mod transcript_health;
 mod transcript_index;
 mod transcript_relations;
 mod transcript_surface;
@@ -1782,6 +1783,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.related_links_open
         || app.duplicate_folds_open
         || app.error_lens_open
+        || app.health_markers_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2415,6 +2417,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::ErrorLensRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Transcript Health Markers overlay (§12.5.7) owns the pointer while open:
+    // a left-click on a marker row selects it and jumps the main view to the entry
+    // behind it; every other click is swallowed so a stray press can't fall
+    // through to the surface beneath. Hit-tested in ABSOLUTE screen coordinates
+    // against the row targets `render_health_markers_surface` registered this
+    // frame.
+    if app.health_markers_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::HealthMarkerRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3676,6 +3697,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // dispatch, so a stray key never leaks into the composer underneath. Sits
     // beside the duplicate-folds overlay at the front for the same reason.
     if app.error_lens_open && handle_error_lens_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Transcript Health Markers overlay (§12.5.7) is modal while open: it owns
+    // the keyboard (↑↓/kj move the marker cursor, Enter/→/l jump to the marked
+    // entry, Esc/Alt+n close) BEFORE any selection-clear, search, chord, or keymap
+    // dispatch, so a stray key never leaks into the composer underneath. Sits
+    // beside the error-lens overlay at the front for the same reason.
+    if app.health_markers_open && handle_health_markers_key(app, key) {
         return Ok(false);
     }
 
@@ -5371,6 +5401,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_error_lens(app);
             true
         }
+        keymap::Action::ToggleHealthMarkers => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_health_markers(app);
+            true
+        }
     }
 }
 
@@ -5983,6 +6023,118 @@ fn error_lens_jump_to_selected(app: &mut TuiApp, advance: bool) {
         app.needs_redraw = true;
     } else {
         app.status = "error lenses: could not jump".to_string();
+    }
+}
+
+/// `Alt+n`: open / close the Transcript Health Markers overlay (§12.5.7). On open
+/// it refreshes the marker model (cheap when nothing changed), resets the cursor,
+/// and sets a status line summarizing what was detected (or an empty-state hint).
+/// Mirrors `toggle_error_lens` exactly.
+fn toggle_health_markers(app: &mut TuiApp) {
+    app.health_markers_open = !app.health_markers_open;
+    if app.health_markers_open {
+        refresh_health_markers(app);
+        app.health_markers_selected = 0;
+        app.status = if app.health_markers.is_empty() {
+            "health markers (none) — Esc to close".to_string()
+        } else {
+            format!(
+                "health markers: {} — \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                app.health_markers.summary(),
+            )
+        };
+    } else {
+        app.status = "health markers closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Transcript Health Markers overlay (§12.5.7) is open.
+/// Returns `true` when the key was consumed (so it never leaks to the composer or
+/// global keymap). Mirrors the error-lens overlay's before-the-global-keymap
+/// modal consumption: the toggle chord (`Alt+n`) and Esc close; Up/Down (and k/j)
+/// move the marker cursor; Enter (and l/→) jumps the main view to the entry
+/// behind the selected marker.
+fn handle_health_markers_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.health_markers_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+n` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleHealthMarkers) {
+        app.health_markers_open = false;
+        app.status = "health markers closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.health_markers.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.health_markers_open = false;
+            app.status = "health markers closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.health_markers_selected = app.health_markers_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.health_markers_selected = (app.health_markers_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            health_markers_jump_to_selected(app, true);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the entry behind the health-markers overlay's selected
+/// marker (§12.5.7). Resolves the marker at the cursor, scrolls to its source
+/// entry via the same `jump_to_entry_id` path the index/minimap/jump-nav use, and
+/// reports the kind in the status line. A no-op (status hint) when there is
+/// nothing to jump to.
+///
+/// `advance` controls the cursor afterward: the keyboard Enter verb passes `true`
+/// so a *repeated* Enter walks forward through the marker list (wrapping at the
+/// end) — the "Enter for next" idiom the status line advertises; the mouse click
+/// passes `false` because a click is a precise pick that should land and stay on
+/// exactly the clicked row.
+fn health_markers_jump_to_selected(app: &mut TuiApp, advance: bool) {
+    let Some((entry_id, kind)) = app
+        .health_markers
+        .get(app.health_markers_selected)
+        .map(|marker| (marker.entry_id, marker.kind))
+    else {
+        app.status = "health markers: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, entry_id) {
+        let position = app.health_markers_selected + 1;
+        let total = app.health_markers.len();
+        app.status = format!(
+            "health marker {position}/{total} [{}] — Enter for next \u{00b7} Esc close",
+            kind.label(),
+        );
+        // Walk the cursor forward to the next marker so a repeated Enter steps
+        // through the whole list (wrapping). The mouse path skips this so a click
+        // stays put on the row it picked.
+        if advance
+            && let Some(next) = app
+                .health_markers
+                .next_index(Some(app.health_markers_selected))
+        {
+            app.health_markers_selected = next;
+        }
+        app.needs_redraw = true;
+    } else {
+        app.status = "health markers: could not jump".to_string();
     }
 }
 
@@ -6900,6 +7052,125 @@ fn refresh_error_lenses(app: &mut TuiApp) {
     let candidates = build_error_candidates(active_transcript_entries(app));
     let fingerprint = error_lens::ErrorLenses::fingerprint_of(candidates.iter());
     app.error_lenses.rebuild_if_stale(fingerprint, &candidates);
+}
+
+/// Number of preview lines a tool's inline card *hides* via head-tail elision
+/// (§12.5.7), or `0` when its preview is shown in full. Reuses the SAME
+/// `expanded_tool_detail_lines` + `tool_preview_line_cap` + bypass gate the
+/// renderer uses to decide elision, so the marker's notion of "hidden" matches
+/// exactly what the user sees folded. Tools whose body bypasses the cap (diffs,
+/// patches) are never elided, so they report `0`.
+fn tool_elided_line_count(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
+) -> usize {
+    if tool_bypasses_preview_cap_for_tool(tool) {
+        return 0;
+    }
+    let detail = expanded_tool_detail_lines(
+        tool,
+        ToolDetailMode::Preview(verbosity),
+        transcript_shortcut,
+    );
+    let cap = tool_preview_line_cap(tool);
+    // `head_tail_truncate_lines` elides only when the line count exceeds `2*cap`,
+    // hiding the middle `len - 2*cap` lines. Mirror that arithmetic exactly.
+    if cap == 0 || detail.len() <= cap.saturating_mul(2) {
+        0
+    } else {
+        detail.len().saturating_sub(cap * 2)
+    }
+}
+
+/// Build the per-entry Transcript Health Markers candidate slice from the active
+/// transcript (§12.5.7). Reuses the renderer/jump-nav classifications
+/// (`entry_is_error`, the structured tool status, `LogKind::Subagent`,
+/// `is_failure_log`) so the markers' notion of "failed / elided / large" matches
+/// what the user sees. Each candidate carries only *measured facts* — never the
+/// raw output text — so the detector cannot leak a hidden secret line. Pure over
+/// the entry slice apart from reading the shared transcript shortcut for the
+/// elision measurement.
+fn build_health_candidates(
+    entries: &[TranscriptEntry],
+    verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
+) -> Vec<transcript_health::HealthCandidate> {
+    let mut out: Vec<transcript_health::HealthCandidate> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let (title, tool_failed, subagent_failed, turn_failed, elided, hidden_lines, output_bytes) =
+            match &entry.kind {
+                TranscriptEntryKind::ToolResult(tool) => {
+                    let failed = tool.result.status != ToolStatus::Success;
+                    let hidden = tool_elided_line_count(tool, verbosity, transcript_shortcut);
+                    (
+                        tool.result.tool_name.clone(),
+                        failed,
+                        false,
+                        false,
+                        hidden > 0,
+                        hidden,
+                        tool.result.cost_hint.output_bytes,
+                    )
+                }
+                TranscriptEntryKind::Log(log) if log.kind == LogKind::Subagent => (
+                    "subagent".to_string(),
+                    false,
+                    is_failure_log(log.message()),
+                    false,
+                    false,
+                    0,
+                    0,
+                ),
+                TranscriptEntryKind::Message(item) if item.role == Role::Assistant => (
+                    "turn".to_string(),
+                    false,
+                    false,
+                    entry_is_error(entries, index),
+                    false,
+                    0,
+                    0,
+                ),
+                _ => continue,
+            };
+        // Only entries that justify at least one marker contribute, so the
+        // fingerprint and the model stay tight (no candidate per healthy entry).
+        if !(tool_failed
+            || subagent_failed
+            || turn_failed
+            || elided
+            || output_bytes >= transcript_health::LARGE_OUTPUT_BYTES)
+        {
+            continue;
+        }
+        out.push(transcript_health::HealthCandidate {
+            id: entry.id,
+            revision: entry.revision,
+            title,
+            tool_failed,
+            subagent_failed,
+            turn_failed,
+            elided,
+            hidden_lines,
+            output_bytes,
+        });
+    }
+    out
+}
+
+/// Refresh the Transcript Health Markers model (§12.5.7) against the active
+/// transcript, recomputing **only** when the candidates' (id, revision)
+/// fingerprint has moved since the last refresh. Called lazily — right before the
+/// overlay opens or renders — so an idle session that never opens the overlay
+/// pays nothing, and an open overlay re-detects only on a real transcript change
+/// rather than every frame.
+fn refresh_health_markers(app: &mut TuiApp) {
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let verbosity = app.tool_output_verbosity;
+    let candidates = build_health_candidates(active_transcript_entries(app), verbosity, &shortcut);
+    let fingerprint = transcript_health::HealthMarkers::fingerprint_of(candidates.iter());
+    app.health_markers
+        .rebuild_if_stale(fingerprint, &candidates);
 }
 
 /// Compact human label for an entry id used in the recent-jump status readout
@@ -7869,6 +8140,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::ErrorLensSelect(index) => {
             app.error_lens_selected = index;
             error_lens_jump_to_selected(app, false);
+        }
+        // A click on a Transcript Health Markers row (§12.5.7): move the cursor
+        // onto it and jump the main view to the entry behind it — the mouse twin
+        // of ↑↓ + Enter, in one go.
+        interaction::Action::HealthMarkerSelect(index) => {
+            app.health_markers_selected = index;
+            health_markers_jump_to_selected(app, false);
         }
     }
 }
@@ -13391,6 +13669,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_error_lens_surface(frame, area, app);
         return;
     }
+    // The Transcript Health Markers overlay (§12.5.7) paints as a fullscreen list
+    // over everything else while open, registering its per-marker row click
+    // targets every frame. Checked beside the error-lens overlay so its targets
+    // register and it owns the surface while open.
+    if app.health_markers_open {
+        render_health_markers_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -14611,6 +14897,118 @@ fn render_error_lens_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::ErrorLensRow(index)),
             interaction::Action::ErrorLensSelect(index),
+        );
+    }
+}
+
+/// Paint the Transcript Health Markers overlay (§12.5.7) as a centered modal: a
+/// title, a one-line summary/navigation header (or an empty-state line), then one
+/// row per detected marker — a severity tag (color + text label, never
+/// color-only), the `[kind]` in brackets, and the short message. Each row is a
+/// [`interaction::ChromeKey::HealthMarkerRow`] click target so a click reaches the
+/// same `health_markers_jump_to_selected` path as ↑↓+Enter. Reads the
+/// already-refreshed marker model (kept current by the run loop while open), so
+/// painting is constant-time and does no transcript walk.
+fn render_health_markers_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Health markers ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} what is hidden or degraded ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 88, 20, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let count = app.health_markers.len();
+    // Header: summary + navigation hint, or an empty-state line.
+    let header = if count == 0 {
+        Line::from(Span::styled(
+            "No health markers — nothing hidden or degraded.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                app.health_markers.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the marker count so a marker that vanished (e.g. after a
+    // refresh) can never leave the cursor past the end.
+    let selected = app.health_markers_selected.min(count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    for (index, marker) in app.health_markers.markers().iter().enumerate().take(rows) {
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + index as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let marker_caret = if is_selected { "\u{203a} " } else { "  " };
+        // A red important / cyan minor tag so severity carries color *and* a text
+        // label (no color-only meaning), the [kind] in brackets, then the message.
+        let severity_color = match marker.severity {
+            transcript_health::HealthSeverity::Important => crate::render::theme::red(),
+            transcript_health::HealthSeverity::Minor => crate::render::theme::cyan(),
+        };
+        let message_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker_caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:<9} ", marker.severity.label()),
+                Style::default()
+                    .fg(severity_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<17} ", format!("[{}]", marker.kind.label())),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(marker.message.clone(), message_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its marker-list index
+        // so a click selects + jumps to exactly that marker.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::HealthMarkerRow(index)),
+            interaction::Action::HealthMarkerSelect(index),
         );
     }
 }
@@ -26203,6 +26601,23 @@ pub(crate) struct TuiApp {
     /// Clamped to the lens count each render. Only meaningful while the overlay
     /// is open.
     pub(crate) error_lens_selected: usize,
+    /// Transcript Health Markers model (§12.5.7): the health/status markers
+    /// detected on the transcript — failed tool, failed subagent, failed turn,
+    /// output elided to a preview, large output — each carrying its short message
+    /// and severity. Rebuilt incrementally — only when the candidates' (id,
+    /// revision) fingerprint moves — by `refresh_health_markers`, so an idle
+    /// session pays one `u64` comparison per refresh. Drives the health-markers
+    /// overlay's list and quick-jump navigation.
+    pub(crate) health_markers: transcript_health::HealthMarkers,
+    /// Whether the Transcript Health Markers overlay (§12.5.7) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// list owns key/mouse routing. Toggled by the `ToggleHealthMarkers` keymap
+    /// action.
+    pub(crate) health_markers_open: bool,
+    /// Cursor into the health-markers overlay's list of detected markers
+    /// (§12.5.7). Clamped to the marker count each render. Only meaningful while
+    /// the overlay is open.
+    pub(crate) health_markers_selected: usize,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -26778,6 +27193,9 @@ impl TuiApp {
             error_lenses: error_lens::ErrorLenses::new(),
             error_lens_open: false,
             error_lens_selected: 0,
+            health_markers: transcript_health::HealthMarkers::new(),
+            health_markers_open: false,
+            health_markers_selected: 0,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -28999,6 +29417,14 @@ impl TerminalGuard {
         // branch is skipped entirely).
         if app.error_lens_open {
             refresh_error_lenses(app);
+        }
+
+        // Keep the Transcript Health Markers model (§12.5.7) current while its
+        // overlay is open, on the same no-op-when-unchanged terms: an open-but-idle
+        // overlay costs one `u64` comparison and a closed overlay costs nothing
+        // (this branch is skipped entirely).
+        if app.health_markers_open {
+            refresh_health_markers(app);
         }
 
         let paint = self.paint_one_frame(app);

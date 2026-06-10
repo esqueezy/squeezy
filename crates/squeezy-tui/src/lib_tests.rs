@@ -27873,3 +27873,313 @@ async fn error_lens_renders_across_resizes() {
         );
     }
 }
+
+// ---- Transcript Health Markers (§12.5.7) ----
+
+/// Build a transcript with several health-worthy entries: a FAILED tool (an
+/// important `tool failed` marker), a successful tool with a LARGE output (a minor
+/// `large output` marker), a successful tool whose preview is ELIDED (a minor
+/// `output elided` marker), a FAILED subagent breadcrumb (an important `subagent
+/// failed` marker), plus a healthy tool that contributes nothing. Seeds a
+/// deterministic viewport so geometry is host-independent.
+fn app_with_health_markers() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("run the build".to_string()));
+
+    // A healthy tool: short, successful — no marker.
+    app.push_tool_result(sample_tool_result("shell", "ok\n"));
+
+    // A FAILED tool — important `tool failed` marker.
+    let mut failed = sample_tool_result("shell", "boom: the command exited non-zero");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+
+    // A successful tool with a LARGE (>16 KiB) output — minor `large output`
+    // marker. `sample_tool_result` sets `output_bytes` to the output length.
+    let big = "x".repeat((transcript_health::LARGE_OUTPUT_BYTES as usize) + 1024);
+    app.push_tool_result(sample_tool_result("read_file", &big));
+
+    // A successful shell tool whose multi-line preview is head-tail ELIDED — minor
+    // `output elided` marker. Well past the per-card preview cap.
+    let many_lines: String = (0..80).map(|i| format!("line {i}\n")).collect();
+    app.push_tool_result(sample_tool_result("shell", &many_lines));
+
+    // A FAILED subagent breadcrumb — important `subagent failed` marker.
+    app.push_subagent_note("subagent research failed: could not reach host".to_string());
+
+    app
+}
+
+#[tokio::test]
+async fn health_markers_alt_n_opens_overlay_and_lists_markers() {
+    let mut app = app_with_health_markers();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+n opens the health-markers overlay");
+
+    assert!(app.health_markers_open, "Alt+n opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Health markers"), "header present:\n{out}");
+
+    // The failed tool and failed subagent each contribute an important marker.
+    assert!(
+        app.health_markers
+            .count_of(transcript_health::HealthKind::ToolFailed)
+            >= 1,
+        "tool-failed marker detected",
+    );
+    assert_eq!(
+        app.health_markers
+            .count_of(transcript_health::HealthKind::SubagentFailed),
+        1,
+        "subagent-failed marker detected",
+    );
+    assert_eq!(
+        app.health_markers
+            .count_of(transcript_health::HealthKind::LargeOutput),
+        1,
+        "large-output marker detected",
+    );
+    assert!(
+        app.health_markers
+            .count_of(transcript_health::HealthKind::OutputElided)
+            >= 1,
+        "output-elided marker detected",
+    );
+    // A kind tag and a severity tag appear in the painted rows.
+    assert!(out.contains("[tool failed]"), "kind tag row:\n{out}");
+    assert!(out.contains("important"), "severity tag row:\n{out}");
+}
+
+#[tokio::test]
+async fn health_markers_keyboard_navigates_and_jumps() {
+    let mut app = app_with_health_markers();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open markers");
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(
+        app.health_markers_selected, 0,
+        "cursor starts at the first marker"
+    );
+    assert!(app.health_markers.len() >= 2, "several markers detected");
+
+    // Down moves the cursor.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(
+        app.health_markers_selected, 1,
+        "Down advances the marker cursor"
+    );
+
+    // Up moves it back.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up moves cursor");
+    assert_eq!(
+        app.health_markers_selected, 0,
+        "Up retreats the marker cursor"
+    );
+
+    // Enter jumps to the entry behind the selected marker and walks the cursor
+    // forward (the "Enter for next" idiom).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert!(
+        app.status.contains("health marker"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+    assert_eq!(
+        app.health_markers_selected, 1,
+        "Enter walks the cursor forward to the next marker",
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.health_markers_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn health_markers_alt_n_toggles_closed_without_leaking() {
+    let mut app = app_with_health_markers();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.health_markers_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.health_markers_open, "Alt+n toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn health_markers_mouse_click_selects_and_jumps() {
+    let mut app = app_with_health_markers();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open markers");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for a registered marker-row target — the SECOND row so the click
+    // changes the cursor off 0.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::HealthMarkerRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a marker row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.health_markers_selected, 1,
+        "clicking a marker row selects exactly that marker (no auto-advance)",
+    );
+    assert!(
+        app.status.contains("health marker"),
+        "click jumps and reports: {}",
+        app.status,
+    );
+    // The overlay stays open (the click jumped within it, not closed it).
+    assert!(app.health_markers_open);
+}
+
+#[tokio::test]
+async fn health_markers_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open markers on an empty transcript");
+
+    assert!(app.health_markers_open);
+    assert!(app.health_markers.is_empty());
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("Health markers"),
+        "header still paints:\n{out}"
+    );
+    assert!(
+        out.contains("No health markers"),
+        "empty-state line:\n{out}"
+    );
+
+    // Enter on an empty overlay is a harmless no-op (no panic, nothing jumps).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty markers");
+    assert!(app.health_markers.is_empty());
+}
+
+#[tokio::test]
+async fn health_markers_healthy_transcript_emits_nothing() {
+    // A transcript whose only tool succeeded with small, non-elided output must
+    // produce no markers — structured facts gate detection.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_tool_result(sample_tool_result("shell", "all good\n"));
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open markers");
+    assert!(
+        app.health_markers.is_empty(),
+        "a healthy tool contributes no marker",
+    );
+}
+
+#[tokio::test]
+async fn health_markers_renders_across_resizes() {
+    let mut app = app_with_health_markers();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open markers");
+
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Health markers"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+}

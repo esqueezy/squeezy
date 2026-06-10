@@ -662,6 +662,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // click and the keyboard reach the same `error_lens_jump_to_selected`
         // handler.
         A::ErrorLensSelect(_) => KeyboardPath::Always("error lenses ↑↓/Enter"),
+        // Transcript Health Markers overlay (§12.5.7) — the overlay's own key
+        // handler owns ↑↓/kj (move the marker cursor) and Enter/→/l (jump to the
+        // entry behind the selected marker) before the global keymap sees them, so
+        // a row click and the keyboard reach the same
+        // `health_markers_jump_to_selected` handler.
+        A::HealthMarkerSelect(_) => KeyboardPath::Always("health markers ↑↓/Enter"),
     })
 }
 

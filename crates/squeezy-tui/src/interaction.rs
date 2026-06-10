@@ -135,6 +135,10 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the detected-lens list so a click selects + jumps to the
     /// failing entry behind exactly that lens.
     ErrorLensRow(usize),
+    /// A health-marker row in the Transcript Health Markers overlay (§12.5.7),
+    /// keyed by its 0-based index in the detected-marker list so a click selects
+    /// + jumps to the entry behind exactly that marker.
+    HealthMarkerRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -254,6 +258,11 @@ pub(crate) enum Action {
     /// it. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click
     /// both selects and jumps in one go.
     ErrorLensSelect(usize),
+    /// Select the given health-marker row in the Transcript Health Markers
+    /// overlay (§12.5.7): move the cursor onto it and jump the main view to the
+    /// entry behind it. Mouse twin of moving the cursor with ↑↓ and pressing
+    /// Enter; a click both selects and jumps in one go.
+    HealthMarkerSelect(usize),
 }
 
 impl Action {
@@ -295,6 +304,7 @@ impl Action {
         Action::RelatedLinkSelect(0),
         Action::DuplicateFoldSelect(0),
         Action::ErrorLensSelect(0),
+        Action::HealthMarkerSelect(0),
     ];
 }
 
