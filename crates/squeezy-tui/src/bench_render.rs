@@ -478,7 +478,15 @@ fn verify_teardown(app: &TuiApp, width: u16) -> bool {
     let lines = transcript_lines_for_render(app, Some(width), true);
     let mirror = render_lines_to_owned_buffer(&lines, width);
     let mut bytes = Vec::new();
-    if emit_finish_fullscreen(&mut bytes, &mirror, width, None).is_err() {
+    if emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        app.effective_hyperlink_caps(),
+    )
+    .is_err()
+    {
         return false;
     }
     let ansi = String::from_utf8_lossy(&bytes);

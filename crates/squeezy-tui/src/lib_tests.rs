@@ -5671,7 +5671,14 @@ fn emit_buffer_row_styled_drops_wide_moon_overflowing_last_column() {
     buf.set_string(WIDTH - 1, 0, "◐", Style::default()); // x = 7 (last column)
 
     let mut out = Vec::new();
-    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    emit_buffer_row_styled(
+        &mut out,
+        &buf,
+        0,
+        WIDTH,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit");
     let text = strip_ansi(&String::from_utf8_lossy(&out));
 
     assert!(
@@ -5705,7 +5712,14 @@ fn emit_buffer_row_styled_keeps_wide_moon_with_room_to_spare() {
     buf.set_string(0, 0, "◐ab", Style::default());
 
     let mut out = Vec::new();
-    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    emit_buffer_row_styled(
+        &mut out,
+        &buf,
+        0,
+        WIDTH,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit");
     let text = strip_ansi(&String::from_utf8_lossy(&out));
 
     assert!(
@@ -5730,7 +5744,14 @@ fn emit_buffer_row_styled_keeps_wide_moon_at_exact_fit_boundary() {
     buf.set_string(WIDTH - 2, 0, "◐", Style::default()); // x = 6
 
     let mut out = Vec::new();
-    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    emit_buffer_row_styled(
+        &mut out,
+        &buf,
+        0,
+        WIDTH,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit");
     let text = strip_ansi(&String::from_utf8_lossy(&out));
 
     assert!(
@@ -5767,7 +5788,14 @@ fn emit_buffer_row_styled_keeps_wide_cjk_at_exact_fit_boundary() {
     buf.set_string(WIDTH - 2, 0, "好", Style::default()); // x = 6, continuation at 7
 
     let mut out = Vec::new();
-    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    emit_buffer_row_styled(
+        &mut out,
+        &buf,
+        0,
+        WIDTH,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit");
     let text = strip_ansi(&String::from_utf8_lossy(&out));
 
     assert!(
@@ -6006,7 +6034,14 @@ fn width_audit_mirror_keeps_wide_moon_at_exact_fit_and_drops_it_when_overflowing
     overflow.set_string(0, 0, "abcde", Style::default());
     overflow.set_string(WIDTH - 1, 0, "●", Style::default());
     let mut out = Vec::new();
-    emit_buffer_row_styled(&mut out, &overflow, 0, WIDTH).expect("emit");
+    emit_buffer_row_styled(
+        &mut out,
+        &overflow,
+        0,
+        WIDTH,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit");
     let text = strip_ansi(&String::from_utf8_lossy(&out));
     assert!(
         !text.contains('●'),
@@ -6019,7 +6054,14 @@ fn width_audit_mirror_keeps_wide_moon_at_exact_fit_and_drops_it_when_overflowing
     fit.set_string(0, 0, "abcd", Style::default());
     fit.set_string(WIDTH - 2, 0, "●", Style::default());
     let mut out2 = Vec::new();
-    emit_buffer_row_styled(&mut out2, &fit, 0, WIDTH).expect("emit");
+    emit_buffer_row_styled(
+        &mut out2,
+        &fit,
+        0,
+        WIDTH,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit");
     let text2 = strip_ansi(&String::from_utf8_lossy(&out2));
     assert!(
         text2.contains('●'),
@@ -9453,7 +9495,14 @@ fn finish_fullscreen_leaves_alt_screen_before_mirror_rows() {
     let mirror = mirror_buffer_for(&app, width);
 
     let mut bytes = Vec::new();
-    emit_finish_fullscreen(&mut bytes, &mirror, width, None).expect("emit finish_fullscreen");
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit finish_fullscreen");
     let ansi = String::from_utf8(bytes).expect("ansi");
 
     // The leave sequence must be present and precede the mirrored response text.
@@ -9487,7 +9536,14 @@ fn finish_fullscreen_normal_exit_does_not_purge_scrollback() {
     let mirror = mirror_buffer_for(&app, width);
 
     let mut bytes = Vec::new();
-    emit_finish_fullscreen(&mut bytes, &mirror, width, None).expect("emit finish_fullscreen");
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit finish_fullscreen");
     let ansi = String::from_utf8(bytes).expect("ansi");
 
     // The scrollback-wipe `\x1b[3J` is reserved for `/clear`; a normal exit must
@@ -9508,7 +9564,14 @@ fn finish_fullscreen_emits_exit_hint_after_the_mirror() {
     let hint = "Resume: squeezy sessions resume abc123";
 
     let mut bytes = Vec::new();
-    emit_finish_fullscreen(&mut bytes, &mirror, width, Some(hint)).expect("emit finish_fullscreen");
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        Some(hint),
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit finish_fullscreen");
     let ansi = String::from_utf8(bytes).expect("ansi");
 
     let mirror_pos = ansi
@@ -9525,6 +9588,276 @@ fn finish_fullscreen_emits_exit_hint_after_the_mirror() {
     assert!(
         leave_pos < mirror_pos,
         "LeaveAlternateScreen must precede the mirror, which precedes the hint",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OSC 8 hyperlinks (§11G.5) through the real exit-mirror render path. Each test
+// drives `emit_finish_fullscreen` (the production clean-exit emitter) and
+// asserts on the captured byte stream — the capture-sink framework the spec
+// requires, exercising detection + encoding + the per-column emit plan end to
+// end, not just the pure module in isolation.
+// ---------------------------------------------------------------------------
+
+/// The OSC 8 open prefix and the close sequence, as the emitter writes them.
+const OSC8_OPEN_PREFIX: &str = "\u{1b}]8;;";
+const OSC8_CLOSE: &str = "\u{1b}]8;;\u{1b}\\";
+
+#[test]
+fn exit_mirror_wraps_a_url_in_osc8_when_capable() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "docs at https://example.test/guide",
+    ));
+
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::enabled(),
+    )
+    .expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // The OSC 8 open carries the full URI, the visible text follows, and a close
+    // sequence terminates the run.
+    let open = format!("{OSC8_OPEN_PREFIX}https://example.test/guide\u{1b}\\");
+    assert!(
+        ansi.contains(&open),
+        "a capable terminal must get the OSC 8 open with the full URI: {ansi:?}",
+    );
+    assert!(
+        ansi.contains(OSC8_CLOSE),
+        "the link run must be closed with an empty OSC 8: {ansi:?}",
+    );
+    // The visible glyphs are still present (strip the escapes and the URL text
+    // remains intact — the link is additive, never replacing the text).
+    let visible = strip_ansi(&ansi);
+    assert!(
+        visible.contains("https://example.test/guide"),
+        "the visible URL text must survive: {visible:?}",
+    );
+}
+
+#[test]
+fn exit_mirror_is_plain_text_when_terminal_is_incapable() {
+    // The SAME transcript, emitted with the capability OFF, must produce the
+    // exact previous plain-text output — no OSC 8 escapes at all.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "docs at https://example.test/guide",
+    ));
+
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        !ansi.contains(OSC8_OPEN_PREFIX),
+        "an incapable terminal must never receive an OSC 8 hyperlink: {ansi:?}",
+    );
+    // The visible URL text is of course still mirrored — plain, clickable-or-not.
+    assert!(
+        strip_ansi(&ansi).contains("https://example.test/guide"),
+        "the plain URL text is still mirrored",
+    );
+}
+
+#[test]
+fn exit_mirror_links_an_absolute_path_with_file_scheme() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("edited /home/user/main.rs"));
+
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::enabled(),
+    )
+    .expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    let open = format!("{OSC8_OPEN_PREFIX}file:///home/user/main.rs\u{1b}\\");
+    assert!(
+        ansi.contains(&open),
+        "an absolute path must link via the file:// scheme: {ansi:?}",
+    );
+    assert!(ansi.contains(OSC8_CLOSE), "the path link must be closed");
+    assert!(
+        strip_ansi(&ansi).contains("/home/user/main.rs"),
+        "the visible path text survives",
+    );
+}
+
+#[test]
+fn exit_mirror_without_links_emits_no_osc8_even_when_capable() {
+    // Edge case: a capable terminal but a transcript with nothing linkable must
+    // still produce zero OSC 8 escapes — the feature pays nothing on a plain row.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "just a plain answer, no links here",
+    ));
+
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::enabled(),
+    )
+    .expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        !ansi.contains(OSC8_OPEN_PREFIX),
+        "a link-free transcript must emit no OSC 8, even on a capable terminal: {ansi:?}",
+    );
+}
+
+#[test]
+fn exit_mirror_link_survives_a_narrow_resize_clip() {
+    // Resize where the feature paints: a width so narrow the URL wraps/clips.
+    // The emitter must still balance every OSC 8 open with a close (an
+    // unbalanced open would leak the link onto the following scrollback rows).
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "link https://example.test/a/very/long/path/that/wraps/around",
+    ));
+
+    // A deliberately tight width forces the URL across wrapped rows.
+    let width = 20u16;
+    let mirror = mirror_buffer_for(&app, width);
+
+    let mut bytes = Vec::new();
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::enabled(),
+    )
+    .expect("emit finish_fullscreen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // Every OSC 8 open must have a matching close: count the opens (prefix
+    // occurrences that are NOT the close form) and the closes, and require the
+    // closes to be at least the opens so no run is left dangling.
+    let opens = ansi.matches(OSC8_OPEN_PREFIX).count();
+    let closes = ansi.matches(OSC8_CLOSE).count();
+    // Each close also begins with the open prefix, so closes are counted within
+    // `opens`; the real open count is `opens - closes`, and that must be > 0
+    // (the URL did link) and <= closes (every open is balanced).
+    let real_opens = opens - closes;
+    assert!(real_opens > 0, "the wrapped URL still links: {ansi:?}");
+    assert!(
+        closes >= real_opens,
+        "every OSC 8 open ({real_opens}) must be balanced by a close ({closes}): {ansi:?}",
+    );
+}
+
+#[test]
+fn toggle_hyperlinks_cycles_auto_on_off_and_back() {
+    // The keyboard verb cycles the override: auto (probe) -> on -> off -> auto.
+    let mut app = test_app(SessionMode::Build);
+    // Force a known probe so `auto` is deterministic regardless of the CI env.
+    app.hyperlink_caps = hyperlinks::HyperlinkCapabilities::disabled();
+    assert_eq!(app.hyperlink_override, None, "starts in auto (deferring)");
+    assert!(
+        !app.effective_hyperlink_caps().osc8,
+        "auto over an incapable probe is off"
+    );
+
+    toggle_hyperlinks(&mut app);
+    assert_eq!(app.hyperlink_override, Some(true), "auto -> on");
+    assert!(app.effective_hyperlink_caps().osc8, "forced on");
+    assert!(
+        app.status.contains("hyperlinks"),
+        "status reflects the mode"
+    );
+
+    toggle_hyperlinks(&mut app);
+    assert_eq!(app.hyperlink_override, Some(false), "on -> off");
+    assert!(!app.effective_hyperlink_caps().osc8, "forced off");
+
+    toggle_hyperlinks(&mut app);
+    assert_eq!(app.hyperlink_override, None, "off -> auto");
+    assert!(
+        !app.effective_hyperlink_caps().osc8,
+        "back to auto, deferring to the incapable probe"
+    );
+}
+
+#[test]
+fn effective_caps_force_on_over_an_incapable_probe() {
+    let mut app = test_app(SessionMode::Build);
+    app.hyperlink_caps = hyperlinks::HyperlinkCapabilities::disabled();
+    app.hyperlink_override = Some(true);
+    assert!(
+        app.effective_hyperlink_caps().osc8,
+        "an explicit force-on beats an incapable probe",
+    );
+    app.hyperlink_override = Some(false);
+    app.hyperlink_caps = hyperlinks::HyperlinkCapabilities::enabled();
+    assert!(
+        !app.effective_hyperlink_caps().osc8,
+        "an explicit force-off beats a capable probe",
+    );
+}
+
+#[tokio::test]
+async fn hyperlinks_keymap_chord_toggles_through_dispatch() {
+    // Keyboard path: the Alt+8 keymap action drives the toggle through the real
+    // dispatch, the same routing a rebound key would take.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert_eq!(app.hyperlink_override, None);
+    let chord = KeyEvent::new(KeyCode::Char('8'), KeyModifiers::ALT);
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, chord);
+    assert!(
+        consumed,
+        "the Alt+8 chord is consumed by the keymap dispatch"
+    );
+    assert_eq!(
+        app.hyperlink_override,
+        Some(true),
+        "Alt+8 advances auto -> on through dispatch",
+    );
+}
+
+#[test]
+fn toggling_hyperlinks_requests_no_idle_repaint() {
+    // The mode only affects the persisted exit-mirror, not any live frame, so
+    // the toggle must NOT set needs_redraw — idle redraw stays zero.
+    let mut app = test_app(SessionMode::Build);
+    app.needs_redraw = false;
+    toggle_hyperlinks(&mut app);
+    assert!(
+        !app.needs_redraw,
+        "a hyperlink-mode toggle paints no live frame, so it requests no repaint",
     );
 }
 
@@ -9624,7 +9957,14 @@ fn finish_fullscreen_mirror_height_covers_wrapped_rows_not_visual_estimate() {
     // content survives across the wrapped rows. Strip the styling escapes, drop
     // CRLFs, and the de-wrapped text must contain the long word and all CJK.
     let mut bytes = Vec::new();
-    emit_finish_fullscreen(&mut bytes, &mirror, width, None).expect("emit finish_fullscreen");
+    emit_finish_fullscreen(
+        &mut bytes,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit finish_fullscreen");
     let ansi = String::from_utf8(bytes).expect("ansi");
     let visible: String = strip_ansi(&ansi)
         .chars()

@@ -376,6 +376,38 @@ fn wide_block_defaults_do_not_collide_with_other_actions() {
 }
 
 #[test]
+fn hyperlink_toggle_action_is_registered_and_defaults_to_alt_8() {
+    // §11G.5: the OSC 8 hyperlink-mode cycle resolves from its slug, is in
+    // `ALL`, defaults to `Alt+8`, and is honestly terminal-dependent (Meta).
+    assert_eq!(
+        Action::from_slug("toggle_hyperlinks"),
+        Some(Action::ToggleHyperlinks)
+    );
+    assert!(Action::ALL.contains(&Action::ToggleHyperlinks));
+
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::ToggleHyperlinks),
+        KeyBinding::new(KeyCode::Char('8'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('8'), KeyModifiers::ALT),
+        Some(Action::ToggleHyperlinks),
+    );
+    assert_eq!(
+        Action::ToggleHyperlinks.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+    // The default must not collide with any other action's default.
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::ToggleHyperlinks),
+            "hyperlink-toggle default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

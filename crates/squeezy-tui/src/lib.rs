@@ -91,6 +91,7 @@ mod dogfood;
 mod events;
 mod fuzzy;
 mod history;
+mod hyperlinks;
 mod input;
 mod interaction;
 mod jump_marks;
@@ -4697,7 +4698,40 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             }
             scroll_wide_block(app, HorizontalDir::Right)
         }
+        keymap::Action::ToggleHyperlinks => {
+            // A render/output setting, not surface-specific — it is fine to flip
+            // from the config/setup screens too (it changes only the exit-mirror
+            // and any future link emission, never the active surface's layout),
+            // so no surface guard here.
+            toggle_hyperlinks(app);
+            true
+        }
     }
+}
+
+/// `Alt+8`: cycle the OSC 8 hyperlink mode (§11G.5) auto → on → off and surface
+/// the new state. `auto` defers to the startup terminal probe; `on`/`off` force
+/// the capability regardless of the probe, so a mis-detected terminal can be
+/// corrected without restarting. Only the persisted exit-mirror rows carry the
+/// escapes today, so this sets no `needs_redraw` — there is no live frame to
+/// repaint, keeping idle redraw at zero.
+fn toggle_hyperlinks(app: &mut TuiApp) {
+    let (next, label) = match app.hyperlink_override {
+        // auto -> on
+        None => (Some(true), "on (forced)"),
+        // on -> off
+        Some(true) => (Some(false), "off (plain text)"),
+        // off -> auto
+        Some(false) => (None, {
+            if app.hyperlink_caps.osc8 {
+                "auto (detected: on)"
+            } else {
+                "auto (detected: off)"
+            }
+        }),
+    };
+    app.hyperlink_override = next;
+    app.status = format!("hyperlinks: {label}");
 }
 
 /// `Alt+r`: toggle the minimap turn rail on the main view. The rail is a render
@@ -21281,6 +21315,18 @@ pub(crate) struct TuiApp {
     /// code/diff blocks and long command output scroll horizontally instead of
     /// wrapping or being hidden.
     pub(crate) wide_block: wide_block::WideBlockView,
+    /// OSC 8 hyperlinks (§11.5 / 11G.5): whether the host terminal is believed
+    /// to honour OSC 8 hyperlink escapes, probed once from the environment at
+    /// startup. The exit-mirror row emitter consults
+    /// [`TuiApp::effective_hyperlink_caps`] (this value unless
+    /// `hyperlink_override` forces it) to decide whether to wrap URLs/paths in
+    /// click-to-open escapes; an incapable terminal gets the plain-text rows.
+    pub(crate) hyperlink_caps: hyperlinks::HyperlinkCapabilities,
+    /// Runtime override for the probed [`TuiApp::hyperlink_caps`]: `Some(true)`
+    /// forces OSC 8 on (a capable terminal the heuristic missed), `Some(false)`
+    /// forces plain text (a terminal that mangles the escapes), `None` defers to
+    /// the probe. Flipped by the `ToggleHyperlinks` keymap action.
+    pub(crate) hyperlink_override: Option<bool>,
     /// Timestamp + cell + running count of the last left press, for
     /// synthesising double/triple clicks (crossterm delivers no click-count). A
     /// press within the multi-click window at the same cell escalates word →
@@ -21744,6 +21790,18 @@ impl TuiApp {
         self.clickables.borrow_mut().begin_frame();
     }
 
+    /// The OSC 8 hyperlink capability actually in effect (§11G.5): the runtime
+    /// `hyperlink_override` when the user has forced a state, otherwise the
+    /// startup environment probe. The exit-mirror row emitter reads this to
+    /// decide whether to wrap URLs/paths in click-to-open escapes.
+    pub(crate) fn effective_hyperlink_caps(&self) -> hyperlinks::HyperlinkCapabilities {
+        match self.hyperlink_override {
+            Some(true) => hyperlinks::HyperlinkCapabilities::enabled(),
+            Some(false) => hyperlinks::HyperlinkCapabilities::disabled(),
+            None => self.hyperlink_caps,
+        }
+    }
+
     /// Record a click target for the frame currently being drawn, keyed by a
     /// stable [`interaction::TargetKey`]. Render fns hold only `&TuiApp`, so
     /// the registry lives in a `RefCell` to allow registration through a
@@ -21915,6 +21973,13 @@ impl TuiApp {
             jump_marks: jump_marks::JumpMarkStack::new(),
             show_minimap: false,
             wide_block: wide_block::WideBlockView::new(),
+            // Probe OSC 8 hyperlink support once from the real environment, the
+            // same env-closure style the clipboard chain uses. An unknown
+            // terminal probes as incapable and gets plain-text exit-mirror rows.
+            hyperlink_caps: hyperlinks::detect_hyperlink_capabilities_from_env(|name| {
+                std::env::var_os(name)
+            }),
+            hyperlink_override: None,
             last_click: None,
             wheel_accum: 0,
             main_scroll_anim: None,
@@ -23688,15 +23753,18 @@ fn emit_finish_fullscreen<W: Write>(
     mirror_rows: &Buffer,
     width: u16,
     exit_hint: Option<&str>,
+    links: hyperlinks::HyperlinkCapabilities,
 ) -> io::Result<()> {
     // 1 + 2: alternate-scroll + mouse off, then leave the alternate screen.
     // `restore_mouse_capture = false`: on a clean exit the TUI is shutting down,
     // so leave mouse reporting disabled rather than re-arming click capture.
     leave_transcript_overlay_screen(writer, false)?;
-    // 3: the collapsed transcript mirror as plain CRLF normal-buffer rows.
+    // 3: the collapsed transcript mirror as plain CRLF normal-buffer rows. OSC 8
+    // hyperlinks (§11G.5) light up URLs/paths in the persisted scrollback when
+    // the terminal is capable; otherwise the rows emit exactly as before.
     for y in 0..mirror_rows.area.height {
         writer.write_all(b"\r")?;
-        emit_buffer_row_styled(writer, mirror_rows, y, width)?;
+        emit_buffer_row_styled(writer, mirror_rows, y, width, links)?;
         writer.write_all(b"\r\n")?;
     }
     // 4: the resume/exit hint, set off by a blank line, persisted in scrollback.
@@ -23936,11 +24004,16 @@ impl TerminalGuard {
         let mirror = render_lines_to_owned_buffer(&lines, width);
 
         let exit_hint = self.exit_hint.clone();
+        // Snapshot the effective hyperlink capability before borrowing the
+        // backend (the call needs `&mut self` for `term()`, so the read can't
+        // straddle that borrow).
+        let links = app.effective_hyperlink_caps();
         let backend = self.term().backend_mut();
         // Emit the whole clean-exit sequence through the shared free helper:
         // mouse/alt-scroll off, `LeaveAlternateScreen` (never `\x1b[3J`), the
-        // CRLF mirror rows, the resume hint, and the mode restores.
-        emit_finish_fullscreen(backend, &mirror, width, exit_hint.as_deref())?;
+        // CRLF mirror rows (with OSC 8 hyperlinks when capable), the resume
+        // hint, and the mode restores.
+        emit_finish_fullscreen(backend, &mirror, width, exit_hint.as_deref(), links)?;
         // The alternate screen has been left; record it so `Drop` won't leave it
         // again. Set BEFORE the trailing fallible calls so an error here still
         // prevents a double-leave. Mirror the same fact into the crash-path flag
@@ -24347,11 +24420,18 @@ fn term_display_width(symbol: &str) -> u16 {
 /// Emit a single buffer row up to its last non-blank cell, tracking style
 /// transitions, then reset SGR. Reuses ratatui's `into_crossterm` color mapping
 /// and mirrors its `ModifierDiff` so styling matches the stock backend exactly.
+///
+/// When `links.osc8` is set, URL/file-path runs in the row's reconstructed
+/// plain text are wrapped in OSC 8 hyperlink escapes (§11G.5) so a capable
+/// terminal makes them click-to-open. The escapes are out-of-band: the visible
+/// glyphs are byte-for-byte identical with and without them, so a terminal that
+/// ignores OSC 8 sees exactly the previous plain-text output.
 fn emit_buffer_row_styled<W: io::Write>(
     out: &mut W,
     buf: &Buffer,
     y: u16,
     width: u16,
+    links: hyperlinks::HyperlinkCapabilities,
 ) -> io::Result<()> {
     let mut last: Option<u16> = None;
     for x in 0..width {
@@ -24366,6 +24446,21 @@ fn emit_buffer_row_styled<W: io::Write>(
     }
     let Some(last) = last else {
         return Ok(());
+    };
+    // Per-column OSC 8 link plan: `open_at[x]` is the open sequence to emit just
+    // BEFORE printing the cell at column `x` (the run's first cell), and
+    // `close_at[x]` is `true` when the close sequence must follow the cell at
+    // column `x` (the run's last cell). Empty (and unconsulted) when the
+    // terminal is not OSC-8 capable, so a plain row stays on the exact previous
+    // byte path. Built from the row's reconstructed plain text so detection
+    // operates on the same characters the user sees.
+    let (open_at, close_at) = if links.osc8 {
+        plan_row_hyperlinks(buf, y, last)
+    } else {
+        (
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
     };
     let mut cur_fg = Color::Reset;
     let mut cur_bg = Color::Reset;
@@ -24382,6 +24477,10 @@ fn emit_buffer_row_styled<W: io::Write>(
     // edge so a glyph the terminal draws wider than ratatui measured can't
     // overflow the last column and wrap into scrollback.
     let mut rcol: u16 = 0;
+    // Whether an OSC 8 link is currently open, so a row clipped at the width
+    // edge mid-link still emits the close before the trailing SGR reset (an
+    // unbalanced open would leak the link onto following scrollback rows).
+    let mut link_open = false;
     queue!(out, SetAttribute(CtAttribute::Reset))?;
     for x in 0..=last {
         if to_skip > 0 {
@@ -24407,6 +24506,12 @@ fn emit_buffer_row_styled<W: io::Write>(
             break;
         }
         rcol += render_w;
+        // Open a link run before its first cell's glyph (and style), so the
+        // OSC 8 open precedes the visible text exactly as the spec frames it.
+        if let Some(open) = open_at.get(&x) {
+            queue!(out, Print(open))?;
+            link_open = true;
+        }
         if cell.modifier != cur_mod {
             apply_modifier_diff(out, cur_mod, cell.modifier)?;
             cur_mod = cell.modifier;
@@ -24423,7 +24528,17 @@ fn emit_buffer_row_styled<W: io::Write>(
             cur_bg = cell.bg;
         }
         queue!(out, Print(cell.symbol()))?;
+        // Close the link run after its last cell's glyph.
+        if close_at.get(&x).copied().unwrap_or(false) {
+            queue!(out, Print(hyperlinks::CLOSE_SEQUENCE))?;
+            link_open = false;
+        }
         to_skip = (cell.symbol().width() as u16).saturating_sub(1);
+    }
+    // A link clipped at the width edge never reached its close column; balance
+    // it before the SGR reset so the escape can't bleed onto the next row.
+    if link_open {
+        queue!(out, Print(hyperlinks::CLOSE_SEQUENCE))?;
     }
     queue!(
         out,
@@ -24431,6 +24546,68 @@ fn emit_buffer_row_styled<W: io::Write>(
         SetForegroundColor(CtColor::Reset),
         SetBackgroundColor(CtColor::Reset)
     )
+}
+
+/// Build the per-column OSC 8 link plan for buffer row `y` over columns
+/// `0..=last`: a `column -> open-sequence` map keyed on each link run's first
+/// cell and a `column -> bool` map flagging each run's last cell.
+///
+/// The row's plain text is reconstructed by concatenating cell symbols (one
+/// entry per column, skipping wide-glyph continuation cells exactly as the
+/// emit loop does), recording the byte offset at which each column's symbol
+/// begins. [`hyperlinks::find_links`] then operates on that text, and each
+/// returned byte span is mapped back to its first/last contributing column.
+/// Returning column-keyed maps lets the single emit pass stay O(width) with no
+/// re-scan.
+fn plan_row_hyperlinks(
+    buf: &Buffer,
+    y: u16,
+    last: u16,
+) -> (
+    std::collections::HashMap<u16, String>,
+    std::collections::HashMap<u16, bool>,
+) {
+    // Reconstruct the row text and remember, for each byte offset where a
+    // column's symbol starts, which column it was — so a detected byte span
+    // resolves to the columns that must carry the open/close escapes.
+    let mut text = String::new();
+    // (byte_offset_at_start_of_symbol, column) for every symbol-bearing column.
+    let mut col_at_byte: Vec<(usize, u16)> = Vec::new();
+    let mut to_skip: u16 = 0;
+    for x in 0..=last {
+        if to_skip > 0 {
+            to_skip -= 1;
+            continue;
+        }
+        let Some(cell) = buf.cell((x, y)) else {
+            continue;
+        };
+        let symbol = cell.symbol();
+        col_at_byte.push((text.len(), x));
+        text.push_str(symbol);
+        to_skip = (symbol.width() as u16).saturating_sub(1);
+    }
+    let links = hyperlinks::find_links(&text);
+    let mut open_at = std::collections::HashMap::new();
+    let mut close_at = std::collections::HashMap::new();
+    for link in links {
+        // First column whose symbol starts at or after the span start.
+        let first = col_at_byte
+            .iter()
+            .find(|(byte, _)| *byte >= link.start)
+            .map(|(_, col)| *col);
+        // Last column whose symbol starts strictly before the span end.
+        let last_col = col_at_byte
+            .iter()
+            .rev()
+            .find(|(byte, _)| *byte < link.end)
+            .map(|(_, col)| *col);
+        if let (Some(first), Some(last_col)) = (first, last_col) {
+            open_at.insert(first, hyperlinks::open_sequence(&link.uri));
+            close_at.insert(last_col, true);
+        }
+    }
+    (open_at, close_at)
 }
 
 /// Emit the SGR attribute changes to move from modifier set `from` to `to`.

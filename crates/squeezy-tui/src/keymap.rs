@@ -159,6 +159,11 @@ pub(crate) enum Action {
     /// Pan the no-wrap main view right one step (`Alt+l` default; §11G.4). The
     /// keyboard twin of Shift+wheel-down. A no-op while soft-wrap is on.
     ScrollBlockRight,
+    /// Cycle the OSC 8 hyperlink mode for rendered URLs/file paths (`Alt+8`
+    /// default; §11.5 / 11G.5). Rotates auto (the startup terminal probe) → on
+    /// (force click-to-open escapes) → off (force plain text), so a user whose
+    /// terminal was mis-detected either way can correct it without restarting.
+    ToggleHyperlinks,
 }
 
 impl Action {
@@ -202,6 +207,7 @@ impl Action {
             Self::ToggleSoftWrap => "toggle_soft_wrap",
             Self::ScrollBlockLeft => "scroll_block_left",
             Self::ScrollBlockRight => "scroll_block_right",
+            Self::ToggleHyperlinks => "toggle_hyperlinks",
         }
     }
 
@@ -244,6 +250,7 @@ impl Action {
         Action::ToggleSoftWrap,
         Action::ScrollBlockLeft,
         Action::ScrollBlockRight,
+        Action::ToggleHyperlinks,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -314,6 +321,8 @@ impl Action {
             | Self::ToggleSoftWrap
             | Self::ScrollBlockLeft
             | Self::ScrollBlockRight
+            // Hyperlink-mode toggle is `Alt+8` — the same Meta/Alt encoding case.
+            | Self::ToggleHyperlinks
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -433,6 +442,10 @@ impl Action {
             Self::ToggleSoftWrap => KeyBinding::new(KeyCode::Char('w'), KeyModifiers::ALT),
             Self::ScrollBlockLeft => KeyBinding::new(KeyCode::Char('h'), KeyModifiers::ALT),
             Self::ScrollBlockRight => KeyBinding::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            // Hyperlink-mode cycle (§11.5 / 11G.5). `Alt+8` — the `8` recalls
+            // "OSC 8". Bare `Alt` letters in the nav/copy family are taken;
+            // `Alt`+digit is free and mnemonic.
+            Self::ToggleHyperlinks => KeyBinding::new(KeyCode::Char('8'), KeyModifiers::ALT),
         }
     }
 }
