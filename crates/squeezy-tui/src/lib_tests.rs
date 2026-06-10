@@ -1671,6 +1671,222 @@ async fn begin_frame_clickables_clears_registry() {
     );
 }
 
+// ── External Editor Handoff (§12.6.5) integration ─────────────────────────
+
+/// Seed an open editor-handoff review overlay on `app` with a known change.
+fn open_editor_review(app: &mut TuiApp, original: &str, edited: &str) {
+    app.editor_handoff = Some(editor_handoff::EditorHandoffReview::new(
+        editor_handoff::EditorTarget::Composer,
+        original,
+        edited.to_string(),
+    ));
+}
+
+#[test]
+fn editor_handoff_outcome_changed_opens_review_unchanged_only_statuses() {
+    let mut app = test_app(SessionMode::Build);
+    // A real change opens the confirmation overlay seeded with the edited text.
+    apply_editor_handoff_outcome(
+        &mut app,
+        editor_handoff::EditorTarget::Composer,
+        "before",
+        editor_handoff::HandoffOutcome::Changed("after".to_string()),
+    );
+    let review = app.editor_handoff.as_ref().expect("review overlay opens");
+    assert_eq!(review.edited_text, "after");
+    assert_eq!(
+        review.selected_action(),
+        editor_handoff::ReviewAction::Accept
+    );
+
+    // An unchanged edit never opens the overlay — it only confirms via status.
+    app.editor_handoff = None;
+    apply_editor_handoff_outcome(
+        &mut app,
+        editor_handoff::EditorTarget::Composer,
+        "before",
+        editor_handoff::HandoffOutcome::Unchanged,
+    );
+    assert!(
+        app.editor_handoff.is_none(),
+        "an unchanged edit must not open the overlay"
+    );
+    assert!(app.status.contains("no changes"), "status: {}", app.status);
+}
+
+#[tokio::test]
+async fn editor_handoff_keyboard_accept_replaces_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "before".to_string();
+    open_editor_review(&mut app, "before", "after the edit");
+
+    // Enter on the freshly-opened overlay (Accept is the default) re-imports the
+    // edited buffer into the composer and closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.editor_handoff.is_none(), "Accept closes the overlay");
+    assert_eq!(
+        app.input, "after the edit",
+        "composer takes the edited text"
+    );
+    assert_eq!(app.input_cursor, app.input.len(), "caret parks at the end");
+}
+
+#[tokio::test]
+async fn editor_handoff_keyboard_discard_keeps_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "before".to_string();
+    open_editor_review(&mut app, "before", "after");
+
+    // Down twice lands on Discard; Enter throws the edit away and keeps the
+    // pre-edit composer untouched.
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.editor_handoff.is_none(), "Discard closes the overlay");
+    assert_eq!(app.input, "before", "Discard leaves the composer as it was");
+}
+
+#[tokio::test]
+async fn editor_handoff_esc_discards_and_swallows_stray_keys() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "before".to_string();
+    open_editor_review(&mut app, "before", "after");
+
+    // A stray printable key is swallowed by the modal — it never leaks into the
+    // composer underneath.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.editor_handoff.is_some(),
+        "stray key keeps the overlay open"
+    );
+    assert_eq!(app.input, "before", "stray key must not reach the composer");
+
+    // Esc discards.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.editor_handoff.is_none(), "Esc discards the overlay");
+    assert_eq!(app.input, "before");
+}
+
+#[tokio::test]
+async fn editor_handoff_letter_shortcut_accepts() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "before".to_string();
+    open_editor_review(&mut app, "before", "edited via shortcut");
+
+    // `a` is the direct Accept shortcut regardless of the cursor position.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.editor_handoff.is_none());
+    assert_eq!(app.input, "edited via shortcut");
+}
+
+#[test]
+fn editor_handoff_renders_through_render_with_summary_and_buttons() {
+    let mut app = test_app(SessionMode::Build);
+    open_editor_review(&mut app, "line one", "line one\nline two\nline three");
+    let output = render_to_string(&app, 100, 24);
+    // Header summary, the edited preview, and all three action buttons paint.
+    assert!(output.contains("Editor handoff"), "{output}");
+    assert!(output.contains("1 → 3 lines"), "{output}");
+    assert!(output.contains("line three"), "{output}");
+    assert!(output.contains("Accept"), "{output}");
+    assert!(output.contains("Reopen"), "{output}");
+    assert!(output.contains("Discard"), "{output}");
+}
+
+#[test]
+fn editor_handoff_renders_on_a_tiny_resize_without_panicking() {
+    // Edge case: a terminal smaller than the modal caps must still paint (the
+    // surface helper shrinks to fit) and must not panic on the subtraction math.
+    let mut app = test_app(SessionMode::Build);
+    open_editor_review(&mut app, "x", "y");
+    // Several small sizes, including ones narrower/shorter than the chrome.
+    for (w, h) in [(20u16, 6u16), (8, 3), (40, 10), (1, 1)] {
+        let _ = render_to_string(&app, w, h);
+    }
+}
+
+#[tokio::test]
+async fn editor_handoff_mouse_click_on_discard_button_keeps_composer() {
+    let mut app = test_app(SessionMode::Build);
+    app.input = "before".to_string();
+    open_editor_review(&mut app, "before", "after");
+
+    // Render through the real `render()` so the button click targets register,
+    // then locate the Discard button's rect from the registry and click it.
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    let mut discard_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..100u16 {
+            if let Some((_, interaction::Action::EditorHandoffSelect(2))) =
+                app.click_target_at(col, row)
+            {
+                discard_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = discard_cell.expect("the Discard button registers a click target");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.editor_handoff.is_none(),
+        "clicking Discard closes the overlay"
+    );
+    assert_eq!(app.input, "before", "clicking Discard keeps the composer");
+}
+
 #[tokio::test]
 async fn wheel_scroll_works_in_inline_mode() {
     let mut app = test_app(SessionMode::Build);

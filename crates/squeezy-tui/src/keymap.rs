@@ -177,6 +177,13 @@ pub(crate) enum Action {
     /// atomically under session storage, and echoes a preview into the transcript
     /// for review before sharing. A one-shot action — it paints nothing at idle.
     BuildSessionBundle,
+    /// Open the composer text in the user's `$VISUAL`/`$EDITOR` (`Alt+e` default;
+    /// §12.6.5 External Editor Handoff). Suspends the alt-screen, hands a temp
+    /// file to the editor, and re-imports the saved buffer through an
+    /// accept/reopen/discard confirmation. A safe no-op (status hint) when no
+    /// editor is configured, and degrades to the same hint off Unix where the
+    /// spawn/terminal-restore plumbing is not wired. Records nothing at idle.
+    OpenComposerInEditor,
 }
 
 impl Action {
@@ -223,6 +230,7 @@ impl Action {
             Self::ToggleHyperlinks => "toggle_hyperlinks",
             Self::ToggleClipboardHistory => "toggle_clipboard_history",
             Self::BuildSessionBundle => "build_session_bundle",
+            Self::OpenComposerInEditor => "open_composer_in_editor",
         }
     }
 
@@ -268,6 +276,7 @@ impl Action {
         Action::ToggleHyperlinks,
         Action::ToggleClipboardHistory,
         Action::BuildSessionBundle,
+        Action::OpenComposerInEditor,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -345,6 +354,9 @@ impl Action {
             | Self::ToggleClipboardHistory
             // Session-bundle build is `Alt+b` — the same Meta/Alt encoding case.
             | Self::BuildSessionBundle
+            // External-editor handoff is `Alt+e` — the same Meta/Alt encoding
+            // case as the rest of the nav/copy family.
+            | Self::OpenComposerInEditor
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -477,6 +489,10 @@ impl Action {
             // `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p) are
             // taken; `b` is free.
             Self::BuildSessionBundle => KeyBinding::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            // External Editor Handoff (§12.6.5). `Alt+e` — `e` recalls "edit".
+            // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p)
+            // are taken; `e` is free.
+            Self::OpenComposerInEditor => KeyBinding::new(KeyCode::Char('e'), KeyModifiers::ALT),
         }
     }
 }

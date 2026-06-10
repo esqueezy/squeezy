@@ -628,6 +628,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         A::ClipboardRecopy(_) => KeyboardPath::Always("clipboard history Enter"),
         A::ClipboardDelete(_) => KeyboardPath::Always("clipboard history d"),
         A::ClipboardClear => KeyboardPath::Always("clipboard history c"),
+        // External Editor Handoff confirmation overlay (§12.6.5) — the overlay's
+        // own key handler owns ↑↓/kj (move the cursor), Enter (apply), and the
+        // a/r/d first-letter shortcuts before the global keymap sees them, so the
+        // button click and the keyboard reach the same `apply_editor_handoff_review`
+        // handler.
+        A::EditorHandoffSelect(_) => KeyboardPath::Always("editor handoff ↑↓/Enter"),
     })
 }
 

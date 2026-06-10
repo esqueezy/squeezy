@@ -90,6 +90,7 @@ mod config_screen;
 mod copy;
 mod diff_detail_pane;
 mod dogfood;
+mod editor_handoff;
 mod events;
 mod export_destination;
 mod fuzzy;
@@ -915,6 +916,16 @@ async fn run_inner_with_terminal(
         if signal_teardown::take_suspend_request() {
             terminal.suspend_and_resume(&mut app);
         }
+
+        // External Editor Handoff (§12.6.5): if `Alt+e` queued a handoff, run it
+        // here at the top of the loop (the guard owns the terminal, so it can
+        // safely suspend the alt-screen around the editor spawn) before the next
+        // draw. `run_pending_editor_handoff` is a no-op when nothing is queued, so
+        // this costs a single `Option` check at idle. Unix-only: the spawn /
+        // terminal-restore plumbing is gated to Unix, and the dispatch never
+        // queues a request off Unix.
+        #[cfg(unix)]
+        terminal.run_pending_editor_handoff(&mut app);
 
         // Drain producers first so the next draw reflects everything that
         // has landed since the previous iteration. A flurry of events
@@ -1761,6 +1772,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.paste_transform.is_some()
         || app.paste_staging.is_some()
         || app.clipboard_history_open
+        || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
         return false;
@@ -2325,6 +2337,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 _ => dispatch_click_action(app, action),
             }
         }
+        return true;
+    }
+
+    // The External Editor Handoff confirmation overlay (§12.6.5) owns the pointer
+    // while open: a left-click on an accept/reopen/discard button selects +
+    // applies that action; any other click is swallowed so a stray press can't
+    // fall through to the surface beneath. Hit-tested in ABSOLUTE screen
+    // coordinates against the button targets `render_editor_handoff_surface`
+    // registered this frame.
+    if app.editor_handoff.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::EditorHandoffItem(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -3508,6 +3539,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // key never leaks into the composer underneath. Sits beside the paste modal
     // at the front for the same reason.
     if app.clipboard_history_open && handle_clipboard_history_key(app, key) {
+        return Ok(false);
+    }
+
+    // The External Editor Handoff confirmation overlay (§12.6.5) is modal while
+    // open: it owns the keyboard (↑↓/kj move, Enter apply, a/r/d shortcuts, Esc
+    // discard) BEFORE any selection-clear, search, chord, or keymap dispatch, so
+    // a stray key never leaks into the composer underneath while the user is
+    // deciding whether to re-import an edit. Sits beside the other front-of-loop
+    // modals for the same reason.
+    if app.editor_handoff.is_some() && handle_editor_handoff_key(app, key) {
         return Ok(false);
     }
 
@@ -5123,6 +5164,17 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             handle_bundle_command(app, agent, "");
             true
         }
+        keymap::Action::OpenComposerInEditor => {
+            // Main-composer-only verb (§12.6.5): the config/setup screens own
+            // their own input, and the Ctrl+T overlay guard above already blocks
+            // this while the overlay is open. A turn being live is fine — editing
+            // the composer text never touches the running turn.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            open_composer_in_editor(app);
+            true
+        }
     }
 }
 
@@ -5301,6 +5353,216 @@ fn toggle_pin_selected_clipboard_entry(app: &mut TuiApp) {
         } else {
             "clipboard entry unpinned".to_string()
         };
+        app.needs_redraw = true;
+    }
+}
+
+/// `Alt+e`: open the composer text in the user's `$VISUAL`/`$EDITOR` (§12.6.5
+/// External Editor Handoff). Resolves the editor from the environment; when none
+/// is configured (or this is a non-Unix build, where the suspend/spawn plumbing
+/// is not wired) this degrades to a safe status hint and changes nothing.
+/// Otherwise it stamps a [`editor_handoff::EditorHandoffRequest`] for the run
+/// loop to execute on its next turn — the loop owns the terminal guard, so it
+/// (not this side-effect-light arm) does the alt-screen suspend / spawn /
+/// restore. Editing during a live turn is fine: the composer text is independent
+/// of the running turn.
+fn open_composer_in_editor(app: &mut TuiApp) {
+    // Off Unix the suspend/spawn/terminal-restore differs sharply (see the spec's
+    // platform notes), so the spawn is Unix-only; the non-Unix build keeps the
+    // keybinding reachable but degrades to the same hint as "no editor set".
+    #[cfg(not(unix))]
+    {
+        app.status = "external editor handoff is only available on Unix builds".to_string();
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let Some(command) = editor_handoff::resolve_editor(|key| std::env::var_os(key)) else {
+            app.status =
+                "no editor configured — set $VISUAL or $EDITOR to edit in your editor".to_string();
+            return;
+        };
+        app.pending_editor_handoff = Some(editor_handoff::EditorHandoffRequest {
+            target: editor_handoff::EditorTarget::Composer,
+            initial_text: app.input.clone(),
+            command,
+        });
+        // The loop runs the handoff before its next draw; surface the editor we
+        // are about to hand off to so the brief alt-screen leave is explained.
+        app.status = format!(
+            "opening composer in {} …",
+            app.pending_editor_handoff
+                .as_ref()
+                .map(|r| r.command.display())
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// Apply a completed editor handoff to the app: a real change opens the
+/// accept/reopen/discard confirmation overlay (§12.6.5) seeded with the edited
+/// text; an unchanged buffer just confirms via the status line. Shared by the
+/// loop's run path and the overlay's "Reopen" round-trip so both land in the
+/// same place. Marks a redraw since the overlay (or status) is a visible change.
+///
+/// Driven only from the Unix spawn path (and the tests); off Unix the spawn is
+/// not wired, so this is dead in a non-Unix lib build — hence the `dead_code`
+/// allow for the Windows clippy gate.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn apply_editor_handoff_outcome(
+    app: &mut TuiApp,
+    target: editor_handoff::EditorTarget,
+    original: &str,
+    outcome: editor_handoff::HandoffOutcome,
+) {
+    match outcome {
+        editor_handoff::HandoffOutcome::Changed(edited) => {
+            let review = editor_handoff::EditorHandoffReview::new(target, original, edited);
+            app.status = format!("edited in editor · {} — Enter accept", review.summary());
+            app.editor_handoff = Some(review);
+        }
+        editor_handoff::HandoffOutcome::Unchanged => {
+            app.status = "editor closed — no changes".to_string();
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Report a failed editor handoff (spawn error, read-back failure, …) on the
+/// status line. The terminal is already restored by the loop's run path before
+/// this is called, so this only surfaces the error text — nothing is applied to
+/// the composer. Driven only from the Unix spawn path, so dead off Unix — hence
+/// the `dead_code` allow for the Windows clippy gate.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn report_editor_handoff_error(app: &mut TuiApp, error: &std::io::Error) {
+    app.status = format!("editor handoff failed: {error}");
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the External Editor Handoff confirmation overlay (§12.6.5)
+/// is open. Returns `true` when the key was consumed (so it never leaks to the
+/// composer or the global keymap). Mirrors the other modal overlays: Esc / `q`
+/// discard, Up/Down (and `k`/`j`) move the action cursor, Enter applies the
+/// highlighted action, and the action's first letter (a/r/d) is a direct
+/// shortcut. The keyboard twin of clicking an action button.
+fn handle_editor_handoff_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.editor_handoff.is_none() {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            discard_editor_handoff(app);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(review) = app.editor_handoff.as_mut() {
+                review.move_up();
+                app.needs_redraw = true;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(review) = app.editor_handoff.as_mut() {
+                review.move_down();
+                app.needs_redraw = true;
+            }
+        }
+        KeyCode::Enter => {
+            apply_editor_handoff_review(app);
+        }
+        // Direct first-letter shortcuts for each action, so the user need not
+        // arrow to a button first. Lower/upper both accepted.
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            select_and_apply_editor_handoff(app, editor_handoff::ReviewAction::Accept);
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            select_and_apply_editor_handoff(app, editor_handoff::ReviewAction::Reopen);
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            select_and_apply_editor_handoff(app, editor_handoff::ReviewAction::Discard);
+        }
+        // Swallow every other key so the overlay stays modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Move the review cursor onto `action` and apply it (the shared first-letter /
+/// mouse path). A click or a letter shortcut both select and apply in one go.
+fn select_and_apply_editor_handoff(app: &mut TuiApp, action: editor_handoff::ReviewAction) {
+    if let Some(index) = editor_handoff::ReviewAction::ALL
+        .iter()
+        .position(|a| *a == action)
+        && let Some(review) = app.editor_handoff.as_mut()
+    {
+        review.select(index);
+    }
+    apply_editor_handoff_review(app);
+}
+
+/// Apply the highlighted review action: Accept re-imports the edited text into
+/// the composer, Reopen hands the edited text back to the editor for another
+/// pass, and Discard throws the edit away. Closes the overlay (except Reopen,
+/// which closes it and re-queues a fresh handoff).
+fn apply_editor_handoff_review(app: &mut TuiApp) {
+    let Some(review) = app.editor_handoff.as_ref() else {
+        return;
+    };
+    match review.selected_action() {
+        editor_handoff::ReviewAction::Accept => {
+            let Some(review) = app.editor_handoff.take() else {
+                return;
+            };
+            // Replace the composer outright with the edited buffer; the handoff
+            // edits the whole composer, not a fragment, so a full replace (not an
+            // insert) is correct, and parks the caret at the end.
+            input::set_input(app, review.edited_text);
+            app.status = "composer updated from editor".to_string();
+            app.needs_redraw = true;
+        }
+        editor_handoff::ReviewAction::Reopen => {
+            // Hand the edited text back to the editor for another pass. Off Unix
+            // (where the spawn is not wired) the queued request never runs, so
+            // fall back to accepting the edit rather than silently discarding it.
+            let Some(review) = app.editor_handoff.take() else {
+                return;
+            };
+            #[cfg(unix)]
+            {
+                let target = review.target;
+                let text = review.edited_text;
+                if let Some(command) = editor_handoff::resolve_editor(|key| std::env::var_os(key)) {
+                    app.pending_editor_handoff = Some(editor_handoff::EditorHandoffRequest {
+                        target,
+                        initial_text: text,
+                        command,
+                    });
+                    app.status = "reopening in editor …".to_string();
+                    app.needs_redraw = true;
+                } else {
+                    // Editor disappeared between passes — keep the edit.
+                    input::set_input(app, text);
+                    app.status = "editor no longer configured — kept the edit".to_string();
+                    app.needs_redraw = true;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                input::set_input(app, review.edited_text);
+                app.status = "composer updated from editor".to_string();
+                app.needs_redraw = true;
+            }
+        }
+        editor_handoff::ReviewAction::Discard => {
+            discard_editor_handoff(app);
+        }
+    }
+}
+
+/// Close the editor-handoff confirmation overlay without applying the edit. A
+/// no-op when nothing is in flight. The composer keeps its pre-edit text.
+fn discard_editor_handoff(app: &mut TuiApp) {
+    if app.editor_handoff.take().is_some() {
+        app.status = "editor changes discarded".to_string();
         app.needs_redraw = true;
     }
 }
@@ -6570,6 +6832,16 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             app.clipboard_history.clear();
             app.status = "clipboard history cleared".to_string();
             app.needs_redraw = true;
+        }
+        // External Editor Handoff confirmation overlay (§12.6.5): clicking a
+        // button selects that action and applies it, the same `select` +
+        // `apply_editor_handoff_review` the keyboard path drives, so the mouse
+        // and Enter verbs are identical by construction.
+        interaction::Action::EditorHandoffSelect(index) => {
+            if let Some(review) = app.editor_handoff.as_mut() {
+                review.select(index);
+            }
+            apply_editor_handoff_review(app);
         }
     }
 }
@@ -12020,6 +12292,15 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_clipboard_history_surface(frame, area, app);
         return;
     }
+    // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
+    // fullscreen modal over everything else while open, registering its
+    // accept/reopen/discard button click targets every frame. Checked after the
+    // clipboard picker but before the transcript overlay / config screens so it
+    // owns the surface while a re-import decision is pending.
+    if app.editor_handoff.is_some() {
+        render_editor_handoff_surface(frame, area, app);
+        return;
+    }
     if app.transcript_overlay.is_some() {
         render_transcript_overlay_surface(frame, area, app);
         return;
@@ -12762,6 +13043,178 @@ fn render_clipboard_history_buttons(frame: &mut Frame<'_>, inner: Rect, app: &Tu
                 interaction::Action::ClipboardClear,
             );
         }
+    }
+}
+
+/// Paint the External Editor Handoff confirmation overlay (§12.6.5) as a
+/// centered modal: a header summarizing the change, a bounded preview of the
+/// edited buffer, and the accept/reopen/discard action rows. Each action row is
+/// registered as an [`interaction::ChromeKey::EditorHandoffItem`] click target so
+/// the mouse and keyboard reach the same `apply_editor_handoff_review` path.
+fn render_editor_handoff_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(review) = app.editor_handoff.as_ref() else {
+        return;
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " Editor handoff ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "— re-import the edited text? ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 90, 22, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: the coarse line-count summary of the change.
+    let header = Line::from(Span::styled(
+        format!(
+            "Edited {} · ↑↓ choose · Enter apply · Esc discard",
+            review.summary()
+        ),
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    // Preview: a bounded head window of the edited buffer so a huge edit renders
+    // at a fixed size. Sits between the header and the bottom action strip.
+    let actions_rows = editor_handoff::ReviewAction::ALL.len() as u16;
+    let preview_top = inner.y.saturating_add(2);
+    let preview_bottom = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(actions_rows.saturating_add(1));
+    if preview_bottom > preview_top {
+        let preview_rect = Rect {
+            x: inner.x,
+            y: preview_top,
+            width: inner.width,
+            height: preview_bottom - preview_top,
+        };
+        render_editor_handoff_preview(frame, preview_rect, &review.edited_text);
+    }
+
+    render_editor_handoff_actions(frame, inner, app, review);
+}
+
+/// Paint a bounded, single-line-per-row preview of the edited buffer into
+/// `rect`. Tabs are rendered as spaces and control bytes dropped so a pasted
+/// escape sequence cannot reach the terminal inertly; lines past the window are
+/// summarized by a "+N more lines" marker on the last row.
+fn render_editor_handoff_preview(frame: &mut Frame<'_>, rect: Rect, text: &str) {
+    if rect.height == 0 {
+        return;
+    }
+    let rows = rect.height as usize;
+    let lines: Vec<&str> = text.lines().collect();
+    let window = rows.saturating_sub(1).max(1);
+    let shown = lines.len().min(window);
+    let quiet = crate::render::theme::quiet();
+    let foreground = crate::render::theme::foreground();
+
+    for (offset, raw) in lines.iter().take(shown).enumerate() {
+        // Drop control bytes (keep tabs as spaces) so the inert preview never
+        // emits a stray escape sequence into the modal.
+        let sanitized: String = raw
+            .chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        let line = Line::from(Span::styled(sanitized, Style::default().fg(foreground)));
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                x: rect.x,
+                y: rect.y + offset as u16,
+                width: rect.width,
+                height: 1,
+            },
+        );
+    }
+    if lines.len() > shown {
+        let more = lines.len() - shown;
+        let marker = Line::from(Span::styled(
+            format!(
+                "… +{more} more {}",
+                if more == 1 { "line" } else { "lines" }
+            ),
+            Style::default().fg(quiet),
+        ));
+        frame.render_widget(
+            Paragraph::new(marker),
+            Rect {
+                x: rect.x,
+                y: rect.y + shown.min(rows.saturating_sub(1)) as u16,
+                width: rect.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// Paint the accept/reopen/discard action rows on the modal's bottom rows and
+/// register each as an [`interaction::ChromeKey::EditorHandoffItem`] click
+/// target. The highlighted action (the keyboard cursor) is shown bold/accented;
+/// the others quiet. Mouse and keyboard reach the same handler, so parity holds.
+fn render_editor_handoff_actions(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    app: &TuiApp,
+    review: &editor_handoff::EditorHandoffReview,
+) {
+    let actions = editor_handoff::ReviewAction::ALL;
+    let first_row = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(actions.len() as u16);
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    let selected = review.selected_index();
+
+    for (index, action) in actions.iter().enumerate() {
+        let row_y = first_row + index as u16;
+        if row_y >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+        let is_selected = index == selected;
+        let marker = if is_selected { "› " } else { "  " };
+        let style = if is_selected {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(quiet)
+        };
+        // The first letter (a/r/d) is the keyboard shortcut; spell it out so the
+        // button label and the shortcut never drift.
+        let shortcut = action
+            .label()
+            .chars()
+            .next()
+            .unwrap_or(' ')
+            .to_ascii_lowercase();
+        let line = Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(format!("[ {} ({shortcut}) ]", action.label()), style),
+        ]);
+        let row_rect = Rect {
+            x: inner.x,
+            y: row_y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(line), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::EditorHandoffItem(index)),
+            interaction::Action::EditorHandoffSelect(index),
+        );
     }
 }
 
@@ -23992,6 +24445,23 @@ pub(crate) struct TuiApp {
     /// picker owns key/mouse routing. Toggled by the `ToggleClipboardHistory`
     /// keymap action.
     pub(crate) clipboard_history_open: bool,
+    /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
+    /// `None` = no handoff in flight (the resting state, paints nothing extra);
+    /// `Some` = the user edited the composer in `$EDITOR` and the
+    /// accept/reopen/discard confirmation owns key/mouse routing. Opened only
+    /// after a successful edit that actually changed the text.
+    pub(crate) editor_handoff: Option<editor_handoff::EditorHandoffReview>,
+    /// A queued External Editor Handoff (§12.6.5) the `Alt+e` dispatch stamped
+    /// for the run loop to execute. `None` = nothing queued; `Some` = the loop's
+    /// next turn should suspend the alt-screen, run the editor, restore, and
+    /// apply the result. The keymap arm only resolves the editor and records the
+    /// request here so it stays side-effect-light; the loop owns the terminal
+    /// guard and so the suspend/spawn/restore. Always drained the same turn, so
+    /// it is `Some` for at most one loop iteration. Only read on Unix (the spawn
+    /// path); off Unix the dispatch never queues a request, so the field is dead
+    /// there — hence the non-Unix `dead_code` allow for the Windows clippy gate.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) pending_editor_handoff: Option<editor_handoff::EditorHandoffRequest>,
     /// Persistent main-view focus cursor for entry/tool/code copies, as a
     /// `RowId` into the freshly built transcript row list. `None` defaults to
     /// the live tail (the last entry-owned row), so "copy current entry"
@@ -24535,6 +25005,8 @@ impl TuiApp {
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),
             clipboard_history: clipboard_history::ClipboardHistoryStore::new(),
             clipboard_history_open: false,
+            editor_handoff: None,
+            pending_editor_handoff: None,
             copy_focus: None,
             copy_format: copy::CopyFormat::default_format(),
             main_text_width: std::cell::Cell::new(0),
@@ -26563,6 +27035,99 @@ impl TerminalGuard {
         // next turn regardless of the idle-skip gate.
         let _ = self.term().clear();
         mark_full_redraw_after_resume(app);
+    }
+
+    /// Execute a queued External Editor Handoff (§12.6.5) if one is pending.
+    ///
+    /// The `Alt+e` dispatch only resolves the editor and stamps
+    /// [`TuiApp::pending_editor_handoff`]; the run loop owns this guard, so it is
+    /// the right place to suspend the alt-screen around the spawn (running a
+    /// full-screen editor *inside* the alt-screen would fight it — leaving the
+    /// alt-screen first is the safe option the spec calls for).
+    ///
+    /// Order mirrors [`Self::suspend_and_resume`]:
+    ///   1. RESTORE the terminal to a sane shell state (reuse the single-sourced
+    ///      emergency-teardown bytes: leave alt-screen, disable mouse / paste /
+    ///      focus, reset title, show cursor, disable raw mode LAST) so the editor
+    ///      inherits a normal terminal.
+    ///   2. Run the editor on a temp file via [`editor_handoff::run_handoff`],
+    ///      blocking until it exits.
+    ///   3. RE-ENTER the alt-screen (raw mode, enter setup, hidden cursor) and
+    ///      force a full repaint, exactly like resume.
+    ///   4. Apply the outcome (open the accept/reopen/discard overlay on a real
+    ///      change, status-only when unchanged, error on failure).
+    ///
+    /// Best-effort terminal restoration throughout: every emit is `let _ =` so a
+    /// flaky terminal cannot abort the re-enter mid-restore. A no-op when no
+    /// handoff is queued or the alternate screen has already been left.
+    #[cfg(unix)]
+    fn run_pending_editor_handoff(&mut self, app: &mut TuiApp) {
+        let Some(request) = app.pending_editor_handoff.take() else {
+            return;
+        };
+        if !self.alt_screen_active {
+            // The screen is already torn down (a clean exit raced the handoff);
+            // there is nothing safe to suspend/restore around, so drop it.
+            return;
+        }
+
+        // 1. Restore the terminal BEFORE spawning the editor.
+        {
+            let backend = self.term().backend_mut();
+            let _ = emit_terminal_emergency_teardown(backend, /* alt_screen_active = */ true);
+            let _ = backend.flush();
+        }
+        let _ = self.term().show_cursor();
+        let _ = disable_raw_mode();
+        self.alt_screen_active = false;
+        signal_teardown::set_alt_screen_active(false);
+
+        // 2. Run the editor on a temp file under the platform temp dir (never a
+        //    hardcoded /tmp). A monotonic nonce + the pid keep the leaf unique.
+        let nonce = app.next_queue_id;
+        let dir = std::env::temp_dir();
+        let outcome = editor_handoff::run_handoff(
+            &request.command,
+            request.target,
+            &request.initial_text,
+            &dir,
+            std::process::id(),
+            nonce,
+            |command, path| {
+                let status = std::process::Command::new(&command.program)
+                    .args(&command.args)
+                    .arg(path)
+                    .status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "editor exited with status {status}"
+                    )))
+                }
+            },
+        );
+
+        // 3. RE-ENTER the alternate screen and force a full repaint.
+        let _ = enable_raw_mode();
+        {
+            let mouse_capture = self.mouse_capture;
+            let backend = self.term().backend_mut();
+            let _ = emit_terminal_enter_setup(backend, mouse_capture);
+            let _ = backend.flush();
+        }
+        self.alt_screen_active = true;
+        signal_teardown::set_alt_screen_active(true);
+        let _ = self.term().clear();
+        mark_full_redraw_after_resume(app);
+
+        // 4. Apply the outcome (terminal is restored, so a failure only reports).
+        match outcome {
+            Ok(outcome) => {
+                apply_editor_handoff_outcome(app, request.target, &request.initial_text, outcome);
+            }
+            Err(error) => report_editor_handoff_error(app, &error),
+        }
     }
 
     /// Paint a single centered status line, flushed before the first real

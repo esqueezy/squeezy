@@ -111,6 +111,10 @@ pub(crate) enum ChromeKey {
     ClipboardDelete,
     /// The "Clear all" button in the clipboard-history picker (§12.6.1).
     ClipboardClear,
+    /// An action button in the External Editor Handoff confirmation overlay
+    /// (§12.6.5), keyed by its 0-based index in the accept/reopen/discard list so
+    /// a click selects exactly that action.
+    EditorHandoffItem(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -202,6 +206,11 @@ pub(crate) enum Action {
     /// Clear the entire in-app clipboard history (§12.6.1). Mouse twin of the
     /// picker's `c` verb / the "Clear all" button.
     ClipboardClear,
+    /// Select (move the cursor to) the given action in the External Editor
+    /// Handoff confirmation overlay (§12.6.5) and apply it. Mouse twin of moving
+    /// the cursor with ↑↓ and pressing Enter; a click both selects and applies
+    /// the accept/reopen/discard action in one go.
+    EditorHandoffSelect(usize),
 }
 
 impl Action {
@@ -237,6 +246,7 @@ impl Action {
         Action::ClipboardRecopy(0),
         Action::ClipboardDelete(0),
         Action::ClipboardClear,
+        Action::EditorHandoffSelect(0),
     ];
 }
 
