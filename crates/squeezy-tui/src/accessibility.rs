@@ -680,6 +680,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // row click and the keyboard reach the same `lane_fold_toggle_selected`
         // handler.
         A::LaneFoldToggle(_) => KeyboardPath::Always("lane folds ↑↓/Enter"),
+        // Reading Position Bookmarks overlay (§12.2.4) — the overlay's own key
+        // handler owns ↑↓/kj/n/p (move the bookmark cursor / next-previous) and
+        // Enter (jump to the entry behind the selected bookmark) before the global
+        // keymap sees them, so a row click and the keyboard reach the same
+        // `bookmark_jump_to_selected` handler.
+        A::BookmarkSelectJump(_) => KeyboardPath::Always("bookmarks ↑↓/Enter"),
     })
 }
 

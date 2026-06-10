@@ -82,6 +82,7 @@ mod approval;
 // its sibling `bench_render_tests.rs`, so the module carries no dead code.
 #[cfg(test)]
 mod bench_render;
+mod bookmarks;
 mod clipboard;
 mod clipboard_history;
 mod commands;
@@ -1789,6 +1790,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.health_markers_open
         || app.turn_outline_open
         || app.lane_fold_open
+        || app.bookmarks_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -1827,6 +1829,9 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // Entry ids restart from 0 on a transcript rebuild, so old marks
             // would point at unrelated new entries — drop them.
             app.jump_marks = jump_marks::JumpMarkStack::new();
+            // Reading Position Bookmarks (§12.2.4) are keyed by entry id too, so
+            // they would likewise re-anchor to unrelated new entries — drop them.
+            app.bookmarks = bookmarks::BookmarkStore::new();
             app.clear_turn_divider();
             for item in transcript {
                 hydrate_transcript_item(app, item);
@@ -2478,6 +2483,27 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::LaneFoldRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Reading Position Bookmarks overlay (§12.2.4) owns the pointer while
+    // open: a left-click on a bookmark row selects it and jumps the main view to
+    // the entry that bookmark anchors; every other click is swallowed so a stray
+    // press can't fall through to the surface beneath. Hit-tested in ABSOLUTE
+    // screen coordinates against the row targets `render_bookmarks_surface`
+    // registered this frame. While the rename field is active a click is swallowed
+    // (the text field has no clickable affordances).
+    if app.bookmarks_open {
+        if app.bookmark_rename.is_none()
+            && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::BookmarkRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3806,6 +3832,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
     if app.lane_fold_open && handle_lane_fold_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Reading Position Bookmarks overlay (§12.2.4) is modal while open: it
+    // owns the keyboard (↑↓/kj/n/p move the bookmark cursor, Enter jump, r rename,
+    // d/Delete delete, Esc/Alt+q close — or, in rename mode, free text edit) BEFORE
+    // any selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.bookmarks_open && handle_bookmarks_key(app, key) {
         return Ok(false);
     }
 
@@ -5546,6 +5582,26 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_pinned_compare(app);
             true
         }
+        keymap::Action::DropBookmark => {
+            // Main-surface verb; the config/setup screens own their own routing,
+            // and the Ctrl+T overlay guard above already blocks this while an
+            // overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            drop_bookmark(app);
+            true
+        }
+        keymap::Action::ToggleBookmarks => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_bookmarks(app);
+            true
+        }
     }
 }
 
@@ -6517,6 +6573,257 @@ fn lane_fold_set_all(app: &mut TuiApp, collapse: bool) {
         "expanded all lanes"
     };
     app.status = format!("lane folds: {verb} — Esc close");
+    app.needs_redraw = true;
+}
+
+// ---- Reading Position Bookmarks (§12.2.4) ----
+
+/// `Alt+t`: drop a Reading Position Bookmark at the entry currently at the top of
+/// the viewport (§12.2.4). The bookmark anchors to the entry's stable id, so it
+/// survives every later append, resize, fold, and filter. Dropped anonymous (the
+/// overlay can name it later). A no-op (status hint) on an empty transcript.
+fn drop_bookmark(app: &mut TuiApp) {
+    let Some(entry_id) = current_top_entry_id(app) else {
+        app.status = "no transcript to bookmark".to_string();
+        return;
+    };
+    app.bookmarks.add(entry_id, None);
+    let label = jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"));
+    let count = app.bookmarks.len();
+    app.status = format!("bookmark dropped at {label} ({count} total) — Alt+q to list");
+    app.needs_redraw = true;
+}
+
+/// `Alt+q`: toggle the Reading Position Bookmarks overlay (§12.2.4) — a list of
+/// every bookmark in transcript-reading order. Opening it parks the cursor on the
+/// nearest bookmark to the current reading position (so the list opens where the
+/// user is looking), leaves rename mode off, and confirms via the status line.
+/// Sets `needs_redraw` so the toggle paints immediately.
+fn toggle_bookmarks(app: &mut TuiApp) {
+    app.bookmarks_open = !app.bookmarks_open;
+    if app.bookmarks_open {
+        app.bookmark_rename = None;
+        // Park the cursor on the bookmark nearest the current reading position so
+        // the list opens where the user is looking. Stale-but-still-anchored
+        // bookmarks are kept and shown as "unresolved" at paint time (per the
+        // spec) rather than pruned; a hard transcript reset clears the whole store
+        // at the rebuild site instead.
+        app.bookmarks_selected = bookmark_cursor_near_current(app);
+        app.status = if app.bookmarks.is_empty() {
+            "bookmarks (none yet) — Alt+t to drop one \u{00b7} Esc close".to_string()
+        } else {
+            format!(
+                "bookmarks: {} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} r rename \u{00b7} d delete \u{00b7} Esc close",
+                app.bookmarks.len(),
+            )
+        };
+    } else {
+        app.bookmark_rename = None;
+        app.status = "bookmarks closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// The list index of the bookmark nearest the current top-of-view reading
+/// position, so the overlay opens with its cursor where the user is. Prefers the
+/// first bookmark at or after the position; when the view sits past every bookmark
+/// (nothing after it) it parks on the last bookmark via the reverse walk instead
+/// of wrapping to the top. `0` on an empty store.
+fn bookmark_cursor_near_current(app: &TuiApp) -> usize {
+    let current = current_top_entry_id(app);
+    // Prefer the first bookmark at or after the view; when the view sits past
+    // every bookmark, `prev` parks on the last one rather than wrapping to the
+    // top. Both use the store's reading-order walks.
+    let after_is_real = current
+        .map(|id| app.bookmarks.list().iter().any(|b| b.entry_id > id))
+        .unwrap_or(true);
+    let target = if after_is_real {
+        app.bookmarks.next(current)
+    } else {
+        app.bookmarks.prev(current)
+    };
+    target
+        .and_then(|b| app.bookmarks.index_of(b.id))
+        .unwrap_or(0)
+}
+
+/// Step the overlay cursor to the next (`forward == true`) or previous bookmark in
+/// the list (§12.2.4), wrapping around the ends — the overlay's `n`/`p`
+/// "next/previous bookmark" verbs. The list is already in transcript-reading
+/// order, so a position step is a reading-order step. A no-op on an empty list.
+fn bookmark_step(app: &mut TuiApp, forward: bool) {
+    let count = app.bookmarks.len();
+    if count == 0 {
+        return;
+    }
+    app.bookmarks_selected = if forward {
+        (app.bookmarks_selected + 1) % count
+    } else {
+        (app.bookmarks_selected + count - 1) % count
+    };
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Reading Position Bookmarks overlay (§12.2.4) is open.
+/// Returns `true` when the key was consumed (so it never leaks to the composer or
+/// global keymap). In list mode: the toggle chord (`Alt+q`) and Esc close; ↑↓/kj
+/// move the cursor; n/p step next/previous; Enter jumps to the selected
+/// bookmark's entry; `r` enters rename mode; `d`/Delete deletes the selected
+/// bookmark. In rename mode: free text edit, Enter commits, Esc cancels.
+fn handle_bookmarks_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.bookmarks_open {
+        return false;
+    }
+    // Rename mode owns every key: type a name, Enter commits, Esc cancels. Handled
+    // first so a name containing 'd'/'n'/'q' is never mistaken for a list verb.
+    if app.bookmark_rename.is_some() {
+        handle_bookmark_rename_key(app, key);
+        return true;
+    }
+    // The overlay's own toggle chord (`Alt+q` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleBookmarks) {
+        app.bookmarks_open = false;
+        app.status = "bookmarks closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.bookmarks.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.bookmarks_open = false;
+            app.status = "bookmarks closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.bookmarks_selected = app.bookmarks_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.bookmarks_selected = (app.bookmarks_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        // Next / previous bookmark by reading order — the spec's next/previous
+        // commands. Resolved through the store relative to the selected bookmark's
+        // anchor so the step honors transcript order and wraps around the list.
+        KeyCode::Char('n') => bookmark_step(app, true),
+        KeyCode::Char('p') => bookmark_step(app, false),
+        KeyCode::Enter => bookmark_jump_to_selected(app),
+        // Begin renaming the selected bookmark: seed the buffer with its current
+        // name so an edit (rather than a retype) is one keystroke away.
+        KeyCode::Char('r') => bookmark_begin_rename(app),
+        // Delete the selected bookmark.
+        KeyCode::Char('d') | KeyCode::Delete => bookmark_delete_selected(app),
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Handle a key while the bookmark overlay is in rename mode (§12.2.4). Enter
+/// commits the typed name (a blank clears the label, turning the bookmark
+/// anonymous), Esc cancels without changing anything, Backspace deletes a char,
+/// and a printable char is appended. Everything else is swallowed.
+fn handle_bookmark_rename_key(app: &mut TuiApp, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            let name = app.bookmark_rename.take().unwrap_or_default();
+            if let Some(bookmark) = app.bookmarks.get(app.bookmarks_selected) {
+                let id = bookmark.id;
+                app.bookmarks.rename(id, Some(name.clone()));
+                let shown = if name.trim().is_empty() {
+                    "(anonymous)".to_string()
+                } else {
+                    name.trim().to_string()
+                };
+                app.status = format!("bookmark renamed to {shown} — Esc close");
+            } else {
+                app.status = "bookmarks: nothing to rename".to_string();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Esc => {
+            app.bookmark_rename = None;
+            app.status = "rename cancelled — Esc close".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.bookmark_rename.as_mut() {
+                buf.pop();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Char(ch) => {
+            if let Some(buf) = app.bookmark_rename.as_mut() {
+                buf.push(ch);
+            }
+            app.needs_redraw = true;
+        }
+        _ => {}
+    }
+}
+
+/// Jump the main view to the entry the cursor's bookmark anchors (§12.2.4). The
+/// mouse twin (a row click) routes here too. Resolves the anchor through the live
+/// transcript; when the anchored entry is gone (a rebuild dropped it) the
+/// bookmark is shown as unresolved rather than jumping incorrectly, per the spec's
+/// stale-anchor risk mitigation. A no-op (status hint) on an empty list.
+fn bookmark_jump_to_selected(app: &mut TuiApp) {
+    let Some((entry_id, name)) = app
+        .bookmarks
+        .get(app.bookmarks_selected)
+        .map(|b| (b.entry_id, b.display_name().to_string()))
+    else {
+        app.status = "bookmarks: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, entry_id) {
+        let label = jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"));
+        app.bookmarks_open = false;
+        app.status = format!("jumped to bookmark {name} at {label}");
+        app.needs_redraw = true;
+    } else {
+        // The anchored entry is gone (transcript rebuilt). Show it as unresolved
+        // rather than jumping somewhere wrong.
+        app.status = format!("bookmark {name} is unresolved (its entry is gone)");
+        app.needs_redraw = true;
+    }
+}
+
+/// Begin renaming the selected bookmark (§12.2.4): seed the rename buffer with the
+/// bookmark's current name (empty for an anonymous one) so the overlay enters
+/// text-input mode. A no-op (status hint) on an empty list.
+fn bookmark_begin_rename(app: &mut TuiApp) {
+    let Some(bookmark) = app.bookmarks.get(app.bookmarks_selected) else {
+        app.status = "bookmarks: nothing to rename".to_string();
+        return;
+    };
+    app.bookmark_rename = Some(bookmark.name.clone().unwrap_or_default());
+    app.status = "rename bookmark: type a name \u{00b7} Enter save \u{00b7} Esc cancel".to_string();
+    app.needs_redraw = true;
+}
+
+/// Delete the selected bookmark (§12.2.4), clamping the cursor so it stays in
+/// range, and report the new count. A no-op (status hint) on an empty list.
+fn bookmark_delete_selected(app: &mut TuiApp) {
+    let Some(bookmark) = app.bookmarks.get(app.bookmarks_selected) else {
+        app.status = "bookmarks: nothing to delete".to_string();
+        return;
+    };
+    let id = bookmark.id;
+    let name = bookmark.display_name().to_string();
+    app.bookmarks.remove(id);
+    let count = app.bookmarks.len();
+    // Keep the cursor in range after the removal.
+    if count == 0 {
+        app.bookmarks_selected = 0;
+    } else {
+        app.bookmarks_selected = app.bookmarks_selected.min(count - 1);
+    }
+    app.status = format!("bookmark {name} deleted ({count} left) — Esc close");
     app.needs_redraw = true;
 }
 
@@ -8823,6 +9130,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             app.lane_fold_selected = index;
             lane_fold_toggle_selected(app);
         }
+        // A click on a Reading Position Bookmarks row (§12.2.4): move the cursor
+        // onto it and jump the main view to the entry that bookmark anchors — the
+        // mouse twin of ↑↓ + Enter, in one go.
+        interaction::Action::BookmarkSelectJump(index) => {
+            app.bookmarks_selected = index;
+            bookmark_jump_to_selected(app);
+        }
     }
 }
 
@@ -10720,6 +11034,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 // Entry ids restart from 0 after a clear, so old marks would
                 // point at unrelated new entries — drop them.
                 app.jump_marks = jump_marks::JumpMarkStack::new();
+                // Reading Position Bookmarks (§12.2.4) are keyed by entry id too,
+                // so they would likewise re-anchor to unrelated entries — drop them.
+                app.bookmarks = bookmarks::BookmarkStore::new();
                 app.clear_turn_divider();
                 app.render_cache_session = render::cache::next_session_id();
                 app.attachments = agent.context_attachments_snapshot().await;
@@ -14717,6 +15034,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_lane_fold_surface(frame, area, app);
         return;
     }
+    // The Reading Position Bookmarks overlay (§12.2.4) paints as a fullscreen
+    // jump-list over everything else while open, registering its per-bookmark row
+    // click targets every frame. Checked beside the lane-fold overlay so its
+    // targets register and it owns the surface while open.
+    if app.bookmarks_open {
+        render_bookmarks_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -16340,6 +16665,156 @@ fn render_lane_fold_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::LaneFoldRow(index)),
             interaction::Action::LaneFoldToggle(index),
+        );
+    }
+}
+
+/// Paint the Reading Position Bookmarks overlay (§12.2.4) as a centered modal: a
+/// title, a one-line summary/navigation header (or a rename-input line while
+/// renaming, or an empty-state line), then one row per bookmark in
+/// transcript-reading order — a cursor caret, the bookmark name (an em-dash for an
+/// anonymous bookmark), the anchored entry's compact label, and an `unresolved`
+/// tag (color *and* text, never color-only) when the anchored entry is no longer
+/// live (so a stale bookmark is shown rather than silently jumping wrong). Each
+/// row is an [`interaction::ChromeKey::BookmarkRow`] click target so a click
+/// reaches the same `bookmark_jump_to_selected` path as ↑↓+Enter. Reads app state
+/// directly, so painting is constant-time over the bookmark list.
+fn render_bookmarks_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Bookmarks ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} reading positions ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 88, 24, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let count = app.bookmarks.len();
+    // Header: a rename prompt while renaming, else a summary + navigation hint, or
+    // an empty-state line.
+    let header = if let Some(buf) = app.bookmark_rename.as_ref() {
+        Line::from(vec![
+            Span::styled(
+                "rename: ",
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{buf}\u{2588}"),
+                Style::default().fg(crate::render::theme::foreground()),
+            ),
+            Span::styled(
+                "  \u{00b7} Enter save \u{00b7} Esc cancel",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ])
+    } else if count == 0 {
+        Line::from(Span::styled(
+            "No bookmarks yet \u{2014} Alt+t drops one at the current position.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{count} bookmark{} \u{00b7} \u{2191}\u{2193}/n/p select \u{00b7} Enter jump \u{00b7} r rename \u{00b7} d delete \u{00b7} Esc close",
+                if count == 1 { "" } else { "s" },
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the bookmark count so a bookmark that vanished (e.g.
+    // after a delete) can never leave the cursor past the end.
+    let selected = app.bookmarks_selected.min(count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+    if rows == 0 {
+        return;
+    }
+
+    // Scroll the list so the selected bookmark stays visible when the list is
+    // taller than the available rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, bookmark) in app
+        .bookmarks
+        .list()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
+        let index = offset;
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let caret = if is_selected { "\u{203a} " } else { "  " };
+        // Resolve the anchor to a compact entry label; `None` means the anchored
+        // entry is gone, so the bookmark is shown as unresolved (color *and* text,
+        // never color-only) rather than offering a jump that would land wrong.
+        let resolved = jump_mark_entry_label(app, bookmark.entry_id);
+        let status_span = if resolved.is_some() {
+            Span::raw(format!("{:<11} ", ""))
+        } else {
+            Span::styled(
+                format!("{:<11} ", "unresolved"),
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let anchor_label = resolved.unwrap_or_else(|| format!("#{}", bookmark.entry_id));
+        let name_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{:<24} ", bookmark.display_name()), name_style),
+            status_span,
+            Span::styled(
+                format!("at {anchor_label}"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its list index so a
+        // click selects + jumps to exactly that bookmark.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::BookmarkRow(index)),
+            interaction::Action::BookmarkSelectJump(index),
         );
     }
 }
@@ -28173,6 +28648,26 @@ pub(crate) struct TuiApp {
     /// Cursor into the lane overlay's list of lanes (§12.2.2). Clamped to the lane
     /// count each render. Only meaningful while the overlay is open.
     pub(crate) lane_fold_selected: usize,
+    /// Reading Position Bookmarks (§12.2.4): the durable set of reading-position
+    /// anchors the user has dropped, each keyed by a stable transcript entry id so
+    /// it survives appends, resize, folds, and filters. Lives here (not recomputed
+    /// from terminal cells) so a bookmark persists across every redraw. The resting
+    /// state is an empty store, so a session with no bookmarks costs nothing.
+    /// Mutated by the drop verb and the overlay's rename/delete actions.
+    pub(crate) bookmarks: bookmarks::BookmarkStore,
+    /// Whether the Reading Position Bookmarks overlay (§12.2.4) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// bookmark list owns key/mouse routing. Toggled by the `ToggleBookmarks`
+    /// keymap action.
+    pub(crate) bookmarks_open: bool,
+    /// Cursor into the bookmark overlay's list (§12.2.4). Clamped to the bookmark
+    /// count each render. Only meaningful while the overlay is open.
+    pub(crate) bookmarks_selected: usize,
+    /// In-overlay rename buffer for the Reading Position Bookmarks overlay
+    /// (§12.2.4). `None` = the overlay is in list/navigation mode; `Some(text)` =
+    /// the user is typing a new name for the selected bookmark (Enter commits,
+    /// Esc cancels). Only meaningful while the overlay is open.
+    pub(crate) bookmark_rename: Option<String>,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -28760,6 +29255,10 @@ impl TuiApp {
             lane_panel: lane_fold::LanePanel::new(),
             lane_fold_open: false,
             lane_fold_selected: 0,
+            bookmarks: bookmarks::BookmarkStore::new(),
+            bookmarks_open: false,
+            bookmarks_selected: 0,
+            bookmark_rename: None,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,

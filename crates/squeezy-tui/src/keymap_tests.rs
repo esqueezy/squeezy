@@ -473,6 +473,63 @@ fn pinned_compare_toggle_action_is_registered_and_defaults_to_alt_t() {
 }
 
 #[test]
+fn bookmark_actions_round_trip_and_default_to_alt_chords() {
+    // §12.2.4 Reading Position Bookmarks: both slugs round-trip, are registered in
+    // `ALL`, and default to `Alt+;` (drop) / `Alt+q` (list).
+    assert_eq!(
+        Action::from_slug("drop_bookmark"),
+        Some(Action::DropBookmark)
+    );
+    assert_eq!(
+        Action::from_slug("toggle_bookmarks"),
+        Some(Action::ToggleBookmarks)
+    );
+    assert!(Action::ALL.contains(&Action::DropBookmark));
+    assert!(Action::ALL.contains(&Action::ToggleBookmarks));
+
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::DropBookmark),
+        KeyBinding::new(KeyCode::Char(';'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.binding(Action::ToggleBookmarks),
+        KeyBinding::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char(';'), KeyModifiers::ALT),
+        Some(Action::DropBookmark),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('q'), KeyModifiers::ALT),
+        Some(Action::ToggleBookmarks),
+    );
+    // Alt (Meta) chords are honestly classified terminal-dependent.
+    assert_eq!(
+        Action::DropBookmark.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+    assert_eq!(
+        Action::ToggleBookmarks.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
+fn bookmark_defaults_do_not_collide_with_other_actions() {
+    // The new `Alt+;` / `Alt+q` defaults must not shadow (or be shadowed by) any
+    // existing default binding.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::DropBookmark)
+                && !collision.1.contains(&Action::ToggleBookmarks),
+            "bookmark default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

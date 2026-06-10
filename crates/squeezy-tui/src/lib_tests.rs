@@ -29169,3 +29169,474 @@ async fn lane_fold_errored_lane_keeps_visible_header_across_resizes() {
         );
     }
 }
+
+// ---- Reading Position Bookmarks (§12.2.4) ----
+
+/// Build a transcript with several distinct user turns (so there are several
+/// stable entry ids to bookmark and jump between) and a deterministic viewport.
+fn app_with_bookmarkable_transcript() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    for i in 0..6 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {i}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("reply {i}")));
+    }
+    app
+}
+
+/// The stable entry id at list position `index`, for tests that position the view
+/// on a known entry before bookmarking it.
+fn bookmark_test_entry_id(app: &TuiApp, index: usize) -> u64 {
+    active_transcript_entries(app)
+        .get(index)
+        .map(|entry| entry.id)
+        .expect("an entry exists at the requested index")
+}
+
+#[tokio::test]
+async fn bookmark_drop_and_alt_q_lists() {
+    let mut app = app_with_bookmarkable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Alt+; drops a bookmark at the current reading position.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(';'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+; drops a bookmark");
+    assert_eq!(app.bookmarks.len(), 1, "one bookmark dropped");
+    assert!(
+        app.status.contains("bookmark dropped"),
+        "status confirms the drop: {}",
+        app.status,
+    );
+
+    // Alt+q opens the list overlay and paints the bookmark.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+q opens the bookmark list");
+    assert!(app.bookmarks_open, "Alt+q opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Bookmarks"), "header present:\n{out}");
+    assert!(out.contains("1 bookmark"), "count line:\n{out}");
+}
+
+#[tokio::test]
+async fn bookmark_jump_moves_main_view_to_the_anchored_entry() {
+    let mut app = app_with_bookmarkable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Position the view on the first entry, then bookmark that reading position.
+    let top_id = bookmark_test_entry_id(&app, 0);
+    assert!(
+        jump_to_entry_id(&mut app, top_id),
+        "view moves to first entry"
+    );
+    assert_eq!(current_top_entry_id(&app), Some(top_id));
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(';'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("drop a bookmark at the top");
+    assert_eq!(app.bookmarks.list()[0].entry_id, top_id);
+
+    // Move the view to a much later entry so it is somewhere else.
+    let entries_len = active_transcript_entries(&app).len();
+    let late_id = bookmark_test_entry_id(&app, entries_len - 1);
+    assert!(
+        jump_to_entry_id(&mut app, late_id),
+        "view moves to last entry"
+    );
+    assert_ne!(
+        current_top_entry_id(&app),
+        Some(top_id),
+        "the view moved away from the bookmark",
+    );
+
+    // Open the overlay and Enter on the bookmark; the main view returns to the
+    // anchored entry and the overlay closes.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the list");
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Enter jumps to the bookmark");
+    assert!(!app.bookmarks_open, "jumping closes the overlay");
+    assert_eq!(
+        current_top_entry_id(&app),
+        Some(top_id),
+        "the main view jumped back to the bookmarked entry",
+    );
+    assert!(
+        app.status.contains("jumped to bookmark"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+}
+
+#[tokio::test]
+async fn bookmark_rename_then_delete_via_keyboard() {
+    let mut app = app_with_bookmarkable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(';'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("drop a bookmark");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the list");
+    let _ = render_to_string(&app, 80, 24);
+
+    // `r` enters rename mode; type a name; Enter commits.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("r begins rename");
+    assert!(app.bookmark_rename.is_some(), "rename mode is active");
+    for ch in "spec".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type a rename char");
+    }
+    // The rename field paints with the typed text (not as a list verb).
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("rename:"), "rename field visible:\n{out}");
+    assert!(out.contains("spec"), "typed name visible:\n{out}");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Enter commits the rename");
+    assert_eq!(app.bookmarks.list()[0].name.as_deref(), Some("spec"));
+    assert!(app.bookmark_rename.is_none(), "rename mode ends on commit");
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("spec"),
+        "renamed bookmark shows its name:\n{out}"
+    );
+
+    // `d` deletes it; the list empties and shows the empty state.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("d deletes the bookmark");
+    assert_eq!(app.bookmarks.len(), 0, "the bookmark was deleted");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("No bookmarks yet"), "empty-state line:\n{out}");
+}
+
+#[tokio::test]
+async fn bookmark_next_previous_cycle_the_cursor() {
+    let mut app = app_with_bookmarkable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Drop three bookmarks at three distinct entries.
+    for index in [0usize, 4, 8] {
+        let id = bookmark_test_entry_id(&app, index);
+        assert!(
+            jump_to_entry_id(&mut app, id),
+            "view moves to entry {index}"
+        );
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(';'), KeyModifiers::ALT),
+        )
+        .await
+        .expect("drop a bookmark");
+    }
+    assert_eq!(app.bookmarks.len(), 3, "three distinct bookmarks");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the list");
+    let _ = render_to_string(&app, 80, 24);
+
+    let count = app.bookmarks.len();
+    assert!(count >= 2, "at least two distinct bookmarks: {count}");
+    // The store's reading-order anchors, in list order. The `n`/`p` keys must walk
+    // the cursor in lockstep with the store's own next/prev so the overlay's
+    // "next/previous bookmark" matches the model.
+    let anchors: Vec<u64> = app.bookmarks.list().iter().map(|b| b.entry_id).collect();
+
+    // From the first bookmark, `n` advances and walks forward one position; a full
+    // lap of `n` returns to the start (wrap-around).
+    app.bookmarks_selected = 0;
+    for step in 1..=count {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("n steps forward");
+        let want = step % count;
+        assert_eq!(
+            app.bookmarks_selected, want,
+            "n advances to {want} on step {step} (anchors {anchors:?})",
+        );
+    }
+
+    // From the first bookmark, `p` retreats and wraps to the last.
+    app.bookmarks_selected = 0;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("p steps back");
+    assert_eq!(
+        app.bookmarks_selected,
+        count - 1,
+        "p from the first bookmark wraps to the last",
+    );
+}
+
+#[tokio::test]
+async fn bookmark_mouse_click_selects_and_jumps() {
+    let mut app = app_with_bookmarkable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Drop two bookmarks at two distinct entries so there are two clickable rows.
+    for index in [0usize, 8] {
+        let id = bookmark_test_entry_id(&app, index);
+        assert!(
+            jump_to_entry_id(&mut app, id),
+            "view moves to entry {index}"
+        );
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(';'), KeyModifiers::ALT),
+        )
+        .await
+        .expect("drop a bookmark");
+    }
+    assert_eq!(app.bookmarks.len(), 2);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the list");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for the SECOND bookmark row target so the click changes the cursor.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::BookmarkRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a bookmark row target is registered");
+    let target_id = app.bookmarks.list()[1].entry_id;
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.bookmarks_selected, 1,
+        "clicking a bookmark row selects exactly that bookmark",
+    );
+    assert!(
+        !app.bookmarks_open,
+        "the click jumped and closed the overlay"
+    );
+    assert_eq!(
+        current_top_entry_id(&app),
+        Some(target_id),
+        "the main view jumped to the clicked bookmark's entry",
+    );
+}
+
+#[tokio::test]
+async fn bookmark_alt_q_toggles_closed_without_leaking() {
+    let mut app = app_with_bookmarkable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.bookmarks_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.bookmarks_open, "Alt+q toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn bookmark_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Dropping on an empty transcript is a harmless no-op with a hint.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(';'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+; on an empty transcript");
+    assert_eq!(app.bookmarks.len(), 0, "nothing to bookmark");
+    assert!(
+        app.status.contains("no transcript"),
+        "status hint: {}",
+        app.status,
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the empty list");
+    assert!(app.bookmarks_open);
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Bookmarks"), "header still paints:\n{out}");
+    assert!(out.contains("No bookmarks yet"), "empty-state line:\n{out}");
+
+    // Enter / next / delete on an empty overlay are harmless no-ops (no panic).
+    for code in [
+        KeyCode::Enter,
+        KeyCode::Char('n'),
+        KeyCode::Char('p'),
+        KeyCode::Char('d'),
+        KeyCode::Char('r'),
+    ] {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(code, KeyModifiers::NONE),
+        )
+        .await
+        .expect("key on the empty overlay");
+    }
+    assert!(app.bookmarks.is_empty());
+}
+
+#[tokio::test]
+async fn bookmark_survives_appends_and_resize() {
+    // A bookmark anchored before more turns arrive still resolves to the same
+    // entry across widths — the spec's "survive appends + resize" invariant,
+    // end-to-end through the real render().
+    let mut app = app_with_bookmarkable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    let anchored = bookmark_test_entry_id(&app, 0);
+    assert!(
+        jump_to_entry_id(&mut app, anchored),
+        "view moves to first entry"
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(';'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("drop a bookmark");
+
+    // Append several more turns AFTER the bookmark was dropped.
+    for i in 100..106 {
+        app.push_transcript_item(TranscriptItem::user(format!("late turn {i}")));
+    }
+    assert_eq!(
+        app.bookmarks.list()[0].entry_id,
+        anchored,
+        "the bookmark's anchor id is unchanged by appends",
+    );
+
+    // The overlay paints the bookmark as resolved (no "unresolved" tag) across
+    // several widths, and a jump from any of them lands on the same entry.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the list");
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Bookmarks"),
+            "header paints at {w}x{h}:\n{out}"
+        );
+        assert!(
+            !out.contains("unresolved"),
+            "a live bookmark is NOT unresolved at {w}x{h}:\n{out}",
+        );
+    }
+    // The cursor is on the bookmark; Enter still lands on the original entry even
+    // though the transcript grew under it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("jump after appends");
+    assert_eq!(
+        current_top_entry_id(&app),
+        Some(anchored),
+        "the bookmark still lands on its original entry after appends",
+    );
+}

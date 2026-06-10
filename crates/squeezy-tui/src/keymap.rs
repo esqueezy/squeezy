@@ -265,6 +265,22 @@ pub(crate) enum Action {
     /// overlay (it compares against what the overlay shows) and paints nothing at
     /// idle. Reuses the §11G.10 detail-pane split machinery.
     TogglePinnedCompare,
+    /// Drop a Reading Position Bookmark at the entry currently at the top of the
+    /// viewport (`Alt+;` default; §12.2.4). A bookmark is a durable
+    /// reading-position anchor (distinct from a transient jump mark): it is keyed
+    /// by the stable transcript entry id, so it survives appends, resize, folds,
+    /// and filters until the user deletes it. The first drop with no name is an
+    /// anonymous bookmark; the bookmark list overlay can name/rename it later.
+    /// Costs nothing until pressed.
+    DropBookmark,
+    /// Open / close the Reading Position Bookmarks overlay (`Alt+q` default;
+    /// §12.2.4). A list of every bookmark in transcript-reading order; the cursor
+    /// (↑↓/kj, plus n/p for next/previous) selects one and Enter jumps the main
+    /// view to its anchored entry. `r` renames, `d`/Delete deletes, Esc/Alt+q
+    /// closes. The list lives in app state (not recomputed from cells) so it is
+    /// stable across redraws and resize; an idle session that never opens it pays
+    /// nothing.
+    ToggleBookmarks,
 }
 
 impl Action {
@@ -322,6 +338,8 @@ impl Action {
             Self::ToggleTurnOutline => "toggle_turn_outline",
             Self::ToggleLaneFold => "toggle_lane_fold",
             Self::TogglePinnedCompare => "toggle_pinned_compare",
+            Self::DropBookmark => "drop_bookmark",
+            Self::ToggleBookmarks => "toggle_bookmarks",
         }
     }
 
@@ -378,6 +396,8 @@ impl Action {
         Action::ToggleTurnOutline,
         Action::ToggleLaneFold,
         Action::TogglePinnedCompare,
+        Action::DropBookmark,
+        Action::ToggleBookmarks,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -488,6 +508,12 @@ impl Action {
             // Pinned-Compare-View overlay toggle is `Alt+t` — the same Meta/Alt
             // encoding case as the rest of the nav/overlay family.
             | Self::TogglePinnedCompare
+            // Reading Position Bookmarks (§12.2.4): drop is `Alt+;`, the list
+            // overlay is `Alt+q` — both Meta/Alt chords, the same
+            // terminal-dependent encoding case as the rest of the nav/overlay
+            // family.
+            | Self::DropBookmark
+            | Self::ToggleBookmarks
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -668,6 +694,14 @@ impl Action {
             // letters `t` is the mnemonic pick. Distinct from `Ctrl+T` (the
             // transcript-overlay toggle); the modifier disambiguates them.
             Self::TogglePinnedCompare => KeyBinding::new(KeyCode::Char('t'), KeyModifiers::ALT),
+            // Reading Position Bookmarks (§12.2.4). `Alt+;` drops a bookmark ("`;`"
+            // is a free, easy-to-reach punctuation key — `Alt+t` is now the Pinned
+            // Compare View toggle); `Alt+q` opens the bookmark list overlay (`q`
+            // for the "quick-jump" list). Bare `Alt` letters in the nav/copy/
+            // overlay family (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x/n/s/z/t) are
+            // taken; `q` and `;` are free.
+            Self::DropBookmark => KeyBinding::new(KeyCode::Char(';'), KeyModifiers::ALT),
+            Self::ToggleBookmarks => KeyBinding::new(KeyCode::Char('q'), KeyModifiers::ALT),
         }
     }
 }

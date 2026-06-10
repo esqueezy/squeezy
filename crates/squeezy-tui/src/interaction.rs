@@ -147,6 +147,10 @@ pub(crate) enum ChromeKey {
     /// by its 0-based index in the focused entry's lane list so a click selects +
     /// toggles the collapse state of exactly that lane.
     LaneFoldRow(usize),
+    /// A bookmark row in the Reading Position Bookmarks overlay (§12.2.4), keyed
+    /// by its 0-based index in the bookmark list so a click selects + jumps the
+    /// main view to the entry that exact bookmark anchors.
+    BookmarkRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -281,6 +285,11 @@ pub(crate) enum Action {
     /// Mouse twin of moving the cursor with ↑↓ and pressing Enter/Space; a click
     /// both selects and folds/unfolds the lane in one go.
     LaneFoldToggle(usize),
+    /// Select the given bookmark row in the Reading Position Bookmarks overlay
+    /// (§12.2.4): move the cursor onto it and jump the main view to the entry that
+    /// bookmark anchors. Mouse twin of moving the cursor with ↑↓ and pressing
+    /// Enter; a click both selects and jumps in one go.
+    BookmarkSelectJump(usize),
 }
 
 impl Action {
@@ -325,6 +334,7 @@ impl Action {
         Action::HealthMarkerSelect(0),
         Action::TurnOutlineSelect(0),
         Action::LaneFoldToggle(0),
+        Action::BookmarkSelectJump(0),
     ];
 }
 
