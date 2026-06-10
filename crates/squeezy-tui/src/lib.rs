@@ -110,6 +110,7 @@ mod paste_preview;
 mod prompt_history;
 mod prompt_queue;
 mod proposed_plan;
+mod queue_edit;
 mod quote_compose;
 mod render;
 mod resume_picker;
@@ -3798,7 +3799,21 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             let raw_input = app.input.clone();
             let input = raw_input.trim().to_string();
             if input.is_empty() {
-                app.status = "enter a prompt first".to_string();
+                // Saving an *empty* edit deletes nothing: abandon the edit (clear
+                // the tracked id) and report the usual empty-prompt hint, leaving
+                // the queued item unchanged.
+                if app.editing_queue_id.take().is_some() {
+                    app.status = "edit cancelled — queued prompt unchanged".to_string();
+                } else {
+                    app.status = "enter a prompt first".to_string();
+                }
+                return Ok(false);
+            }
+            // Edit Queued Prompt (§11G.8): if we're editing a queued prompt,
+            // submitting saves the composer text back onto that item by id
+            // rather than enqueuing/running it. A vanished item falls through to
+            // the normal path so the edited text is never lost.
+            if save_queue_edit(app, input.clone()) {
                 return Ok(false);
             }
             if app.turn_rx.is_some() {
@@ -5414,12 +5429,82 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
     }
     app.status = if app.prompt_queue_overlay.is_some() {
         format!(
-            "prompt queue ({} queued) · ↑↓ focus · Shift+↑↓ move · Del remove · u undo · Enter close",
+            "prompt queue ({} queued) · ↑↓ focus · Shift+↑↓ move · Enter/e edit · Del remove · u undo · Esc close",
             app.prompt_queue.len()
         )
     } else {
         "prompt queue closed".to_string()
     };
+}
+
+/// Begin editing the queued prompt with stable `id` (§11G.8): pull its current
+/// text into the composer, remember the id on `editing_queue_id` so the next
+/// submit updates that exact item, and close the overlay so the composer takes
+/// focus. The single source of truth shared by the keyboard (`Enter`/`e`) and
+/// mouse (double-click) edit paths, so the two stay identical by construction.
+///
+/// No-op (returns false) when the id has drained out, when the composer already
+/// holds an unrelated draft (so a stray edit can't clobber in-progress typing),
+/// or while a queued-item drag is in flight.
+fn begin_queue_edit(app: &mut TuiApp, id: u64) -> bool {
+    if app.prompt_queue_drag.is_some() {
+        return false;
+    }
+    sync_queue_ids(app);
+    let Some(index) = queue_index_for_id(app, id) else {
+        return false;
+    };
+    // Refuse to overwrite a draft the user is already composing (unless it is
+    // itself the same edit-in-progress for this id). Keeps the user's typed
+    // text safe; they can clear the composer first if they truly want to edit.
+    if !app.input.is_empty() && app.editing_queue_id != Some(id) {
+        app.status = "clear the composer before editing a queued prompt".to_string();
+        app.needs_redraw = true;
+        return false;
+    }
+    let Some(pick) = queue_edit::pick_edit(&app.prompt_queue, &app.prompt_queue_ids, index) else {
+        return false;
+    };
+    // Load the prompt into the composer. `clear_input` first resets cursor /
+    // attachments / the (about-to-be-overwritten) edit id, then we install the
+    // text and park the cursor at the end so the user can immediately type.
+    clear_input(app);
+    app.input = pick.text;
+    app.input_cursor = app.input.len();
+    app.editing_queue_id = Some(pick.id);
+    // Pulling the prompt into the composer closes the overlay and abandons any
+    // in-flight reorder; the queue keeps draining normally meanwhile.
+    app.prompt_queue_overlay = None;
+    app.prompt_queue_drag = None;
+    app.status = "editing queued prompt — Enter saves the change".to_string();
+    app.needs_redraw = true;
+    true
+}
+
+/// Save the composer draft back onto the queued item being edited (§11G.8).
+/// Resolves `editing_queue_id` to its live slot and replaces the text *by id*
+/// (so a drain/reorder since editing began can't misdirect the save), then
+/// clears the edit state and the composer. Returns `true` when it consumed the
+/// submit as an in-place update; `false` (leaving `editing_queue_id` cleared)
+/// when the tracked item has vanished, so the caller falls back to a normal
+/// enqueue/run and the edited text is never lost.
+fn save_queue_edit(app: &mut TuiApp, text: String) -> bool {
+    let Some(id) = app.editing_queue_id.take() else {
+        return false;
+    };
+    sync_queue_ids(app);
+    match queue_edit::apply_edit(&mut app.prompt_queue, &app.prompt_queue_ids, id, text) {
+        queue_edit::EditResult::Updated => {
+            clear_input(app);
+            app.status = format!("updated queued prompt ({} queued)", app.prompt_queue.len());
+            app.needs_redraw = true;
+            true
+        }
+        // The item drained/ran or was deleted while it sat in the composer:
+        // the edit can't update a row that no longer exists. Report not-handled
+        // so the caller treats the composer text as a fresh prompt.
+        queue_edit::EditResult::Vanished => false,
+    }
 }
 
 /// Resolve a focused/clicked `EntryId` back to its live transcript index, or
@@ -5504,6 +5589,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // Undo the last queue mutation (mouse twin of the keyboard verb).
         interaction::Action::QueueUndo => {
             queue_undo(app);
+        }
+        // Edit a queued prompt (§11G.8): pull it into the composer for editing.
+        // Mouse twin of the keyboard `Enter`/`e` verb; both route through the
+        // same `begin_queue_edit`, so the paths stay identical by construction.
+        interaction::Action::QueueEdit(id) => {
+            begin_queue_edit(app, id);
         }
         // Scrollbar-jump and jump-to-latest are not yet registered as targets
         // by the render paths; their handlers land with the affordances that
@@ -6973,6 +7064,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.prompt_queue_undo.clear();
                 app.prompt_queue_drag = None;
                 app.prompt_queue_overlay = None;
+                app.editing_queue_id = None;
                 app.auto_drain_queue = false;
                 app.transcript_overlay = None;
                 app.transcript_overlay_scrollbar_cache.set(None);
@@ -8572,6 +8664,31 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.prompt_queue_overlay.is_none() {
         return false;
     }
+    // Edit Queued Prompt (§11G.8): Enter or `e` on the focused queued prompt
+    // opens it in the composer for editing. Intercepted ahead of the pure-state
+    // dispatch (which would otherwise treat Enter as "close"), and only when the
+    // queue is non-empty — on an empty queue Enter must still fall through to
+    // close the overlay as before. `e` carries no modifiers so it never
+    // shadows a chord. Esc stays a plain close (handled by `dispatch`).
+    let wants_edit = matches!(key.code, KeyCode::Enter)
+        || (matches!(key.code, KeyCode::Char('e'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER));
+    if wants_edit && !app.prompt_queue.is_empty() {
+        sync_queue_ids(app);
+        let selected = app
+            .prompt_queue_overlay
+            .as_ref()
+            .expect("checked is_some above")
+            .selected;
+        if let Some(&id) = app.prompt_queue_ids.get(selected) {
+            begin_queue_edit(app, id);
+        }
+        // Whether or not the edit started, the key is consumed by the overlay
+        // (it never leaks into the composer underneath).
+        return true;
+    }
     sync_queue_ids(app);
     let before: Vec<String> = app.prompt_queue.iter().cloned().collect();
     // Capture the cursor's stable identity BEFORE the dispatch mutates the
@@ -8717,10 +8834,28 @@ fn handle_queue_overlay_mouse(
             // (e.g. the indicator strip, handled by the footer arm, or empty
             // space) falls through.
             match hit {
-                Some((interaction::TargetKey::QueueItem(_), action)) => {
-                    app.gestures.recognize(interaction::Phase::Press, hit, now);
-                    // Delete fires on the press; reorder arms a drag.
-                    dispatch_click_action(app, action);
+                Some((interaction::TargetKey::QueueItem(id), action)) => {
+                    let gesture = app.gestures.recognize(interaction::Phase::Press, hit, now);
+                    // A double-click on a queue row opens it in the composer for
+                    // editing (§11G.8) — the mouse twin of the keyboard Enter/`e`
+                    // verb. A double-click on the delete `x` still deletes (the
+                    // first click already removed the row), so only the body
+                    // (`QueueReorderBegin`) escalates into an edit. A single
+                    // click keeps its press behaviour: delete fires immediately;
+                    // the body arms a reorder drag.
+                    if matches!(gesture, interaction::Gesture::DoubleClick { .. })
+                        && matches!(action, interaction::Action::QueueReorderBegin(_))
+                    {
+                        // The first click of the pair armed a (never-moved)
+                        // reorder drag; the second escalates to an edit, so
+                        // cancel that armed drag before opening the composer
+                        // (otherwise `begin_queue_edit` would bail on the
+                        // mid-drag guard).
+                        app.prompt_queue_drag = None;
+                        dispatch_click_action(app, interaction::Action::QueueEdit(id));
+                    } else {
+                        dispatch_click_action(app, action);
+                    }
                     Some(true)
                 }
                 _ => None,
@@ -21672,6 +21807,14 @@ pub(crate) struct TuiApp {
     /// Open reorder overlay state. `None` when the overlay is closed;
     /// the queue itself lives on `prompt_queue` regardless.
     pub(crate) prompt_queue_overlay: Option<prompt_queue::PromptQueueState>,
+    /// Stable id of the queued prompt currently being edited in the composer
+    /// (§11G.8). Set when `Enter`/`e`/double-click pulls a queued prompt into
+    /// the composer; the next composer submit replaces that item's text *by
+    /// id* (so a concurrent drain/reorder can't misdirect the save) and clears
+    /// this. `None` whenever the composer is composing a fresh prompt. Cleared
+    /// on any path that abandons the composer draft (clear, cancel restore,
+    /// `/clear`) so a later submit never mistakes a fresh prompt for an edit.
+    pub(crate) editing_queue_id: Option<u64>,
     /// Set true when a turn just completed (success, cancel, or fail)
     /// and the queue is non-empty. The main loop reads this immediately
     /// after `drain_agent_events` returns, pops the next prompt, and
@@ -22106,6 +22249,7 @@ impl TuiApp {
             prompt_queue_undo: Vec::new(),
             prompt_queue_drag: None,
             prompt_queue_overlay: None,
+            editing_queue_id: None,
             auto_drain_queue: false,
             pending_chord: None,
             clickables: std::cell::RefCell::new(interaction::Registry::new()),

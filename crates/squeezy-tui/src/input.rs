@@ -583,6 +583,10 @@ pub(crate) fn clear_input(app: &mut TuiApp) {
     app.input.clear();
     app.input_cursor = 0;
     app.clear_prompt_attachments();
+    // Clearing the composer abandons any in-progress queued-prompt edit
+    // (§11G.8): a fresh prompt typed afterwards must never be mistaken for a
+    // save against the previously-edited item.
+    app.editing_queue_id = None;
     clamp_slash_menu_index(app);
 }
 

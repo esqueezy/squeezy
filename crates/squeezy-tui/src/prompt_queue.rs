@@ -163,7 +163,7 @@ pub(crate) fn render_lines(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  ↑↓ select · Shift+↑↓ reorder · Del remove · Enter close",
+            "  ↑↓ select · Shift+↑↓ reorder · Enter/e edit · Del remove · Esc close",
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);

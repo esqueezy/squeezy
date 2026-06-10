@@ -105,9 +105,9 @@ pub(crate) enum ChromeKey {
 /// by construction.
 ///
 /// `ToggleQueueOverlay`, `ToggleEntryCollapsed`, `FocusEntry`, `ExpandEntry`,
-/// the queue `QueueDelete` / `QueueReorderBegin` / `QueueUndo` actions, and
-/// `MinimapJump` are wired to live affordances today (real dispatch arms +
-/// registered hit targets + keyboard parity). Only `OpenEntryInDetail` (no
+/// the queue `QueueDelete` / `QueueReorderBegin` / `QueueUndo` / `QueueEdit`
+/// actions, and `MinimapJump` are wired to live affordances today (real dispatch
+/// arms + registered hit targets + keyboard parity). Only `OpenEntryInDetail` (no
 /// mouse affordance registers it yet; the `Ctrl+Enter` keyboard verb goes
 /// straight through `open_focused_entry_in_detail`) and the jump/scrollbar
 /// actions remain substrate that dispatches its handlers as its registering
@@ -138,6 +138,11 @@ pub(crate) enum Action {
     /// twin of the keyboard undo verb; both pop one entry off the queue's
     /// bounded undo stack and reverse it exactly.
     QueueUndo,
+    /// Open the given queue item (by stable item id) in the composer for editing
+    /// (§11G.8). The mouse twin of the keyboard `Enter`/`e` edit verb; both pull
+    /// the prompt's text into the composer and track its id so the next submit
+    /// updates that item in place. Fed by a double-click on a queue-item row.
+    QueueEdit(u64),
     /// Jump the transcript to the latest (tail) row.
     JumpToLatest,
     /// Jump the scrollbar thumb to the clicked gutter row.
@@ -174,6 +179,7 @@ impl Action {
         Action::QueueDelete(0),
         Action::QueueReorderBegin(0),
         Action::QueueUndo,
+        Action::QueueEdit(0),
         Action::JumpToLatest,
         Action::ScrollbarJump,
         Action::MinimapJump(EntryId(0)),

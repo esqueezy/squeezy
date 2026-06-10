@@ -21735,6 +21735,334 @@ async fn integration_mouse_drag_reorders_then_undo_restores() {
     assert_eq!(queue_texts(&app), vec!["alpha", "beta", "gamma"]);
 }
 
+// ---------------------------------------------------------------------------
+// Edit Queued Prompt (§11G.8): Enter/`e`/double-click open a queued prompt in
+// the composer; saving updates that item by its stable id.
+// ---------------------------------------------------------------------------
+
+/// Probe the per-frame registry for the cell carrying `action` on `key`, after
+/// a real `render_to_string` has populated it. Mirrors the helper the existing
+/// queue mouse integration tests use.
+fn queue_cell_for(
+    app: &TuiApp,
+    width: u16,
+    height: u16,
+    key: interaction::TargetKey,
+    action: interaction::Action,
+) -> Option<(u16, u16)> {
+    let registry = app.clickables.borrow();
+    for y in 0..height {
+        for x in 0..width {
+            if let Some((k, a)) = registry.hit_test(x, y)
+                && k == key
+                && a == action
+            {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn enter_on_queued_prompt_opens_it_in_the_composer() {
+    let mut app = queue_app(&["first", "second", "third"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1; // focus "second"
+    }
+    let id_second = queue_id_at(&app, 1);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on queued prompt");
+
+    // The prompt is loaded into the composer with the cursor at the end, the
+    // overlay closes, and the edit id is tracked.
+    assert_eq!(app.input, "second");
+    assert_eq!(app.input_cursor, "second".len());
+    assert!(app.prompt_queue_overlay.is_none(), "overlay closes on edit");
+    assert_eq!(app.editing_queue_id, Some(id_second));
+    // The queue itself is unchanged — the item stays queued until the save.
+    assert_eq!(queue_texts(&app), vec!["first", "second", "third"]);
+}
+
+#[tokio::test]
+async fn e_key_opens_focused_queued_prompt_like_enter() {
+    let mut app = queue_app(&["alpha", "beta"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    let id_alpha = queue_id_at(&app, 0);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("e on queued prompt");
+
+    assert_eq!(app.input, "alpha");
+    assert_eq!(app.editing_queue_id, Some(id_alpha));
+    assert!(app.prompt_queue_overlay.is_none());
+}
+
+#[tokio::test]
+async fn saving_an_edit_updates_the_queue_item_in_place_by_id() {
+    let mut app = queue_app(&["one", "two", "three"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // A turn is running, so a normal Enter would *enqueue* — but an edit save
+    // must instead update the existing item rather than appending a new one.
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 2; // focus "three"
+    }
+    let id_three = queue_id_at(&app, 2);
+
+    // Open it for editing.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open edit");
+    assert_eq!(app.input, "three");
+
+    // Append " edited" and submit.
+    for ch in " edited".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save edit");
+
+    // The third item's text is replaced in place; the queue length is unchanged
+    // (no spurious enqueue), and the item keeps its stable id and position.
+    assert_eq!(queue_texts(&app), vec!["one", "two", "three edited"]);
+    assert_eq!(queue_id_at(&app, 2), id_three);
+    assert_eq!(app.input, "", "composer clears after a save");
+    assert_eq!(app.editing_queue_id, None, "edit state clears after a save");
+    assert!(app.status.contains("updated queued prompt"));
+}
+
+#[tokio::test]
+async fn edit_save_lands_on_the_right_item_after_a_front_drain() {
+    // The classic id-vs-position trap: begin editing the item at index 1, then a
+    // queued prompt drains off the front (shifting positions). The save must
+    // still land on the *same* item by id, not on whatever now sits at index 1.
+    let mut app = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1; // focus "b"
+    }
+    let id_b = queue_id_at(&app, 1);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open edit on b");
+    assert_eq!(app.input, "b");
+    assert_eq!(app.editing_queue_id, Some(id_b));
+
+    // Simulate the front item ("a") draining out while "b" sits in the composer.
+    app.prompt_queue.pop_front();
+    app.prompt_queue_ids.pop_front();
+    // Now index 1 holds "c"; "b" lives at index 0.
+
+    // Save: the update must hit "b" (id) wherever it now lives.
+    clear_input(&mut app);
+    // clear_input drops the edit id, so re-establish the editing context the way
+    // a real continuous edit would (the id rides on the field across the drain).
+    app.editing_queue_id = Some(id_b);
+    app.input = "b edited".to_string();
+    app.input_cursor = app.input.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save edit");
+
+    assert_eq!(queue_texts(&app), vec!["b edited", "c"]);
+    assert_eq!(queue_index_for_id(&app, id_b), Some(0));
+}
+
+#[tokio::test]
+async fn edit_of_a_vanished_item_falls_back_to_a_fresh_enqueue() {
+    // The edited item drains/runs while it sits in the composer: saving can't
+    // update a row that no longer exists, so the text must NOT be lost — it
+    // falls through to the normal enqueue path instead.
+    let mut app = queue_app(&["only"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    let id_only = queue_id_at(&app, 0);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open edit");
+    assert_eq!(app.editing_queue_id, Some(id_only));
+
+    // The item drains out from under the composer.
+    app.prompt_queue.pop_front();
+    app.prompt_queue_ids.pop_front();
+    assert!(queue_index_for_id(&app, id_only).is_none());
+
+    // Re-stage the edit context and submit the edited text.
+    app.editing_queue_id = Some(id_only);
+    app.input = "rescued".to_string();
+    app.input_cursor = app.input.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save edit of vanished item");
+
+    // The edited text survives as a freshly-enqueued prompt; edit state clears.
+    assert_eq!(queue_texts(&app), vec!["rescued"]);
+    assert_eq!(app.editing_queue_id, None);
+    assert!(app.status.contains("queued"));
+}
+
+#[tokio::test]
+async fn enter_on_empty_queue_still_closes_the_overlay() {
+    // Edge case: the edit interception only fires on a non-empty queue, so Enter
+    // on an empty queue must keep its old "close the overlay" behaviour.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    app.prompt_queue_overlay = Some(prompt_queue::PromptQueueState::new());
+    assert!(app.prompt_queue.is_empty());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty queue overlay");
+
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "Enter closes the overlay when there is nothing to edit"
+    );
+    assert_eq!(app.editing_queue_id, None);
+    assert!(app.input.is_empty(), "nothing leaks into the composer");
+}
+
+#[tokio::test]
+async fn edit_refuses_to_clobber_a_nonempty_composer_draft() {
+    let mut app = queue_app(&["queued one"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // The user already has an unrelated draft in the composer.
+    app.input = "my unsent draft".to_string();
+    app.input_cursor = app.input.len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("e with a draft present");
+
+    // The draft is preserved; no edit started.
+    assert_eq!(app.input, "my unsent draft");
+    assert_eq!(app.editing_queue_id, None);
+    assert!(app.status.contains("clear the composer"));
+}
+
+#[tokio::test]
+async fn double_click_on_queue_row_opens_it_in_the_composer() {
+    // Mouse parity: a double-click on a queued row drives the same edit verb the
+    // keyboard Enter/`e` does, through the real render() hit-test registry.
+    let mut app = queue_app(&["aaa", "bbb", "ccc"]);
+    let width = 100u16;
+    let height = 20u16;
+    let _ = render_to_string(&app, width, height);
+
+    let id_bbb = queue_id_at(&app, 1);
+    let (col, row) = queue_cell_for(
+        &app,
+        width,
+        height,
+        interaction::TargetKey::QueueItem(id_bbb),
+        interaction::Action::QueueReorderBegin(id_bbb),
+    )
+    .expect("bbb reorder handle registered");
+
+    let press = |app: &mut TuiApp| {
+        handle_mouse(
+            app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: col,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    };
+    // First click arms a reorder drag; the second click within the multi-click
+    // window escalates to a double-click and opens the editor.
+    press(&mut app);
+    press(&mut app);
+
+    assert_eq!(app.input, "bbb");
+    assert_eq!(app.editing_queue_id, Some(id_bbb));
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "double-click closes the overlay into the composer"
+    );
+    // No spurious mutation of the queue contents.
+    assert_eq!(queue_texts(&app), vec!["aaa", "bbb", "ccc"]);
+}
+
+#[test]
+fn queue_overlay_paints_the_edit_hint_across_a_resize() {
+    // The overlay header advertises the new Enter/e edit verb; it must paint at
+    // both a wide and a narrow terminal (the feature paints into the footer).
+    let mut app = queue_app(&["draft prompt"]);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for (w, h) in [(120u16, 16u16), (60u16, 16u16)] {
+        let rendered = render_to_string(&app, w, h);
+        assert!(
+            rendered.contains("edit"),
+            "edit affordance must be visible at {w}x{h}: {rendered}"
+        );
+    }
+}
+
 #[test]
 fn sync_queue_ids_heals_front_drain() {
     // Simulate an external front-drain (a queued prompt ran) without touching

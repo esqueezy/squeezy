@@ -587,6 +587,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         A::QueueReorderBegin(_) => KeyboardPath::Always("queue overlay Shift+Up/Down"),
         // Queue undo — `QueueUndo` (u default).
         A::QueueUndo => KeyboardPath::Keymap(Action::QueueUndo),
+        // Queue edit (§11G.8) — the queue overlay's own Enter/`e` handler pulls
+        // the focused prompt into the composer before the global keymap sees
+        // the key, the same `begin_queue_edit` the double-click drives.
+        A::QueueEdit(_) => KeyboardPath::Always("queue overlay Enter/e"),
         // Jump to latest — `TranscriptEnd` (End default) reaches the tail.
         A::JumpToLatest => KeyboardPath::Keymap(Action::TranscriptEnd),
         // Scrollbar jump — page scroll keys move the same viewport.
