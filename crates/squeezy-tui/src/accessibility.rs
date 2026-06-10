@@ -591,6 +591,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // the focused prompt into the composer before the global keymap sees
         // the key, the same `begin_queue_edit` the double-click drives.
         A::QueueEdit(_) => KeyboardPath::Always("queue overlay Enter/e"),
+        // Queue run-next (§11G.9) — the queue overlay's own `r` handler promotes
+        // the focused prompt to the front before the global keymap sees the key,
+        // the same `queue_run_selected_next` the click drives.
+        A::QueueRunNext(_) => KeyboardPath::Always("queue overlay r"),
         // Jump to latest — `TranscriptEnd` (End default) reaches the tail.
         A::JumpToLatest => KeyboardPath::Keymap(Action::TranscriptEnd),
         // Scrollbar jump — page scroll keys move the same viewport.

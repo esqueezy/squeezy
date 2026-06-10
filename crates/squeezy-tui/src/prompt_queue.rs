@@ -165,7 +165,7 @@ pub(crate) fn render_lines(
     let hint = if group_active {
         "  Space tag · a all · Del delete group · Shift+↑↓ move group · m merge · c clear"
     } else {
-        "  ↑↓ select · Space tag · Shift+↑↓ reorder · Enter/e edit · Del remove · m merge · Esc close"
+        "  ↑↓ select · Space tag · Shift+↑↓ reorder · Enter/e edit · r run next · Del remove · m merge · Esc close"
     };
     let header = Line::from(vec![
         Span::styled(

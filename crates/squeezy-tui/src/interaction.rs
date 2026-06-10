@@ -143,6 +143,12 @@ pub(crate) enum Action {
     /// the prompt's text into the composer and track its id so the next submit
     /// updates that item in place. Fed by a double-click on a queue-item row.
     QueueEdit(u64),
+    /// Promote the given queue item (by stable item id) to the front so it runs
+    /// next (§11G.9). The mouse twin of the keyboard `r` verb; both move the item
+    /// to the front of the queue, then — when idle — arm the drain pump so it
+    /// starts immediately, or — when a turn is running — let the drain-on-finish
+    /// path run it next ahead of the rest of the queue.
+    QueueRunNext(u64),
     /// Jump the transcript to the latest (tail) row.
     JumpToLatest,
     /// Jump the scrollbar thumb to the clicked gutter row.
@@ -180,6 +186,7 @@ impl Action {
         Action::QueueReorderBegin(0),
         Action::QueueUndo,
         Action::QueueEdit(0),
+        Action::QueueRunNext(0),
         Action::JumpToLatest,
         Action::ScrollbarJump,
         Action::MinimapJump(EntryId(0)),

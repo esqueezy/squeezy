@@ -22316,6 +22316,253 @@ fn queue_overlay_paints_the_edit_hint_across_a_resize() {
     }
 }
 
+// ===========================================================================
+// Run Selected Queued Next (§11G.9)
+// ===========================================================================
+
+#[tokio::test]
+async fn r_when_idle_promotes_focused_prompt_to_front_and_arms_drain() {
+    // Idle (no turn running): `r` on a non-front queued prompt moves it to the
+    // front of the queue AND arms the auto-drain pump so the event loop runs it
+    // immediately on the next tick.
+    let mut app = queue_app(&["first", "second", "third"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 2; // focus "third"
+    }
+    let id_third = queue_id_at(&app, 2);
+    assert!(app.turn_rx.is_none(), "precondition: idle");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("r on queued prompt");
+
+    // "third" is now at the front, keeping its stable id; the pump is armed and
+    // the overlay closed so the running turn takes focus.
+    assert_eq!(queue_texts(&app), vec!["third", "first", "second"]);
+    assert_eq!(queue_id_at(&app, 0), id_third);
+    assert!(app.auto_drain_queue, "idle run-next arms the drain pump");
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "idle run-next closes the overlay into the transcript"
+    );
+    assert!(app.status.contains("running selected prompt now"));
+}
+
+#[tokio::test]
+async fn r_when_busy_promotes_to_front_without_arming_drain() {
+    // A turn is running: `r` only reorders (front-promotes); it must NOT arm the
+    // drain pump (which would not interrupt the live turn anyway) and must keep
+    // the overlay open so the user can keep manipulating the queue.
+    let mut app = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 2; // focus "c"
+    }
+    let id_c = queue_id_at(&app, 2);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("r while busy");
+
+    assert_eq!(queue_texts(&app), vec!["c", "a", "b"]);
+    assert_eq!(queue_id_at(&app, 0), id_c);
+    assert!(
+        !app.auto_drain_queue,
+        "a running turn must never be pre-empted by run-next"
+    );
+    assert!(
+        app.prompt_queue_overlay.is_some(),
+        "busy run-next keeps the overlay open"
+    );
+    assert!(app.status.contains("will run next"));
+}
+
+#[tokio::test]
+async fn r_undo_restores_order_after_busy_promote() {
+    // The front-promotion is one undoable `Reordered` step: `u` (the queue undo
+    // verb) puts the promoted prompt back where it was.
+    let mut app = queue_app(&["a", "b", "c", "d"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 2; // focus "c"
+    }
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("r while busy");
+    assert_eq!(queue_texts(&app), vec!["c", "a", "b", "d"]);
+
+    // Undo the promotion (bare `u`, the keymap QueueUndo verb).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("undo the promote");
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c", "d"]);
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+}
+
+#[tokio::test]
+async fn r_on_already_front_prompt_runs_now_when_idle_without_reorder() {
+    // The focused row is already the front: idle `r` does not reorder (nothing to
+    // move) but still arms the drain so the front prompt runs immediately.
+    let mut app = queue_app(&["only", "next"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0; // already at the front
+    }
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("r on the front prompt");
+
+    assert_eq!(queue_texts(&app), vec!["only", "next"], "order unchanged");
+    assert!(app.auto_drain_queue, "front prompt still runs immediately");
+    assert!(app.prompt_queue_overlay.is_none());
+    // No spurious undo record for a no-op reorder.
+    assert!(app.prompt_queue_undo.is_empty());
+}
+
+#[tokio::test]
+async fn r_on_already_front_prompt_while_busy_is_inert() {
+    // Front + busy: nothing to move and nothing to run — a quiet no-op that still
+    // consumes the key (the overlay stays open, the composer stays untouched).
+    let mut app = queue_app(&["front", "tail"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("r front while busy");
+
+    assert_eq!(queue_texts(&app), vec!["front", "tail"]);
+    assert!(!app.auto_drain_queue);
+    assert!(
+        app.prompt_queue_overlay.is_some(),
+        "inert run-next still keeps the overlay open"
+    );
+    assert!(app.input.is_empty(), "no key leaks into the composer");
+    assert!(app.prompt_queue_undo.is_empty());
+}
+
+#[tokio::test]
+async fn r_on_empty_queue_overlay_is_a_quiet_noop() {
+    // Edge case: the overlay is open over an empty queue. `r` must not panic,
+    // must not arm a drain, and must not leak into the composer.
+    let mut app = queue_app(&[]);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(app.prompt_queue.is_empty());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("r on an empty queue");
+
+    assert!(app.prompt_queue.is_empty());
+    assert!(!app.auto_drain_queue);
+    assert!(
+        app.prompt_queue_overlay.is_some(),
+        "the overlay stays open over the empty queue"
+    );
+    assert!(app.input.is_empty(), "no key leaks into the composer");
+}
+
+#[tokio::test]
+async fn right_click_on_queue_row_runs_it_next_via_mouse() {
+    // Mouse parity: a right-click on a queued row drives the same run-next verb
+    // the keyboard `r` does, through the real render() hit-test registry. Idle,
+    // so it promotes to the front and arms the drain.
+    let mut app = queue_app(&["aaa", "bbb", "ccc"]);
+    let width = 100u16;
+    let height = 20u16;
+    let _ = render_to_string(&app, width, height);
+
+    let id_ccc = queue_id_at(&app, 2);
+    // Any registered QueueItem cell for "ccc" works — right-click hit-tests the
+    // row by its QueueItem key regardless of which left-click action owns the
+    // cell, so target on the reorder handle (the row body).
+    let (col, row) = queue_cell_for(
+        &app,
+        width,
+        height,
+        interaction::TargetKey::QueueItem(id_ccc),
+        interaction::Action::QueueReorderBegin(id_ccc),
+    )
+    .expect("ccc row registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(queue_texts(&app), vec!["ccc", "aaa", "bbb"]);
+    assert_eq!(queue_id_at(&app, 0), id_ccc);
+    assert!(
+        app.auto_drain_queue,
+        "idle right-click run-next arms the drain"
+    );
+    assert!(app.prompt_queue_overlay.is_none());
+}
+
+#[test]
+fn queue_overlay_paints_the_run_next_hint_across_a_resize() {
+    // The overlay header advertises the new `r run next` verb; it must paint at
+    // both a wide and a narrow terminal (the feature paints into the footer).
+    let mut app = queue_app(&["draft one", "draft two"]);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for (w, h) in [(120u16, 16u16), (60u16, 16u16)] {
+        let rendered = render_to_string(&app, w, h);
+        assert!(
+            rendered.contains("run next"),
+            "run-next affordance must be visible at {w}x{h}: {rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn ctrl_click_toggles_multiselect_via_mouse() {
     // Render so the per-item hit targets register, then Ctrl-click "beta".

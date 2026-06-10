@@ -112,6 +112,7 @@ mod prompt_queue;
 mod prompt_queue_multiselect;
 mod proposed_plan;
 mod queue_edit;
+mod queue_run_next;
 mod quote_compose;
 mod render;
 mod resume_picker;
@@ -5678,6 +5679,85 @@ fn queue_merge_to_composer(app: &mut TuiApp) -> bool {
     true
 }
 
+/// Run Selected Queued Next (§11G.9): promote the focused queued prompt to the
+/// front so it runs before everything else still waiting. When idle (no turn
+/// running) the prompt is moved to the front and the auto-drain pump is armed, so
+/// the next event-loop tick pops it and starts a turn immediately; when a turn is
+/// running it is moved to the front only, and the existing drain-on-turn-finish
+/// path runs it next ahead of the rest of the queue (the live turn is never
+/// pre-empted). The reorder is recorded as a single `Reordered` undo (by stable
+/// id + left-neighbour id, so a concurrent front-drain can't stale it), exactly
+/// like the keyboard/mouse reorder verbs.
+///
+/// The single source of truth shared by the keyboard (`r`) and mouse
+/// (`interaction::Action::QueueRunNext`) paths, so the two stay identical by
+/// construction. Returns `true` if it changed anything (moved a row, or armed an
+/// idle run); `false` when the queue is empty, the cursor is stale, or the
+/// focused row is already at the front while a turn is running (nothing to do).
+fn queue_run_selected_next(app: &mut TuiApp) -> bool {
+    // A reorder mid-drag would fight the in-flight gesture; ignore it like the
+    // edit verb does.
+    if app.prompt_queue_drag.is_some() {
+        return false;
+    }
+    sync_queue_ids(app);
+    let Some(selected) = app
+        .prompt_queue_overlay
+        .as_ref()
+        .map(|state| state.selected)
+    else {
+        return false;
+    };
+    let Some(plan) = queue_run_next::plan(selected, app.prompt_queue.len(), app.turn_rx.is_some())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    if plan.moves {
+        // Record the undo BEFORE moving: `prev` is the id that sat immediately
+        // before the focused row's original slot (None at the front), so undo
+        // re-inserts the promoted item back after it, surviving a front-drain.
+        let id = app.prompt_queue_ids.get(plan.from).copied();
+        let prev = queue_prev_id_at(app, plan.from);
+        if queue_move_indices(app, plan.from, 0) {
+            if let Some(id) = id {
+                push_queue_undo(app, QueueMutation::Reordered { id, prev });
+            }
+            // The promoted item now sits at the front; keep the overlay cursor on
+            // it so a follow-up keyboard verb acts on the same prompt.
+            if let Some(state) = app.prompt_queue_overlay.as_mut() {
+                state.selected = 0;
+            }
+            // A focused-row promotion supersedes any group multi-selection: a
+            // stale group must not silently act on the reshuffled queue.
+            app.prompt_queue_multiselect.clear();
+            changed = true;
+        }
+    }
+    if plan.run_now {
+        // Idle: arm the drain pump so the (now front) prompt runs on the next
+        // tick. Close the overlay so focus returns to the transcript the running
+        // turn paints into, mirroring the edit/merge verbs that hand focus back.
+        app.auto_drain_queue = true;
+        app.prompt_queue_overlay = None;
+        app.prompt_queue_drag = None;
+        app.prompt_queue_multiselect.clear();
+        app.status = "running selected prompt now".to_string();
+        app.needs_redraw = true;
+        changed = true;
+    } else if changed {
+        // Busy: the reorder landed but the live turn keeps running; report that
+        // the promoted prompt is queued to run next, and keep the overlay open so
+        // the user can keep manipulating the queue.
+        app.status = format!(
+            "selected prompt will run next ({} queued)",
+            app.prompt_queue.len()
+        );
+        app.needs_redraw = true;
+    }
+    changed
+}
+
 /// Toggle the prompt-queue reorder overlay. Hard-coded as a chord
 /// (`Ctrl+X` then `Q`) rather than a rebindable keymap action because
 /// single-Ctrl-letter defaults collide with terminal flow control
@@ -5706,7 +5786,7 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
     }
     app.status = if app.prompt_queue_overlay.is_some() {
         format!(
-            "prompt queue ({} queued) · ↑↓ focus · Space tag · Enter/e edit · m merge · Del remove · u undo · Esc close",
+            "prompt queue ({} queued) · ↑↓ focus · Space tag · Enter/e edit · r run next · m merge · Del remove · u undo · Esc close",
             app.prompt_queue.len()
         )
     } else {
@@ -5872,6 +5952,21 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // same `begin_queue_edit`, so the paths stay identical by construction.
         interaction::Action::QueueEdit(id) => {
             begin_queue_edit(app, id);
+        }
+        // Run a queued prompt next (§11G.9): promote it to the front of the queue
+        // (runs immediately when idle, on turn-finish when busy). Mouse twin of
+        // the keyboard `r` verb; both seat the overlay focus on the clicked row
+        // and route through the same `queue_run_selected_next`, so the paths stay
+        // identical by construction. A click on a row that has since drained out
+        // resolves to a no-op.
+        interaction::Action::QueueRunNext(id) => {
+            sync_queue_ids(app);
+            if let Some(index) = queue_index_for_id(app, id) {
+                if let Some(state) = app.prompt_queue_overlay.as_mut() {
+                    state.selected = index;
+                }
+                queue_run_selected_next(app);
+            }
         }
         // Scrollbar-jump and jump-to-latest are not yet registered as targets
         // by the render paths; their handlers land with the affordances that
@@ -9035,6 +9130,21 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         // (it never leaks into the composer underneath).
         return true;
     }
+    // Run Selected Queued Next (§11G.9): `r` promotes the focused queued prompt
+    // to the front so it runs ahead of the rest of the queue (immediately when
+    // idle, on turn-finish when busy). Intercepted ahead of the pure-state
+    // dispatch like the edit verb. `r` carries no modifiers so it never shadows a
+    // chord; the key is consumed by the overlay whether or not it changed
+    // anything (an empty queue / already-front-while-busy is a quiet no-op rather
+    // than leaking into the composer).
+    let wants_run_next = matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    if wants_run_next {
+        queue_run_selected_next(app);
+        return true;
+    }
     sync_queue_ids(app);
     let before: Vec<String> = app.prompt_queue.iter().cloned().collect();
     // Capture the cursor's stable identity BEFORE the dispatch mutates the
@@ -9227,6 +9337,18 @@ fn handle_queue_overlay_mouse(
                 _ => None,
             }
         }
+        // Right-click on a queue row runs it next (§11G.9) — the mouse twin of
+        // the keyboard `r` verb. The left-button row is full (drag handle + delete
+        // zone), so run-next rides the right button rather than crowding a third
+        // left-click zone. Routes through the same `QueueRunNext` dispatch the
+        // keyboard verb shares. A press off any queue item falls through.
+        MouseEventKind::Down(MouseButton::Right) => match hit_test(app, &mouse) {
+            Some((interaction::TargetKey::QueueItem(id), _)) => {
+                dispatch_click_action(app, interaction::Action::QueueRunNext(id));
+                Some(true)
+            }
+            _ => None,
+        },
         // Drag/Release are only queue gestures while a reorder drag is armed;
         // otherwise fall through (a held drag with no queue drag is a
         // text-selection / scrollbar gesture the later arms own).
