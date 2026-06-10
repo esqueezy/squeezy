@@ -259,6 +259,62 @@ fn shifted_symbol_binding_folds_away_an_incidental_shift_modifier() {
 }
 
 #[test]
+fn jump_mark_actions_round_trip_and_default_to_alt_chords() {
+    // §11.2 / 11G.2 jump marks: both slugs round-trip, are registered in `ALL`
+    // (so `/keymap` lists them and overrides can target them), and default to
+    // the `Alt+m` / `Alt+'` chords.
+    assert_eq!(
+        Action::from_slug("set_jump_mark"),
+        Some(Action::SetJumpMark)
+    );
+    assert_eq!(Action::from_slug("jump_to_mark"), Some(Action::JumpToMark));
+    assert!(Action::ALL.contains(&Action::SetJumpMark));
+    assert!(Action::ALL.contains(&Action::JumpToMark));
+
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::SetJumpMark),
+        KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.binding(Action::JumpToMark),
+        KeyBinding::new(KeyCode::Char('\''), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('m'), KeyModifiers::ALT),
+        Some(Action::SetJumpMark),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('\''), KeyModifiers::ALT),
+        Some(Action::JumpToMark),
+    );
+    // Alt (Meta) chords are honestly classified terminal-dependent.
+    assert_eq!(
+        Action::SetJumpMark.terminal_compat_note(),
+        Some("terminal-dependent")
+    );
+    assert_eq!(
+        Action::JumpToMark.terminal_compat_note(),
+        Some("terminal-dependent")
+    );
+}
+
+#[test]
+fn jump_mark_defaults_do_not_collide_with_other_actions() {
+    // The new `Alt+m` / `Alt+'` defaults must not shadow (or be shadowed by)
+    // any existing default binding.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::SetJumpMark)
+                && !collision.1.contains(&Action::JumpToMark),
+            "jump-mark default collides: {:?}",
+            collision
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

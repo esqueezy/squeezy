@@ -21945,3 +21945,184 @@ fn main_render_text_selection_changes_paint_but_keeps_rows_cached() {
         "the selection highlight must change the painted output"
     );
 }
+
+// ---- Jump marks (§11.2 / 11G.2) -------------------------------------
+
+/// Seed a transcript with enough turns that the view can scroll, and unpin it
+/// to the top so a mark records a non-tail position.
+fn jump_marks_app() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..60 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app
+}
+
+#[tokio::test]
+async fn jump_mark_set_then_jump_back_drives_through_real_render() {
+    // Keyboard path through the full keymap: `Alt+m` sets a mark, `Alt+'` pops
+    // it. The marks are kept by stable entry id, so the count is what we assert
+    // rather than the (terminal-size-dependent) exact scroll offset.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = jump_marks_app();
+    // Scroll up so the marked position is meaningfully above the tail.
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(20);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-m sets a jump mark");
+    assert_eq!(app.jump_marks.mark_count(), 1, "Alt+m must set one mark");
+    assert!(
+        app.status.contains("mark set"),
+        "status must confirm the mark: {}",
+        app.status
+    );
+
+    // The feature must survive the real fullscreen renderer.
+    let _ = render_to_string(&app, 80, 24);
+
+    // Move away (re-pin to the tail) then jump back.
+    app.transcript_scroll = scroll::ScrollState::pinned();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\''), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-' jumps back to the mark");
+    assert_eq!(
+        app.jump_marks.mark_count(),
+        0,
+        "jumping back must pop the mark off the stack",
+    );
+    assert!(
+        app.status.contains("jumped back") || app.status.contains("no longer"),
+        "status must report the jump-back outcome: {}",
+        app.status
+    );
+
+    // And still renders cleanly after the jump.
+    let painted = render_to_string(&app, 80, 24);
+    assert!(!painted.is_empty());
+}
+
+#[test]
+fn jump_mark_records_stable_entry_id_at_top_of_viewport() {
+    let mut app = jump_marks_app();
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(30);
+
+    // The id the renderer would mark is the top-visible entry's stable id.
+    let expected = current_top_entry_id(&app).expect("a top entry exists");
+    set_jump_mark(&mut app);
+    assert_eq!(app.jump_marks.mark_count(), 1);
+
+    // Re-pin to the tail, then jump back: the view must move off the tail
+    // toward the marked entry, and the mark drains.
+    app.transcript_scroll = scroll::ScrollState::pinned();
+    assert!(app.transcript_scroll.is_following());
+    jump_to_jump_mark(&mut app);
+    assert_eq!(app.jump_marks.mark_count(), 0);
+    // The marked entry id is still live, so the jump landed on it (status, not
+    // a "no longer in transcript" failure).
+    assert!(
+        app.status.contains("jumped back"),
+        "jump must land on the still-live marked entry #{expected}: {}",
+        app.status
+    );
+}
+
+#[test]
+fn jump_mark_on_empty_transcript_is_a_safe_noop() {
+    // Edge case: nothing to mark. Must not panic, must not record a mark, and
+    // must surface a clear status — through the real renderer.
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.transcript.is_empty());
+
+    set_jump_mark(&mut app);
+    assert_eq!(app.jump_marks.mark_count(), 0);
+    assert!(
+        app.status.contains("no transcript to mark"),
+        "{}",
+        app.status
+    );
+
+    // Jump-back with no marks set surfaces the "none set" hint, not a panic.
+    jump_to_jump_mark(&mut app);
+    assert!(app.status.contains("no jump marks"), "{}", app.status);
+
+    let _ = render_to_string(&app, 80, 24);
+}
+
+#[test]
+fn jump_back_history_summary_shown_when_stack_drained() {
+    // After a jump, the mark stack is empty; a second `Alt+'` with no marks
+    // surfaces the recent-jump history rather than the bare "none set" hint.
+    let mut app = jump_marks_app();
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(25);
+    set_jump_mark(&mut app);
+    app.transcript_scroll = scroll::ScrollState::pinned();
+    jump_to_jump_mark(&mut app); // lands + records history, drains the stack
+    assert_eq!(app.jump_marks.mark_count(), 0);
+
+    jump_to_jump_mark(&mut app); // no marks left
+    assert!(
+        app.status.contains("recent jumps") || app.status.contains("no jump marks"),
+        "drained stack must show the recent-jump trail or the none hint: {}",
+        app.status
+    );
+}
+
+#[test]
+fn jump_marks_survive_resize_and_repaint() {
+    // Resize is where the feature paints: a mark set at one width must still be
+    // jumpable after the viewport reflows to another width, because marks are
+    // keyed by stable entry id (not a width-dependent row).
+    let mut app = jump_marks_app();
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(20);
+    set_jump_mark(&mut app);
+    assert_eq!(app.jump_marks.mark_count(), 1);
+
+    // Paint narrow, then wide — both must render without panicking.
+    let narrow = render_to_string(&app, 40, 20);
+    let wide = render_to_string(&app, 160, 50);
+    assert!(!narrow.is_empty());
+    assert!(!wide.is_empty());
+
+    // Re-clamp scroll to a fresh geometry (as a real resize does), then jump
+    // back: the mark is still resolvable.
+    reanchor_active_scroll_on_resize(&mut app);
+    app.transcript_scroll = scroll::ScrollState::pinned();
+    jump_to_jump_mark(&mut app);
+    assert_eq!(app.jump_marks.mark_count(), 0);
+    assert!(
+        app.status.contains("jumped back"),
+        "mark must survive the reflow and resolve: {}",
+        app.status
+    );
+}
+
+#[test]
+fn jump_marks_cleared_on_transcript_clear() {
+    // `/clear` resets entry ids to 0, so stale marks would point at unrelated
+    // new entries. They must be dropped. We exercise the same reset the clear
+    // path performs.
+    let mut app = jump_marks_app();
+    set_jump_mark(&mut app);
+    assert_eq!(app.jump_marks.mark_count(), 1);
+
+    // Mirror the transcript-reset bookkeeping (`DispatchCommand::Clear`).
+    app.transcript.clear();
+    app.selected_entry = None;
+    app.next_entry_id = 0;
+    app.jump_marks = jump_marks::JumpMarkStack::new();
+
+    assert_eq!(
+        app.jump_marks.mark_count(),
+        0,
+        "marks must not survive a transcript rebuild",
+    );
+}

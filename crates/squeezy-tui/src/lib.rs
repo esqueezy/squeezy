@@ -93,6 +93,7 @@ mod fuzzy;
 mod history;
 mod input;
 mod interaction;
+mod jump_marks;
 mod keymap;
 mod keymap_config;
 mod latency;
@@ -1776,6 +1777,9 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.transcript.clear();
             app.selected_entry = None;
             app.next_entry_id = 0;
+            // Entry ids restart from 0 on a transcript rebuild, so old marks
+            // would point at unrelated new entries — drop them.
+            app.jump_marks = jump_marks::JumpMarkStack::new();
             app.clear_turn_divider();
             for item in transcript {
                 hydrate_transcript_item(app, item);
@@ -4477,6 +4481,23 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             app.toggle_dogfood_metrics();
             true
         }
+        keymap::Action::SetJumpMark => {
+            // Main-surface transcript navigation; the config/setup screens own
+            // their own routing, and the Ctrl+T overlay guard above already
+            // blocks this while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            set_jump_mark(app);
+            true
+        }
+        keymap::Action::JumpToMark => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            jump_to_jump_mark(app);
+            true
+        }
     }
 }
 
@@ -4677,6 +4698,140 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
     let from_bottom = max_scroll.saturating_sub(entry_offsets[target_index].min(max_scroll));
     commit_main_from_bottom_animated(app, from_bottom);
     true
+}
+
+/// The viewport geometry the main transcript renders at right now: the
+/// per-entry header row offsets, the wrapped row total, and the viewport
+/// height — all measured against the same text width `render()` paints with so
+/// the scroll math agrees with the screen. Shared by the jump-mark set/jump
+/// path. Returns `None` when there is nothing to navigate (empty transcript or
+/// a degenerate zero-height viewport).
+fn jump_nav_geometry(app: &TuiApp) -> Option<(Vec<usize>, usize, usize)> {
+    let (width, height) = terminal_size().unwrap_or((80, 24));
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let include_startup_card = area.height >= 16;
+    let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
+    let text_width = area.width.saturating_sub(1).max(1);
+    let (rows, entry_offsets) =
+        transcript_lines_and_entry_offsets(app, Some(text_width), include_startup_card);
+    let total_rows = rows.len();
+    if entry_offsets.is_empty() || total_rows == 0 {
+        return None;
+    }
+    Some((entry_offsets, total_rows, viewport_h))
+}
+
+/// Stable entry id of the entry currently at (or nearest above) the top of the
+/// main viewport — the "current transcript row" a jump mark records. Picks the
+/// entry with the greatest header offset that is still at or above the top
+/// visible row, so a mark lands on the entry the user is actually looking at.
+/// `None` when the transcript is empty.
+fn current_top_entry_id(app: &TuiApp) -> Option<u64> {
+    let (entry_offsets, total_rows, viewport_h) = jump_nav_geometry(app)?;
+    let top_row = active_transcript_scroll(app).offset(total_rows, viewport_h);
+    let entries = active_transcript_entries(app);
+    // Greatest header offset that is <= top_row (the entry occupying the top
+    // row). If we are scrolled above every header, fall back to the first.
+    let index = entry_offsets
+        .iter()
+        .enumerate()
+        .filter(|&(_, &off)| off <= top_row)
+        .map(|(i, _)| i)
+        .next_back()
+        .unwrap_or(0);
+    entries.get(index).map(|entry| entry.id)
+}
+
+/// Scroll (with a smooth ease) so the entry with stable id `entry_id` sits at
+/// the top of the viewport. Returns `true` when the entry exists and the view
+/// moved there; `false` when no live entry carries that id (e.g. it was dropped
+/// by a transcript rebuild) or there is nothing to navigate.
+fn jump_to_entry_id(app: &mut TuiApp, entry_id: u64) -> bool {
+    let Some((entry_offsets, total_rows, viewport_h)) = jump_nav_geometry(app) else {
+        return false;
+    };
+    let entries = active_transcript_entries(app);
+    let Some(index) = entries.iter().position(|entry| entry.id == entry_id) else {
+        return false;
+    };
+    let Some(&offset) = entry_offsets.get(index) else {
+        return false;
+    };
+    let max_scroll = total_rows.saturating_sub(viewport_h);
+    let from_bottom = max_scroll.saturating_sub(offset.min(max_scroll));
+    commit_main_from_bottom_animated(app, from_bottom);
+    true
+}
+
+/// Compact human label for an entry id used in the recent-jump status readout
+/// (`"#3 user"`, `"#5 tool"`). `None` when the id is no longer live.
+fn jump_mark_entry_label(app: &TuiApp, entry_id: u64) -> Option<String> {
+    let entries = active_transcript_entries(app);
+    let index = entries.iter().position(|entry| entry.id == entry_id)?;
+    let kind = match &entries[index].kind {
+        TranscriptEntryKind::Message(item) if item.role == Role::User => "user",
+        TranscriptEntryKind::Message(item) if item.role == Role::Assistant => "asst",
+        TranscriptEntryKind::Message(_) => "msg",
+        TranscriptEntryKind::ToolResult(_) => "tool",
+        TranscriptEntryKind::Reasoning(_) => "think",
+        TranscriptEntryKind::Log(_) => "log",
+        _ => "entry",
+    };
+    Some(format!("#{} {kind}", index + 1))
+}
+
+/// `Alt+m`: record a jump mark at the entry currently at the top of the
+/// viewport. Marks are stored by stable entry id so they survive a transcript
+/// reflow. Sets a status line confirming the mark and the running mark count.
+fn set_jump_mark(app: &mut TuiApp) {
+    let Some(entry_id) = current_top_entry_id(app) else {
+        app.status = "no transcript to mark".to_string();
+        return;
+    };
+    let count = app.jump_marks.set(entry_id);
+    let label = jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"));
+    app.status = if count == 1 {
+        format!("mark set at {label}")
+    } else {
+        format!("mark set at {label} ({count} marks) — Alt+' to jump back")
+    };
+}
+
+/// `Alt+'`: jump back to the most recently set jump mark, popping it off the
+/// stack. With no marks set, surfaces the recent jump history (or a hint when
+/// there is none) instead of moving the view.
+fn jump_to_jump_mark(app: &mut TuiApp) {
+    let current = current_top_entry_id(app);
+    let Some(target) = app.jump_marks.jump_back(current) else {
+        // Nothing to pop. Show the recent trail if we have one, else a hint.
+        let summary = app
+            .jump_marks
+            .history_summary(4, |id| jump_mark_entry_label(app, id));
+        app.status = if summary.is_empty() {
+            "no jump marks — Alt+m to set one".to_string()
+        } else {
+            format!("no marks left — recent jumps: {summary}")
+        };
+        return;
+    };
+    if jump_to_entry_id(app, target) {
+        let label = jump_mark_entry_label(app, target).unwrap_or_else(|| format!("#{target}"));
+        let remaining = app.jump_marks.mark_count();
+        app.status = if remaining == 0 {
+            format!("jumped back to {label}")
+        } else {
+            format!("jumped back to {label} ({remaining} marks left)")
+        };
+    } else {
+        // The mark's entry is gone (transcript rebuilt). It was already popped;
+        // tell the user and try the next-older mark on the next press.
+        app.status = "mark target no longer in transcript".to_string();
+    }
 }
 
 /// Largest number of queue mutations kept on the undo stack. Small on
@@ -6453,6 +6608,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.transcript.clear();
                 app.selected_entry = None;
                 app.next_entry_id = 0;
+                // Entry ids restart from 0 after a clear, so old marks would
+                // point at unrelated new entries — drop them.
+                app.jump_marks = jump_marks::JumpMarkStack::new();
                 app.clear_turn_divider();
                 app.render_cache_session = render::cache::next_session_id();
                 app.attachments = agent.context_attachments_snapshot().await;
@@ -20429,6 +20587,11 @@ pub(crate) struct TuiApp {
     /// the active surface's wrapped `Vec<Line>`; drives the in-search key
     /// mini-buffer, the match highlight in both renders, and scroll-into-view.
     pub(crate) search: Option<search::SearchState>,
+    /// Jump marks (§11.2 / 11G.2): a LIFO stack of remembered transcript
+    /// positions plus a short recent-jump history, both keyed by stable entry
+    /// id so they survive a reflow. `Alt+m` sets a mark at the top-visible
+    /// entry; `Alt+'` jumps back to the most recent one.
+    pub(crate) jump_marks: jump_marks::JumpMarkStack,
     /// Timestamp + cell + running count of the last left press, for
     /// synthesising double/triple clicks (crossterm delivers no click-count). A
     /// press within the multi-click window at the same cell escalates word →
@@ -21059,6 +21222,7 @@ impl TuiApp {
             main_text_area_cache: std::cell::Cell::new(None),
             selection: None,
             search: None,
+            jump_marks: jump_marks::JumpMarkStack::new(),
             last_click: None,
             wheel_accum: 0,
             main_scroll_anim: None,

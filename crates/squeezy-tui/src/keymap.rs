@@ -135,6 +135,14 @@ pub(crate) enum Action {
     /// visible and adds a session-long counter snapshot (frames/bytes/cache/
     /// input/storms/copy/terminal-profile/a11y/teardown). Off by default.
     ToggleDogfoodMetrics,
+    /// Set a jump mark at the entry currently at the top of the viewport
+    /// (`Alt+m` default; §11.2 / 11G.2). Marks are stored by stable entry id,
+    /// so they survive a transcript reflow. Paired with `JumpToMark`.
+    SetJumpMark,
+    /// Jump back to the most recently set jump mark, popping it off the mark
+    /// stack (`Alt+'` default; §11.2 / 11G.2). With no marks set, falls back to
+    /// showing the recent jump history in the status line.
+    JumpToMark,
 }
 
 impl Action {
@@ -172,6 +180,8 @@ impl Action {
             Self::QueueUndo => "queue_undo",
             Self::ToggleLatencyOverlay => "toggle_latency_overlay",
             Self::ToggleDogfoodMetrics => "toggle_dogfood_metrics",
+            Self::SetJumpMark => "set_jump_mark",
+            Self::JumpToMark => "jump_to_mark",
         }
     }
 
@@ -208,6 +218,8 @@ impl Action {
         Action::QueueUndo,
         Action::ToggleLatencyOverlay,
         Action::ToggleDogfoodMetrics,
+        Action::SetJumpMark,
+        Action::JumpToMark,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -265,6 +277,11 @@ impl Action {
             // terminals, tmux, and SSH.
             | Self::ToggleLatencyOverlay
             | Self::ToggleDogfoodMetrics
+            // Jump-mark chords are `Alt`+key (`Alt+m` / `Alt+'`) — the same
+            // Meta/Alt encoding that is unreliable across Linux terminals,
+            // tmux, and SSH as the copy / jump-nav chords above.
+            | Self::SetJumpMark
+            | Self::JumpToMark
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -365,6 +382,12 @@ impl Action {
                 KeyCode::Char('m'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
+            // Jump marks (§11.2 / 11G.2). `Alt`+key chords matching the rest of
+            // the navigation/copy family: `Alt+m` ("mark") sets, `Alt+'`
+            // (the vi mark-jump key) jumps back. Bare `Alt` letters/punctuation
+            // c/o/k/v/a/y/,/./[/] are taken; m and ' are free.
+            Self::SetJumpMark => KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            Self::JumpToMark => KeyBinding::new(KeyCode::Char('\''), KeyModifiers::ALT),
         }
     }
 }
