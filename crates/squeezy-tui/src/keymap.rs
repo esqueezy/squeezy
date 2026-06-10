@@ -170,6 +170,13 @@ pub(crate) enum Action {
     /// fullscreen overlay. Records every copy through the same provider chain and
     /// records nothing at idle, so an unopened picker costs zero.
     ToggleClipboardHistory,
+    /// Build a shareable session bundle with the defaults (`Alt+b` default;
+    /// §12.6.6) — the keyboard twin of `/bundle`. Renders the transcript through
+    /// the export pipeline, assembles a self-contained Markdown artifact
+    /// (transcript + manifest + checksum + diagnostics, redacted), writes it
+    /// atomically under session storage, and echoes a preview into the transcript
+    /// for review before sharing. A one-shot action — it paints nothing at idle.
+    BuildSessionBundle,
 }
 
 impl Action {
@@ -215,6 +222,7 @@ impl Action {
             Self::ScrollBlockRight => "scroll_block_right",
             Self::ToggleHyperlinks => "toggle_hyperlinks",
             Self::ToggleClipboardHistory => "toggle_clipboard_history",
+            Self::BuildSessionBundle => "build_session_bundle",
         }
     }
 
@@ -259,6 +267,7 @@ impl Action {
         Action::ScrollBlockRight,
         Action::ToggleHyperlinks,
         Action::ToggleClipboardHistory,
+        Action::BuildSessionBundle,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -334,6 +343,8 @@ impl Action {
             // Clipboard-history picker toggle is `Alt+p` — the same Meta/Alt
             // encoding that is unreliable across Linux terminals, tmux, and SSH.
             | Self::ToggleClipboardHistory
+            // Session-bundle build is `Alt+b` — the same Meta/Alt encoding case.
+            | Self::BuildSessionBundle
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -462,6 +473,10 @@ impl Action {
             // r/w/h/l) are taken; `p` is free (`Ctrl+P` is the task-panel toggle,
             // a distinct chord).
             Self::ToggleClipboardHistory => KeyBinding::new(KeyCode::Char('p'), KeyModifiers::ALT),
+            // Session bundle (§12.6.6). `Alt+b` — `b` recalls "bundle". Bare
+            // `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p) are
+            // taken; `b` is free.
+            Self::BuildSessionBundle => KeyBinding::new(KeyCode::Char('b'), KeyModifiers::ALT),
         }
     }
 }

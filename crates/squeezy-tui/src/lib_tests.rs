@@ -12970,6 +12970,216 @@ async fn export_empty_transcript_is_a_no_op_for_clipboard() {
     );
 }
 
+// ===========================================================================
+// §12.6.6 — Shareable Session Bundle.
+//
+// `/bundle [md|json] [no-redact]` builds a self-contained shareable artifact
+// (transcript + manifest + checksum + diagnostics, redacted by default) under
+// session storage, then echoes a preview into the transcript for review. These
+// drive the command through the real `handle_slash_command` dispatch (the
+// composer path) and the keymap action through the real `handle_key` (the
+// keyboard path), plus the real `render()` for the in-app preview.
+// ===========================================================================
+
+/// `/bundle` writes a Markdown bundle under `.squeezy/bundles/`, atomically,
+/// with the transcript, manifest, and checksum embedded, and echoes a preview
+/// into the transcript.
+#[tokio::test]
+async fn bundle_writes_markdown_artifact_with_manifest_and_preview() {
+    let root = temp_workspace("bundle_md");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("a question"));
+    app.push_transcript_item(TranscriptItem::assistant("bundle response body"));
+
+    let before = app.transcript.len();
+    assert!(handle_slash_command(&mut app, &mut agent, "/bundle").await);
+    assert!(
+        app.status.starts_with("wrote bundle "),
+        "status: {}",
+        app.status
+    );
+    // A preview row is echoed into the transcript for review before sharing.
+    assert!(app.transcript.len() > before, "bundle echoes a preview row");
+
+    let bundles_dir = root.join(".squeezy").join("bundles");
+    let written = walk_files(&bundles_dir);
+    assert_eq!(written.len(), 1, "one bundle file under {bundles_dir:?}");
+    let file = &written[0];
+    assert_eq!(file.extension().and_then(|e| e.to_str()), Some("md"));
+    let body = std::fs::read_to_string(file).expect("read bundle");
+    assert!(body.contains("# Squeezy Session Bundle"), "header: {body}");
+    assert!(body.contains("## Manifest"), "manifest: {body}");
+    assert!(body.contains("transcript_sha256"), "checksum: {body}");
+    assert!(
+        body.contains("bundle response body"),
+        "transcript embedded: {body}"
+    );
+    assert!(
+        body.contains("| redacted | yes"),
+        "redacted by default: {body}"
+    );
+    // The atomic temp file must not survive.
+    assert!(
+        !walk_files(&bundles_dir)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("squeezy-export-tmp")),
+        "atomic temp file should be renamed away"
+    );
+}
+
+/// `/bundle json` writes a valid-JSON bundle whose manifest and transcript
+/// fields round-trip through a parser.
+#[tokio::test]
+async fn bundle_json_is_valid_and_machine_readable() {
+    let root = temp_workspace("bundle_json");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("json bundle body"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/bundle json").await);
+
+    let written = walk_files(&root.join(".squeezy").join("bundles"));
+    assert_eq!(written.len(), 1);
+    let file = &written[0];
+    assert_eq!(file.extension().and_then(|e| e.to_str()), Some("json"));
+    let body = std::fs::read_to_string(file).expect("read bundle");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid json bundle");
+    assert_eq!(value["manifest"]["model"], "gpt-test");
+    assert_eq!(value["manifest"]["redacted"], true);
+    assert!(
+        value["transcript"]
+            .as_str()
+            .is_some_and(|t| t.contains("json bundle body")),
+        "transcript field carries the body: {body}"
+    );
+}
+
+/// Redaction is on by default; `/bundle no-redact` opts out and the manifest is
+/// honest about it. A bearer token in the transcript is masked under the default
+/// and preserved (with a NOT-sanitized notice) under the opt-out.
+#[tokio::test]
+async fn bundle_redacts_secrets_by_default_and_opt_out_is_honest() {
+    let root = temp_workspace("bundle_redact");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "run: curl -H 'Authorization: Bearer sk-leakedsecretvalue123' https://api",
+    ));
+
+    // Default: redacted.
+    assert!(handle_slash_command(&mut app, &mut agent, "/bundle").await);
+    let redacted_file = walk_files(&root.join(".squeezy").join("bundles"))
+        .into_iter()
+        .next()
+        .expect("a bundle file");
+    let redacted = std::fs::read_to_string(&redacted_file).expect("read");
+    assert!(
+        !redacted.contains("sk-leakedsecretvalue123"),
+        "secret masked by default: {redacted}"
+    );
+    assert!(redacted.contains("***REDACTED***"), "{redacted}");
+
+    // Opt-out: NOT redacted, and the manifest says so.
+    assert!(handle_slash_command(&mut app, &mut agent, "/bundle md no-redact").await);
+    let raw = walk_files(&root.join(".squeezy").join("bundles"))
+        .into_iter()
+        .map(|p| std::fs::read_to_string(&p).expect("read"))
+        .find(|b| b.contains("NOT sanitized"))
+        .expect("an unredacted bundle exists");
+    assert!(
+        raw.contains("sk-leakedsecretvalue123"),
+        "opt-out keeps the secret: {raw}"
+    );
+}
+
+/// `/bundle yaml` is a usage error that writes no file.
+#[tokio::test]
+async fn bundle_rejects_unknown_option() {
+    let root = temp_workspace("bundle_bad");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hi"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/bundle yaml").await);
+    assert!(
+        app.status.contains("unknown bundle option"),
+        "status: {}",
+        app.status
+    );
+    assert!(
+        !root.join(".squeezy").join("bundles").exists(),
+        "no file written on parse error"
+    );
+}
+
+/// An empty transcript reports "nothing to bundle" and writes no file.
+#[tokio::test]
+async fn bundle_empty_transcript_is_a_no_op() {
+    let root = temp_workspace("bundle_empty");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/bundle").await);
+    assert!(
+        app.status.contains("nothing to bundle"),
+        "empty transcript: {}",
+        app.status
+    );
+    assert!(
+        !root.join(".squeezy").join("bundles").exists(),
+        "no file written for an empty transcript"
+    );
+}
+
+/// The keyboard path: `Alt+b` (the `BuildSessionBundle` keymap action) builds a
+/// bundle with the defaults through the real `handle_key`, and the echoed
+/// preview is visible through the real `render()` across sizes, including a
+/// resize down.
+#[tokio::test]
+async fn alt_b_builds_bundle_and_preview_renders_across_sizes() {
+    let root = temp_workspace("bundle_key");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("keyboard bundle marker"));
+
+    let before = app.transcript.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        app.status.starts_with("wrote bundle "),
+        "Alt+b builds a bundle: {}",
+        app.status
+    );
+    assert!(app.transcript.len() > before, "Alt+b echoes a preview row");
+    let written = walk_files(&root.join(".squeezy").join("bundles"));
+    assert_eq!(written.len(), 1, "Alt+b wrote one bundle file");
+
+    // The preview paints through the real render() across sizes, including a
+    // resize down to a small terminal. The preview is the bottom-most transcript
+    // item, so the viewport anchors on it; the redaction status line is in view
+    // at every size (the header scrolls above the fold on the tiniest one).
+    for (w, h) in [(120u16, 40u16), (80, 24), (40, 20)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("redaction:"),
+            "bundle preview visible at {w}x{h}:\n{out}"
+        );
+    }
+}
+
 /// Recursively collect every regular file under `dir` (empty when missing).
 fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

@@ -350,6 +350,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<md|txt|json> [clipboard|stdout|dir:<name>|<path>]",
         &[PermissionCapability::Edit],
     ),
+    slash_args_caps(
+        "/bundle",
+        "build a shareable session bundle (transcript + manifest + checksum, redacted)",
+        true,
+        "[md|json] [no-redact]",
+        &[PermissionCapability::Edit],
+    ),
     slash(
         "/terminal",
         "show terminal diagnostic info (TTY, TERM, clipboard, notifications, shell)",

@@ -1060,6 +1060,19 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["tui"],
     },
     SlashCommandHelp {
+        name: "/bundle",
+        what: "Build a self-contained shareable session bundle for support or handoff: the rendered transcript plus a manifest (session/model/mode metadata), a SHA-256 checksum, and terminal diagnostics, written to a single Markdown or JSON file. Secrets are redacted by default; pass 'no-redact' for a local-only bundle. A preview is echoed into the transcript for review before sharing.",
+        syntax: "/bundle [md|json] [no-redact]",
+        examples: &[
+            "/bundle             — build a redacted Markdown bundle",
+            "/bundle json        — build a redacted JSON bundle",
+            "/bundle md no-redact — build a Markdown bundle without redaction",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Writes a file to disk (Edit capability)."),
+        related: &["tui", "export"],
+    },
+    SlashCommandHelp {
         name: "/terminal",
         what: "Show terminal diagnostic info: TTY status, TERM/COLORTERM, clipboard and desktop-notification capability, and the detected shell. Useful when debugging display, color, copy, or notification issues across terminal emulators.",
         syntax: "/terminal",

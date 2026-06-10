@@ -125,6 +125,7 @@ mod resume_picker;
 mod scroll;
 mod search;
 mod selection;
+mod session_bundle;
 mod settings_watcher;
 mod signal_teardown;
 mod size_source;
@@ -5112,6 +5113,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_clipboard_history(app);
             true
         }
+        keymap::Action::BuildSessionBundle => {
+            // The keyboard twin of `/bundle`: build a shareable bundle with the
+            // defaults (Markdown, redacted). A main-surface action; the
+            // config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            handle_bundle_command(app, agent, "");
+            true
+        }
     }
 }
 
@@ -7193,6 +7204,28 @@ async fn handle_slash_command_on_surface(
             slash_arg_shape_from_rest(input),
         );
         handle_export_command(app, agent, rest);
+        return true;
+    }
+
+    // `/bundle` (§12.6.6) is likewise a TUI-local command: it reuses the same
+    // in-memory transcript row model + Markdown export formatter to build a
+    // self-contained shareable artifact (transcript + manifest + checksum +
+    // diagnostics, redacted by default), so it is handled here before the
+    // agent-owned dispatch parser, which does not know it.
+    if raw_head == "/bundle" {
+        let rest = input
+            .strip_prefix(raw_head)
+            .map(str::trim)
+            .unwrap_or_default();
+        record_slash_command_telemetry(
+            agent,
+            "/bundle",
+            surface,
+            SlashOutcome::Accepted,
+            SlashAliasKind::Canonical,
+            slash_arg_shape_from_rest(input),
+        );
+        handle_bundle_command(app, agent, rest);
         return true;
     }
 
@@ -9356,6 +9389,152 @@ fn write_export_atomically(target: &Path, content: &str) -> std::io::Result<()> 
     let tmp = target.with_extension("squeezy-export-tmp");
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, target)
+}
+
+/// Handle `/bundle [md|json] [no-redact]` (§12.6.6): build a self-contained,
+/// shareable artifact for support/handoff — the rendered transcript plus a
+/// manifest (session metadata), a checksum over the (redacted) transcript body,
+/// and the terminal/environment diagnostics — and write it atomically under
+/// session storage, then echo a *preview* into the transcript so the user can
+/// review what they are about to share before sending the file.
+///
+/// Reuses the export pipeline end to end: the transcript text is the same
+/// Markdown payload `/export md` produces ([`build_scope_payload`]), and the
+/// file is written through the same atomic-write helper. Redaction is on by
+/// default (the share-safe default); `no-redact` opts out for a local-only
+/// bundle, and both the manifest and the preview say plainly which it is.
+fn handle_bundle_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
+    let request = match session_bundle::parse_bundle_request(rest) {
+        Ok(request) => request,
+        Err(usage) => {
+            set_status_with_notice(app, usage.clone(), usage);
+            return;
+        }
+    };
+
+    // Render the transcript through the shared Markdown export formatter so the
+    // bundle never grows a second transcript renderer.
+    let Some(transcript) = build_scope_payload(
+        app,
+        copy::CopyScope::FullTranscript,
+        copy::CopyFormat::Markdown,
+    ) else {
+        set_status_notice(app, "nothing to bundle yet");
+        return;
+    };
+
+    let meta = bundle_meta_for(app, agent);
+    let diagnostics = bundle_diagnostics(app);
+    let bundle = session_bundle::SessionBundle::build(
+        request.format,
+        &meta,
+        &diagnostics,
+        &transcript,
+        request.redact,
+    );
+
+    let target = bundle_export_path(app, &meta, request.format);
+    match write_export_atomically(&target, &bundle.artifact) {
+        Ok(()) => {
+            app.status = format!(
+                "wrote bundle {} ({} bytes)",
+                target.display(),
+                bundle.report.bytes
+            );
+            app.toasts.push(
+                format!("session bundle written to {}", target.display()),
+                toast::ToastVariant::Success,
+            );
+            // Preview the manifest essentials + redaction status in-app so the
+            // user reviews what they are about to share before handing the file
+            // off (the spec's mandatory preview affordance).
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "{}\n\nWritten to {}",
+                bundle.preview(&meta),
+                target.display(),
+            )));
+        }
+        Err(error) => {
+            let message = format!("bundle failed: {error}");
+            app.status = message.clone();
+            app.toasts.push(message.clone(), toast::ToastVariant::Error);
+            app.push_transcript_item(TranscriptItem::system(message));
+        }
+    }
+}
+
+/// Gather the manifest facts for a bundle from the live app + agent. Pure read;
+/// the bundle module owns all assembly.
+fn bundle_meta_for(app: &TuiApp, agent: &Agent) -> session_bundle::BundleMeta {
+    let session_id = agent
+        .session_id()
+        .or_else(|| app.session_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let generated_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    session_bundle::BundleMeta {
+        session_id,
+        model: app.model.clone(),
+        mode: title_case_mode(app.mode).to_ascii_lowercase(),
+        provider: app.provider_name.to_string(),
+        version: app.version.to_string(),
+        workspace: session_bundle::portable_path(&app.workspace_root.to_string_lossy()),
+        transcript_entries: app.transcript.len(),
+        generated_at_unix,
+    }
+}
+
+/// The terminal/environment diagnostic rows embedded in a bundle. A compact,
+/// sanitized subset of the `/terminal` diagnostic — enough to reproduce
+/// rendering context without leaking the environment. Env values are never
+/// included verbatim beyond the small terminal-identity set, and the bundle
+/// redactor still runs over the whole artifact when redaction is on.
+fn bundle_diagnostics(app: &TuiApp) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    rows.push(("term".to_string(), env_var_label("TERM")));
+    rows.push(("colorterm".to_string(), env_var_label("COLORTERM")));
+    let mux = if env::var_os("TMUX").is_some() {
+        "tmux"
+    } else if env::var_os("STY").is_some() {
+        "screen"
+    } else {
+        "none"
+    };
+    rows.push(("multiplexer".to_string(), mux.to_string()));
+    rows.push((
+        "hyperlinks".to_string(),
+        if app.hyperlink_caps.osc8 {
+            "osc8".to_string()
+        } else {
+            "plain".to_string()
+        },
+    ));
+    rows.push((
+        "directory".to_string(),
+        session_bundle::portable_path(&app.directory),
+    ));
+    rows
+}
+
+/// Destination path for a `/bundle` artifact: a timestamped bundle file under
+/// session storage (`<workspace>/.squeezy/bundles/<session>/`). Mirrors the
+/// `/export` session-storage layout so both land beside each other.
+fn bundle_export_path(
+    app: &TuiApp,
+    meta: &session_bundle::BundleMeta,
+    format: session_bundle::BundleFormat,
+) -> PathBuf {
+    app.workspace_root
+        .join(".squeezy")
+        .join("bundles")
+        .join(&meta.session_id)
+        .join(format!(
+            "session-bundle-{}.{}",
+            meta.generated_at_unix,
+            format.file_extension()
+        ))
 }
 
 /// Build a compact terminal diagnostic string for the `/terminal` command.
