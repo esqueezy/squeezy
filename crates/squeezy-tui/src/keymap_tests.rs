@@ -530,6 +530,63 @@ fn bookmark_defaults_do_not_collide_with_other_actions() {
 }
 
 #[test]
+fn annotation_actions_round_trip_and_default_to_alt_chords() {
+    // §12.2.5 Entry Annotations: both slugs round-trip, are registered in `ALL`,
+    // and default to `Alt+/` (annotate) / `Alt+\` (list).
+    assert_eq!(
+        Action::from_slug("annotate_entry"),
+        Some(Action::AnnotateEntry)
+    );
+    assert_eq!(
+        Action::from_slug("toggle_annotations"),
+        Some(Action::ToggleAnnotations)
+    );
+    assert!(Action::ALL.contains(&Action::AnnotateEntry));
+    assert!(Action::ALL.contains(&Action::ToggleAnnotations));
+
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::AnnotateEntry),
+        KeyBinding::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.binding(Action::ToggleAnnotations),
+        KeyBinding::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('/'), KeyModifiers::ALT),
+        Some(Action::AnnotateEntry),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('\\'), KeyModifiers::ALT),
+        Some(Action::ToggleAnnotations),
+    );
+    // Alt (Meta) chords are honestly classified terminal-dependent.
+    assert_eq!(
+        Action::AnnotateEntry.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+    assert_eq!(
+        Action::ToggleAnnotations.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
+fn annotation_defaults_do_not_collide_with_other_actions() {
+    // The new `Alt+/` / `Alt+\` defaults must not shadow (or be shadowed by) any
+    // existing default binding.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::AnnotateEntry)
+                && !collision.1.contains(&Action::ToggleAnnotations),
+            "annotation default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

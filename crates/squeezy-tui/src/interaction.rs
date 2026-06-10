@@ -155,6 +155,14 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the *visible* (filtered) event list so a click selects +
     /// jumps the main view to the transcript row the event stands for.
     TimelineRow(usize),
+    /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
+    /// 0-based index in the annotation list so a click selects + jumps the main
+    /// view to the entry that exact annotation anchors.
+    AnnotationRow(usize),
+    /// The small inline annotation marker painted on an annotated transcript
+    /// entry's header row (§12.2.5), keyed by the entry's stable [`EntryId`] so a
+    /// click opens the annotations overlay parked on that entry's note.
+    EntryAnnotationMarker(EntryId),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -300,6 +308,16 @@ pub(crate) enum Action {
     /// click both selects and jumps in one go. The index is into the *visible*
     /// (filtered) event list.
     TimelineSelectJump(usize),
+    /// Select the given annotation row in the Entry Annotations overlay (§12.2.5):
+    /// move the cursor onto it and jump the main view to the entry that annotation
+    /// anchors. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click
+    /// both selects and jumps in one go.
+    AnnotationSelectJump(usize),
+    /// Open the Entry Annotations overlay (§12.2.5) parked on the first annotation
+    /// of the given entry — the mouse twin of clicking the inline annotation marker
+    /// on an entry's header row. Keyed by the entry's stable [`EntryId`] so the
+    /// target survives resize.
+    OpenAnnotationsForEntry(EntryId),
 }
 
 impl Action {
@@ -346,6 +364,8 @@ impl Action {
         Action::LaneFoldToggle(0),
         Action::BookmarkSelectJump(0),
         Action::TimelineSelectJump(0),
+        Action::AnnotationSelectJump(0),
+        Action::OpenAnnotationsForEntry(EntryId(0)),
     ];
 }
 

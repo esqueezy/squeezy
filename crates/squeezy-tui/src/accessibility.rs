@@ -692,6 +692,16 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // before the global keymap sees them, so a row click and the keyboard
         // reach the same `session_timeline_jump_to_selected` handler.
         A::TimelineSelectJump(_) => KeyboardPath::Always("session timeline ↑↓/Enter"),
+        // Entry Annotations overlay (§12.2.5) — the overlay's own key handler owns
+        // ↑↓/kj/n/p (move the annotation cursor / next-previous) and Enter (jump to
+        // the entry behind the selected annotation) before the global keymap sees
+        // them, so a row click and the keyboard reach the same
+        // `annotation_jump_to_selected` handler.
+        A::AnnotationSelectJump(_) => KeyboardPath::Always("annotations ↑↓/Enter"),
+        // The inline annotation marker (§12.2.5) opens the overlay on that entry's
+        // note; the keyboard twin is `Alt+\` (open the list) then ↑↓ to the entry,
+        // or `Alt+/` to annotate the focused entry. Reachable without a mouse.
+        A::OpenAnnotationsForEntry(_) => KeyboardPath::Always("annotations Alt+\\ / Alt+/"),
     })
 }
 

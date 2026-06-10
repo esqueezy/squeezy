@@ -30009,3 +30009,703 @@ async fn bookmark_survives_appends_and_resize() {
         "the bookmark still lands on its original entry after appends",
     );
 }
+
+// ---- Entry Annotations (§12.2.5) ----
+
+/// Build a transcript with several distinct user/assistant turns (so there are
+/// several stable entry ids to annotate and jump between) and a deterministic
+/// viewport.
+fn app_with_annotatable_transcript() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    for i in 0..6 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {i}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("reply {i}")));
+    }
+    app
+}
+
+/// The stable entry id at list position `index`, for tests that position the view
+/// on a known entry before annotating it.
+fn annotation_test_entry_id(app: &TuiApp, index: usize) -> u64 {
+    active_transcript_entries(app)
+        .get(index)
+        .map(|entry| entry.id)
+        .expect("an entry exists at the requested index")
+}
+
+/// Type a string into whatever compose/edit field is currently active.
+async fn annotation_type(app: &mut TuiApp, agent: &mut Agent, text: &str) {
+    for ch in text.chars() {
+        handle_key(
+            app,
+            agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type a char");
+    }
+}
+
+#[tokio::test]
+async fn annotation_alt_slash_composes_and_alt_backslash_lists() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Alt+/ opens the overlay straight into compose mode on the focused/top entry.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+/ starts an annotation");
+    assert!(app.annotations_open, "Alt+/ opens the overlay");
+    assert!(app.annotation_edit.is_some(), "compose mode is active");
+    annotation_type(&mut app, &mut agent, "needs a follow up").await;
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("note:"), "compose field visible:\n{out}");
+    assert!(
+        out.contains("needs a follow up"),
+        "typed note visible:\n{out}"
+    );
+
+    // Enter commits the note.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Enter commits the note");
+    assert_eq!(app.annotations.len(), 1, "one annotation attached");
+    assert!(app.annotation_edit.is_none(), "compose mode ends on commit");
+
+    // Esc closes, Alt+\ reopens the list and paints the note.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Esc closes");
+    assert!(!app.annotations_open);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+\\ opens the list");
+    assert!(app.annotations_open, "Alt+\\ opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Annotations"), "header present:\n{out}");
+    assert!(out.contains("1 annotation"), "count line:\n{out}");
+    assert!(
+        out.contains("needs a follow up"),
+        "note shown in list:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn annotation_inline_marker_paints_on_annotated_entry() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Before any annotation, no marker glyph is painted (zero idle cost).
+    let before = render_to_string(&app, 80, 24);
+    assert!(
+        !before.contains('\u{270e}'),
+        "no annotation marker before any note:\n{before}"
+    );
+
+    // Focus the first entry, annotate it, commit.
+    let top_id = annotation_test_entry_id(&app, 0);
+    app.selected_entry = Some(0);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("start an annotation");
+    annotation_type(&mut app, &mut agent, "marker note").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("close the overlay so the main view paints");
+    assert!(!app.annotations_open);
+
+    // Pin the view back on the annotated entry and settle the smooth-scroll ease
+    // so the painted top row is the logical top (entry 0), then the marker is in
+    // the visible window.
+    assert!(
+        jump_to_entry_id(&mut app, top_id),
+        "view returns to first entry"
+    );
+    cancel_main_scroll_anim(&mut app);
+    assert_eq!(current_top_entry_id(&app), Some(top_id));
+
+    // Now the inline marker glyph paints on the main surface.
+    let after = render_to_string(&app, 80, 24);
+    assert!(
+        after.contains('\u{270e}'),
+        "the inline annotation marker paints after a note:\n{after}"
+    );
+}
+
+#[tokio::test]
+async fn annotation_inline_marker_click_opens_overlay_on_that_entry() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Annotate the first entry.
+    let top_id = annotation_test_entry_id(&app, 0);
+    app.selected_entry = Some(0);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("start an annotation");
+    annotation_type(&mut app, &mut agent, "click me").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("close");
+    assert!(!app.annotations_open);
+
+    // Pin the view back on the annotated entry and settle the ease so the marker
+    // is in the visible window, then paint the main surface so the marker target
+    // registers, and locate it.
+    assert!(
+        jump_to_entry_id(&mut app, top_id),
+        "view returns to first entry"
+    );
+    cancel_main_scroll_anim(&mut app);
+    let _ = render_to_string(&app, 80, 24);
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::EntryAnnotationMarker(id)),
+                _,
+            )) = app.click_target_at(col, row)
+                && id.0 == top_id
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("an inline annotation marker target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.annotations_open,
+        "clicking the marker opens the annotations overlay"
+    );
+    assert_eq!(
+        app.annotations
+            .get(app.annotations_selected)
+            .map(|a| a.entry_id),
+        Some(top_id),
+        "the overlay parks on the clicked entry's note",
+    );
+}
+
+#[tokio::test]
+async fn annotation_jump_moves_main_view_to_the_anchored_entry() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Annotate the first entry.
+    let top_id = annotation_test_entry_id(&app, 0);
+    app.selected_entry = Some(0);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("start an annotation");
+    annotation_type(&mut app, &mut agent, "jump anchor").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit");
+    assert_eq!(app.annotations.list()[0].entry_id, top_id);
+
+    // Move the view far away, then jump back via the overlay.
+    let entries_len = active_transcript_entries(&app).len();
+    let late_id = annotation_test_entry_id(&app, entries_len - 1);
+    assert!(
+        jump_to_entry_id(&mut app, late_id),
+        "view moves to last entry"
+    );
+    assert_ne!(current_top_entry_id(&app), Some(top_id));
+
+    // Reopen the list (the compose overlay is still open after commit) and Enter.
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Enter jumps to the annotation");
+    assert!(!app.annotations_open, "jumping closes the overlay");
+    assert_eq!(
+        current_top_entry_id(&app),
+        Some(top_id),
+        "the main view jumped back to the annotated entry",
+    );
+    assert!(
+        app.status.contains("jumped to annotation"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+}
+
+#[tokio::test]
+async fn annotation_edit_then_delete_via_keyboard() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Add a note, commit, and stay in the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("start an annotation");
+    annotation_type(&mut app, &mut agent, "draft").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit");
+    let _ = render_to_string(&app, 80, 24);
+
+    // `e` edits the existing note: append text and commit.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("e begins edit");
+    assert!(app.annotation_edit.is_some(), "edit mode active");
+    annotation_type(&mut app, &mut agent, " updated").await;
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("edit:"), "edit field visible:\n{out}");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit edit");
+    assert_eq!(app.annotations.list()[0].text, "draft updated");
+
+    // `d` deletes it; the list empties and shows the empty state.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("d deletes the annotation");
+    assert_eq!(app.annotations.len(), 0, "the annotation was deleted");
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("No annotations yet"),
+        "empty-state line:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn annotation_blank_edit_deletes_the_note() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("start an annotation");
+    annotation_type(&mut app, &mut agent, "to be cleared").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit");
+    assert_eq!(app.annotations.len(), 1);
+    let _ = render_to_string(&app, 80, 24);
+
+    // Edit, clear the whole note with Backspace, commit -> delete.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("begin edit");
+    for _ in 0.."to be cleared".len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await
+        .expect("backspace");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit empty");
+    assert_eq!(app.annotations.len(), 0, "a blank edit deletes the note");
+}
+
+#[tokio::test]
+async fn annotation_next_previous_cycle_the_cursor() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Annotate three distinct entries. Focus each entry directly (the annotate
+    // verb targets the focused entry first) so the target is deterministic and
+    // never depends on tail-clamped scroll geometry.
+    for index in [0usize, 4, 8] {
+        app.selected_entry = Some(index);
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+        )
+        .await
+        .expect("start an annotation");
+        annotation_type(&mut app, &mut agent, &format!("note {index}")).await;
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .expect("commit");
+        // Close the overlay so the next annotate verb targets the new entry.
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .expect("close");
+    }
+    assert_eq!(app.annotations.len(), 3, "three distinct annotations");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the list");
+    let _ = render_to_string(&app, 80, 24);
+
+    let count = app.annotations.len();
+    // From the first annotation, `n` advances one position; a full lap returns to
+    // the start (wrap-around).
+    app.annotations_selected = 0;
+    for step in 1..=count {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("n steps forward");
+        assert_eq!(
+            app.annotations_selected,
+            step % count,
+            "n advances on step {step}"
+        );
+    }
+
+    // `p` from the first wraps to the last.
+    app.annotations_selected = 0;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("p steps back");
+    assert_eq!(app.annotations_selected, count - 1, "p wraps to the last");
+}
+
+#[tokio::test]
+async fn annotation_mouse_click_selects_and_jumps() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Annotate two distinct entries so there are two clickable rows. Focus each
+    // entry directly so the annotate target is deterministic. The entries are
+    // chosen near the top so a jump anchors them at the viewport top without
+    // tail-clamping (the bottommost entries all clamp to the same top row).
+    for index in [0usize, 4] {
+        app.selected_entry = Some(index);
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+        )
+        .await
+        .expect("start an annotation");
+        annotation_type(&mut app, &mut agent, &format!("row {index}")).await;
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .expect("commit");
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .expect("close");
+    }
+    assert_eq!(app.annotations.len(), 2);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the list");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for the SECOND annotation row target so the click changes the cursor.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::AnnotationRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("an annotation row target is registered");
+    let target_id = app.annotations.list()[1].entry_id;
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.annotations_selected, 1,
+        "clicking an annotation row selects exactly that annotation",
+    );
+    assert!(
+        !app.annotations_open,
+        "the click jumped and closed the overlay"
+    );
+    assert_eq!(
+        current_top_entry_id(&app),
+        Some(target_id),
+        "the main view jumped to the clicked annotation's entry",
+    );
+}
+
+#[tokio::test]
+async fn annotation_alt_backslash_toggles_closed_without_leaking() {
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT);
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.annotations_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.annotations_open, "Alt+\\ toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn annotation_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Annotating an empty transcript is a harmless no-op with a hint.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+/ on an empty transcript");
+    assert_eq!(app.annotations.len(), 0, "nothing to annotate");
+    assert!(
+        !app.annotations_open,
+        "no overlay opens on an empty transcript"
+    );
+    assert!(
+        app.status.contains("no transcript"),
+        "status hint: {}",
+        app.status,
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open the empty list");
+    assert!(app.annotations_open);
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Annotations"), "header still paints:\n{out}");
+    assert!(
+        out.contains("No annotations yet"),
+        "empty-state line:\n{out}"
+    );
+
+    // Enter / next / delete / edit on an empty overlay are harmless no-ops.
+    for code in [
+        KeyCode::Enter,
+        KeyCode::Char('n'),
+        KeyCode::Char('p'),
+        KeyCode::Char('d'),
+        KeyCode::Char('e'),
+    ] {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(code, KeyModifiers::NONE),
+        )
+        .await
+        .expect("key on the empty overlay");
+    }
+    assert!(app.annotations.is_empty());
+}
+
+#[tokio::test]
+async fn annotation_survives_appends_and_resize() {
+    // A note attached before more turns arrive still resolves to the same entry
+    // across widths — the spec's "survive appends + resize" invariant, end-to-end
+    // through the real render().
+    let mut app = app_with_annotatable_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    let anchored = annotation_test_entry_id(&app, 0);
+    app.selected_entry = Some(0);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("start an annotation");
+    annotation_type(&mut app, &mut agent, "sticky note").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("commit");
+
+    // Append several more turns AFTER the note was attached.
+    for i in 100..106 {
+        app.push_transcript_item(TranscriptItem::user(format!("late turn {i}")));
+    }
+    assert_eq!(
+        app.annotations.list()[0].entry_id,
+        anchored,
+        "the note's anchor id is unchanged by appends",
+    );
+
+    // The overlay paints the note as resolved (no "unresolved" tag) across several
+    // widths.
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Annotations"),
+            "header paints at {w}x{h}:\n{out}"
+        );
+        assert!(
+            !out.contains("unresolved"),
+            "a live note is NOT unresolved at {w}x{h}:\n{out}",
+        );
+    }
+    // Enter still lands on the original entry even though the transcript grew.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("jump after appends");
+    assert_eq!(
+        current_top_entry_id(&app),
+        Some(anchored),
+        "the note still lands on its original entry after appends",
+    );
+}

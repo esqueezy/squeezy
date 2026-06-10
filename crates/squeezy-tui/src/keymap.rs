@@ -291,6 +291,21 @@ pub(crate) enum Action {
     /// rebuilds incrementally only on a transcript revision bump, so an idle
     /// session pays nothing.
     ToggleSessionTimeline,
+    /// Annotate the focused (or top-visible) transcript entry with a short private
+    /// note (`Alt+/` default; §12.2.5). The note is attached to the stable
+    /// transcript entry id and stored only in session UI metadata, never in the
+    /// model transcript, so it never enters model context. A small inline marker
+    /// appears on the annotated entry's row; the note is editable in the
+    /// annotations overlay's composer. Costs nothing until pressed.
+    AnnotateEntry,
+    /// Open / close the Entry Annotations overlay (`Alt+\` default; §12.2.5). A
+    /// list of every annotation in transcript-reading order; the cursor (↑↓/kj,
+    /// plus n/p for next/previous) selects one and Enter jumps the main view to its
+    /// anchored entry. `e` edits the note in the composer, `d`/Delete deletes,
+    /// Esc/Alt+\ closes. The list lives in app state (not recomputed from cells) so
+    /// it is stable across redraws and resize; an idle session that never opens it
+    /// pays nothing.
+    ToggleAnnotations,
 }
 
 impl Action {
@@ -351,6 +366,8 @@ impl Action {
             Self::DropBookmark => "drop_bookmark",
             Self::ToggleBookmarks => "toggle_bookmarks",
             Self::ToggleSessionTimeline => "toggle_session_timeline",
+            Self::AnnotateEntry => "annotate_entry",
+            Self::ToggleAnnotations => "toggle_annotations",
         }
     }
 
@@ -410,6 +427,8 @@ impl Action {
         Action::DropBookmark,
         Action::ToggleBookmarks,
         Action::ToggleSessionTimeline,
+        Action::AnnotateEntry,
+        Action::ToggleAnnotations,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -530,6 +549,11 @@ impl Action {
             // the same Meta/Alt encoding that is unreliable across Linux
             // terminals, tmux, and SSH as the rest of the nav/overlay family.
             | Self::ToggleSessionTimeline
+            // Entry Annotations (§12.2.5): annotate is `Alt+/`, the list overlay
+            // is `Alt+\` — both Meta/Alt chords, the same terminal-dependent
+            // encoding case as the rest of the nav/overlay family.
+            | Self::AnnotateEntry
+            | Self::ToggleAnnotations
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -723,6 +747,13 @@ impl Action {
             // free `Alt`+digit after `Alt+8` (hyperlinks). `9` is mnemonic-free
             // but unambiguous and stays clear of every composer chord.
             Self::ToggleSessionTimeline => KeyBinding::new(KeyCode::Char('9'), KeyModifiers::ALT),
+            // Entry Annotations (§12.2.5). `Alt+/` annotates the focused entry
+            // (`/` is a free punctuation key — the "note" slash; the bare Alt
+            // letters c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x/n/s/z/t/q are taken),
+            // and `Alt+\` opens the annotations list overlay (the adjacent free
+            // punctuation key).
+            Self::AnnotateEntry => KeyBinding::new(KeyCode::Char('/'), KeyModifiers::ALT),
+            Self::ToggleAnnotations => KeyBinding::new(KeyCode::Char('\\'), KeyModifiers::ALT),
         }
     }
 }

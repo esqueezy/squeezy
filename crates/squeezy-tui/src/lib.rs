@@ -76,6 +76,7 @@ use unicode_width::UnicodeWidthStr;
 // runtime feature).
 #[cfg(test)]
 mod accessibility;
+mod annotations;
 mod approval;
 // Real Terminal Benchmark Suite (§12.10.2). `cfg(test)`-gated so the benchmark
 // harness never compiles into a shipped TUI binary; every item is exercised by
@@ -1793,6 +1794,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.lane_fold_open
         || app.bookmarks_open
         || app.session_timeline_open
+        || app.annotations_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -1834,6 +1836,9 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // Reading Position Bookmarks (§12.2.4) are keyed by entry id too, so
             // they would likewise re-anchor to unrelated new entries — drop them.
             app.bookmarks = bookmarks::BookmarkStore::new();
+            // Entry Annotations (§12.2.5) are keyed by entry id too, so they would
+            // likewise re-anchor to unrelated new entries — drop them.
+            app.annotations = annotations::AnnotationStore::new();
             app.clear_turn_divider();
             for item in transcript {
                 hydrate_transcript_item(app, item);
@@ -2534,6 +2539,27 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         return true;
     }
 
+    // The Entry Annotations overlay (§12.2.5) owns the pointer while open: a
+    // left-click on an annotation row selects it and jumps the main view to the
+    // entry that annotation anchors; every other click is swallowed so a stray
+    // press can't fall through to the surface beneath. Hit-tested in ABSOLUTE
+    // screen coordinates against the row targets `render_annotations_surface`
+    // registered this frame. While the editor is active a click is swallowed (the
+    // compose field has no clickable affordances).
+    if app.annotations_open {
+        if app.annotation_edit.is_none()
+            && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::AnnotationRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
     // The External Editor Handoff confirmation overlay (§12.6.5) owns the pointer
     // while open: a left-click on an accept/reopen/discard button selects +
     // applies that action; any other click is swallowed so a stray press can't
@@ -2624,6 +2650,23 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((
             interaction::TargetKey::Chrome(interaction::ChromeKey::SemanticFilterBadge),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // Main-view inline annotation marker (§12.2.5): a left-click on an annotated
+    // entry's marker opens the annotations overlay parked on that entry's note —
+    // the mouse twin of `Alt+\` then ↑↓ to the entry. The marker is a dedicated
+    // non-text affordance painted on the entry's header row, so (like the Semantic
+    // Filter badge) it is hit-tested in ABSOLUTE coordinates here, BEFORE the
+    // card-affordance / selection arms, so a click on it never doubles as a card
+    // focus or a transcript selection.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::EntryAnnotationMarker(_)),
             action,
         )) = app.click_target_at(mouse.column, mouse.row)
     {
@@ -3873,6 +3916,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
     if app.session_timeline_open && handle_session_timeline_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Entry Annotations overlay (§12.2.5) is modal while open: it owns the
+    // keyboard (↑↓/kj/n/p move the annotation cursor, Enter jump, e edit, d/Delete
+    // delete, Esc/Alt+\ close — or, in edit mode, free text compose) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.annotations_open && handle_annotations_key(app, key) {
         return Ok(false);
     }
 
@@ -5643,6 +5696,26 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_session_timeline(app);
             true
         }
+        keymap::Action::AnnotateEntry => {
+            // Main-surface verb; the config/setup screens own their own routing,
+            // and the Ctrl+T overlay guard above already blocks this while an
+            // overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            annotate_focused_entry(app);
+            true
+        }
+        keymap::Action::ToggleAnnotations => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_annotations(app);
+            true
+        }
     }
 }
 
@@ -7005,6 +7078,328 @@ fn bookmark_delete_selected(app: &mut TuiApp) {
         app.bookmarks_selected = app.bookmarks_selected.min(count - 1);
     }
     app.status = format!("bookmark {name} deleted ({count} left) — Esc close");
+    app.needs_redraw = true;
+}
+
+// ---- Entry Annotations (§12.2.5) ----
+
+/// The transcript entry id the annotate verb attaches a note to: the focused
+/// entry when one is focused (`Ctrl+↑/↓`), else the entry currently at the top of
+/// the viewport (the same reading-position anchor the bookmark/jump-mark verbs
+/// use). `None` only when the transcript is empty. Resolving to a stable id here
+/// (not a row) is what lets the note survive every later reflow.
+fn annotation_target_entry_id(app: &TuiApp) -> Option<u64> {
+    if let Some(index) = active_selected_entry(app)
+        && let Some(entry) = active_transcript_entries(app).get(index)
+    {
+        return Some(entry.id);
+    }
+    current_top_entry_id(app)
+}
+
+/// `Alt+/`: annotate the focused (or top-visible) transcript entry (§12.2.5).
+/// Opens the annotations overlay straight into its composer so the user types the
+/// note and presses Enter to attach it — the note lives only in session UI
+/// metadata, never in the model transcript. When the targeted entry already
+/// carries a note this edits the first one rather than stacking a duplicate. A
+/// no-op (status hint) on an empty transcript.
+fn annotate_focused_entry(app: &mut TuiApp) {
+    let Some(entry_id) = annotation_target_entry_id(app) else {
+        app.status = "no transcript entry to annotate".to_string();
+        return;
+    };
+    app.annotations_open = true;
+    // If the entry already has a note, edit the first one in place; otherwise
+    // start a fresh note bound to this entry id (committed on Enter).
+    if let Some(index) = app.annotations.first_index_for_entry(entry_id) {
+        app.annotations_selected = index;
+        let seed = app
+            .annotations
+            .get(index)
+            .map(|a| a.text.clone())
+            .unwrap_or_default();
+        app.annotation_edit = Some(seed);
+        app.annotation_edit_new_entry = None;
+        app.status =
+            "edit annotation: type a note \u{00b7} Enter save \u{00b7} Esc cancel".to_string();
+    } else {
+        app.annotation_edit = Some(String::new());
+        app.annotation_edit_new_entry = Some(entry_id);
+        let label = jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"));
+        app.status =
+            format!("annotate {label}: type a note \u{00b7} Enter save \u{00b7} Esc cancel");
+    }
+    app.needs_redraw = true;
+}
+
+/// `Alt+\\`: toggle the Entry Annotations overlay (§12.2.5) — a list of every
+/// annotation in transcript-reading order. Opening it parks the cursor on the
+/// annotation nearest the current reading position, leaves edit mode off, and
+/// confirms via the status line. Sets `needs_redraw` so the toggle paints
+/// immediately.
+fn toggle_annotations(app: &mut TuiApp) {
+    app.annotations_open = !app.annotations_open;
+    if app.annotations_open {
+        app.annotation_edit = None;
+        app.annotation_edit_new_entry = None;
+        app.annotations_selected = annotation_cursor_near_current(app);
+        app.status = if app.annotations.is_empty() {
+            "annotations (none yet) — Alt+/ to add one \u{00b7} Esc close".to_string()
+        } else {
+            format!(
+                "annotations: {} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} e edit \u{00b7} d delete \u{00b7} Esc close",
+                app.annotations.len(),
+            )
+        };
+    } else {
+        app.annotation_edit = None;
+        app.annotation_edit_new_entry = None;
+        app.status = "annotations closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// The list index of the annotation nearest the current top-of-view reading
+/// position, so the overlay opens with its cursor where the user is. Prefers the
+/// first annotation at or after the position; when the view sits past every
+/// annotation it parks on the last one via the reverse walk instead of wrapping
+/// to the top. `0` on an empty store.
+fn annotation_cursor_near_current(app: &TuiApp) -> usize {
+    let current = current_top_entry_id(app);
+    let after_is_real = current
+        .map(|id| app.annotations.list().iter().any(|a| a.entry_id > id))
+        .unwrap_or(true);
+    let target = if after_is_real {
+        app.annotations.next(current)
+    } else {
+        app.annotations.prev(current)
+    };
+    target
+        .and_then(|a| app.annotations.index_of(a.id))
+        .unwrap_or(0)
+}
+
+/// Step the overlay cursor to the next (`forward == true`) or previous annotation
+/// in the list (§12.2.5), wrapping around the ends — the overlay's `n`/`p`
+/// "next/previous annotation" verbs. The list is already in transcript-reading
+/// order, so a position step is a reading-order step. A no-op on an empty list.
+fn annotation_step(app: &mut TuiApp, forward: bool) {
+    let count = app.annotations.len();
+    if count == 0 {
+        return;
+    }
+    app.annotations_selected = if forward {
+        (app.annotations_selected + 1) % count
+    } else {
+        (app.annotations_selected + count - 1) % count
+    };
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Entry Annotations overlay (§12.2.5) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or global
+/// keymap). In list mode: the toggle chord (`Alt+\\`) and Esc close; ↑↓/kj move the
+/// cursor; n/p step next/previous; Enter jumps to the selected annotation's entry;
+/// `e` edits the note in the composer; `d`/Delete deletes the selected annotation.
+/// In edit mode: free text edit, Enter commits, Esc cancels.
+fn handle_annotations_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.annotations_open {
+        return false;
+    }
+    // Edit mode owns every key: type a note, Enter commits, Esc cancels. Handled
+    // first so a note containing 'd'/'n'/'e' is never mistaken for a list verb.
+    if app.annotation_edit.is_some() {
+        handle_annotation_edit_key(app, key);
+        return true;
+    }
+    // The overlay's own toggle chord (`Alt+\\` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleAnnotations) {
+        app.annotations_open = false;
+        app.status = "annotations closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.annotations.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.annotations_open = false;
+            app.status = "annotations closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.annotations_selected = app.annotations_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.annotations_selected = (app.annotations_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        // Next / previous annotation by reading order — the spec's next/previous
+        // commands. The list is already in reading order, so a position step
+        // honors transcript order and wraps around the list.
+        KeyCode::Char('n') => annotation_step(app, true),
+        KeyCode::Char('p') => annotation_step(app, false),
+        KeyCode::Enter => annotation_jump_to_selected(app),
+        // Begin editing the selected annotation's note: seed the composer with its
+        // current text so a tweak (rather than a retype) is one keystroke away.
+        KeyCode::Char('e') => annotation_begin_edit(app),
+        // Delete the selected annotation.
+        KeyCode::Char('d') | KeyCode::Delete => annotation_delete_selected(app),
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Handle a key while the annotations overlay is in edit/compose mode (§12.2.5).
+/// Enter commits the typed note (a blank note deletes an existing annotation, or
+/// cancels a brand-new one), Esc cancels without changing anything, Backspace
+/// deletes a char, and a printable char is appended. Everything else is swallowed.
+fn handle_annotation_edit_key(app: &mut TuiApp, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => annotation_commit_edit(app),
+        KeyCode::Esc => {
+            app.annotation_edit = None;
+            app.annotation_edit_new_entry = None;
+            app.status = "edit cancelled — Esc close".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.annotation_edit.as_mut() {
+                buf.pop();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Char(ch) => {
+            if let Some(buf) = app.annotation_edit.as_mut() {
+                buf.push(ch);
+            }
+            app.needs_redraw = true;
+        }
+        _ => {}
+    }
+}
+
+/// Commit the composer buffer (§12.2.5). For a brand-new note (`Alt+/` on an
+/// un-annotated entry) this adds the annotation; a blank note cancels instead of
+/// adding an empty one. For an edit of an existing note, a blank note deletes it,
+/// otherwise the text is replaced. Parks the cursor on the affected annotation.
+fn annotation_commit_edit(app: &mut TuiApp) {
+    let text = app.annotation_edit.take().unwrap_or_default();
+    let new_entry = app.annotation_edit_new_entry.take();
+    if let Some(entry_id) = new_entry {
+        // Brand-new note. A blank note is a cancel, not an empty annotation.
+        match app.annotations.add(entry_id, &text) {
+            Some(id) => {
+                if let Some(index) = app.annotations.index_of(id) {
+                    app.annotations_selected = index;
+                }
+                let label =
+                    jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"));
+                app.status = format!("annotation added to {label} — Esc close");
+            }
+            None => {
+                app.status = "empty note — nothing added".to_string();
+            }
+        }
+    } else if let Some(annotation) = app.annotations.get(app.annotations_selected) {
+        // Edit of an existing note. A blank note deletes it (set_text handles that).
+        let id = annotation.id;
+        app.annotations.set_text(id, &text);
+        let count = app.annotations.len();
+        if count == 0 {
+            app.annotations_selected = 0;
+        } else {
+            app.annotations_selected = app.annotations_selected.min(count - 1);
+        }
+        app.status = if text.trim().is_empty() {
+            "annotation deleted (empty note) — Esc close".to_string()
+        } else {
+            "annotation updated — Esc close".to_string()
+        };
+    } else {
+        app.status = "annotations: nothing to edit".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Jump the main view to the entry the cursor's annotation anchors (§12.2.5). The
+/// mouse twin (a row click) routes here too. Resolves the anchor through the live
+/// transcript; when the anchored entry is gone the annotation is shown as
+/// unresolved rather than jumping incorrectly. A no-op (status hint) on an empty
+/// list.
+fn annotation_jump_to_selected(app: &mut TuiApp) {
+    let Some(entry_id) = app
+        .annotations
+        .get(app.annotations_selected)
+        .map(|a| a.entry_id)
+    else {
+        app.status = "annotations: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, entry_id) {
+        let label = jump_mark_entry_label(app, entry_id).unwrap_or_else(|| format!("#{entry_id}"));
+        app.annotations_open = false;
+        app.status = format!("jumped to annotation at {label}");
+        app.needs_redraw = true;
+    } else {
+        app.status = "annotation is unresolved (its entry is gone)".to_string();
+        app.needs_redraw = true;
+    }
+}
+
+/// Begin editing the selected annotation's note (§12.2.5): seed the composer with
+/// its current text so the overlay enters text-input mode. A no-op (status hint)
+/// on an empty list.
+fn annotation_begin_edit(app: &mut TuiApp) {
+    let Some(annotation) = app.annotations.get(app.annotations_selected) else {
+        app.status = "annotations: nothing to edit".to_string();
+        return;
+    };
+    app.annotation_edit = Some(annotation.text.clone());
+    app.annotation_edit_new_entry = None;
+    app.status = "edit annotation: type a note \u{00b7} Enter save \u{00b7} Esc cancel".to_string();
+    app.needs_redraw = true;
+}
+
+/// Delete the selected annotation (§12.2.5), clamping the cursor so it stays in
+/// range, and report the new count. A no-op (status hint) on an empty list.
+fn annotation_delete_selected(app: &mut TuiApp) {
+    let Some(annotation) = app.annotations.get(app.annotations_selected) else {
+        app.status = "annotations: nothing to delete".to_string();
+        return;
+    };
+    let id = annotation.id;
+    app.annotations.remove(id);
+    let count = app.annotations.len();
+    if count == 0 {
+        app.annotations_selected = 0;
+    } else {
+        app.annotations_selected = app.annotations_selected.min(count - 1);
+    }
+    app.status = format!("annotation deleted ({count} left) — Esc close");
+    app.needs_redraw = true;
+}
+
+/// Open the Entry Annotations overlay (§12.2.5) parked on the first annotation of
+/// `entry_id` — the handler behind a click on an entry's inline annotation marker.
+/// A no-op when the entry has no annotation (the marker would not have painted).
+fn open_annotations_for_entry(app: &mut TuiApp, entry_id: u64) {
+    let Some(index) = app.annotations.first_index_for_entry(entry_id) else {
+        return;
+    };
+    app.annotations_open = true;
+    app.annotation_edit = None;
+    app.annotation_edit_new_entry = None;
+    app.annotations_selected = index;
+    app.status = format!(
+        "annotations: {} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} e edit \u{00b7} d delete \u{00b7} Esc close",
+        app.annotations.len(),
+    );
     app.needs_redraw = true;
 }
 
@@ -9417,6 +9812,19 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             app.session_timeline_selected = index;
             session_timeline_jump_to_selected(app, false);
         }
+        // A click on an Entry Annotations row (§12.2.5): move the cursor onto it
+        // and jump the main view to the entry that annotation anchors — the mouse
+        // twin of ↑↓ + Enter, in one go.
+        interaction::Action::AnnotationSelectJump(index) => {
+            app.annotations_selected = index;
+            annotation_jump_to_selected(app);
+        }
+        // A click on an entry's inline annotation marker (§12.2.5): open the
+        // annotations overlay parked on that entry's first note — the mouse twin of
+        // opening the list (Alt+\) and selecting the entry.
+        interaction::Action::OpenAnnotationsForEntry(id) => {
+            open_annotations_for_entry(app, id.0);
+        }
     }
 }
 
@@ -11317,6 +11725,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 // Reading Position Bookmarks (§12.2.4) are keyed by entry id too,
                 // so they would likewise re-anchor to unrelated entries — drop them.
                 app.bookmarks = bookmarks::BookmarkStore::new();
+                // Entry Annotations (§12.2.5) are keyed by entry id too, so they
+                // would likewise re-anchor to unrelated entries — drop them.
+                app.annotations = annotations::AnnotationStore::new();
                 app.clear_turn_divider();
                 app.render_cache_session = render::cache::next_session_id();
                 app.attachments = agent.context_attachments_snapshot().await;
@@ -15330,6 +15741,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_session_timeline_surface(frame, area, app);
         return;
     }
+    // The Entry Annotations overlay (§12.2.5) paints as a fullscreen jump-list /
+    // composer over everything else while open, registering its per-annotation row
+    // click targets every frame. Checked beside the bookmarks overlay so its
+    // targets register and it owns the surface while open.
+    if app.annotations_open {
+        render_annotations_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -17254,6 +17673,165 @@ fn render_bookmarks_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 }
 
+/// Paint the Entry Annotations overlay (§12.2.5) as a centered modal: a title, a
+/// one-line summary/navigation header (or a compose-input line while editing/
+/// adding a note, or an empty-state line), then one row per annotation in
+/// transcript-reading order — a cursor caret, the note preview, an `unresolved`
+/// tag (color *and* text, never color-only) when the anchored entry is no longer
+/// live, and the anchored entry's compact label. Each row is an
+/// [`interaction::ChromeKey::AnnotationRow`] click target so a click reaches the
+/// same `annotation_jump_to_selected` path as ↑↓+Enter. Reads app state directly,
+/// so painting is constant-time over the annotation list.
+fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Annotations ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} private entry notes ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 88, 24, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let count = app.annotations.len();
+    // Header: a compose prompt while editing/adding, else a summary + navigation
+    // hint, or an empty-state line.
+    let header = if let Some(buf) = app.annotation_edit.as_ref() {
+        let verb = if app.annotation_edit_new_entry.is_some() {
+            "note: "
+        } else {
+            "edit: "
+        };
+        Line::from(vec![
+            Span::styled(
+                verb,
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{buf}\u{2588}"),
+                Style::default().fg(crate::render::theme::foreground()),
+            ),
+            Span::styled(
+                "  \u{00b7} Enter save \u{00b7} Esc cancel",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ])
+    } else if count == 0 {
+        Line::from(Span::styled(
+            "No annotations yet \u{2014} Alt+/ annotates the focused entry.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{count} annotation{} \u{00b7} \u{2191}\u{2193}/n/p select \u{00b7} Enter jump \u{00b7} e edit \u{00b7} d delete \u{00b7} Esc close",
+                if count == 1 { "" } else { "s" },
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the annotation count so an annotation that vanished
+    // (e.g. after a delete) can never leave the cursor past the end.
+    let selected = app.annotations_selected.min(count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+    if rows == 0 {
+        return;
+    }
+
+    // Budget the note preview to whatever the inner width leaves after the caret,
+    // unresolved tag, and anchor label columns, so a long note never overflows.
+    let preview_budget = (inner.width as usize).saturating_sub(2 + 12 + 14).max(8);
+
+    // Scroll the list so the selected annotation stays visible when the list is
+    // taller than the available rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, annotation) in app
+        .annotations
+        .list()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
+        let index = offset;
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let caret = if is_selected { "\u{203a} " } else { "  " };
+        // Resolve the anchor to a compact entry label; `None` means the anchored
+        // entry is gone, so the annotation is shown as unresolved (color *and*
+        // text, never color-only) rather than offering a jump that would land
+        // wrong.
+        let resolved = jump_mark_entry_label(app, annotation.entry_id);
+        let status_span = if resolved.is_some() {
+            Span::raw(format!("{:<11} ", ""))
+        } else {
+            Span::styled(
+                format!("{:<11} ", "unresolved"),
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let anchor_label = resolved.unwrap_or_else(|| format!("#{}", annotation.entry_id));
+        let note_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            status_span,
+            Span::styled(annotation.preview(preview_budget), note_style),
+            Span::styled(
+                format!("  \u{00b7} {anchor_label}"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its list index so a
+        // click selects + jumps to exactly that annotation.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::AnnotationRow(index)),
+            interaction::Action::AnnotationSelectJump(index),
+        );
+    }
+}
+
 /// Paint the External Editor Handoff confirmation overlay (§12.6.5) as a
 /// centered modal: a header summarizing the change, a bounded preview of the
 /// edited buffer, and the accept/reopen/discard action rows. Each action row is
@@ -18361,6 +18939,107 @@ fn register_transcript_card_targets(
     }
 }
 
+/// Paint the small inline annotation markers (§12.2.5) on the header rows of the
+/// currently-visible transcript entries that carry a note, and register each as an
+/// [`interaction::ChromeKey::EntryAnnotationMarker`] click target (opening the
+/// annotations overlay on that entry). The marker is a single accent glyph (with a
+/// `+N` suffix when an entry carries several notes) drawn at the right edge of the
+/// header row, just left of the scrollbar gutter, so it reads as a margin badge.
+///
+/// ZERO IDLE COST: the resting empty store makes `annotated` return immediately,
+/// so an un-annotated session paints nothing and registers nothing. Mirrors
+/// [`register_transcript_card_targets`]'s window/offset math so the marker lands on
+/// the same row the header paints, in both wrap and no-wrap modes.
+// Mirrors `register_transcript_card_targets`' parameter list (the same painted-
+// window geometry), plus the `frame` it paints into; folding these into a struct
+// would obscure the 1:1 correspondence with that sibling.
+#[allow(clippy::too_many_arguments)]
+fn render_entry_annotation_markers(
+    frame: &mut Frame<'_>,
+    app: &TuiApp,
+    text_area: Rect,
+    build_width: Option<u16>,
+    include_startup_card: bool,
+    total_rows: usize,
+    viewport_h: usize,
+    from_bottom: usize,
+) {
+    // The resting state: no annotations means nothing to paint and nothing to
+    // register, so the per-frame cost of this feature is exactly zero.
+    if app.annotations.is_empty()
+        || text_area.width == 0
+        || text_area.height == 0
+        || total_rows == 0
+    {
+        return;
+    }
+    let top_row = total_rows
+        .saturating_sub(viewport_h)
+        .saturating_sub(from_bottom);
+    let bottom_row = total_rows.min(top_row + viewport_h);
+
+    let (_lines, entry_offsets) =
+        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entries = active_transcript_entries(app);
+    for (i, &header_row) in entry_offsets.iter().enumerate() {
+        let Some(entry) = entries.get(i) else {
+            continue;
+        };
+        if header_row < top_row || header_row >= bottom_row {
+            continue;
+        }
+        // The badge-presence check first (cheap), then the exact count only for
+        // entries that actually carry a note.
+        if !app.annotations.annotated(entry.id) {
+            continue;
+        }
+        let extra = app.annotations.count_for_entry(entry.id);
+        if extra == 0 {
+            continue;
+        }
+        // A pencil glyph, plus a `+N` count when the entry carries several notes.
+        let label = if extra > 1 {
+            format!("\u{270e}+{}", extra - 1)
+        } else {
+            "\u{270e}".to_string()
+        };
+        let label_w = label.chars().count() as u16;
+        if label_w >= text_area.width {
+            continue;
+        }
+        let screen_y = text_area.y + (header_row - top_row) as u16;
+        // Right-align the marker against the text area's right edge (the scrollbar
+        // gutter, if any, is already carved off `text_area`).
+        let marker_x = text_area.x + text_area.width - label_w;
+        let marker_rect = Rect {
+            x: marker_x,
+            y: screen_y,
+            width: label_w,
+            height: 1,
+        };
+        frame.render_widget(ratatui::widgets::Clear, marker_rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            marker_rect,
+        );
+        // Register the marker as a click target keyed by the entry's stable id.
+        // Registered AFTER the card header targets so, via the registry's reverse
+        // hit-test, a click on these cells opens the annotations overlay rather
+        // than focusing the card.
+        let id = transcript_surface::EntryId(entry.id);
+        app.register_click(
+            marker_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::EntryAnnotationMarker(id)),
+            interaction::Action::OpenAnnotationsForEntry(id),
+        );
+    }
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     // When the minimap turn rail is on, carve its 1-cell column off the right
     // edge BEFORE the scrollbar split, so the rail sits just left of the
@@ -18517,6 +19196,21 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // (and its click target registered) only while a filter narrows the view; a
     // no-op at the resting `All` state.
     render_semantic_filter_badge(frame, text_area, app);
+
+    // Entry Annotations (§12.2.5) inline markers on annotated entries' header
+    // rows. Painted over the body (so the marker draws on top) and registered as
+    // per-entry click targets every frame. A complete no-op when the annotation
+    // store is empty, so an un-annotated session pays nothing here.
+    render_entry_annotation_markers(
+        frame,
+        app,
+        text_area,
+        build_width,
+        include_startup_card,
+        total_rows,
+        viewport_h,
+        from_bottom,
+    );
 
     // Minimap turn rail in its reserved column (when toggled on). Painted last
     // so it draws over the body; it registers one frame-local hit target per
@@ -29122,6 +29816,33 @@ pub(crate) struct TuiApp {
     /// (§12.2.6). Clamped to the visible count each render. Only meaningful while
     /// the overlay is open.
     pub(crate) session_timeline_selected: usize,
+    /// Entry Annotations (§12.2.5): the durable set of private notes the user has
+    /// attached to transcript entries, each keyed by a stable transcript entry id
+    /// so it survives appends, resize, folds, and filters. Lives here (session UI
+    /// metadata), never in the model transcript, so a note can never leak into
+    /// model context. The resting state is an empty store, so an un-annotated
+    /// session costs nothing. Mutated by the annotate verb and the overlay's
+    /// edit/delete actions.
+    pub(crate) annotations: annotations::AnnotationStore,
+    /// Whether the Entry Annotations overlay (§12.2.5) is open. `false` = closed
+    /// (the resting state, paints nothing extra); `true` = the fullscreen
+    /// annotation list / composer owns key/mouse routing. Toggled by the
+    /// `ToggleAnnotations` keymap action (and opened by the annotate verb).
+    pub(crate) annotations_open: bool,
+    /// Cursor into the annotation overlay's list (§12.2.5). Clamped to the
+    /// annotation count each render. Only meaningful while the overlay is open.
+    pub(crate) annotations_selected: usize,
+    /// In-overlay compose buffer for the Entry Annotations overlay (§12.2.5).
+    /// `None` = the overlay is in list/navigation mode; `Some(text)` = the user is
+    /// typing/editing a note (Enter commits, Esc cancels). Only meaningful while
+    /// the overlay is open.
+    pub(crate) annotation_edit: Option<String>,
+    /// When the compose buffer is for a *brand-new* note (the `Alt+/` annotate verb
+    /// on an entry with no existing note), this holds the target entry id so the
+    /// commit knows to add a fresh annotation there. `None` while editing an
+    /// existing annotation (the commit replaces the selected one) or while not
+    /// composing.
+    pub(crate) annotation_edit_new_entry: Option<u64>,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -29716,6 +30437,11 @@ impl TuiApp {
             session_timeline: session_timeline::SessionTimeline::new(),
             session_timeline_open: false,
             session_timeline_selected: 0,
+            annotations: annotations::AnnotationStore::new(),
+            annotations_open: false,
+            annotations_selected: 0,
+            annotation_edit: None,
+            annotation_edit_new_entry: None,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
