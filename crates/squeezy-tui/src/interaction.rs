@@ -167,6 +167,10 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the flattened (grouped) change list so a click selects +
     /// jumps the main view to the transcript entry the change stands for.
     ChangeSinceRow(usize),
+    /// An action row in the Contextual Action Palette (§12.1.2), keyed by its
+    /// 0-based index in the gathered action list so a click selects + runs exactly
+    /// that contextual action on the focused unit.
+    ActionPaletteRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -328,6 +332,12 @@ pub(crate) enum Action {
     /// pressing Enter; a click both selects and jumps in one go. The index is into
     /// the flattened (grouped) change list.
     ChangeSinceSelectJump(usize),
+    /// Select the given action row in the Contextual Action Palette (§12.1.2):
+    /// move the cursor onto it and run that contextual action on the focused unit.
+    /// Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click both
+    /// selects and runs the action in one go. The index is into the gathered
+    /// action list.
+    PaletteActionRun(usize),
 }
 
 impl Action {
@@ -377,6 +387,7 @@ impl Action {
         Action::AnnotationSelectJump(0),
         Action::OpenAnnotationsForEntry(EntryId(0)),
         Action::ChangeSinceSelectJump(0),
+        Action::PaletteActionRun(0),
     ];
 }
 

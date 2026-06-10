@@ -621,6 +621,40 @@ fn changes_since_default_does_not_collide_with_other_actions() {
 }
 
 #[test]
+fn action_palette_default_binds_alt_enter_and_is_terminal_dependent() {
+    // §12.1.2 Contextual Action Palette: slug round-trips, is registered in `ALL`,
+    // binds `Alt+Enter`, and is honestly classified terminal-dependent (an
+    // Alt+Enter Meta chord).
+    assert_eq!(
+        Action::from_slug("open_action_palette"),
+        Some(Action::OpenActionPalette),
+    );
+    assert!(Action::ALL.contains(&Action::OpenActionPalette));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.lookup(KeyCode::Enter, KeyModifiers::ALT),
+        Some(Action::OpenActionPalette),
+    );
+    assert_eq!(
+        Action::OpenActionPalette.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
+fn action_palette_default_does_not_collide_with_other_actions() {
+    // The new `Alt+Enter` default must not shadow (or be shadowed by) any existing
+    // default binding — notably `Ctrl+Enter` (open in detail) and plain `Enter`.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::OpenActionPalette),
+            "action-palette default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

@@ -76,6 +76,7 @@ use unicode_width::UnicodeWidthStr;
 // runtime feature).
 #[cfg(test)]
 mod accessibility;
+mod action_palette;
 mod annotations;
 mod approval;
 // Real Terminal Benchmark Suite (§12.10.2). `cfg(test)`-gated so the benchmark
@@ -1799,6 +1800,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.session_timeline_open
         || app.annotations_open
         || app.changes_since_open
+        || app.action_palette.is_some()
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2552,6 +2554,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::ChangeSinceRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Contextual Action Palette (§12.1.2) owns the pointer while open: a
+    // left-click on an action row selects it and runs that action on the focused
+    // unit; every other click is swallowed so a stray press can't fall through to
+    // the surface beneath. Hit-tested in ABSOLUTE screen coordinates against the
+    // row targets `render_action_palette_surface` registered this frame.
+    if app.action_palette.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ActionPaletteRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3948,6 +3968,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
     if app.changes_since_open && handle_changes_since_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Contextual Action Palette (§12.1.2) is modal while open: it owns the
+    // keyboard (↑↓/kj move the action cursor, Enter/→/l run the selected action,
+    // Esc/Alt+Enter close) BEFORE any selection-clear, search, chord, or keymap
+    // dispatch, so a stray key never leaks into the composer underneath. Sits
+    // beside the other front-of-loop overlays for the same reason.
+    if app.action_palette.is_some() && handle_action_palette_key(app, key) {
         return Ok(false);
     }
 
@@ -5758,6 +5787,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_changes_since(app);
             true
         }
+        keymap::Action::OpenActionPalette => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            open_action_palette(app);
+            true
+        }
     }
 }
 
@@ -6902,6 +6941,283 @@ fn changes_since_jump_to_selected(app: &mut TuiApp, advance: bool) {
     } else {
         app.status = "what changed since here: could not jump".to_string();
     }
+}
+
+// ---- Contextual Action Palette (§12.1.2) ----
+
+/// Classify the focused transcript entry into the small [`action_palette::UnitKind`]
+/// set the action menu's gathering rule keys on. Reuses the same kind distinctions
+/// the renderer and index already draw (user vs assistant message, reasoning, tool
+/// result, plan, diff, note) so the palette's notion of "what is this" matches what
+/// the user sees. Total over the entry-kind set.
+fn action_palette_unit_kind(entry: &TranscriptEntry) -> action_palette::UnitKind {
+    use action_palette::UnitKind;
+    match &entry.kind {
+        TranscriptEntryKind::Message(item) if item.role == Role::User => UnitKind::UserMessage,
+        TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+            UnitKind::AssistantMessage
+        }
+        // A system/other-role message reads as a note for action purposes.
+        TranscriptEntryKind::Message(_) => UnitKind::Note,
+        TranscriptEntryKind::ToolResult(_) => UnitKind::ToolResult,
+        TranscriptEntryKind::Reasoning(_) => UnitKind::Reasoning,
+        TranscriptEntryKind::PlanCard(_) => UnitKind::PlanCard,
+        TranscriptEntryKind::Diff(_) => UnitKind::Diff,
+        TranscriptEntryKind::Log(_) | TranscriptEntryKind::SlashEcho(_) => UnitKind::Note,
+    }
+}
+
+/// Largest number of characters retained in the palette header's entry title.
+/// One short line: long enough to disambiguate, short enough that the header never
+/// wraps the modal.
+const ACTION_PALETTE_TITLE_CAP: usize = 48;
+
+/// A short, bounded, deterministic, secret-free one-line title for the focused
+/// entry — its first content line / tool name (`outline_title_of`), collapsed to a
+/// single line, trimmed, and capped — for the palette header so the menu shows
+/// *which* entry it acts on. Falls back to the kind noun when the source has no
+/// usable text.
+fn action_palette_title(entry: &TranscriptEntry, kind: action_palette::UnitKind) -> String {
+    let raw = outline_title_of(entry);
+    let first_line = raw.lines().map(str::trim).find(|line| !line.is_empty());
+    let Some(line) = first_line else {
+        return kind.noun().to_string();
+    };
+    let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return kind.noun().to_string();
+    }
+    if collapsed.chars().count() <= ACTION_PALETTE_TITLE_CAP {
+        return collapsed;
+    }
+    let prefix: String = collapsed.chars().take(ACTION_PALETTE_TITLE_CAP).collect();
+    format!("{prefix}\u{2026}")
+}
+
+/// Point the copy-scope focus at the entry with stable `entry_id` so the palette's
+/// copy verbs (`copy entry`, `copy code`, `copy tool output`) act on the focused
+/// unit rather than the transcript tail. Resolves the entry's first row in the
+/// freshly built (collapsed) row model — the same id-keyed metadata the copy
+/// formatters consume — and stamps `copy_focus`. A no-op (focus left as-is) when
+/// the entry has no painted row. Built off transcript metadata, never rendered
+/// terminal cells.
+fn set_copy_focus_to_entry(app: &mut TuiApp, entry_id: u64) {
+    let width = main_text_width(app);
+    let rows = transcript_surface::build_transcript_rows(
+        app,
+        width,
+        transcript_surface::DetailPolicy::Collapsed,
+    );
+    if let Some(index) = rows
+        .iter()
+        .position(|row| row.entry_id == Some(transcript_surface::EntryId(entry_id)))
+    {
+        app.copy_focus = Some(transcript_surface::RowId(index));
+    }
+}
+
+/// `Alt+Enter`: open the Contextual Action Palette (§12.1.2) for the currently
+/// focused transcript unit — the focused entry (`Ctrl+↑/↓`) when one is focused,
+/// else the entry at the top of the viewport (the same reading-position anchor the
+/// annotate / bookmark / jump-mark verbs use). Classifies the entry, gathers the
+/// actions that apply to it, parks the cursor on the first, and confirms via the
+/// status line. A no-op (status hint) on an empty transcript. Sets `needs_redraw`
+/// so the menu paints immediately.
+fn open_action_palette(app: &mut TuiApp) {
+    let Some(entry_id) = annotation_target_entry_id(app) else {
+        app.action_palette = None;
+        app.status = "no transcript entry — nothing to act on".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let entries = active_transcript_entries(app);
+    let Some(entry) = entries.iter().find(|entry| entry.id == entry_id) else {
+        app.action_palette = None;
+        app.status = "no transcript entry — nothing to act on".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let kind = action_palette_unit_kind(entry);
+    let collapsed = entry.collapsed;
+    let has_detail = entry_has_detail_pane_content(entry);
+    let title = action_palette_title(entry, kind);
+    let actions = action_palette::applicable_actions(kind, has_detail);
+    app.action_palette = Some(action_palette::ActionPalette::open(
+        entry_id, kind, collapsed, title, actions,
+    ));
+    app.status = format!(
+        "actions for {} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter run \u{00b7} Esc close",
+        kind.noun(),
+    );
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Contextual Action Palette (§12.1.2) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or global
+/// keymap). The toggle chord (`Alt+Enter`) and Esc close; Up/Down (and k/j) move
+/// the action cursor; Enter (and l/→) runs the selected action on the focused
+/// unit.
+fn handle_action_palette_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.action_palette.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+Enter` by default) closes it, so the
+    // same key both opens and closes — without leaking to the global keymap, which
+    // the modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::OpenActionPalette) {
+        app.action_palette = None;
+        app.status = "actions closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.action_palette = None;
+            app.status = "actions closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(palette) = app.action_palette.as_mut() {
+                palette.move_up();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(palette) = app.action_palette.as_mut() {
+                palette.move_down();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            run_selected_action_palette_action(app);
+        }
+        // Swallow every other key so the palette is modal: a stray keystroke
+        // cannot leak into the composer underneath while the palette owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Run the action under the Contextual Action Palette's cursor (§12.1.2) on the
+/// focused unit, then close the palette. Resolves the palette's stable entry id to
+/// a live entry (a no-op status hint if it dropped out), focuses it so every
+/// downstream handler — copy / quote / annotate / detail / fold / related / jump —
+/// acts on the right unit, and routes the action to the SAME handler its own chord
+/// already drives. The palette closes after running so the menu is a one-shot
+/// pick. Closing-actions (annotate / open-in-detail / related links) open their own
+/// surface; the rest leave the main view in place.
+fn run_selected_action_palette_action(app: &mut TuiApp) {
+    let Some(palette) = app.action_palette.as_ref() else {
+        return;
+    };
+    let entry_id = palette.entry_id;
+    let Some(action) = palette.selected_action() else {
+        app.action_palette = None;
+        app.status = "actions: nothing to run".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    // Resolve the focused entry to a live index up front; if it dropped out of the
+    // transcript while the palette was open, report an honest no-op.
+    let Some(index) = active_selected_index_for_entry(app, entry_id) else {
+        app.action_palette = None;
+        app.status = "actions: entry is gone".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    // Focus the entry so every downstream handler acts on it (annotate / detail /
+    // fold key off `selected_entry`; the copy verbs key off `copy_focus`).
+    app.selected_entry = Some(index);
+    set_copy_focus_to_entry(app, entry_id);
+    // The palette is a one-shot pick: close it before running so a handler that
+    // opens its own overlay (annotate / detail / related) is not painted under a
+    // stale palette.
+    app.action_palette = None;
+
+    use action_palette::PaletteAction;
+    match action {
+        PaletteAction::CopyEntry => {
+            copy_transcript_scope(app, copy::CopyScope::FocusedEntry, app.copy_format);
+        }
+        PaletteAction::CopyCode => {
+            copy_transcript_scope(app, copy::CopyScope::AllCode, app.copy_format);
+        }
+        PaletteAction::CopyToolOutput => {
+            copy_transcript_scope(app, copy::CopyScope::CurrentToolOutput, app.copy_format);
+        }
+        PaletteAction::QuoteToCompose => {
+            quote_entry_to_compose(app, entry_id);
+        }
+        PaletteAction::Annotate => {
+            annotate_focused_entry(app);
+        }
+        PaletteAction::OpenInDetail => {
+            open_focused_entry_in_detail(app);
+        }
+        PaletteAction::ToggleFold => {
+            if toggle_transcript_entry_fold(app, index) {
+                let collapsed = app.transcript[index].collapsed;
+                app.status = if collapsed {
+                    "entry collapsed".to_string()
+                } else {
+                    "entry expanded".to_string()
+                };
+            }
+        }
+        PaletteAction::RelatedLinks => {
+            toggle_related_links(app);
+        }
+        PaletteAction::JumpToEntry => {
+            if jump_to_entry_id(app, entry_id) {
+                app.status = "jumped to entry".to_string();
+            } else {
+                app.status = "could not jump to entry".to_string();
+            }
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Resolve a stable transcript entry id to its current index in the active
+/// transcript, or `None` when the id is no longer present. Identity is the stable
+/// id; the position is derived on demand so a concurrent rebuild cannot stale it.
+fn active_selected_index_for_entry(app: &TuiApp, entry_id: u64) -> Option<usize> {
+    active_transcript_entries(app)
+        .iter()
+        .position(|entry| entry.id == entry_id)
+}
+
+/// Quote the focused entry's prose into the composer (the palette's "quote into
+/// composer" verb, §12.1.2). Pulls the entry's plain content (message body or
+/// reasoning text), wraps it as a Markdown blockquote via the same
+/// `quote_compose::quote_block` formatter the selection-quote verb uses, and
+/// inserts it at the cursor. A no-op (status hint) when the entry has no quotable
+/// prose. Builds off transcript metadata, never rendered cells, so it cannot leak
+/// a wall of terminal chrome into the composer.
+fn quote_entry_to_compose(app: &mut TuiApp, entry_id: u64) {
+    let text = active_transcript_entries(app)
+        .iter()
+        .find(|entry| entry.id == entry_id)
+        .and_then(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => Some(item.content.clone()),
+            TranscriptEntryKind::Reasoning(snapshot) => Some(snapshot.display_text.clone()),
+            _ => None,
+        });
+    let Some(text) = text else {
+        app.status = "nothing to quote from this entry".to_string();
+        return;
+    };
+    let Some(block) = quote_compose::quote_block(&text) else {
+        app.status = "nothing to quote from this entry".to_string();
+        return;
+    };
+    let lines = block.lines().filter(|l| !l.is_empty()).count();
+    input::insert_input_text(app, &block);
+    app.status = if lines == 1 {
+        "quoted entry (1 line) into composer".to_string()
+    } else {
+        format!("quoted entry ({lines} lines) into composer")
+    };
 }
 
 /// `Alt+z`: toggle the Collapsible Reasoning/Tool Lanes overlay (§12.2.2). The
@@ -10057,6 +10373,16 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::ChangeSinceSelectJump(index) => {
             app.changes_since_selected = index;
             changes_since_jump_to_selected(app, false);
+        }
+        // A click on a Contextual Action Palette action row (§12.1.2): move the
+        // cursor onto it and run that action on the focused unit — the mouse twin
+        // of ↑↓ + Enter, in one go. The index is into the gathered action list,
+        // matching what the row registered.
+        interaction::Action::PaletteActionRun(index) => {
+            if let Some(palette) = app.action_palette.as_mut() {
+                palette.select(index);
+            }
+            run_selected_action_palette_action(app);
         }
     }
 }
@@ -15983,6 +16309,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_changes_since_surface(frame, area, app);
         return;
     }
+    // The Contextual Action Palette (§12.1.2) paints as a centered action menu over
+    // everything else while open, registering its per-action row click targets every
+    // frame. Checked beside the other main-surface overlays so its targets register
+    // and it owns the surface while open.
+    if app.action_palette.is_some() {
+        render_action_palette_surface(frame, area, app);
+        return;
+    }
     // The Entry Annotations overlay (§12.2.5) paints as a fullscreen jump-list /
     // composer over everything else while open, registering its per-annotation row
     // click targets every frame. Checked beside the bookmarks overlay so its
@@ -17758,6 +18092,158 @@ fn render_changes_since_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             }
         }
     }
+}
+
+/// Paint the Contextual Action Palette (§12.1.2) as a centered action menu: a
+/// title naming the focused unit and its short entry label, a one-line navigation
+/// header, then one selectable row per applicable action (a caret on the selected
+/// row, the action's short label, and the matching keyboard hint where the action
+/// has its own default chord). Each action row is an
+/// [`interaction::ChromeKey::ActionPaletteRow`] click target keyed by its index so
+/// a click reaches the same `run_selected_action_palette_action` path as ↑↓+Enter.
+/// Reads the already-gathered action list off the palette state, so painting is
+/// constant-time and does no transcript walk.
+fn render_action_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(palette) = app.action_palette.as_ref() else {
+        return;
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " Actions ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("\u{2014} {} ", palette.kind.noun()),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 56, 16, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: the focused entry's short label, so the menu shows *which* entry it
+    // acts on, the count of applicable actions, plus the navigation hint.
+    let action_word = if palette.len() == 1 {
+        "action"
+    } else {
+        "actions"
+    };
+    let header = Line::from(vec![
+        Span::styled(
+            format!("{} ", palette.title),
+            Style::default()
+                .fg(crate::render::theme::foreground())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "\u{00b7} {} {action_word} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter run \u{00b7} Esc close",
+                palette.len(),
+            ),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if palette.is_empty() {
+        // Defensive empty-state: a focused unit always offers at least the
+        // always-available verbs, so this only paints if the gather degenerated.
+        let line = Line::from(Span::styled(
+            "No actions apply to this entry \u{00b7} Esc close",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                y: inner.y.saturating_add(2),
+                height: 1,
+                ..inner
+            },
+        );
+        return;
+    }
+
+    let selected = palette.selected();
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+    // Scroll so the selected row stays visible when the menu is taller than the
+    // available rows (a narrow terminal).
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+
+    for (offset, action) in palette.actions().iter().enumerate().skip(first).take(rows) {
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let is_selected = offset == selected;
+        let caret = if is_selected { "  \u{203a} " } else { "    " };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        // The default keyboard chord for the action, where it has one, so the menu
+        // doubles as a discoverability hint (the spec's "current bindings" goal).
+        let hint = action_palette_action_hint(app, *action);
+        let mut spans = vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(action.label(palette.collapsed).to_string(), label_style),
+        ];
+        if let Some(hint) = hint {
+            spans.push(Span::styled(
+                format!("  ({hint})"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+
+        // Register the whole action row as a click target keyed by its index so a
+        // click selects + runs exactly that action.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ActionPaletteRow(offset)),
+            interaction::Action::PaletteActionRun(offset),
+        );
+    }
+}
+
+/// The default keyboard chord that drives the same handler a palette action runs,
+/// for the menu's "current binding" hint — or `None` for an action whose only
+/// reach is the palette itself (quote-into-composer, jump, fold-by-id). Reads the
+/// live keymap so a rebound chord still reads back correctly.
+fn action_palette_action_hint(
+    app: &TuiApp,
+    action: action_palette::PaletteAction,
+) -> Option<String> {
+    use action_palette::PaletteAction;
+    let keymap_action = match action {
+        PaletteAction::CopyEntry => keymap::Action::CopyFocusedEntry,
+        PaletteAction::CopyCode => keymap::Action::CopyAllCode,
+        PaletteAction::CopyToolOutput => keymap::Action::CopyCurrentToolOutput,
+        PaletteAction::Annotate => keymap::Action::AnnotateEntry,
+        PaletteAction::OpenInDetail => keymap::Action::OpenFocusedInDetail,
+        PaletteAction::RelatedLinks => keymap::Action::ToggleRelatedLinks,
+        // No dedicated global chord; reachable only through the palette.
+        PaletteAction::QuoteToCompose | PaletteAction::ToggleFold | PaletteAction::JumpToEntry => {
+            return None;
+        }
+    };
+    Some(key_hint(app, keymap_action))
 }
 
 /// Paint the Collapsible Reasoning/Tool Lanes overlay (§12.2.2) as a centered
@@ -30267,6 +30753,13 @@ pub(crate) struct TuiApp {
     /// Clamped to the change count each render. Only meaningful while the overlay
     /// is open.
     pub(crate) changes_since_selected: usize,
+    /// The open Contextual Action Palette (§12.1.2), or `None` when closed (the
+    /// resting state, paints nothing extra). `Some` holds the focused unit's stable
+    /// id, kind, and the gathered applicable-action list + cursor; the menu owns
+    /// key/mouse routing while open. Built fresh each time the palette opens via
+    /// `OpenActionPalette` (`Alt+Enter`); a session that never opens it costs
+    /// nothing.
+    pub(crate) action_palette: Option<action_palette::ActionPalette>,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -30869,6 +31362,7 @@ impl TuiApp {
             change_summary: change_summary::ChangeSummary::new(),
             changes_since_open: false,
             changes_since_selected: 0,
+            action_palette: None,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,

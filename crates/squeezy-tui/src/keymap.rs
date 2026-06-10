@@ -319,6 +319,16 @@ pub(crate) enum Action {
     /// reports only what this session's transcript recorded, never a full project
     /// history.
     ToggleChangesSince,
+    /// Open the Contextual Action Palette (`Alt+Enter` default; §12.1.2) for the
+    /// currently focused transcript unit — the focused entry (`Ctrl+↑/↓`) when one
+    /// is focused, else the top-visible entry. The palette lists only the actions
+    /// that apply to what is under focus (copy, copy code, copy tool output, quote
+    /// into composer, annotate, open in detail, expand/collapse, related entries,
+    /// jump) and runs the highlighted one with Enter — or a click on its row. Each
+    /// action routes to the same handler its own chord already drives, so the menu
+    /// never introduces new behavior. Closed is the resting state, so a session
+    /// that never opens it pays nothing.
+    OpenActionPalette,
 }
 
 impl Action {
@@ -382,6 +392,7 @@ impl Action {
             Self::AnnotateEntry => "annotate_entry",
             Self::ToggleAnnotations => "toggle_annotations",
             Self::ToggleChangesSince => "toggle_changes_since",
+            Self::OpenActionPalette => "open_action_palette",
         }
     }
 
@@ -444,6 +455,7 @@ impl Action {
         Action::AnnotateEntry,
         Action::ToggleAnnotations,
         Action::ToggleChangesSince,
+        Action::OpenActionPalette,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -573,6 +585,11 @@ impl Action {
             // chord, the same Meta/Alt encoding that is unreliable across Linux
             // terminals, tmux, and SSH as the rest of the nav/overlay family.
             | Self::ToggleChangesSince
+            // Contextual Action Palette (§12.1.2) opens with `Alt+Enter` — an
+            // Alt+Enter chord whose Meta-modifier encoding is exactly the
+            // terminal-dependent case (Linux terminals / tmux / SSH may swallow or
+            // remap it) the renderer plan flags for Alt chords.
+            | Self::OpenActionPalette
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -779,6 +796,13 @@ impl Action {
             // delta) and every bare `Alt` letter in the nav/copy/overlay family is
             // taken. Mnemonic-free but unambiguous and clear of every composer chord.
             Self::ToggleChangesSince => KeyBinding::new(KeyCode::Char('0'), KeyModifiers::ALT),
+            // Contextual Action Palette (§12.1.2). `Alt+Enter` — the classic
+            // "act on the focused thing" chord, free of every composer key (plain
+            // Enter submits, `Ctrl+Enter` opens detail, `Alt+Enter` is the next
+            // natural Enter-family chord) and of every bare `Alt` letter/digit/
+            // punctuation already claimed by the nav/copy/overlay family. Mnemonic
+            // and unambiguous: a context menu for what is under focus.
+            Self::OpenActionPalette => KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
         }
     }
 }

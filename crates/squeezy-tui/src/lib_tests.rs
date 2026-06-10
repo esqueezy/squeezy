@@ -29543,6 +29543,331 @@ async fn changes_since_renders_across_resizes() {
     );
 }
 
+// ---- Contextual Action Palette (§12.1.2) ----
+
+/// Build a transcript with a user prompt, a successful tool result, and a final
+/// assistant message, then focus a chosen entry so the palette's target is
+/// deterministic. Seeds a deterministic viewport so geometry is host-independent.
+fn app_with_action_palette(focus: usize) -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("refactor the parser".to_string()));
+    app.push_tool_result(sample_tool_result("shell", "all tests passed"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Here is the refactored parser.".to_string(),
+    ));
+    app.selected_entry = Some(focus);
+    app
+}
+
+#[tokio::test]
+async fn action_palette_alt_enter_opens_for_focused_unit() {
+    // Focus the assistant message (the last entry).
+    let mut app = app_with_action_palette(2);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+Enter opens the palette");
+
+    let palette = app.action_palette.as_ref().expect("palette is open");
+    assert_eq!(
+        palette.kind,
+        action_palette::UnitKind::AssistantMessage,
+        "palette targets the focused assistant message",
+    );
+    // The assistant message offers quote + copy code but no tool-output verb.
+    let actions = palette.actions().to_vec();
+    assert!(actions.contains(&action_palette::PaletteAction::QuoteToCompose));
+    assert!(actions.contains(&action_palette::PaletteAction::CopyCode));
+    assert!(!actions.contains(&action_palette::PaletteAction::CopyToolOutput));
+
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Actions"), "header present:\n{out}");
+    assert!(
+        out.contains("assistant message"),
+        "header names the focused unit:\n{out}",
+    );
+    assert!(out.contains("copy entry"), "copy verb row:\n{out}");
+    assert!(
+        out.contains("quote into composer"),
+        "quote verb row:\n{out}",
+    );
+}
+
+#[tokio::test]
+async fn action_palette_offers_tool_output_for_a_tool_result() {
+    // Focus the tool result (the middle entry).
+    let mut app = app_with_action_palette(1);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("open palette on a tool result");
+
+    let palette = app.action_palette.as_ref().expect("palette is open");
+    assert_eq!(palette.kind, action_palette::UnitKind::ToolResult);
+    let actions = palette.actions().to_vec();
+    assert!(
+        actions.contains(&action_palette::PaletteAction::CopyToolOutput),
+        "tool result offers copy-tool-output: {actions:?}",
+    );
+    assert!(
+        !actions.contains(&action_palette::PaletteAction::QuoteToCompose),
+        "tool output is not quotable: {actions:?}",
+    );
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("copy tool output"), "tool-output row:\n{out}");
+}
+
+#[tokio::test]
+async fn action_palette_keyboard_navigates_and_runs_copy() {
+    // Focus the user prompt. Use a recording clipboard so we can assert the copy
+    // actually landed (keyboard path -> real handler).
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("keep this decision".to_string()));
+    app.push_transcript_item(TranscriptItem::assistant("acknowledged".to_string()));
+    app.selected_entry = Some(0);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("open palette");
+    let _ = render_to_string(&app, 80, 24);
+    // Opens parked on the first action (copy entry).
+    assert_eq!(
+        app.action_palette.as_ref().unwrap().selected(),
+        0,
+        "cursor parks on the first action",
+    );
+    assert_eq!(
+        app.action_palette.as_ref().unwrap().selected_action(),
+        Some(action_palette::PaletteAction::CopyEntry),
+        "first action is copy entry",
+    );
+
+    // Down then Up clamp inside the menu, landing back on copy entry.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+    assert_eq!(app.action_palette.as_ref().unwrap().selected(), 1);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up");
+    assert_eq!(app.action_palette.as_ref().unwrap().selected(), 0);
+
+    // Enter runs the selected action (copy entry) and closes the palette.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter runs copy entry");
+    assert!(app.action_palette.is_none(), "palette closes after running");
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one copy landed: {copied:?}");
+    assert!(
+        copied[0].contains("keep this decision"),
+        "the focused user entry was copied, not the tail: {copied:?}",
+    );
+    assert!(app.status.contains("copied"), "status: {}", app.status);
+}
+
+#[tokio::test]
+async fn action_palette_mouse_click_runs_action() {
+    // Focus the assistant message; click its "quote into composer" row.
+    let mut app = app_with_action_palette(2);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("open palette");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Find the quote row's registered index, then scan for its click target.
+    let quote_index = app
+        .action_palette
+        .as_ref()
+        .unwrap()
+        .actions()
+        .iter()
+        .position(|a| *a == action_palette::PaletteAction::QuoteToCompose)
+        .expect("assistant message offers quote");
+
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ActionPaletteRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == quote_index
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a quote action row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    // Clicking the quote row runs it: the composer now holds the quoted prose, and
+    // the palette closes.
+    assert!(app.action_palette.is_none(), "click closes the palette");
+    assert!(
+        app.input.contains("Here is the refactored parser"),
+        "quoted the focused entry into the composer: {:?}",
+        app.input,
+    );
+    assert!(
+        app.input.contains('>'),
+        "quote is a blockquote: {:?}",
+        app.input,
+    );
+}
+
+#[tokio::test]
+async fn action_palette_empty_transcript_is_a_no_op() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+Enter on an empty transcript");
+
+    assert!(
+        app.action_palette.is_none(),
+        "no entry to act on -> palette stays closed",
+    );
+    assert!(
+        app.status.contains("nothing to act on"),
+        "honest no-op status: {}",
+        app.status,
+    );
+}
+
+#[tokio::test]
+async fn action_palette_alt_enter_toggles_closed_without_leaking() {
+    let mut app = app_with_action_palette(2);
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.action_palette.is_some());
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(app.action_palette.is_none(), "Alt+Enter toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn action_palette_esc_closes_without_running() {
+    let mut app = app_with_action_palette(2);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("open palette");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(app.action_palette.is_none(), "Esc closes the palette");
+    assert!(app.input.is_empty(), "nothing leaked / nothing ran");
+}
+
+#[tokio::test]
+async fn action_palette_renders_across_resizes() {
+    let mut app = app_with_action_palette(2);
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("open palette");
+
+    // The focused entry's stable id and action list survive resizes (ids and the
+    // gathered list are width-independent).
+    let entry_id = app.action_palette.as_ref().unwrap().entry_id;
+    let count = app.action_palette.as_ref().unwrap().len();
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(out.contains("Actions"), "header paints at {w}x{h}:\n{out}");
+        assert!(
+            out.contains("copy entry"),
+            "an action row paints at {w}x{h}:\n{out}",
+        );
+    }
+    assert_eq!(
+        app.action_palette.as_ref().unwrap().entry_id,
+        entry_id,
+        "the focused entry's stable id survives every resize",
+    );
+    assert_eq!(
+        app.action_palette.as_ref().unwrap().len(),
+        count,
+        "the gathered action list is width-independent",
+    );
+}
+
 // ---- Collapsible Reasoning/Tool Lanes (§12.2.2) ----
 
 /// Build a transcript whose tail is a tool result carrying a call (so it

@@ -708,6 +708,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // before the global keymap sees them, so a row click and the keyboard reach
         // the same `changes_since_jump_to_selected` handler.
         A::ChangeSinceSelectJump(_) => KeyboardPath::Always("what changed since here ↑↓/Enter"),
+        // Contextual Action Palette (§12.1.2) — the palette's own key handler owns
+        // ↑↓/kj (move the action cursor) and Enter/→/l (run the selected action on
+        // the focused unit) before the global keymap sees them, so a row click and
+        // the keyboard reach the same `run_selected_action_palette_action` handler.
+        A::PaletteActionRun(_) => KeyboardPath::Always("action palette ↑↓/Enter"),
     })
 }
 
