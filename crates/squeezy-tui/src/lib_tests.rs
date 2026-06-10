@@ -26943,3 +26943,269 @@ async fn transcript_index_renders_across_resizes() {
         );
     }
 }
+
+// ===========================================================================
+// Related-Entry Links (§12.5.3) — integration tests driving the real
+// `render()` / `handle_key` / `handle_mouse` paths through the TestBackend.
+// ===========================================================================
+
+/// Build an app with a small related sequence: a user prompt, a tool call, a
+/// failed tool call, and an error log, plus a follow-up user turn. Focuses the
+/// failed tool so the related-links overlay has a rich anchor (cause back to the
+/// tool, follow-up forward to the next user turn). Seeds a deterministic
+/// viewport so geometry/jump math is host-independent.
+fn app_with_related_transcript() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("do the thing".to_string()));
+    app.push_transcript_item(TranscriptItem::assistant("on it".to_string()));
+    app.push_tool_result(sample_tool_result("shell", "ok output"));
+    let mut failed = sample_tool_result("edit", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app.push_log("turn failed: provider error".to_string());
+    app.push_transcript_item(TranscriptItem::user("try again".to_string()));
+    app
+}
+
+#[tokio::test]
+async fn related_links_alt_g_opens_overlay_and_lists_relations() {
+    let mut app = app_with_related_transcript();
+    // Focus the error log entry (index 4) so it has a rich relation list.
+    app.selected_entry = Some(4);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+g opens the related-links overlay");
+
+    assert!(app.related_links_open, "Alt+g opens the overlay");
+    // The anchor is the focused entry's id.
+    let anchor_id = app.transcript[4].id;
+    assert_eq!(app.related_links_anchor, Some(anchor_id));
+    assert!(
+        app.related_links.count(anchor_id) > 0,
+        "the focused error has related entries",
+    );
+
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Related links"), "header present:\n{out}");
+    // The error relates back to its cause and forward to the follow-up turn.
+    assert!(out.contains("caused by"), "cause relation row:\n{out}");
+    assert!(
+        out.contains("follow-up to"),
+        "follow-up relation row:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn related_links_anchors_on_latest_entry_when_none_focused() {
+    let mut app = app_with_related_transcript();
+    // No explicit focus: the overlay falls back to the latest (tail) entry.
+    app.selected_entry = None;
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open related links");
+
+    let latest_id = app.transcript.last().unwrap().id;
+    assert_eq!(
+        app.related_links_anchor,
+        Some(latest_id),
+        "with nothing focused the overlay anchors on the latest entry",
+    );
+}
+
+#[tokio::test]
+async fn related_links_keyboard_navigates_and_jumps() {
+    let mut app = app_with_related_transcript();
+    app.selected_entry = Some(4);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open related links");
+    let _ = render_to_string(&app, 80, 24);
+    let original_anchor = app.related_links_anchor;
+
+    // Down moves the relation cursor.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves the cursor");
+    assert_eq!(app.related_links_selected, 1);
+
+    // Enter jumps to the selected related entry and re-anchors the overlay on it
+    // so the user can keep walking the graph.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert_ne!(
+        app.related_links_anchor, original_anchor,
+        "a jump re-anchors the overlay on the entry it landed on",
+    );
+    assert_eq!(
+        app.related_links_selected, 0,
+        "the cursor resets after re-anchoring",
+    );
+    assert!(
+        app.status.contains("related links"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.related_links_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn related_links_alt_g_toggles_closed_again() {
+    let mut app = app_with_related_transcript();
+    app.selected_entry = Some(4);
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.related_links_open);
+    let _ = render_to_string(&app, 80, 24);
+    // The same chord closes it without leaking to the composer.
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.related_links_open, "Alt+g toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn related_links_mouse_click_jumps() {
+    let mut app = app_with_related_transcript();
+    app.selected_entry = Some(4);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open related links");
+    // Render registers the per-row click targets for this frame.
+    let _ = render_to_string(&app, 80, 24);
+    let original_anchor = app.related_links_anchor;
+
+    // Scan the painted area for a registered related-link row target.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::RelatedLinkRow(_)),
+                _,
+            )) = app.click_target_at(col, row)
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a related-link row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_ne!(
+        app.related_links_anchor, original_anchor,
+        "clicking a relation row jumps and re-anchors the overlay",
+    );
+    // The overlay stays open (the click jumped within it, not closed it).
+    assert!(app.related_links_open);
+}
+
+#[tokio::test]
+async fn related_links_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open related links on an empty transcript");
+
+    assert!(app.related_links_open);
+    assert_eq!(app.related_links_anchor, None);
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Related links"), "header still paints:\n{out}");
+    assert!(
+        out.contains("No transcript entry"),
+        "empty-state line:\n{out}",
+    );
+
+    // Enter on an empty overlay is a harmless no-op (no jump, no panic).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty overlay");
+    assert!(app.related_links_anchor.is_none());
+}
+
+#[tokio::test]
+async fn related_links_renders_across_resizes() {
+    let mut app = app_with_related_transcript();
+    app.selected_entry = Some(4);
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open related links");
+
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Related links"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+}

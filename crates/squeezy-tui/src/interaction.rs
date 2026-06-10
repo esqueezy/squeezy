@@ -123,6 +123,10 @@ pub(crate) enum ChromeKey {
     /// its 0-based index in the populated-category list so a click selects (and a
     /// second click jumps within) exactly that category.
     TranscriptIndexRow(usize),
+    /// A related-entry row in the Related-Entry Links overlay (§12.5.3), keyed by
+    /// its 0-based index in the focused entry's ranked relation list so a click
+    /// selects + jumps to exactly that related entry.
+    RelatedLinkRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -228,6 +232,10 @@ pub(crate) enum Action {
     /// moving the cursor with ↑↓ and pressing Enter; a click both selects and
     /// jumps in one go.
     TranscriptIndexSelect(usize),
+    /// Select the given related-entry row in the Related-Entry Links overlay
+    /// (§12.5.3) and jump the main view to it. Mouse twin of moving the cursor
+    /// with ↑↓ and pressing Enter; a click both selects and jumps in one go.
+    RelatedLinkSelect(usize),
 }
 
 impl Action {
@@ -266,6 +274,7 @@ impl Action {
         Action::EditorHandoffSelect(0),
         Action::CycleSemanticFilter,
         Action::TranscriptIndexSelect(0),
+        Action::RelatedLinkSelect(0),
     ];
 }
 

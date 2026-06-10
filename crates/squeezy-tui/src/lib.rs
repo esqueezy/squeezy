@@ -139,6 +139,7 @@ mod streaming_patch;
 mod terminal_writer;
 mod toast;
 mod transcript_index;
+mod transcript_relations;
 mod transcript_surface;
 mod wide_block;
 // Visual Diff Dashboard (§12.10.4). `cfg(test)`-gated so the dev-only cell-grid
@@ -1775,6 +1776,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.paste_staging.is_some()
         || app.clipboard_history_open
         || app.transcript_index_open
+        || app.related_links_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2352,6 +2354,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::TranscriptIndexRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Related-Entry Links overlay (§12.5.3) owns the pointer while open: a
+    // left-click on a relation row selects it and jumps to that related entry;
+    // every other click is swallowed so a stray press can't fall through to the
+    // surface beneath. Hit-tested in ABSOLUTE screen coordinates against the row
+    // targets `render_related_links_surface` registered this frame.
+    if app.related_links_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::RelatedLinkRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3586,6 +3606,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // never leaks into the composer underneath. Sits beside the clipboard picker
     // at the front for the same reason.
     if app.transcript_index_open && handle_transcript_index_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Related-Entry Links overlay (§12.5.3) is modal while open: it owns the
+    // keyboard (↑↓/kj move the relation cursor, Enter/→/l jump, Esc/Alt+g close)
+    // BEFORE any selection-clear, search, chord, or keymap dispatch, so a stray
+    // key never leaks into the composer underneath. Sits beside the transcript-
+    // index picker at the front for the same reason.
+    if app.related_links_open && handle_related_links_key(app, key) {
         return Ok(false);
     }
 
@@ -5242,6 +5271,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_transcript_index(app);
             true
         }
+        keymap::Action::ToggleRelatedLinks => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_related_links(app);
+            true
+        }
     }
 }
 
@@ -5508,6 +5547,128 @@ fn transcript_index_jump_to_selected(app: &mut TuiApp) {
         app.needs_redraw = true;
     } else {
         app.status = format!("could not jump to {}", category.label());
+    }
+}
+
+/// `Alt+g`: toggle the Related-Entry Links overlay (§12.5.3). The overlay lists
+/// the entries related to the focused (or latest) transcript entry — its
+/// prompt/reply, the tool calls it triggered, the error it caused, the follow-up
+/// that fixed it, same-tool calls, and subagent breadcrumbs — and lets the user
+/// jump to any of them. Opening it refreshes the relation graph (a no-op rebuild
+/// when the transcript has not changed, so the cost is only paid on a real
+/// change), anchors on the focused/latest entry, resets the selection cursor, and
+/// confirms via the status line. Sets `needs_redraw` so the toggle paints
+/// immediately.
+fn toggle_related_links(app: &mut TuiApp) {
+    app.related_links_open = !app.related_links_open;
+    if app.related_links_open {
+        refresh_related_links(app);
+        app.related_links_selected = 0;
+        app.related_links_anchor = related_links_anchor_id(app);
+        let count = app
+            .related_links_anchor
+            .map_or(0, |id| app.related_links.count(id));
+        app.status = if app.related_links_anchor.is_none() {
+            "related links (no entry) — Esc to close".to_string()
+        } else if count == 0 {
+            "related links: no related entries — Esc to close".to_string()
+        } else {
+            format!(
+                "related links: {} — \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                count_label_related(count),
+            )
+        };
+    } else {
+        app.status = "related links closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Pluralized "N related" / "1 related" label for the related-links readout.
+fn count_label_related(count: usize) -> String {
+    if count == 1 {
+        "1 related entry".to_string()
+    } else {
+        format!("{count} related entries")
+    }
+}
+
+/// Handle a key while the Related-Entry Links overlay (§12.5.3) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or global
+/// keymap). Mirrors the transcript-index overlay's modal consumption: the toggle
+/// chord (`Alt+g`) and Esc close; Up/Down (and k/j) move the relation cursor;
+/// Enter (and l/→) jumps the main view to the selected related entry.
+fn handle_related_links_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.related_links_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+g` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleRelatedLinks) {
+        app.related_links_open = false;
+        app.status = "related links closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app
+        .related_links_anchor
+        .map_or(0, |id| app.related_links.count(id));
+    match key.code {
+        KeyCode::Esc => {
+            app.related_links_open = false;
+            app.status = "related links closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.related_links_selected = app.related_links_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.related_links_selected = (app.related_links_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            related_links_jump_to_selected(app);
+        }
+        // Swallow every other key so the overlay is modal.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the related-links overlay's selected related entry
+/// (§12.5.3). Resolves the anchor entry and the target at the cursor from the
+/// relation graph, scrolls there via the same `jump_to_entry_id` path the
+/// index/minimap/jump-nav use, and re-anchors the overlay on the entry it jumped
+/// to so the overlay now shows *its* relations (a natural "walk the graph" flow).
+/// A no-op (status hint) when there is nothing to jump to.
+fn related_links_jump_to_selected(app: &mut TuiApp) {
+    let Some(anchor) = app.related_links_anchor else {
+        app.status = "related links: nothing to jump to".to_string();
+        return;
+    };
+    let Some(target) = app
+        .related_links
+        .target_at(anchor, app.related_links_selected)
+    else {
+        app.status = "related links: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, target) {
+        // Re-anchor on the entry we landed on so the overlay now lists its
+        // relations — the user can keep walking the graph entry by entry.
+        app.related_links_anchor = Some(target);
+        app.related_links_selected = 0;
+        let count = app.related_links.count(target);
+        app.status = format!(
+            "related links: jumped \u{00b7} {} here — Enter to keep walking \u{00b7} Esc close",
+            count_label_related(count),
+        );
+        app.needs_redraw = true;
+    } else {
+        app.status = "related links: could not jump".to_string();
     }
 }
 
@@ -6228,6 +6389,76 @@ fn refresh_transcript_index(app: &mut TuiApp) {
     let entries = build_index_entries(active_transcript_entries(app));
     let fingerprint = transcript_index::TranscriptIndex::fingerprint_of(entries.iter());
     app.transcript_index.rebuild_if_stale(fingerprint, &entries);
+}
+
+/// Classify one transcript entry into its [`transcript_relations::RelationEntryKind`]
+/// for the Related-Entry Links graph (§12.5.3). Folds the index's category
+/// (reusing `index_category_of`, so the two stay in lock-step) onto the smaller
+/// relation-kind set the derivation rules branch on.
+fn relation_kind_of(
+    entries: &[TranscriptEntry],
+    index: usize,
+) -> transcript_relations::RelationEntryKind {
+    use transcript_index::EntryCategory;
+    use transcript_relations::RelationEntryKind;
+    match index_category_of(entries, index) {
+        EntryCategory::UserTurn => RelationEntryKind::User,
+        EntryCategory::Assistant => RelationEntryKind::Assistant,
+        EntryCategory::ToolCall => RelationEntryKind::ToolCall,
+        EntryCategory::Reasoning => RelationEntryKind::Reasoning,
+        EntryCategory::Error => RelationEntryKind::Error,
+        EntryCategory::Subagent => RelationEntryKind::Subagent,
+        EntryCategory::Plan | EntryCategory::Diff | EntryCategory::Note => RelationEntryKind::Other,
+    }
+}
+
+/// Build the per-entry classification slice the relation graph consumes from the
+/// active transcript (§12.5.3). Each entry contributes its stable id, content
+/// revision (so a mutation re-derives), relation kind, error flag, and — for
+/// tool results — its tool name (for same-tool links). Pure over the entry slice.
+fn build_relation_entries(entries: &[TranscriptEntry]) -> Vec<transcript_relations::RelationEntry> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let tool_name = match &entry.kind {
+                TranscriptEntryKind::ToolResult(tool) => Some(tool.result.tool_name.clone()),
+                _ => None,
+            };
+            transcript_relations::RelationEntry {
+                id: entry.id,
+                revision: entry.revision,
+                kind: relation_kind_of(entries, i),
+                is_error: entry_is_error(entries, i),
+                tool_name,
+            }
+        })
+        .collect()
+}
+
+/// Refresh the Related-Entry Links graph (§12.5.3) against the active transcript,
+/// rebuilding **only** when the transcript's (id, revision, kind, error, tool)
+/// fingerprint has moved since the last refresh. Called lazily — right before the
+/// overlay opens or renders — so an idle session that never opens the overlay
+/// pays nothing, and an open overlay re-derives only on a real transcript change.
+fn refresh_related_links(app: &mut TuiApp) {
+    let entries = build_relation_entries(active_transcript_entries(app));
+    let fingerprint = transcript_relations::RelationGraph::fingerprint_of(entries.iter());
+    app.related_links.rebuild_if_stale(fingerprint, &entries);
+}
+
+/// The entry id the Related-Entry Links overlay (§12.5.3) should anchor on: the
+/// focused entry when one is focused, else the latest (tail) entry, so opening
+/// the overlay without first focusing still has a sensible pivot. `None` only on
+/// an empty transcript.
+fn related_links_anchor_id(app: &TuiApp) -> Option<u64> {
+    let entries = active_transcript_entries(app);
+    if let Some(index) = active_selected_entry(app)
+        && let Some(entry) = entries.get(index)
+    {
+        return Some(entry.id);
+    }
+    entries.last().map(|entry| entry.id)
 }
 
 /// Compact human label for an entry id used in the recent-jump status readout
@@ -7176,6 +7407,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             }
             app.transcript_index_selected = index;
             transcript_index_jump_to_selected(app);
+        }
+        // A click on a Related-Entry Links row (§12.5.3): move the cursor onto it
+        // and jump the main view to that related entry — the mouse twin of ↑↓ +
+        // Enter, in one go.
+        interaction::Action::RelatedLinkSelect(index) => {
+            app.related_links_selected = index;
+            related_links_jump_to_selected(app);
         }
     }
 }
@@ -12634,6 +12872,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_transcript_index_surface(frame, area, app);
         return;
     }
+    // The Related-Entry Links overlay (§12.5.3) paints as a fullscreen surface
+    // over everything else while open, registering its per-relation row click
+    // targets every frame. Checked beside the transcript-index overlay so its
+    // targets register and it owns the surface while open.
+    if app.related_links_open {
+        render_related_links_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -13484,6 +13730,147 @@ fn render_transcript_index_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::TranscriptIndexRow(index)),
             interaction::Action::TranscriptIndexSelect(index),
+        );
+    }
+}
+
+/// Paint the Related-Entry Links overlay (§12.5.3) as a centered modal listing
+/// the entries related to the anchored (focused / latest) transcript entry,
+/// ranked strongest-first. Each relation row names the link verb, the related
+/// entry, and (debug-honest) its confidence. Each row is registered as an
+/// [`interaction::ChromeKey::RelatedLinkRow`] click target so a click reaches the
+/// same `related_links_jump_to_selected` path as ↑↓+Enter. Reads the already-
+/// refreshed graph (kept current by `draw_app` while open), so painting is
+/// constant-time and does no transcript walk.
+fn render_related_links_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Related links ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} jump to related entries ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 72, 18, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Resolve the anchor entry and its relations. With no anchor (empty
+    // transcript) or no relations, paint an honest empty-state line.
+    let anchor = app.related_links_anchor;
+    let anchor_label = anchor.and_then(|id| jump_mark_entry_label(app, id));
+    let relations = anchor
+        .map(|id| app.related_links.relations(id))
+        .unwrap_or(&[]);
+
+    let header = if anchor.is_none() {
+        Line::from(Span::styled(
+            "No transcript entry to relate yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else if relations.is_empty() {
+        Line::from(Span::styled(
+            format!(
+                "{} has no related entries.",
+                anchor_label.as_deref().unwrap_or("this entry"),
+            ),
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "related to {} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                anchor_label.as_deref().unwrap_or("this entry"),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if relations.is_empty() {
+        return;
+    }
+
+    // Clamp the cursor to the relation count so a graph that shrank (e.g. after a
+    // clear) can never leave the cursor past the end.
+    let selected = app.related_links_selected.min(relations.len() - 1);
+    let list_top = inner.y.saturating_add(2);
+    // Reserve the bottom row for the selected relation's provenance (debug-honest
+    // "why this link"), so a weak link explains itself rather than just showing
+    // its confidence tag.
+    let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(1);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    for (index, relation) in relations.iter().enumerate().take(rows) {
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + index as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_selected { "\u{203a} " } else { "  " };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let target_label = jump_mark_entry_label(app, relation.target)
+            .unwrap_or_else(|| format!("#{}", relation.target));
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{:<16}", relation.kind.label()), label_style),
+            Span::styled(
+                format!("{target_label}  "),
+                Style::default().fg(crate::render::theme::foreground()),
+            ),
+            Span::styled(
+                format!("({})", relation.confidence.label()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its relation-list
+        // index so a click selects + jumps to exactly that related entry.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::RelatedLinkRow(index)),
+            interaction::Action::RelatedLinkSelect(index),
+        );
+    }
+
+    // Provenance footer for the selected relation: debug-honest "why this link",
+    // so a low-confidence heuristic explains itself in plain words.
+    if let Some(relation) = relations.get(selected) {
+        let footer_rect = Rect {
+            x: inner.x,
+            y: list_bottom,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("why: {}", relation.provenance),
+                Style::default().fg(crate::render::theme::quiet()),
+            ))),
+            footer_rect,
         );
     }
 }
@@ -25022,6 +25409,29 @@ pub(crate) struct TuiApp {
     /// category's entries instead of re-landing on the first. `None` until the
     /// first jump; reset when the selected category changes.
     pub(crate) transcript_index_anchor: Option<u64>,
+    /// Related-Entry Links (§12.5.3): an in-memory relation graph over the
+    /// transcript, keyed by stable entry id, that links each entry to the ones it
+    /// relates to (its prompt/reply, the tool calls it triggered, the error it
+    /// caused, the follow-up that fixed it, same-tool calls, subagent
+    /// breadcrumbs). Rebuilt incrementally — only when the transcript's
+    /// (id, revision, kind, error, tool) fingerprint moves — by
+    /// `refresh_related_links`, so an idle session pays one `u64` comparison per
+    /// refresh and rebuilds nothing. Drives the related-links overlay.
+    pub(crate) related_links: transcript_relations::RelationGraph,
+    /// Whether the Related-Entry Links overlay (§12.5.3) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// overlay owns key/mouse routing. Toggled by the `ToggleRelatedLinks` keymap
+    /// action.
+    pub(crate) related_links_open: bool,
+    /// Cursor into the related-links overlay's ranked relation list (§12.5.3).
+    /// Clamped to the relation count each render. Only meaningful while the
+    /// overlay is open.
+    pub(crate) related_links_selected: usize,
+    /// The entry id the related-links overlay is anchored on (§12.5.3) — the
+    /// focused (or latest) entry whose relations the overlay lists. Captured when
+    /// the overlay opens so a later scroll/focus change does not re-pivot the open
+    /// overlay. `None` until the first open.
+    pub(crate) related_links_anchor: Option<u64>,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -25587,6 +25997,10 @@ impl TuiApp {
             transcript_index_open: false,
             transcript_index_selected: 0,
             transcript_index_anchor: None,
+            related_links: transcript_relations::RelationGraph::new(),
+            related_links_open: false,
+            related_links_selected: 0,
+            related_links_anchor: None,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -27784,6 +28198,14 @@ impl TerminalGuard {
         // closed overlay costs nothing (this branch is skipped entirely).
         if app.transcript_index_open {
             refresh_transcript_index(app);
+        }
+
+        // Keep the Related-Entry Links graph (§12.5.3) current while its overlay
+        // is open, on the same no-op-when-unchanged terms as the index above: an
+        // open-but-idle overlay costs one `u64` comparison, a closed overlay
+        // costs nothing.
+        if app.related_links_open {
+            refresh_related_links(app);
         }
 
         let paint = self.paint_one_frame(app);

@@ -199,6 +199,15 @@ pub(crate) enum Action {
     /// entry in the selected category. The index rebuilds incrementally only on a
     /// transcript revision bump, so an idle session pays nothing.
     ToggleTranscriptIndex,
+    /// Open / close the Related-Entry Links overlay (`Alt+g` default; §12.5.3).
+    /// Surfaces the links between the focused (or latest) transcript entry and
+    /// the entries it relates to — its prompt/reply, the tool calls it triggered,
+    /// the error it caused, the follow-up that fixed it, same-tool calls, and
+    /// subagent breadcrumbs — with keyboard/mouse navigation that jumps the main
+    /// view to the selected related entry. The relation graph rebuilds
+    /// incrementally only on a transcript revision bump, so an idle session pays
+    /// nothing.
+    ToggleRelatedLinks,
 }
 
 impl Action {
@@ -248,6 +257,7 @@ impl Action {
             Self::OpenComposerInEditor => "open_composer_in_editor",
             Self::CycleSemanticFilter => "cycle_semantic_filter",
             Self::ToggleTranscriptIndex => "toggle_transcript_index",
+            Self::ToggleRelatedLinks => "toggle_related_links",
         }
     }
 
@@ -296,6 +306,7 @@ impl Action {
         Action::OpenComposerInEditor,
         Action::CycleSemanticFilter,
         Action::ToggleTranscriptIndex,
+        Action::ToggleRelatedLinks,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -381,6 +392,9 @@ impl Action {
             // Transcript-index overlay toggle is `Alt+i` — the same Meta/Alt
             // encoding that is unreliable across Linux terminals, tmux, and SSH.
             | Self::ToggleTranscriptIndex
+            // Related-Entry Links overlay toggle is `Alt+g` — the same Meta/Alt
+            // encoding case.
+            | Self::ToggleRelatedLinks
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -525,6 +539,10 @@ impl Action {
             // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p/
             // b/e/f) are taken; `i` is free.
             Self::ToggleTranscriptIndex => KeyBinding::new(KeyCode::Char('i'), KeyModifiers::ALT),
+            // Related-Entry Links (§12.5.3). `Alt+g` — `g` recalls "graph" /
+            // "go to related". Bare `Alt` letters in the nav/copy family
+            // (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i) are taken; `g` is free.
+            Self::ToggleRelatedLinks => KeyBinding::new(KeyCode::Char('g'), KeyModifiers::ALT),
         }
     }
 }

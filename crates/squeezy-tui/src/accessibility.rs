@@ -644,6 +644,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // so a row click and the keyboard reach the same
         // `transcript_index_jump_to_selected` handler.
         A::TranscriptIndexSelect(_) => KeyboardPath::Always("transcript index ↑↓/Enter"),
+        // Related-Entry Links overlay (§12.5.3) — the overlay's own key handler
+        // owns ↑↓/kj (move the relation cursor) and Enter/→/l (jump to the
+        // selected related entry) before the global keymap sees them, so a row
+        // click and the keyboard reach the same `related_links_jump_to_selected`
+        // handler.
+        A::RelatedLinkSelect(_) => KeyboardPath::Always("related links ↑↓/Enter"),
     })
 }
 
