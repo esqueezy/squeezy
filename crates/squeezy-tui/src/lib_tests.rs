@@ -17765,6 +17765,163 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
     );
 }
 
+// ---- §11G.11: unified logical scroll model, render-driven ------------
+
+/// The overlay opens anchored to the tail and the unified resolve path
+/// (`logical_scroll::resolve_top_offset`) renders the LAST transcript rows.
+#[tokio::test]
+async fn transcript_overlay_renders_tail_when_pinned_unified_model() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..60 {
+        app.push_transcript_item(TranscriptItem::user(format!("line-marker-{index}")));
+    }
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("open overlay");
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        "Ctrl+T opens anchored to the tail (follow-tail intent)"
+    );
+
+    // Drive the REAL render() through the capture-sink/TestBackend framework.
+    // The pinned state must resolve to the bottom of the content, so the last
+    // line is on screen and an early line is scrolled off.
+    let frame = render_to_string(&app, 100, 24);
+    assert!(
+        frame.contains("line-marker-59"),
+        "pinned overlay must render the tail through the unified resolve path:\n{frame}"
+    );
+    assert!(
+        !frame.contains("line-marker-0 "),
+        "the oldest line should be scrolled off the top when pinned:\n{frame}"
+    );
+}
+
+/// Scrolling the overlay to the top with `Home` resolves (through the unified
+/// model) to top-line offset 0, so render() paints the FIRST rows. `End`
+/// re-pins to the tail. Behaviour is identical to the pre-unification model.
+#[tokio::test]
+async fn transcript_overlay_home_end_keys_drive_unified_resolve_in_render() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..60 {
+        app.push_transcript_item(TranscriptItem::user(format!("line-marker-{index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("home");
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        0,
+        "Home stores top-line offset 0 (not the follow-tail sentinel)"
+    );
+    let top = render_to_string(&app, 100, 24);
+    assert!(
+        top.contains("line-marker-0 "),
+        "Home resolves to offset 0 and renders the first line:\n{top}"
+    );
+    assert!(
+        !top.contains("line-marker-59"),
+        "the newest line is below the fold after Home:\n{top}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    let bottom = render_to_string(&app, 100, 24);
+    assert!(
+        bottom.contains("line-marker-59"),
+        "End re-pins to the tail and renders the last line:\n{bottom}"
+    );
+}
+
+/// Empty/edge case: an overlay over a transcript whose rows fit the viewport
+/// renders every line and never panics through the unified resolve/geometry
+/// path (no scrollbar, max_scroll 0).
+#[tokio::test]
+async fn transcript_overlay_short_content_renders_without_scroll_unified() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("only-line".to_string()));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("open overlay");
+    // PageUp on content that fits is a no-op through the shared clamp.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page up on short content");
+
+    let frame = render_to_string(&app, 100, 24);
+    assert!(
+        frame.contains("only-line"),
+        "short overlay content renders through the unified path:\n{frame}"
+    );
+}
+
+/// Resize: a follow-tail overlay re-resolves to the live `(content_len,
+/// viewport_h)` geometry through the unified `resolve_top_offset` at render
+/// time, so the tail stays visible at two very different heights without
+/// panicking or scrolling past the last row.
+#[tokio::test]
+async fn transcript_overlay_resize_reclamps_through_unified_resolve() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..60 {
+        app.push_transcript_item(TranscriptItem::user(format!("line-marker-{index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        // Follow-tail intent: render must resolve to each frame's own bottom.
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
+    });
+
+    // Render at two very different heights. Both must paint without panicking;
+    // the follow-tail intent resolves to each frame's own max_scroll, so the
+    // last line stays on screen regardless of viewport height.
+    let tall = render_to_string(&app, 120, 48);
+    assert!(
+        tall.contains("line-marker-59"),
+        "tall frame: follow-tail resolves to the bottom:\n{tall}"
+    );
+    let short = render_to_string(&app, 80, 10);
+    assert!(
+        short.contains("line-marker-59"),
+        "short frame: follow-tail still resolves to the tail through the clamp:\n{short}"
+    );
+}
+
 #[tokio::test]
 async fn transcript_overlay_swallows_ctrl_x_queue_chord() {
     let mut agent = test_agent(SessionMode::Build);

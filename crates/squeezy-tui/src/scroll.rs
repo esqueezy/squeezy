@@ -113,10 +113,12 @@ impl ScrollState {
     /// lines that can scroll off the top before the first line is at the top.
     ///
     /// Equivalent to `transcript_scroll_offset`'s `max_scroll`
-    /// (`line_count - viewport`), saturating at 0 when content fits.
+    /// (`line_count - viewport`), saturating at 0 when content fits. Delegates to
+    /// the shared [`crate::logical_scroll::max_top_offset`] so the main view and
+    /// the Ctrl+T overlay agree on a single definition of "max scroll".
     #[must_use]
     fn max_scroll(line_count: usize, viewport_h: usize) -> usize {
-        line_count.saturating_sub(viewport_h)
+        crate::logical_scroll::max_top_offset(line_count, viewport_h)
     }
 
     /// Absolute top-line offset for rendering, clamped to the valid range.
@@ -242,31 +244,16 @@ pub(crate) fn scrollbar_geometry(
     viewport_h: usize,
     from_bottom: usize,
 ) -> Option<ScrollbarGeometry> {
-    let track_height = viewport_h;
-    if track_height == 0 || total_rows <= track_height {
-        return None;
-    }
-    let max_scroll = total_rows.saturating_sub(track_height);
-    if max_scroll == 0 {
-        return None;
-    }
-    let thumb_len = ((track_height * track_height) / total_rows).clamp(1, track_height);
-    let travel = track_height.saturating_sub(thumb_len);
     // Convert the "distance from tail" into the renderer's top-line scroll, the
-    // same coordinate `transcript_overlay_scrollbar_geometry` consumes.
+    // same coordinate the overlay consumes, then delegate to the single shared
+    // thumb primitive (§11G.11). `max_top_offset` matches the legacy
+    // `total_rows - viewport` clamp.
+    let max_scroll = crate::logical_scroll::max_top_offset(total_rows, viewport_h);
     let scroll = max_scroll.saturating_sub(from_bottom.min(max_scroll));
-    let thumb_offset = if travel == 0 {
-        0
-    } else {
-        // `scroll * travel` can exceed usize for very large row counts (the
-        // whole point of the migration), so widen the product to u128. The
-        // quotient is bounded by `travel < track_height`, so the narrowing
-        // back to usize is always lossless.
-        ((scroll as u128 * travel as u128) / max_scroll as u128) as usize
-    };
+    let geometry = crate::logical_scroll::thumb_geometry(total_rows, viewport_h, scroll)?;
     Some(ScrollbarGeometry {
-        thumb_offset,
-        thumb_len,
+        thumb_offset: geometry.thumb_offset,
+        thumb_len: geometry.thumb_len,
     })
 }
 

@@ -99,6 +99,7 @@ mod jump_marks;
 mod keymap;
 mod keymap_config;
 mod latency;
+mod logical_scroll;
 mod main_render_cache;
 mod mcp_settings_edit;
 mod mention;
@@ -13558,7 +13559,9 @@ fn reduced_motion_requested() -> bool {
 }
 
 fn transcript_overlay_max_scroll_for_content(content_len: usize, viewport_height: u16) -> usize {
-    content_len.saturating_sub(usize::from(viewport_height))
+    // Shared definition of "max scroll" with the main view (§11G.11): both route
+    // through the single `logical_scroll::max_top_offset` primitive.
+    logical_scroll::max_top_offset(content_len, usize::from(viewport_height))
 }
 
 fn resolved_transcript_overlay_scroll_for_state(
@@ -13566,12 +13569,17 @@ fn resolved_transcript_overlay_scroll_for_state(
     content_len: usize,
     viewport_height: u16,
 ) -> usize {
-    let max_scroll = transcript_overlay_max_scroll_for_content(content_len, viewport_height);
-    if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
-        max_scroll
+    // Convert the overlay's stored scroll into the unified `LogicalScroll`, then
+    // resolve to a terminal top-line offset through the single render-boundary
+    // helper shared with the main view (§11G.11). The `usize::MAX` "snap to
+    // bottom" sentinel becomes the model's `follow_tail` intent; any other value
+    // is a concrete top-line offset.
+    let logical = if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
+        logical_scroll::LogicalScroll::pinned()
     } else {
-        state.scroll.min(max_scroll)
-    }
+        logical_scroll::LogicalScroll::at_top_offset(state.scroll)
+    };
+    logical_scroll::resolve_top_offset(logical, content_len, usize::from(viewport_height))
 }
 
 fn transcript_overlay_scrollbar_geometry(
@@ -13579,26 +13587,15 @@ fn transcript_overlay_scrollbar_geometry(
     viewport_height: u16,
     scroll: usize,
 ) -> Option<TranscriptScrollbarGeometry> {
-    let track_height = usize::from(viewport_height);
-    if track_height == 0 || content_len <= track_height {
-        return None;
-    }
-    let max_scroll = content_len.saturating_sub(track_height);
-    if max_scroll == 0 {
-        return None;
-    }
-    let thumb_height = ((track_height * track_height) / content_len).clamp(1, track_height);
-    let travel = track_height.saturating_sub(thumb_height);
-    let scroll = scroll.min(max_scroll);
-    let thumb_top = if travel == 0 {
-        0
-    } else {
-        scroll * travel / max_scroll
-    };
+    // Single shared thumb primitive (§11G.11). The overlay's `TranscriptScrollbarGeometry`
+    // is just the `u16`-narrowed projection of `logical_scroll::ThumbGeometry`;
+    // narrowing stays funnelled through `scroll::to_u16_clamped`.
+    let geometry =
+        logical_scroll::thumb_geometry(content_len, usize::from(viewport_height), scroll)?;
     Some(TranscriptScrollbarGeometry {
-        thumb_top: thumb_top as u16,
-        thumb_height: thumb_height as u16,
-        max_scroll,
+        thumb_top: scroll::to_u16_clamped(geometry.thumb_offset),
+        thumb_height: scroll::to_u16_clamped(geometry.thumb_len),
+        max_scroll: geometry.max_scroll,
     })
 }
 
