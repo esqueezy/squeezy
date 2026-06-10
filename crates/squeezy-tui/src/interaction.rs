@@ -139,6 +139,31 @@ pub(crate) enum Action {
     ScrollbarJump,
 }
 
+impl Action {
+    /// One representative of every [`Action`] variant, in a stable order. The
+    /// payload-carrying variants use a sentinel id (the variant identity is what
+    /// the audit cares about, not the specific target). The Accessibility
+    /// Quality Gate (§12.10.5) sweeps this to prove every mouse affordance has a
+    /// keyboard equivalent; any new variant must be added here or the gate's
+    /// exhaustiveness assertion fails.
+    ///
+    /// `cfg(test)`-only: the only consumer is the gate, which is itself
+    /// test-gated, so this carries no runtime weight on any platform.
+    #[cfg(test)]
+    pub(crate) const AUDIT_ALL: &'static [Action] = &[
+        Action::ToggleQueueOverlay,
+        Action::ToggleEntryCollapsed(EntryId(0)),
+        Action::FocusEntry(EntryId(0)),
+        Action::ExpandEntry(EntryId(0)),
+        Action::OpenEntryInDetail(EntryId(0)),
+        Action::QueueDelete(0),
+        Action::QueueReorderBegin(0),
+        Action::QueueUndo,
+        Action::JumpToLatest,
+        Action::ScrollbarJump,
+    ];
+}
+
 // ===========================================================================
 // Frame-local hit-test registry
 // ===========================================================================

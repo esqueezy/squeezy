@@ -69,6 +69,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthStr;
 
+// Accessibility Quality Gate (§12.10.5). `cfg(test)`-gated so the audit harness
+// never compiles into a shipped TUI binary; every item is exercised by its
+// sibling `accessibility_tests.rs`, so the module carries no dead code (and adds
+// no keybinding, dispatch arm, or idle redraw — it is a quality gate, not a
+// runtime feature).
+#[cfg(test)]
+mod accessibility;
 mod approval;
 // Real Terminal Benchmark Suite (§12.10.2). `cfg(test)`-gated so the benchmark
 // harness never compiles into a shipped TUI binary; every item is exercised by
