@@ -363,6 +363,13 @@ pub(crate) enum Action {
     /// The verb flips the affordance off for users who prefer none; the resting
     /// state paints nothing and schedules no redraw, so it costs nothing idle.
     ToggleHoverIntent,
+    /// Show / hide the Clickable Breadcrumbs strip (`Alt+2` default; §12.1.5). A
+    /// compact `session ▸ turn ▸ entry` trail (with an `overlay`/`search` suffix)
+    /// that orients long sessions. While shown it is keyboard-focusable —
+    /// Left/Right move the focused crumb, Enter jumps to it — and each crumb is a
+    /// click target; while hidden it paints nothing and schedules no redraw, so it
+    /// costs nothing idle.
+    ToggleBreadcrumbs,
 }
 
 impl Action {
@@ -432,6 +439,7 @@ impl Action {
             Self::ToggleCommandPalette => "toggle_command_palette",
             Self::ToggleHoverPreview => "toggle_hover_preview",
             Self::ToggleHoverIntent => "toggle_hover_intent",
+            Self::ToggleBreadcrumbs => "toggle_breadcrumbs",
         }
     }
 
@@ -500,6 +508,7 @@ impl Action {
         Action::ToggleCommandPalette,
         Action::ToggleHoverPreview,
         Action::ToggleHoverIntent,
+        Action::ToggleBreadcrumbs,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -654,6 +663,10 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M`/
             // `Ctrl+Alt+P` chords above.
             | Self::ToggleHoverIntent
+            // Clickable Breadcrumbs strip toggle is `Alt+2` — an Alt+digit chord,
+            // the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleBreadcrumbs
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -905,6 +918,13 @@ impl Action {
                 KeyCode::Char('h'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
+            // Clickable Breadcrumbs (§12.1.5). `Alt+2` — the next free `Alt`+digit
+            // after `Alt+1` (hover preview); `Alt+8`/`Alt+9`/`Alt+0` are
+            // hyperlinks / session timeline / changes-since, and every bare `Alt`
+            // letter in the nav/copy/overlay family is taken. The `2` reads as
+            // "level-2 / where am I"; it stays clear of every composer chord and of
+            // the `Alt+Enter` action-palette / `Ctrl+Enter` detail chords.
+            Self::ToggleBreadcrumbs => KeyBinding::new(KeyCode::Char('2'), KeyModifiers::ALT),
         }
     }
 }

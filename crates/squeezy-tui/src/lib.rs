@@ -85,6 +85,7 @@ mod approval;
 #[cfg(test)]
 mod bench_render;
 mod bookmarks;
+mod breadcrumbs;
 mod change_summary;
 mod clipboard;
 mod clipboard_history;
@@ -2315,6 +2316,26 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         app.hover_intent.set_suppression(None);
     }
 
+    // The Clickable Breadcrumbs strip (§12.1.5) is NON-modal: while shown it
+    // registers a `BreadcrumbCrumb` target per crumb on the status row. A left
+    // click on one focuses + activates that crumb (the mouse twin of ←→ + Enter),
+    // but — unlike the fullscreen overlays below — a click that misses every crumb
+    // is NOT swallowed: it falls through to the transcript/footer handling so the
+    // strip never steals clicks meant for the surface beneath it. Hit-tested in
+    // absolute screen coordinates against the targets the strip registered this
+    // frame; only fullscreen overlays would have returned before here, and they
+    // never register breadcrumb targets, so this is safe to check up front.
+    if app.breadcrumbs_open
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::BreadcrumbCrumb(_)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
     // The large-paste confirmation modal (§11G.6) owns the pointer while open:
     // a left-click on its Accept/Discard buttons resolves the decision, and any
     // other click is swallowed so a stray press can't fall through to the
@@ -4153,6 +4174,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // dispatch, so a stray key never leaks into the composer underneath. Sits
     // beside the health-markers overlay at the front for the same reason.
     if app.turn_outline_open && handle_turn_outline_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Clickable Breadcrumbs strip (§12.1.5) is non-modal but, while shown, owns
+    // its small set of navigation keys (←→/hl move the breadcrumb focus, Enter jump
+    // to the focused crumb, Esc/Alt+2 hide) BEFORE the selection-clear / chord /
+    // keymap dispatch, so a breadcrumb arrow never leaks into the main view. Every
+    // OTHER key falls through (`handle_breadcrumbs_key` returns false), so normal
+    // composer typing keeps working while the orienting strip is visible.
+    if app.breadcrumbs_open && handle_breadcrumbs_key(app, key) {
         return Ok(false);
     }
 
@@ -6101,6 +6132,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_hover_intent(app);
             true
         }
+        keymap::Action::ToggleBreadcrumbs => {
+            // Main-surface strip; the config/setup screens own their own routing,
+            // and the Ctrl+T overlay path tolerates the strip (the trail simply
+            // reports `overlay` and clicking it returns to the main view).
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_breadcrumbs(app);
+            true
+        }
     }
 }
 
@@ -6939,6 +6980,170 @@ fn turn_outline_jump_to_selected(app: &mut TuiApp, advance: bool) {
     } else {
         app.status = "turn outline: could not jump".to_string();
     }
+}
+
+// ---- Clickable Breadcrumbs (§12.1.5) ----
+
+/// Gather the live facts the Clickable Breadcrumbs trail (§12.1.5) is built from
+/// into a [`breadcrumbs::BreadcrumbContext`]. Pure read over `app` — no mutation,
+/// no caching — so the renderer and the navigation path both derive the trail
+/// from the same current state each frame (the spec's "derive from model each
+/// frame", which is what keeps the trail from going stale after a resize/scroll/
+/// fold). Cheap enough to call only while the strip is shown.
+fn build_breadcrumb_context(app: &TuiApp) -> breadcrumbs::BreadcrumbContext {
+    // Short session label: the trailing slice of the session id (the full id is
+    // long and not user-meaningful), or `None` to let the model fall back to the
+    // generic root label.
+    let session_label = app.session_id.as_ref().map(|id| {
+        let tail: String = id
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        tail
+    });
+
+    // Focused entry → its stable id + a short kind label (reusing the same
+    // classification the turn outline / index use, so the crumb reads the same as
+    // the rest of the UI).
+    let entries = active_transcript_entries(app);
+    let focused_entry = active_selected_entry(app).and_then(|index| {
+        entries.get(index).map(|entry| {
+            let kind = outline_kind_of(entries, index);
+            (entry.id, kind.label().to_string())
+        })
+    });
+
+    breadcrumbs::BreadcrumbContext {
+        session_label,
+        following_tail: focused_entry.is_none() && active_transcript_scroll(app).is_following(),
+        focused_entry,
+        overlay_open: app.transcript_overlay.is_some(),
+        search_query: app.search.as_ref().map(|s| s.query.clone()),
+    }
+}
+
+/// `Alt+2`: show / hide the Clickable Breadcrumbs strip (§12.1.5). The strip is a
+/// compact `session ▸ turn ▸ entry` trail painted on the status row that orients
+/// long sessions without permanent chrome. Showing it parks the breadcrumb focus
+/// on the deepest (rightmost) crumb — the user's current location — and confirms
+/// via the status line. Sets `needs_redraw` so the toggle paints immediately; the
+/// hidden state paints nothing and schedules no redraw.
+fn toggle_breadcrumbs(app: &mut TuiApp) {
+    app.breadcrumbs_open = !app.breadcrumbs_open;
+    if app.breadcrumbs_open {
+        let model = breadcrumbs::BreadcrumbModel::build(&build_breadcrumb_context(app));
+        // Park the focus on the deepest crumb (the current location), so the first
+        // ← steps back up the trail toward the session root.
+        app.breadcrumbs_focus = model.len().saturating_sub(1);
+        app.status = "breadcrumbs — \u{2190}\u{2192} focus \u{00b7} Enter jump \u{00b7} Alt+2 hide"
+            .to_string();
+    } else {
+        app.status = "breadcrumbs hidden".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Clickable Breadcrumbs strip (§12.1.5) is shown. Returns
+/// `true` when the key was consumed so it never leaks to the composer or global
+/// keymap. The strip's own toggle chord (`Alt+2`) and Esc hide it; Left/Right (and
+/// h/l) move the breadcrumb focus along the trail (clamped, no wrap); Enter
+/// activates the focused crumb (jump to its location).
+///
+/// Unlike the fullscreen overlays this is a *non-modal* strip: it only claims the
+/// small set of keys it needs (the arrows it owns, Enter, Esc, its toggle) and
+/// lets every other key fall through to the composer, so typing is unaffected
+/// while the orienting strip is visible.
+fn handle_breadcrumbs_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.breadcrumbs_open {
+        return false;
+    }
+    // The strip's own toggle chord (`Alt+2` by default) hides it.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleBreadcrumbs) {
+        app.breadcrumbs_open = false;
+        app.status = "breadcrumbs hidden".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let model = breadcrumbs::BreadcrumbModel::build(&build_breadcrumb_context(app));
+    let count = model.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.breadcrumbs_open = false;
+            app.status = "breadcrumbs hidden".to_string();
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if let Some(prev) = model.prev_index(app.breadcrumbs_focus.min(count.saturating_sub(1)))
+            {
+                app.breadcrumbs_focus = prev;
+            }
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(next) = model.next_index(app.breadcrumbs_focus.min(count.saturating_sub(1)))
+            {
+                app.breadcrumbs_focus = next;
+            }
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Enter => {
+            breadcrumbs_activate_focused(app);
+            true
+        }
+        // Every other key falls through: the strip is non-modal, so normal
+        // composer input keeps working while it is shown.
+        _ => false,
+    }
+}
+
+/// Navigate to the location the breadcrumb-focused crumb stands for (§12.1.5).
+/// Rebuilds the trail (so the focus index is resolved against the current trail),
+/// reads the focused crumb's [`breadcrumbs::BreadcrumbTarget`], and dispatches it
+/// through the same jump paths the rest of the UI uses: `Home` scrolls to the top,
+/// `Tail` jumps to the latest row, `Entry` jumps by stable id, `CloseOverlay`
+/// closes the Ctrl+T overlay, and `Search` re-opens the incremental search. A
+/// no-op (status hint) when there is nothing focusable. Reports the destination in
+/// the status line.
+fn breadcrumbs_activate_focused(app: &mut TuiApp) {
+    let model = breadcrumbs::BreadcrumbModel::build(&build_breadcrumb_context(app));
+    let index = app.breadcrumbs_focus.min(model.len().saturating_sub(1));
+    let Some((label, target)) = model.get(index).map(|c| (c.label.clone(), c.target)) else {
+        app.status = "breadcrumbs: nothing to jump to".to_string();
+        return;
+    };
+    match target {
+        breadcrumbs::BreadcrumbTarget::Home => {
+            jump_main_to_top_animated(app);
+            app.status = format!("breadcrumbs: {label} (top)");
+        }
+        breadcrumbs::BreadcrumbTarget::Tail => {
+            commit_main_from_bottom_animated(app, 0);
+            app.status = format!("breadcrumbs: {label} (latest)");
+        }
+        breadcrumbs::BreadcrumbTarget::Entry(entry_id) => {
+            if jump_to_entry_id(app, entry_id) {
+                app.status = format!("breadcrumbs: jumped to {label}");
+            } else {
+                app.status = "breadcrumbs: could not jump".to_string();
+            }
+        }
+        breadcrumbs::BreadcrumbTarget::CloseOverlay => {
+            close_transcript_overlay(app);
+            app.status = "breadcrumbs: closed overlay".to_string();
+        }
+        breadcrumbs::BreadcrumbTarget::Search => {
+            open_search(app);
+            app.status = "breadcrumbs: search".to_string();
+        }
+    }
+    app.needs_redraw = true;
 }
 
 // ---- Session Timeline (§12.2.6) ----
@@ -11021,6 +11226,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             // A click on a command row both selects and runs it — the same path
             // ↑↓+Enter takes — keyed by the visible (filtered) index.
             command_palette_select_run(app, index);
+        }
+        // A click on a breadcrumb crumb (§12.1.5): move the breadcrumb focus onto
+        // it and jump to the location it stands for — the mouse twin of ←→ + Enter,
+        // in one go.
+        interaction::Action::BreadcrumbActivate(index) => {
+            app.breadcrumbs_focus = index;
+            breadcrumbs_activate_focused(app);
         }
     }
 }
@@ -29950,8 +30162,138 @@ fn mode_status_color(mode: SessionMode) -> Color {
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(format_status_lines(app, area.width));
-    frame.render_widget(paragraph, area);
+    // The Clickable Breadcrumbs strip (§12.1.5) borrows the status block's TOP row
+    // while shown, registering its per-crumb click targets there; the status text
+    // then condenses onto the remaining row(s). Hidden, the status block keeps its
+    // full height and the strip paints nothing (zero idle cost).
+    let status_area = if app.breadcrumbs_open && area.height >= 1 {
+        let strip = Rect { height: 1, ..area };
+        render_breadcrumbs_strip(frame, strip, app);
+        Rect {
+            y: area.y.saturating_add(1),
+            height: area.height.saturating_sub(1),
+            ..area
+        }
+    } else {
+        area
+    };
+    if status_area.height > 0 {
+        let paragraph = Paragraph::new(format_status_lines(app, status_area.width));
+        frame.render_widget(paragraph, status_area);
+    }
+}
+
+/// Paint the Clickable Breadcrumbs strip (§12.1.5) on a single `row` and register
+/// one [`interaction::ChromeKey::BreadcrumbCrumb`] click target per crumb. The
+/// trail is BUILT FRESH from the current model here (never cached), so it always
+/// reflects the live focus/overlay/search state — the spec's "derive from model
+/// each frame", which is what keeps it correct across a resize/scroll/fold.
+///
+/// Crumbs render root-first, separated by ` ▸ `; the keyboard-/click-focused crumb
+/// is bolded + accented (color AND weight, never color-only). When the full trail
+/// is wider than the row the MIDDLE crumbs are elided to a single `…` so the root
+/// (where am I rooted) and the deepest crumb (where I am) always stay visible — the
+/// spec's "middle truncation". Each rendered crumb's exact rect is registered so a
+/// click reaches the same `breadcrumbs_activate_focused` path as ←→ + Enter.
+fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
+    if row.width == 0 || row.height == 0 {
+        return;
+    }
+    let model = breadcrumbs::BreadcrumbModel::build(&build_breadcrumb_context(app));
+    if model.is_empty() {
+        return;
+    }
+    let count = model.len();
+    let focus = app.breadcrumbs_focus.min(count - 1);
+    let width = row.width as usize;
+
+    // Decide which crumb indices to show. The root (0) and the deepest crumb
+    // (count-1) always stay; middle crumbs are elided with a single `…` when the
+    // full trail does not fit.
+    let show_all = model.full_width() <= width;
+
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    let fg = crate::render::theme::foreground();
+    let sep_style = Style::default().fg(quiet);
+
+    // Build the styled spans AND, in lockstep, the (index, start_col, char_width)
+    // of each rendered crumb so the click rects match exactly where each crumb
+    // landed. `col` tracks the running char column from the row's left edge.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut crumb_rects: Vec<(usize, u16, u16)> = Vec::new();
+    let mut col: usize = 0;
+
+    let push_sep = |spans: &mut Vec<Span<'static>>, col: &mut usize| {
+        spans.push(Span::styled(breadcrumbs::SEPARATOR, sep_style));
+        *col += breadcrumbs::SEPARATOR.chars().count();
+    };
+    let push_crumb = |spans: &mut Vec<Span<'static>>,
+                      crumb_rects: &mut Vec<(usize, u16, u16)>,
+                      col: &mut usize,
+                      index: usize,
+                      label: &str| {
+        let style = if index == focus {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(fg)
+        };
+        let chars = label.chars().count();
+        let start = (row.x as usize + *col).min(u16::MAX as usize) as u16;
+        crumb_rects.push((index, start, chars.min(u16::MAX as usize) as u16));
+        spans.push(Span::styled(label.to_string(), style));
+        *col += chars;
+    };
+
+    if show_all {
+        for (index, crumb) in model.crumbs().iter().enumerate() {
+            if index > 0 {
+                push_sep(&mut spans, &mut col);
+            }
+            push_crumb(&mut spans, &mut crumb_rects, &mut col, index, &crumb.label);
+        }
+    } else {
+        // Root … deepest. Always show the first and last crumb; collapse the
+        // middle to a single ellipsis so the trail still orients on a narrow row.
+        if let Some(first) = model.get(0) {
+            push_crumb(&mut spans, &mut crumb_rects, &mut col, 0, &first.label);
+        }
+        if count > 2 {
+            push_sep(&mut spans, &mut col);
+            spans.push(Span::styled("\u{2026}", sep_style));
+            col += 1;
+        }
+        if count > 1 {
+            push_sep(&mut spans, &mut col);
+            let last = count - 1;
+            if let Some(crumb) = model.get(last) {
+                push_crumb(&mut spans, &mut crumb_rects, &mut col, last, &crumb.label);
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), row);
+
+    // Register each rendered crumb's rect, clamped to the row so a crumb that runs
+    // past the right edge never registers a target off-surface.
+    let row_right = row.x.saturating_add(row.width);
+    for (index, start, w) in crumb_rects {
+        if start >= row_right || w == 0 {
+            continue;
+        }
+        let clamped_w = w.min(row_right.saturating_sub(start));
+        let rect = Rect {
+            x: start,
+            y: row.y,
+            width: clamped_w,
+            height: 1,
+        };
+        app.register_click(
+            rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::BreadcrumbCrumb(index)),
+            interaction::Action::BreadcrumbActivate(index),
+        );
+    }
 }
 
 /// Once every subagent has finished and the user is neither navigating the
@@ -31722,6 +32064,15 @@ pub(crate) struct TuiApp {
     /// Cursor into the turn-outline overlay's list of nodes (§12.2.1). Clamped to
     /// the node count each render. Only meaningful while the overlay is open.
     pub(crate) turn_outline_selected: usize,
+    /// Whether the Clickable Breadcrumbs strip (§12.1.5) is shown. `false` =
+    /// hidden (the resting state, paints nothing and schedules no redraw); `true` =
+    /// the `session ▸ turn ▸ entry` strip paints on the status row and owns
+    /// ←→/Enter while focused. Toggled by the `ToggleBreadcrumbs` keymap action.
+    pub(crate) breadcrumbs_open: bool,
+    /// Focused crumb index into the breadcrumb trail (§12.1.5). Clamped to the
+    /// trail length each render. Only meaningful while `breadcrumbs_open`; the
+    /// trail itself is rebuilt fresh each frame, never cached.
+    pub(crate) breadcrumbs_focus: usize,
     /// Persisted lane collapse state for Collapsible Reasoning/Tool Lanes
     /// (§12.2.2): the set of `(entry_id, lane_id)` lanes the user has folded. Lives
     /// here (not recomputed from terminal cells) so a folded lane survives every
@@ -32461,6 +32812,8 @@ impl TuiApp {
             turn_outline: turn_outline::OutlineIndex::new(),
             turn_outline_open: false,
             turn_outline_selected: 0,
+            breadcrumbs_open: false,
+            breadcrumbs_focus: 0,
             lane_folds: lane_fold::LaneFoldStore::new(),
             lane_panel: lane_fold::LanePanel::new(),
             lane_fold_open: false,

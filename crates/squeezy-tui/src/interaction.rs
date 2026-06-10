@@ -175,6 +175,10 @@ pub(crate) enum ChromeKey {
     /// its 0-based index in the *visible* (fuzzy-filtered) command list so a click
     /// selects + runs exactly that command.
     CommandPaletteRow(usize),
+    /// A crumb in the Clickable Breadcrumbs strip (§12.1.5), keyed by its 0-based
+    /// index in the trail (root-first) so a click focuses + activates exactly that
+    /// crumb's navigation target.
+    BreadcrumbCrumb(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -347,6 +351,12 @@ pub(crate) enum Action {
     /// Enter; a click both selects and runs the command in one go. The index is into
     /// the *visible* (fuzzy-filtered) command list.
     CommandPaletteRun(usize),
+    /// Focus + activate the given crumb in the Clickable Breadcrumbs strip
+    /// (§12.1.5): move the breadcrumb focus onto it and jump to the location it
+    /// stands for. Mouse twin of moving the focus with ←→ and pressing Enter; a
+    /// click both focuses and jumps in one go. The index is into the trail
+    /// (root-first).
+    BreadcrumbActivate(usize),
 }
 
 impl Action {
@@ -398,6 +408,7 @@ impl Action {
         Action::ChangeSinceSelectJump(0),
         Action::PaletteActionRun(0),
         Action::CommandPaletteRun(0),
+        Action::BreadcrumbActivate(0),
     ];
 }
 

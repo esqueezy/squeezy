@@ -29138,6 +29138,303 @@ async fn turn_outline_renders_across_resizes() {
     );
 }
 
+// ---- Clickable Breadcrumbs (§12.1.5) ----
+
+/// Build a transcript with a couple of turns so a focused entry produces a real
+/// `session ▸ entry` trail. Seeds a deterministic viewport so the strip's row
+/// geometry is host-independent.
+fn app_with_breadcrumbs() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("refactor the parser".to_string()));
+    app.push_tool_result(sample_tool_result("read_file", "fn parse() {}\n"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Here is the refactored parser.".to_string(),
+    ));
+    app
+}
+
+#[tokio::test]
+async fn breadcrumbs_alt_2_shows_strip_with_trail() {
+    let mut app = app_with_breadcrumbs();
+    // Focus the tool entry so the trail carries an explicit entry crumb.
+    app.selected_entry = Some(1);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+2 shows the breadcrumb strip");
+
+    assert!(app.breadcrumbs_open, "Alt+2 shows the strip");
+    let out = render_to_string(&app, 80, 24);
+    // The trail paints the separator and the entry kind crumb on the status row.
+    assert!(
+        out.contains('\u{25b8}'),
+        "breadcrumb separator paints:\n{out}"
+    );
+    assert!(
+        out.contains("tool"),
+        "focused entry kind crumb paints:\n{out}"
+    );
+    // Focus parks on the deepest (rightmost) crumb.
+    assert!(
+        app.breadcrumbs_focus >= 1,
+        "focus parks on the deepest crumb"
+    );
+}
+
+#[tokio::test]
+async fn breadcrumbs_keyboard_traverses_and_jumps() {
+    let mut app = app_with_breadcrumbs();
+    app.selected_entry = Some(1);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip");
+    let _ = render_to_string(&app, 80, 24);
+    let deepest = app.breadcrumbs_focus;
+    assert!(deepest >= 1, "starts on the deepest crumb");
+
+    // Left walks the focus back toward the root (clamped, no wrap).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left moves focus");
+    assert_eq!(
+        app.breadcrumbs_focus,
+        deepest - 1,
+        "Left retreats the focus"
+    );
+
+    // Left again at the root stays at the root (no wrap).
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        )
+        .await
+        .expect("left clamps at root");
+    }
+    assert_eq!(app.breadcrumbs_focus, 0, "Left clamps at the session root");
+
+    // Enter on the root jumps home and reports it; the strip stays shown.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert!(
+        app.status.contains("breadcrumbs"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+    assert!(
+        app.breadcrumbs_open,
+        "Enter jumps within the strip, not closes it"
+    );
+
+    // Right walks the focus back toward the deepest crumb.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .expect("right moves focus");
+    assert_eq!(app.breadcrumbs_focus, 1, "Right advances the focus");
+}
+
+#[tokio::test]
+async fn breadcrumbs_alt_2_toggles_hidden_without_leaking() {
+    let mut app = app_with_breadcrumbs();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("show");
+    assert!(app.breadcrumbs_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord).await.expect("hide");
+    assert!(!app.breadcrumbs_open, "Alt+2 toggles the strip hidden");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn breadcrumbs_typing_falls_through_while_strip_shown() {
+    // The strip is NON-modal: a plain character key must reach the composer even
+    // while the strip is visible (only ←→/Enter/Esc/Alt+2 are claimed).
+    let mut app = app_with_breadcrumbs();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type a char");
+    assert!(
+        app.input.contains('x'),
+        "a plain key reaches the composer while the non-modal strip is shown: {:?}",
+        app.input,
+    );
+    assert!(app.breadcrumbs_open, "typing does not hide the strip");
+}
+
+#[tokio::test]
+async fn breadcrumbs_mouse_click_focuses_and_jumps() {
+    let mut app = app_with_breadcrumbs();
+    app.selected_entry = Some(1);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for the root crumb's registered target (index 0) and click it.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::BreadcrumbCrumb(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 0
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("the root crumb registers a click target");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.breadcrumbs_focus, 0,
+        "clicking the root crumb focuses exactly it",
+    );
+    assert!(
+        app.status.contains("breadcrumbs"),
+        "the click jumps and reports: {}",
+        app.status,
+    );
+    assert!(
+        app.breadcrumbs_open,
+        "the strip stays shown after a crumb click"
+    );
+}
+
+#[tokio::test]
+async fn breadcrumbs_empty_session_shows_session_root() {
+    // No transcript, no focus: the trail is still non-empty — just the session
+    // root — and the strip paints without panicking.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip on an empty session");
+
+    assert!(app.breadcrumbs_open);
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("session"), "session root crumb paints:\n{out}");
+
+    // Enter on the (single-crumb) root is a harmless jump-home, no panic.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on the root crumb");
+    assert!(app.breadcrumbs_open);
+}
+
+#[tokio::test]
+async fn breadcrumbs_render_across_resizes_with_middle_truncation() {
+    // With an entry focused AND a search active the trail has several crumbs
+    // (session ▸ entry ▸ search:…); on a narrow row the middle must elide to `…`
+    // while the strip still paints across every width. (The strip lives on the
+    // main surface; the Ctrl+T overlay is its own surface, so this stays on main.)
+    let mut app = app_with_breadcrumbs();
+    app.selected_entry = Some(1);
+    let mut agent = test_agent(SessionMode::Build);
+    // Show the strip FIRST (before search is live, so the `Alt+2` chord is not
+    // swallowed by the search mini-buffer), then activate a search with a
+    // non-trivial query so the trail has three crumbs (session ▸ entry ▸
+    // search:parser) wide enough to force middle truncation on a narrow row.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip");
+    let mut search_state = search::SearchState::open(selection::SelectionSurface::Main, 80);
+    search_state.query = "parser".to_string();
+    app.search = Some(search_state);
+
+    for (w, h) in [(120u16, 30u16), (80, 24), (24, 12)] {
+        let out = render_to_string(&app, w, h);
+        // The session root always survives; on the narrowest row the middle
+        // crumb(s) elide to a single ellipsis rather than dropping the trail.
+        assert!(
+            out.contains("session") || out.contains('\u{2026}'),
+            "the strip paints (root or ellipsis) at {w}x{h}:\n{out}",
+        );
+    }
+    // The narrowest width forces middle truncation (3 crumbs do not fit in 24
+    // cols), so the ellipsis must appear there.
+    let narrow = render_to_string(&app, 24, 12);
+    assert!(
+        narrow.contains('\u{2026}'),
+        "middle truncation elides to an ellipsis on a narrow row:\n{narrow}",
+    );
+    // The trail is rebuilt each frame, so resizing never leaves it stale: the
+    // strip is still shown after the narrowest render.
+    assert!(app.breadcrumbs_open);
+}
+
 // ---- Session Timeline (§12.2.6) ----
 
 /// Build a transcript spanning two turns with a full set of high-signal events:

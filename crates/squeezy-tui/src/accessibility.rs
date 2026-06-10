@@ -719,6 +719,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // sees them, so a row click and the keyboard reach the same
         // `command_palette_run_selected` handler.
         A::CommandPaletteRun(_) => KeyboardPath::Always("command palette ↑↓/Enter"),
+        // Clickable Breadcrumbs strip (§12.1.5) — while the strip is shown its own
+        // key handler owns ←→/hl (move the breadcrumb focus) and Enter (jump to the
+        // focused crumb) before the global keymap sees them, so a crumb click and
+        // the keyboard reach the same `breadcrumbs_activate_focused` handler.
+        A::BreadcrumbActivate(_) => KeyboardPath::Always("breadcrumbs ←→/Enter"),
     })
 }
 
