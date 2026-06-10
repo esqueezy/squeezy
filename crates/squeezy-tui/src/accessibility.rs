@@ -728,6 +728,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // entry's label; the keyboard twin is `Ctrl+Alt+R`, which opens the same
         // editor on the focused (or top-visible) entry. Reachable without a mouse.
         A::OpenRenameForEntry(_) => KeyboardPath::Always("rename label Ctrl+Alt+R"),
+        // Gentle First-Run Interaction Hint dismissal (§12.1.8) — `DismissFirstRunHint`
+        // (Ctrl+Alt+N default). The dim hint strip's click and the keyboard verb both
+        // drive the same `dismiss_first_run_hint` handler.
+        A::DismissFirstRunHint => KeyboardPath::Keymap(Action::DismissFirstRunHint),
     })
 }
 

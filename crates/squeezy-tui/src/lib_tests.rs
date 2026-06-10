@@ -33213,3 +33213,228 @@ fn hover_intent_resize_keeps_reveal_on_the_same_entry() {
         );
     }
 }
+
+// ---- Gentle First-Run Interaction Hints (§12.1.8) ----
+
+/// A stable substring of every hint line, so the integration assertions key on the
+/// chrome marker rather than a specific hint's prose.
+const FIRST_RUN_HINT_MARKER: &str = "tip:";
+
+/// Build a small two-turn transcript with a deterministic viewport so a focused
+/// entry exists (for the jump-used path) and the hint strip has a host-independent
+/// row to paint on.
+fn app_with_first_run_hints() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("refactor the parser".to_string()));
+    app.push_tool_result(sample_tool_result("read_file", "fn parse() {}\n"));
+    app.push_transcript_item(TranscriptItem::user("now add tests".to_string()));
+    app.push_transcript_item(TranscriptItem::assistant("Done.".to_string()));
+    app
+}
+
+#[test]
+fn first_run_hint_paints_a_dim_line_once_settled() {
+    let app = app_with_first_run_hints();
+    // Before the settle window the strip paints nothing (no instant flash) — the
+    // first render only stamps the eligibility clock.
+    let before = render_to_string(&app, 80, 24);
+    assert!(
+        !before.contains(FIRST_RUN_HINT_MARKER),
+        "no hint flashes before the settle delay:\n{before}",
+    );
+    // Force the highest-priority hint past its settle window, then render: the dim
+    // line paints, naming the live command-palette chord and a dismiss affordance.
+    app.first_run_hints.force_settle_for_test();
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains(FIRST_RUN_HINT_MARKER),
+        "the settled hint paints its dim line:\n{out}",
+    );
+    assert!(
+        out.contains("command palette"),
+        "names the palette hint:\n{out}"
+    );
+    assert!(
+        out.contains("dismiss"),
+        "offers a dismiss affordance:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn first_run_palette_hint_fades_once_the_chord_is_used() {
+    let mut app = app_with_first_run_hints();
+    app.first_run_hints.force_settle_for_test();
+    // It is showing before the user acts.
+    let shown = render_to_string(&app, 80, 24);
+    assert!(
+        shown.contains(FIRST_RUN_HINT_MARKER),
+        "hint shows first:\n{shown}"
+    );
+
+    let mut agent = test_agent(SessionMode::Build);
+    // The user opens the command palette — the very interaction the hint teaches.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+P toggles the command palette");
+    // Close it again so the palette overlay does not itself suppress the strip.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+P closes the command palette");
+
+    assert!(
+        app.first_run_hints
+            .is_seen(first_run_hints::HintId::PaletteChord),
+        "using the palette chord retires its hint",
+    );
+    // The next-priority hint has not settled yet, so right now nothing paints — the
+    // palette hint is gone for good.
+    let after = render_to_string(&app, 80, 24);
+    assert!(
+        !after.contains("command palette"),
+        "the palette hint never returns once used:\n{after}",
+    );
+}
+
+#[tokio::test]
+async fn first_run_hint_keyboard_dismiss_retires_it() {
+    let mut app = app_with_first_run_hints();
+    app.first_run_hints.force_settle_for_test();
+    // Paint it so a line is "showing" and the dismiss verb has something to retire.
+    let shown = render_to_string(&app, 80, 24);
+    assert!(
+        shown.contains(FIRST_RUN_HINT_MARKER),
+        "hint shows:\n{shown}"
+    );
+
+    let mut agent = test_agent(SessionMode::Build);
+    // Ctrl+Alt+N dismisses the shown hint (the keyboard twin of the strip click).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+N dismisses the first-run hint");
+
+    assert!(
+        app.first_run_hints
+            .is_seen(first_run_hints::HintId::PaletteChord),
+        "the dismiss verb latches the shown hint seen",
+    );
+    assert_eq!(app.status, "hint dismissed");
+}
+
+#[test]
+fn first_run_hint_click_dismisses_via_the_strip() {
+    let app = app_with_first_run_hints();
+    app.first_run_hints.force_settle_for_test();
+    // Render to register the strip's click target on its bottom row.
+    let _ = render_to_string(&app, 80, 24);
+    // The strip paints on the last row (y = height - 1) at the left edge.
+    let target = app.click_target_at(0, 23);
+    assert!(
+        matches!(
+            target,
+            Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::FirstRunHint),
+                interaction::Action::DismissFirstRunHint,
+            )),
+        ),
+        "a click on the hint strip maps to the dismiss action: {target:?}",
+    );
+
+    let mut app = app;
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 23,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the click on the strip is consumed");
+    assert!(
+        app.first_run_hints
+            .is_seen(first_run_hints::HintId::PaletteChord),
+        "the strip click latches the shown hint seen",
+    );
+}
+
+#[test]
+fn first_run_hint_is_suppressed_while_an_overlay_owns_the_surface() {
+    let mut app = app_with_first_run_hints();
+    app.first_run_hints.force_settle_for_test();
+    // A fullscreen §12 overlay owns the surface: the hint must not paint behind it,
+    // and it must not burn its single showing (it stays un-seen).
+    app.session_timeline_open = true;
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        !out.contains(FIRST_RUN_HINT_MARKER),
+        "no hint paints while an overlay owns the surface:\n{out}",
+    );
+    assert!(
+        !app.first_run_hints
+            .is_seen(first_run_hints::HintId::PaletteChord),
+        "suppression never retires a hint",
+    );
+    // Closing the overlay lets the same un-seen hint reappear.
+    app.session_timeline_open = false;
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains(FIRST_RUN_HINT_MARKER),
+        "the suppressed hint reappears once the overlay closes:\n{out}",
+    );
+}
+
+#[test]
+fn first_run_hint_survives_resize_and_paints_on_the_last_row() {
+    let app = app_with_first_run_hints();
+    app.first_run_hints.force_settle_for_test();
+    // The strip reserves no layout rows and always paints on the bottom row, so it
+    // survives a resize as long as the surface is wide enough to hold the marker.
+    for (w, h) in [(80u16, 24u16), (100, 30), (60, 18)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains(FIRST_RUN_HINT_MARKER),
+            "the hint paints across resize at {w}x{h}:\n{out}",
+        );
+        // It lands on the LAST row, never mid-transcript.
+        let last_row = out.lines().nth((h - 1) as usize).unwrap_or("");
+        assert!(
+            last_row.contains(FIRST_RUN_HINT_MARKER),
+            "the hint paints on the bottom row at {w}x{h}: {last_row:?}",
+        );
+    }
+}
+
+#[test]
+fn first_run_hint_does_not_paint_on_a_too_narrow_surface() {
+    let app = app_with_first_run_hints();
+    app.first_run_hints.force_settle_for_test();
+    // Below the 8-column floor the strip refuses to paint (the edge guard), so a
+    // sliver terminal never shows a clipped tip.
+    let out = render_to_string(&app, 6, 10);
+    assert!(
+        !out.contains(FIRST_RUN_HINT_MARKER),
+        "the hint refuses to paint on a too-narrow surface:\n{out}",
+    );
+}

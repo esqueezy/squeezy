@@ -378,6 +378,13 @@ pub(crate) enum Action {
     /// The resting state stores nothing and paints nothing, so it costs nothing
     /// idle.
     RenameFocusedEntry,
+    /// Dismiss the gentle First-Run Interaction Hint currently shown (`Ctrl+Alt+N`
+    /// default; §12.1.8). The keyboard twin of clicking the dim hint strip: it
+    /// retires the visible hint (latched seen for the session) so it never returns.
+    /// When no hint is showing it is a no-op that falls through, so it never steals
+    /// a key from the composer or transcript. Once every hint is seen the feature is
+    /// quiet and this verb does nothing, costing nothing idle.
+    DismissFirstRunHint,
 }
 
 impl Action {
@@ -449,6 +456,7 @@ impl Action {
             Self::ToggleHoverIntent => "toggle_hover_intent",
             Self::ToggleBreadcrumbs => "toggle_breadcrumbs",
             Self::RenameFocusedEntry => "rename_focused_entry",
+            Self::DismissFirstRunHint => "dismiss_first_run_hint",
         }
     }
 
@@ -519,6 +527,7 @@ impl Action {
         Action::ToggleHoverIntent,
         Action::ToggleBreadcrumbs,
         Action::RenameFocusedEntry,
+        Action::DismissFirstRunHint,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -682,6 +691,11 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M`/
             // `Ctrl+Alt+P`/`Ctrl+Alt+H` chords.
             | Self::RenameFocusedEntry
+            // First-Run Interaction Hint dismissal is `Ctrl+Alt+N` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P` chords
+            // above.
+            | Self::DismissFirstRunHint
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -949,6 +963,17 @@ impl Action {
             // chord and of the `Alt+Enter`/`Ctrl+Enter` chords.
             Self::RenameFocusedEntry => KeyBinding::new(
                 KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // First-Run Interaction Hint dismissal (§12.1.8). `Ctrl+Alt+N` — `N`
+            // recalls "notice / next" and follows the existing `Ctrl+Alt+letter`
+            // style (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`). It is
+            // free: bare `Alt+n` is the health-markers overlay, and the Ctrl+Alt
+            // modifier keeps the dismissal distinct and clear of every composer
+            // chord. It is a no-op when no hint is showing, so the chord never
+            // steals a key from the surface beneath.
+            Self::DismissFirstRunHint => KeyBinding::new(
+                KeyCode::Char('n'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

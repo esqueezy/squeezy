@@ -102,6 +102,7 @@ mod editor_handoff;
 mod error_lens;
 mod events;
 mod export_destination;
+mod first_run_hints;
 mod fuzzy;
 mod history;
 mod hover_intent;
@@ -2332,6 +2333,23 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             interaction::TargetKey::Chrome(interaction::ChromeKey::BreadcrumbCrumb(_)),
             action,
         )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // The Gentle First-Run Interaction Hint strip (§12.1.8) is NON-modal: while a
+    // hint is shown it registers a single `FirstRunHint` target on its dim bottom-row
+    // line. A left click on it dismisses the hint (the mouse twin of the
+    // `DismissFirstRunHint` verb), but — like the breadcrumb strip above — a click
+    // that misses the line is NOT swallowed: it falls through to the transcript /
+    // footer handling so the hint never steals a click meant for the surface beneath
+    // it. Hit-tested in absolute screen coordinates; only fullscreen overlays would
+    // have returned before here, and they never register this target, so it is safe
+    // to check up front.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((interaction::TargetKey::Chrome(interaction::ChromeKey::FirstRunHint), action)) =
+            app.click_target_at(mouse.column, mouse.row)
     {
         dispatch_click_action(app, action);
         return true;
@@ -6180,6 +6198,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             rename_focused_entry(app);
             true
         }
+        keymap::Action::DismissFirstRunHint => {
+            // A global display preference; the config/setup screens own their own
+            // routing, so only those gate it. When no hint is showing it is a no-op
+            // that falls through (returns `false`) so the chord never steals a key
+            // from the composer or the surface beneath.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            dismiss_first_run_hint(app)
+        }
     }
 }
 
@@ -7703,6 +7731,9 @@ fn toggle_hover_preview(app: &mut TuiApp) {
     app.hover_preview = Some(preview);
     app.status = format!("preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / Alt+1 close");
     app.needs_redraw = true;
+    // Opening a peek is the user demonstrating they already know the hover/focus
+    // affordance, so the §12.1.8 Hover hint fades — once used.
+    note_first_run_hint_used(app, first_run_hints::HintId::Hover);
 }
 
 /// Dismiss any live Hover Preview popover (§12.1.4). Called whenever the surface
@@ -7917,6 +7948,9 @@ fn toggle_command_palette(app: &mut TuiApp) {
         app.command_palette = Some(palette);
     }
     app.needs_redraw = true;
+    // Opening (or closing) the command palette is the user demonstrating they
+    // already know the chord, so the §12.1.8 PaletteChord hint fades — once used.
+    note_first_run_hint_used(app, first_run_hints::HintId::PaletteChord);
 }
 
 /// `Ctrl+Alt+H`: toggle Mouse Hover Intent (§12.1.3) on/off. Flips the
@@ -7932,6 +7966,91 @@ fn toggle_hover_intent(app: &mut TuiApp) {
         "hover intent off".to_string()
     };
     app.needs_redraw = true;
+    // Toggling hover intent (and a live hover reveal) is the user demonstrating they
+    // already know the peek affordance, so the §12.1.8 Hover hint fades — once used.
+    note_first_run_hint_used(app, first_run_hints::HintId::Hover);
+}
+
+/// Record that the user performed the interaction a §12.1.8 first-run hint teaches,
+/// so the hint *fades once used*. Latches the hint seen; if a hint line was actually
+/// painted, requests one final redraw to erase it. A cheap no-op once the engine is
+/// quiet, so the call sites pay nothing after every hint is learned.
+fn note_first_run_hint_used(app: &mut TuiApp, id: first_run_hints::HintId) {
+    if app.first_run_hints.note_used(id) {
+        app.needs_redraw = true;
+    }
+}
+
+/// `Ctrl+Alt+N` (and a click on the dim hint strip): dismiss the gentle First-Run
+/// Interaction Hint (§12.1.8) currently shown, latching it seen so it never returns.
+/// Returns `true` when a hint was actually dismissed (so the keymap dispatch reports
+/// the key consumed); `false` — a fall-through — when nothing was showing, so the
+/// chord never steals a key from the composer or the surface beneath.
+fn dismiss_first_run_hint(app: &mut TuiApp) -> bool {
+    match app.first_run_hints.dismiss() {
+        Some(_) => {
+            app.status = "hint dismissed".to_string();
+            app.needs_redraw = true;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The live message for a §12.1.8 hint, with the user's *current* binding for the
+/// interaction it teaches substituted in (so a rebound key shows the real chord,
+/// never a stale default). Pure read over the keymap.
+fn first_run_hint_message(app: &TuiApp, id: first_run_hints::HintId) -> String {
+    let chord = match id {
+        first_run_hints::HintId::PaletteChord => {
+            key_hint(app, keymap::Action::ToggleCommandPalette)
+        }
+        // Jumping has two verbs (prev/next user turn); the "next" binding is the
+        // representative chord shown, matching how the breadcrumbs/jump family names
+        // its forward verb.
+        first_run_hints::HintId::Jump => key_hint(app, keymap::Action::JumpNextUserTurn),
+        // The Hover hint carries no chord (it names the focus keys inline), so the
+        // substitution argument is ignored.
+        first_run_hints::HintId::Hover => String::new(),
+    };
+    id.message(&chord)
+}
+
+/// Whether the §12.1.8 first-run hint strip must stay hidden this frame: a modal,
+/// fullscreen overlay, command palette, search input, or paste flow owns the
+/// surface (the spec's "suppress during modals, approvals, command palette, search
+/// input, paste preview, and inline edits"). Pure read over `app`. When `true`, the
+/// hint neither paints nor burns its single showing — it reappears (still un-seen)
+/// once the surface clears.
+fn first_run_hint_suppressed(app: &TuiApp) -> bool {
+    app.config_screen.is_some()
+        || app.status_line_setup.is_some()
+        || app.transcript_overlay.is_some()
+        || app.command_palette.is_some()
+        || app.action_palette.is_some()
+        || app.paste_preview.is_some()
+        || app.paste_transform.is_some()
+        || app.paste_staging.is_some()
+        || app.clipboard_history_open
+        || app.search.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_request_user_input.is_some()
+        || app.pending_mcp_elicitation.is_some()
+        // Any fullscreen §12 overlay owns the surface; while one is open the hint
+        // would paint behind it, so suppress.
+        || app.transcript_index_open
+        || app.related_links_open
+        || app.duplicate_folds_open
+        || app.error_lens_open
+        || app.health_markers_open
+        || app.turn_outline_open
+        || app.lane_fold_open
+        || app.bookmarks_open
+        || app.session_timeline_open
+        || app.changes_since_open
+        || app.annotations_open
+        || app.breadcrumbs_open
+        || app.editor_handoff.is_some()
 }
 
 /// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
@@ -9487,6 +9606,9 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
     let max_scroll = total_rows.saturating_sub(viewport_h);
     let from_bottom = max_scroll.saturating_sub(entry_offsets[target_index].min(max_scroll));
     commit_main_from_bottom_animated(app, from_bottom);
+    // A successful turn-to-turn jump is the user demonstrating they already know the
+    // jump navigation, so the §12.1.8 Jump hint fades — once used.
+    note_first_run_hint_used(app, first_run_hints::HintId::Jump);
     true
 }
 
@@ -11381,6 +11503,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // and pressing `Ctrl+Alt+R`.
         interaction::Action::OpenRenameForEntry(id) => {
             begin_rename_for_entry(app, id.0);
+        }
+        // A click on the dim First-Run Interaction Hint strip (§12.1.8) dismisses the
+        // shown hint — the mouse twin of the `DismissFirstRunHint` verb, latching it
+        // seen so it never returns.
+        interaction::Action::DismissFirstRunHint => {
+            dismiss_first_run_hint(app);
         }
     }
 }
@@ -17465,6 +17593,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
     render_toast_overlay(frame, area, app);
+    // The Gentle First-Run Interaction Hint (§12.1.8) is a NON-modal dim line
+    // painted on the main surface only — every fullscreen overlay returns earlier
+    // and never reaches here, so the hint never leaks over a modal. It reserves no
+    // layout rows and clips what it overlaps (like the toast stack); when no hint is
+    // active (every hint seen, the feature off, or a transient suppression) it paints
+    // nothing and registers no click target. Drawn after the toast stack so a toast
+    // wins the same corner, and before the hover popover so a peek covers it.
+    render_first_run_hint(frame, area, app);
     // The Hover Preview popover (§12.1.4) is a NON-modal peek painted LAST on the
     // main surface (only — every fullscreen overlay returns earlier and never
     // reaches here, so the popover never leaks over a modal). It is anchored to the
@@ -20296,6 +20432,73 @@ fn render_toast_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 }
 
+/// Overlay the Gentle First-Run Interaction Hint (§12.1.8) as a single dim,
+/// dismissible line at the bottom-left of `area`. Painted only on the main surface
+/// (every fullscreen overlay returns before the caller reaches it) and only when
+/// [`first_run_hints::HintEngine::active_hint`] — which honors the feature flag, the
+/// per-hint seen latch, the settle delay, and the suppression set — names a hint to
+/// show. Reserves no layout rows; it clips whatever pixels it overlaps (like the
+/// toast stack) and registers a single full-line click target that dismisses the
+/// hint (the mouse twin of the `DismissFirstRunHint` verb). When no hint is active
+/// it paints nothing and registers no target, so an all-seen / disabled session pays
+/// nothing.
+fn render_first_run_hint(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Clear, Paragraph},
+    };
+    if area.width < 8 || area.height == 0 {
+        return;
+    }
+    let suppressed = first_run_hint_suppressed(app);
+    let Some(hint) = app
+        .first_run_hints
+        .active_hint(std::time::Instant::now(), suppressed)
+    else {
+        return;
+    };
+    // The hint body with the user's live binding spliced in, plus a trailing
+    // dismissal affordance so the "click / press to dismiss" path is discoverable.
+    let dismiss = key_hint(app, keymap::Action::DismissFirstRunHint);
+    let label = format!(
+        "{} \u{00b7} {} dismiss",
+        first_run_hint_message(app, hint),
+        dismiss
+    );
+    // Bottom-left, on the last row. Clamp the width to the area and leave a one-cell
+    // margin so the line never collides with a right-corner toast.
+    let max_width = area.width.saturating_sub(1) as usize;
+    let visual: String = label.chars().take(max_width).collect();
+    let line_width = visual.chars().count() as u16;
+    if line_width == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.left(),
+        y: area.bottom().saturating_sub(1),
+        width: line_width,
+        height: 1,
+    };
+    // Dim italic so it reads as restrained chrome — never as a transcript entry.
+    let style = Style::default()
+        .fg(crate::render::theme::quiet())
+        .add_modifier(Modifier::ITALIC);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(visual, style))),
+        rect,
+    );
+    // A left click anywhere on the line dismisses the hint — keyboard parity with
+    // the `DismissFirstRunHint` verb. Registered last so it wins over whatever the
+    // status row registered beneath it.
+    app.register_click(
+        rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::FirstRunHint),
+        interaction::Action::DismissFirstRunHint,
+    );
+}
+
 /// Paint the hidden render-budget HUD in the top-right corner: a small bordered
 /// box of the latest [`metrics::RenderMetrics`] snapshot. Reserves no layout
 /// rows; it clips whatever it overlaps (like the toast stack). Only drawn when
@@ -20529,6 +20732,15 @@ fn should_advance_animation_tick(app: &TuiApp) -> bool {
         || turn_in_progress(app)
         || app.has_settling_entry()
         || app.hover_intent.reveal_pending(std::time::Instant::now())
+        // Gentle First-Run Interaction Hints (§12.1.8): keep one tick alive only
+        // while a hint is still settling (un-seen, inside its `HINT_SETTLE` window),
+        // so the dim line paints once after its short delay and then the engine goes
+        // quiet — never a redraw loop. Once every hint is seen (or the feature is
+        // off, or a modal/overlay/search suppresses it), `reveal_pending` returns
+        // `false` here, preserving the zero-idle-cost invariant.
+        || app
+            .first_run_hints
+            .reveal_pending(std::time::Instant::now(), first_run_hint_suppressed(app))
 }
 
 fn working_line(app: &TuiApp) -> Line<'static> {
@@ -32729,6 +32941,16 @@ pub(crate) struct TuiApp {
     /// target / not suppressed", which paints nothing and schedules no tick, so an
     /// un-hovered session pays zero idle cost.
     pub(crate) hover_intent: hover_intent::HoverIntentState,
+    /// Gentle First-Run Interaction Hints (§12.1.8): the durable seen-set for the
+    /// three taught interactions (command-palette chord, hover/peek, turn jump) plus
+    /// the rule that picks the single dim hint line — if any — to paint this frame.
+    /// A hint fades the instant the user performs it ([`first_run_hints::HintEngine::
+    /// note_used`]) or dismisses it (the `DismissFirstRunHint` verb / a click on the
+    /// strip), latched seen for the session. Once every hint is seen — or the feature
+    /// is toggled off — [`first_run_hints::HintEngine::is_quiet`] is `true`, so the
+    /// render path paints nothing and the redraw gate schedules no tick: zero idle
+    /// cost after dismissal.
+    pub(crate) first_run_hints: first_run_hints::HintEngine,
     /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
     /// `<workspace>/.squeezy/prompts/`. Consulted by
     /// [`handle_slash_command`] when the typed head isn't a built-in
@@ -33239,6 +33461,7 @@ impl TuiApp {
             clickables: std::cell::RefCell::new(interaction::Registry::new()),
             gestures: interaction::Recognizer::new(),
             hover_intent: hover_intent::HoverIntentState::default(),
+            first_run_hints: first_run_hints::HintEngine::default(),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,
             settings_path_override: None,

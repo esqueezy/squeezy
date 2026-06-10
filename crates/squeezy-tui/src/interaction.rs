@@ -183,6 +183,10 @@ pub(crate) enum ChromeKey {
     /// row (§12.1.7), keyed by the entry's stable [`EntryId`] so a click opens the
     /// inline rename editor on that entry's label.
     RenameLabel(EntryId),
+    /// The dim Gentle First-Run Interaction Hint strip (§12.1.8). A single
+    /// affordance with no identity of its own; a left click anywhere on the line
+    /// dismisses the shown hint — the mouse twin of the `DismissFirstRunHint` verb.
+    FirstRunHint,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -366,6 +370,10 @@ pub(crate) enum Action {
     /// the rename chord; a click on the entry's label badge both targets it and
     /// opens the editor in one go.
     OpenRenameForEntry(EntryId),
+    /// Dismiss the shown Gentle First-Run Interaction Hint (§12.1.8). Mouse twin of
+    /// the `DismissFirstRunHint` keyboard verb; a click on the dim hint strip retires
+    /// the hint (latched seen for the session) so it never returns.
+    DismissFirstRunHint,
 }
 
 impl Action {
@@ -419,6 +427,7 @@ impl Action {
         Action::CommandPaletteRun(0),
         Action::BreadcrumbActivate(0),
         Action::OpenRenameForEntry(EntryId(0)),
+        Action::DismissFirstRunHint,
     ];
 }
 
