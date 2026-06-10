@@ -4209,6 +4209,7 @@ fn enqueue_snippet(app: &mut TuiApp, id: u64) {
     };
     app.snippets.select_id(id);
     app.prompt_queue.push_back(text);
+    enqueue_queue_id(app);
     app.status = format!("queued snippet ({} in queue)", app.prompt_queue.len());
     app.needs_redraw = true;
 }
@@ -4378,6 +4379,7 @@ fn scratchpad_enqueue(app: &mut TuiApp) {
         return;
     }
     app.prompt_queue.push_back(text);
+    enqueue_queue_id(app);
     app.scratchpad.mark_clean();
     app.status = format!("queued scratchpad ({} in queue)", app.prompt_queue.len());
     app.needs_redraw = true;
@@ -4500,7 +4502,7 @@ fn toggle_macro_record(app: &mut TuiApp) {
         return;
     }
     if app.macro_recorder.is_recording() {
-        let record_chord = key_hint(app, keymap::Action::ReplayMacro);
+        let replay_chord = key_hint(app, keymap::Action::ReplayMacro);
         app.status = match app.macro_recorder.stop_recording() {
             macros::StopOutcome::Stored {
                 name,
@@ -4509,10 +4511,10 @@ fn toggle_macro_record(app: &mut TuiApp) {
             } => {
                 if truncated {
                     format!(
-                        "recorded {name} ({len} steps, clipped at max) — {record_chord} to replay"
+                        "recorded {name} ({len} steps, clipped at max) — {replay_chord} to replay"
                     )
                 } else {
-                    format!("recorded {name} ({len} steps) — {record_chord} to replay")
+                    format!("recorded {name} ({len} steps) — {replay_chord} to replay")
                 }
             }
             macros::StopOutcome::Empty => "macro recording cancelled (no steps)".to_string(),
@@ -5718,6 +5720,9 @@ fn enqueue_template_card(app: &mut TuiApp) {
             app.prompt_queue.push_back(text);
             let name = card.name.clone();
             app.template_card = None;
+            // After the `card` borrow is released (template_card cleared), stamp
+            // the paired stable id so the sidecar stays aligned.
+            enqueue_queue_id(app);
             app.status = format!(
                 "queued template '{name}' ({} in queue)",
                 app.prompt_queue.len()
@@ -7811,9 +7816,12 @@ fn handle_search_key(app: &mut TuiApp, key: KeyEvent) -> Option<bool> {
 /// so it is the natural place to capture the *committed* logical-command stream a
 /// macro records: an action is recorded ONLY when it actually ran (the inner
 /// dispatch returned `true`) and is not itself a macro-control verb (recording the
-/// record/replay toggles would make a replay re-arm recording or recurse). Noise —
-/// hover, mouse move, ticks, resize, toasts — never resolves to a keymap action,
-/// so it is ignored by construction and never reaches the recorder.
+/// record/replay toggles would make a replay re-arm recording or recurse). This is
+/// the ONLY caller of `note_command`, so a macro captures keyboard-dispatched
+/// keymap verbs only — mouse affordances (`dispatch_click_action`) are not (yet)
+/// recorded even when they map to the same logical verb. Noise — hover, mouse
+/// move, ticks, resize, toasts — never resolves to a keymap action, so it is
+/// ignored by construction and never reaches the recorder.
 fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
     let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
         return false;

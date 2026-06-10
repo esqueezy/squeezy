@@ -15253,12 +15253,48 @@ fn scrolled_indicator_appears_only_when_scrolled_up() {
         !live.contains("from live"),
         "a following view shows no scrolled indicator:\n{live}",
     );
-    // Scroll up: the badge appears and reports the live distance.
+    // Scroll up: the badge appears and reports the EXACT live distance. The
+    // count is the load-bearing value, so derive it the way the renderer does
+    // (`offset_from_bottom` against the real render geometry) rather than echoing
+    // the raw `set_from_bottom` arg — the stored value clamps to `max_scroll`, so
+    // a hard-coded 20 can disagree with what is painted.
+    let render_w: u16 = 60;
+    let render_h: u16 = 12;
     app.transcript_scroll.set_from_bottom(20, 320, 12);
-    let scrolled = render_transcript_to_string(&app, 60, 12);
+    // Reproduce the render geometry: `render_transcript` carves the optional
+    // minimap rail and the 1-cell scrollbar gutter off the right edge (height is
+    // untouched), and `include_startup_card` is gated on `area.height >= 16`.
+    let area = Rect::new(0, 0, render_w, render_h);
+    let (body_area, _rail) = transcript_main_body_and_rail_areas(area, app.show_minimap);
+    let (text_area, _scrollbar) = transcript_main_text_and_scrollbar_areas(body_area);
+    let include_startup_card = area.height >= 16;
+    let total_rows =
+        transcript_lines_for_render(&app, Some(text_area.width), include_startup_card).len();
+    let viewport_h = text_area.height as usize;
+    let expected_from_bottom = app
+        .transcript_scroll
+        .offset_from_bottom(total_rows, viewport_h);
     assert!(
-        scrolled.contains("from live"),
-        "a scrolled-up view shows the 'from live' indicator:\n{scrolled}",
+        expected_from_bottom > 0,
+        "the test geometry must leave the view scrolled up (got {expected_from_bottom})",
+    );
+    let scrolled = render_transcript_to_string(&app, render_w, render_h);
+    let expected_badge = format!("↑ {expected_from_bottom} from live");
+    assert!(
+        scrolled.contains(&expected_badge),
+        "a scrolled-up view shows the exact live distance {expected_badge:?}:\n{scrolled}",
+    );
+    // Cross-check by parsing the painted count back out of the badge: it must
+    // equal the renderer-derived offset, not the raw `set_from_bottom` arg.
+    let painted = scrolled
+        .split('↑')
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .expect("the badge carries a parseable '↑ N' count");
+    assert_eq!(
+        painted, expected_from_bottom,
+        "the painted live distance matches `offset_from_bottom`:\n{scrolled}",
     );
 }
 
@@ -23922,6 +23958,43 @@ async fn macro_record_then_replay_re_runs_the_logical_command() {
 }
 
 #[tokio::test]
+async fn replay_while_recording_is_refused_and_keeps_recording() {
+    // Pressing the replay chord while a recording is armed must NOT start a
+    // replay (it would capture/recurse): the recorder stays recording and the
+    // status explains why (`replay_macro`'s `is_recording` guard).
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // Arm recording.
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    assert!(
+        app.macro_recorder.is_recording(),
+        "Ctrl+Alt+K arms recording"
+    );
+
+    // Press the macro replay chord (Ctrl+Alt+J) while still recording.
+    handle_key(&mut app, &mut agent, macro_replay_key())
+        .await
+        .unwrap();
+
+    assert!(
+        app.macro_recorder.is_recording(),
+        "the replay press did not stop or replace the active recording"
+    );
+    assert!(
+        !app.macro_recorder.is_replaying(),
+        "no replay was started while recording"
+    );
+    assert!(
+        app.status.contains("stop recording before replaying"),
+        "the refusal is explained in the status: {}",
+        app.status,
+    );
+}
+
+#[tokio::test]
 async fn macro_record_toggle_is_not_itself_recorded() {
     // The record/replay control verbs must never land inside the macro — else a
     // replay would re-arm recording or recurse. Record an empty session: only the
@@ -24067,11 +24140,9 @@ async fn recording_strip_survives_narrow_resize() {
         .unwrap();
     for (w, h) in [(8u16, 3u16), (20, 6), (40, 12), (120, 40)] {
         let out = render_to_string(&app, w, h);
-        // On the wider frames the strip label is present; on the tightest one it
-        // is clamped but must not panic (the render call above already proved it).
-        if w >= 40 {
-            assert!(out.contains("REC"), "strip paints at {w}x{h}: {out}");
-        }
+        // The clamp keeps the leading characters, so the "REC" label survives at
+        // every width down to 8 — assert it at all four, not just the wide ones.
+        assert!(out.contains("REC"), "strip paints at {w}x{h}: {out}");
     }
 }
 
@@ -26296,6 +26367,75 @@ fn enqueue_stamps_unique_monotonic_ids() {
     let ids: Vec<u64> = app.prompt_queue_ids.iter().copied().collect();
     assert_eq!(ids, vec![0, 1, 2]);
     assert_eq!(app.next_queue_id, 3);
+}
+
+#[test]
+fn snippet_scratchpad_and_template_enqueues_keep_id_sidecar_aligned() {
+    // Every queue-push path must stamp a paired stable id so the
+    // `prompt_queue_ids.len() == prompt_queue.len()` invariant holds WITHOUT
+    // relying on `sync_queue_ids`' length-delta inference. Exercise the three
+    // non-input enqueue paths and assert the sidecar tracks each push.
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(app.prompt_queue.len(), app.prompt_queue_ids.len());
+
+    // Snippet enqueue.
+    let snippet_id = app
+        .snippets
+        .save(
+            "snippet body",
+            snippet_store::SnippetSource {
+                surface: snippet_store::SnippetSurface::Main,
+                row_start: 0,
+                row_end: 0,
+                chars: 12,
+                bytes: 12,
+            },
+        )
+        .expect("snippet saved");
+    enqueue_snippet(&mut app, snippet_id);
+    assert_eq!(app.prompt_queue.len(), 1);
+    assert_eq!(
+        app.prompt_queue_ids.len(),
+        app.prompt_queue.len(),
+        "enqueue_snippet stamps a paired id",
+    );
+
+    // Scratchpad enqueue.
+    app.scratchpad.insert_text("scratch note");
+    scratchpad_enqueue(&mut app);
+    assert_eq!(app.prompt_queue.len(), 2);
+    assert_eq!(
+        app.prompt_queue_ids.len(),
+        app.prompt_queue.len(),
+        "scratchpad_enqueue stamps a paired id",
+    );
+
+    // Template card enqueue (resolve every slot first).
+    app.templates.clear();
+    app.templates
+        .save(Some("Review template"), "Review {file} for bugs.");
+    app.template_card = app
+        .templates
+        .instantiate(app.templates.selected_template().unwrap().id);
+    if let Some(card) = app.template_card.as_mut() {
+        for ch in "main.rs".chars() {
+            card.insert_char(ch);
+        }
+    }
+    enqueue_template_card(&mut app);
+    assert_eq!(app.prompt_queue.len(), 3);
+    assert_eq!(
+        app.prompt_queue_ids.len(),
+        app.prompt_queue.len(),
+        "enqueue_template_card stamps a paired id",
+    );
+
+    // Each id is unique and monotonic — no collisions across the three paths.
+    let ids: Vec<u64> = app.prompt_queue_ids.iter().copied().collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "ids are unique: {ids:?}");
 }
 
 #[test]

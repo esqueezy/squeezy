@@ -2,15 +2,18 @@
 //! *committed* interactions as a named macro and replay it on demand.
 //!
 //! **Logical commands, never coordinates.** A macro records the canonical
-//! [`keymap::Action`] each interaction committed to — the same logical command
-//! the keyboard and the mouse both dispatch through `dispatch_keymap_action` —
-//! NOT a terminal row/column or a raw keystroke. Replay re-feeds those recorded
-//! actions through the *exact same dispatcher*, so a replayed step is
-//! indistinguishable from the user pressing the chord (or clicking the
-//! affordance) themselves. This is what the spec means by "record logical
-//! commands, not terminal coordinates": a macro recorded on an 80x24 terminal
-//! replays correctly on a 200x50 one, and an approval gate a step would hit is
-//! hit on replay exactly as it would be live — replay never bypasses approvals.
+//! [`keymap::Action`] each *keyboard*-committed interaction resolved to — the
+//! logical command a chord dispatches through `dispatch_keymap_action` — NOT a
+//! terminal row/column or a raw keystroke. Only keyboard-dispatched keymap verbs
+//! are captured; mouse affordances (`dispatch_click_action`) are NOT (yet)
+//! recorded, so a clicked affordance does not enter a recording even when it maps
+//! to the same logical verb a chord would. Replay re-feeds the recorded actions
+//! through the *exact same dispatcher*, so a replayed step is indistinguishable
+//! from the user pressing the chord themselves. This is what the spec means by
+//! "record logical commands, not terminal coordinates": a macro recorded on an
+//! 80x24 terminal replays correctly on a 200x50 one, and an approval gate a step
+//! would hit is hit on replay exactly as it would be live — replay never bypasses
+//! approvals.
 //!
 //! **Pure model.** Like the other §12 leaf modules (`first_run_hints`,
 //! `breadcrumbs`, `hover_intent`), this file owns only a tiny state machine and

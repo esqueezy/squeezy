@@ -335,7 +335,6 @@ fn command_after_prompt(line: &str) -> Option<String> {
     } else if let Some(rest) = lower
         .strip_prefix("command:")
         .or_else(|| lower.strip_prefix("running:"))
-        .or_else(|| lower.strip_prefix("$ "))
     {
         // Use the original-case slice at the same byte offset so casing is kept.
         let offset = line.len() - rest.len();
@@ -347,7 +346,7 @@ fn command_after_prompt(line: &str) -> Option<String> {
     // Must start with a command-like token (a letter, `/`, `.`, or `_`) so a bare
     // `$ ` or a `+ 1` arithmetic trace does not become a phantom command.
     let first = cmd.chars().next()?;
-    if cmd.is_empty() || !(first.is_ascii_alphabetic() || matches!(first, '/' | '.' | '_')) {
+    if !(first.is_ascii_alphabetic() || matches!(first, '/' | '.' | '_')) {
         return None;
     }
     Some(cmd.to_string())
