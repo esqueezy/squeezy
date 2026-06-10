@@ -207,6 +207,58 @@ fn toggle_dogfood_metrics_round_trips_and_defaults_to_ctrl_alt_m() {
 }
 
 #[test]
+fn quote_selection_to_compose_round_trips_and_defaults_to_greater_than() {
+    // §11.1 quote-to-compose: slug round-trips, is registered in `ALL` (so
+    // `/keymap` lists it and overrides can target it), and defaults to bare `>`.
+    assert_eq!(
+        Action::from_slug("quote_selection_to_compose"),
+        Some(Action::QuoteSelectionToCompose)
+    );
+    assert!(Action::ALL.contains(&Action::QuoteSelectionToCompose));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::QuoteSelectionToCompose),
+        KeyBinding::new(KeyCode::Char('>'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('>'), KeyModifiers::NONE),
+        Some(Action::QuoteSelectionToCompose),
+    );
+    // A terminal that reports the shift bit alongside the already-shifted `>`
+    // glyph must still resolve to the same action (the SHIFT is folded away).
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('>'), KeyModifiers::SHIFT),
+        Some(Action::QuoteSelectionToCompose),
+    );
+    // A bare printable key is broadly portable — no terminal-dependent note.
+    assert_eq!(Action::QuoteSelectionToCompose.terminal_compat_note(), None);
+}
+
+#[test]
+fn shifted_symbol_binding_folds_away_an_incidental_shift_modifier() {
+    // The shift bit on an already-shifted printable symbol is redundant and
+    // terminal-dependent, so `KeyBinding::new` normalises it away — `>` with or
+    // without SHIFT is the same binding. Alphanumerics keep SHIFT (a Shift+'a'
+    // is distinct from 'a').
+    assert_eq!(
+        KeyBinding::new(KeyCode::Char('>'), KeyModifiers::SHIFT),
+        KeyBinding::new(KeyCode::Char('>'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        KeyBinding::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+        KeyBinding::new(KeyCode::Char('?'), KeyModifiers::NONE),
+    );
+    // Alphanumerics are NOT folded: a digit keeps the SHIFT the caller gave it
+    // (only graphic non-alphanumerics and uppercase letters are folded away).
+    assert!(
+        KeyBinding::new(KeyCode::Char('5'), KeyModifiers::SHIFT)
+            .modifiers
+            .contains(KeyModifiers::SHIFT),
+        "a digit's SHIFT is preserved, not folded",
+    );
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

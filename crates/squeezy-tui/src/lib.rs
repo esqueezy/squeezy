@@ -106,6 +106,7 @@ mod overlay;
 mod prompt_history;
 mod prompt_queue;
 mod proposed_plan;
+mod quote_compose;
 mod render;
 mod resume_picker;
 mod scroll;
@@ -2844,6 +2845,41 @@ fn copy_active_selection(app: &mut TuiApp) -> bool {
     true
 }
 
+/// Quote-to-compose (§11.1): drop the active visual selection into the composer
+/// as a Markdown blockquote, then clear the selection so the composer takes
+/// over. The clean text comes from the selection's own painted surface (the
+/// same gutter-stripped projection a copy uses), so the quote pastes clean
+/// prose/code rather than rail chrome.
+///
+/// Returns `true` only when a non-empty selection was quoted; `false` leaves
+/// `app.selection` and the composer untouched so the `>` keystroke falls
+/// through to normal composer input.
+fn quote_selection_to_compose(app: &mut TuiApp) -> bool {
+    let Some(sel) = app.selection.clone() else {
+        return false;
+    };
+    if sel.is_empty() {
+        return false;
+    }
+    let rows = selection_surface_rows(app, sel.surface);
+    let text = selection::selection_clean_text(&rows, &sel);
+    let Some(block) = quote_compose::quote_block(&text) else {
+        return false;
+    };
+    let lines = block.lines().filter(|l| !l.is_empty()).count();
+    input::insert_input_text(app, &block);
+    // Drop the selection now that it has been consumed into the composer; the
+    // user is editing a reply, not navigating the transcript.
+    app.selection = None;
+    let label = if lines == 1 {
+        "quoted selection (1 line) into composer".to_string()
+    } else {
+        format!("quoted selection ({lines} lines) into composer")
+    };
+    app.status = label;
+    true
+}
+
 fn handle_transcript_overlay_mouse(
     app: &mut TuiApp,
     mouse: crossterm::event::MouseEvent,
@@ -4280,6 +4316,25 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             // `copy_transcript_scope` copies it; with none it falls back to the
             // focused entry (the most useful no-selection default).
             copy_transcript_scope(app, copy::CopyScope::FocusedEntry, app.copy_format)
+        }
+        keymap::Action::QuoteSelectionToCompose => {
+            // `>` quotes the active selection into the composer. Like the `/`
+            // search action, it ONLY claims the keystroke in an unambiguous
+            // transcript-navigation context — a live main-view selection. In
+            // every other case (no selection, a modal/config surface, the
+            // overlay) it returns `false` so the bare `>` falls through to
+            // normal composer input.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            let main_selection_active = app
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.surface == selection::SelectionSurface::Main);
+            if !main_selection_active {
+                return false;
+            }
+            quote_selection_to_compose(app)
         }
         keymap::Action::RestoreCancelledPrompt => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {

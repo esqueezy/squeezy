@@ -63,6 +63,11 @@ pub(crate) enum Action {
     /// default). Convenience only — every copy chord already prefers an
     /// active selection when one is present; this is the explicit verb.
     CopySelection,
+    /// Quote the active visual selection into the composer as a Markdown
+    /// blockquote (`>` default; §11.1 quote-to-compose). Only fires while a
+    /// main-view selection is active; otherwise the `>` keystroke falls
+    /// through to normal composer input.
+    QuoteSelectionToCompose,
     /// Restore the most recently cancelled prompt back into the
     /// composer (`Ctrl+R` default).
     RestoreCancelledPrompt,
@@ -146,6 +151,7 @@ impl Action {
             Self::CopyViewport => "copy_viewport",
             Self::CopyFullTranscript => "copy_full_transcript",
             Self::CopySelection => "copy_selection",
+            Self::QuoteSelectionToCompose => "quote_selection_to_compose",
             Self::RestoreCancelledPrompt => "restore_cancelled_prompt",
             Self::ScrollTranscriptPageUp => "page_up",
             Self::ScrollTranscriptPageDown => "page_down",
@@ -181,6 +187,7 @@ impl Action {
         Action::CopyViewport,
         Action::CopyFullTranscript,
         Action::CopySelection,
+        Action::QuoteSelectionToCompose,
         Action::RestoreCancelledPrompt,
         Action::ScrollTranscriptPageUp,
         Action::ScrollTranscriptPageDown,
@@ -259,13 +266,16 @@ impl Action {
             | Self::ToggleLatencyOverlay
             | Self::ToggleDogfoodMetrics
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
-            // Plain keys and broadly-portable Ctrl chords.
+            // Plain keys and broadly-portable Ctrl chords. `>` is a bare
+            // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
+            // portable across terminals, tmux, and SSH.
             Self::OpenSearch
             | Self::ToggleFocusedFold
             | Self::QueueUndo
             | Self::TranscriptHome
             | Self::TranscriptEnd
             | Self::CopyLastAssistant
+            | Self::QuoteSelectionToCompose
             | Self::RestoreCancelledPrompt => None,
         }
     }
@@ -291,6 +301,15 @@ impl Action {
             Self::CopyViewport => KeyBinding::new(KeyCode::Char('v'), KeyModifiers::ALT),
             Self::CopyFullTranscript => KeyBinding::new(KeyCode::Char('a'), KeyModifiers::ALT),
             Self::CopySelection => KeyBinding::new(KeyCode::Char('y'), KeyModifiers::ALT),
+            // Quote-to-compose. `>` is the conventional "quote" glyph; it is a
+            // shifted printable key with no Ctrl/Alt chord. The composer
+            // fall-through is gated in the dispatch (only fires with an active
+            // selection), so binding the bare `>` here never steals normal
+            // typing. `>` is captured as `KeyCode::Char('>')`; the lookup folds
+            // away an incidental SHIFT (see `KeyBinding::new`).
+            Self::QuoteSelectionToCompose => {
+                KeyBinding::new(KeyCode::Char('>'), KeyModifiers::NONE)
+            }
             Self::RestoreCancelledPrompt => {
                 KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
             }
@@ -385,7 +404,14 @@ impl KeyBinding {
 fn normalise_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyModifiers {
     let mut out = modifiers;
     if let KeyCode::Char(ch) = code
-        && ch.is_ascii_uppercase()
+        // Uppercase letters and shifted ASCII symbols (`>`, `?`, `!`, …) already
+        // encode the shift in the produced glyph, so an additional SHIFT
+        // modifier is redundant and terminal-dependent — fold it away so a
+        // `>`-bound action matches whether or not the terminal also reports
+        // SHIFT. Alphanumerics keep SHIFT (a Shift+letter is its own glyph; a
+        // Shift+digit is a separate symbol the terminal already reports as that
+        // symbol's char).
+        && (ch.is_ascii_uppercase() || (ch.is_ascii_graphic() && !ch.is_ascii_alphanumeric()))
     {
         out.remove(KeyModifiers::SHIFT);
     }

@@ -20082,6 +20082,185 @@ async fn copy_acts_on_the_active_selection_over_the_focused_unit() {
     );
 }
 
+/// Helper: a bare `>` key event (KeyCode::Char('>'), no modifiers).
+fn quote_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE)
+}
+
+#[tokio::test]
+async fn quote_key_with_active_selection_drops_a_blockquote_into_the_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("the answer text"));
+
+    // Render so the main text-area cache is populated (selection needs it).
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "the answer text").expect("answer painted");
+
+    // Triple-click selects the whole row regardless of layout chrome.
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    assert!(app.selection.is_some(), "triple-click arms a row selection");
+    assert!(app.input.is_empty(), "composer starts empty");
+
+    handle_key(&mut app, &mut agent, quote_key())
+        .await
+        .expect("quote key");
+
+    assert_eq!(
+        app.input, "> the answer text\n\n",
+        "the selection is quoted into the composer with a trailing blank line"
+    );
+    assert!(
+        app.selection.is_none(),
+        "quoting consumes the selection so the composer takes over"
+    );
+    // Caret lands at the end (on the fresh blank line under the quote).
+    assert_eq!(app.input_cursor, app.input.len());
+    assert!(
+        app.status.contains("quoted selection"),
+        "status names the quote action: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn quote_key_without_a_selection_falls_through_to_normal_composer_input() {
+    // Without an active selection, `>` must keep its normal composer meaning so
+    // a user can still type `>` (e.g. a shell redirect, a markdown quote) into
+    // a prompt — the quote action only claims the key in transcript-nav context.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.selection.is_none());
+
+    handle_key(&mut app, &mut agent, quote_key())
+        .await
+        .expect("quote key");
+
+    assert_eq!(
+        app.input, ">",
+        "with no selection the bare `>` types a literal `>` into the composer"
+    );
+}
+
+#[tokio::test]
+async fn quote_key_quotes_a_multi_row_selection_with_one_marker_per_line() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("alpha line"));
+    app.push_transcript_item(TranscriptItem::assistant("beta line"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+
+    // Seed a whole-row selection spanning both painted rows directly through the
+    // selection model so the test is independent of inter-row chrome geometry.
+    let rows = main_surface_rows(&app);
+    let a = find_text_cell(&render_transcript_to_buffer(&app, 40, 12), "alpha line")
+        .expect("alpha painted")
+        .1;
+    let b = find_text_cell(&render_transcript_to_buffer(&app, 40, 12), "beta line")
+        .expect("beta painted")
+        .1;
+    // Map the painted screen rows back to surface row indices via plain text.
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|line| crate::transcript_surface::plain_text_of_line(line).contains(needle))
+            .expect("row present")
+    };
+    let lo = row_of("alpha line").min(row_of("beta line"));
+    let hi = row_of("alpha line").max(row_of("beta line"));
+    let last_len = crate::transcript_surface::plain_text_of_line(&rows[hi])
+        .chars()
+        .count();
+    let mut sel = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos::new(lo, 0),
+        selection::SelectionMode::Row,
+        40,
+    );
+    sel.cursor = selection::Pos::new(hi, last_len);
+    app.selection = Some(sel);
+    // (a, b are just sanity that both rows painted on distinct screen lines.)
+    assert_ne!(a, b, "the two messages paint on distinct screen rows");
+
+    handle_key(&mut app, &mut agent, quote_key())
+        .await
+        .expect("quote key");
+
+    assert!(
+        app.input.contains("> alpha line") && app.input.contains("> beta line"),
+        "both selected rows are quoted: {:?}",
+        app.input
+    );
+    assert!(
+        app.input.ends_with("\n\n"),
+        "the block ends with a trailing blank line: {:?}",
+        app.input
+    );
+    assert!(app.selection.is_none(), "selection consumed");
+}
+
+#[tokio::test]
+async fn quote_key_survives_a_resize_between_selection_and_quote() {
+    // The feature paints/reads through the live text-area cache; a resize
+    // between arming the selection and pressing `>` must still produce a clean
+    // quote (re-anchoring against the reflowed surface), not a panic or garbage.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("resize me please"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "resize me please").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    assert!(app.selection.is_some(), "row selection armed");
+
+    // Re-render at a narrower width: the cache the quote reads from is rebuilt.
+    let _ = render_transcript_to_buffer(&app, 24, 12);
+
+    handle_key(&mut app, &mut agent, quote_key())
+        .await
+        .expect("quote key");
+
+    assert!(
+        app.input.starts_with("> resize me"),
+        "the quote survives the resize re-anchor: {:?}",
+        app.input
+    );
+    assert!(
+        app.selection.is_none(),
+        "selection consumed after the resize"
+    );
+}
+
+#[tokio::test]
+async fn quote_key_with_an_overlay_open_does_not_quote() {
+    // The Ctrl+T overlay owns its own key routing; the global quote action is
+    // gated out while it is open (matching every other main-view action), so a
+    // lingering main selection is not quoted from under the overlay.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("behind the overlay"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "behind the overlay").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    assert!(app.selection.is_some(), "selection armed on the main view");
+
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    handle_key(&mut app, &mut agent, quote_key())
+        .await
+        .expect("quote key");
+
+    assert!(
+        app.input.is_empty(),
+        "the overlay guard blocks the quote: composer stays empty ({:?})",
+        app.input
+    );
+}
+
 #[tokio::test]
 async fn esc_clears_the_selection_before_any_other_consumer() {
     let mut agent = test_agent(SessionMode::Build);
