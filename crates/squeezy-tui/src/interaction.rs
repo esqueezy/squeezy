@@ -151,6 +151,10 @@ pub(crate) enum ChromeKey {
     /// by its 0-based index in the bookmark list so a click selects + jumps the
     /// main view to the entry that exact bookmark anchors.
     BookmarkRow(usize),
+    /// An event row in the Session Timeline overlay (§12.2.6), keyed by its
+    /// 0-based index in the *visible* (filtered) event list so a click selects +
+    /// jumps the main view to the transcript row the event stands for.
+    TimelineRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -290,6 +294,12 @@ pub(crate) enum Action {
     /// bookmark anchors. Mouse twin of moving the cursor with ↑↓ and pressing
     /// Enter; a click both selects and jumps in one go.
     BookmarkSelectJump(usize),
+    /// Select the given event row in the Session Timeline overlay (§12.2.6): move
+    /// the cursor onto it and jump the main view to the transcript row the event
+    /// stands for. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a
+    /// click both selects and jumps in one go. The index is into the *visible*
+    /// (filtered) event list.
+    TimelineSelectJump(usize),
 }
 
 impl Action {
@@ -335,6 +345,7 @@ impl Action {
         Action::TurnOutlineSelect(0),
         Action::LaneFoldToggle(0),
         Action::BookmarkSelectJump(0),
+        Action::TimelineSelectJump(0),
     ];
 }
 

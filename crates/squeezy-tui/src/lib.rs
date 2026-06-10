@@ -134,6 +134,7 @@ mod search;
 mod selection;
 mod semantic_filter;
 mod session_bundle;
+mod session_timeline;
 mod settings_watcher;
 mod signal_teardown;
 mod size_source;
@@ -1791,6 +1792,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.turn_outline_open
         || app.lane_fold_open
         || app.bookmarks_open
+        || app.session_timeline_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2504,6 +2506,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::BookmarkRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Session Timeline overlay (§12.2.6) owns the pointer while open: a
+    // left-click on an event row selects it and jumps the main view to the
+    // transcript row the event stands for; every other click is swallowed so a
+    // stray press can't fall through to the surface beneath. Hit-tested in
+    // ABSOLUTE screen coordinates against the row targets
+    // `render_session_timeline_surface` registered this frame.
+    if app.session_timeline_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TimelineRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3842,6 +3863,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
     if app.bookmarks_open && handle_bookmarks_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Session Timeline overlay (§12.2.6) is modal while open: it owns the
+    // keyboard (↑↓/kj move the event cursor, Enter/→/l jump to the event's
+    // transcript row, f cycles the per-kind filter, Esc/Alt+9 close) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.session_timeline_open && handle_session_timeline_key(app, key) {
         return Ok(false);
     }
 
@@ -5602,6 +5633,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_bookmarks(app);
             true
         }
+        keymap::Action::ToggleSessionTimeline => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_session_timeline(app);
+            true
+        }
     }
 }
 
@@ -6439,6 +6480,146 @@ fn turn_outline_jump_to_selected(app: &mut TuiApp, advance: bool) {
         app.needs_redraw = true;
     } else {
         app.status = "turn outline: could not jump".to_string();
+    }
+}
+
+// ---- Session Timeline (§12.2.6) ----
+
+/// `Alt+9`: toggle the Session Timeline overlay (§12.2.6). A compact
+/// chronological event view of the session — prompts, turns, tool runs,
+/// approvals, edits, errors, and other high-signal state changes — grouped by
+/// turn. Opening it refreshes the timeline (a no-op rebuild when the transcript
+/// has not changed since the last refresh, so the cost is only paid on a real
+/// change), parks the cursor on the most recent event (the timeline reads
+/// newest-relevant first the way a session tail does), and confirms via the
+/// status line. Sets `needs_redraw` so the toggle paints immediately.
+fn toggle_session_timeline(app: &mut TuiApp) {
+    app.session_timeline_open = !app.session_timeline_open;
+    if app.session_timeline_open {
+        refresh_session_timeline(app);
+        // Park the cursor on the last visible event so the timeline opens at the
+        // freshest end of the session (where the user just was).
+        let visible = app.session_timeline.visible_len();
+        app.session_timeline_selected = visible.saturating_sub(1);
+        app.status = if app.session_timeline.is_empty() {
+            "session timeline (empty) — Esc to close".to_string()
+        } else {
+            format!(
+                "session timeline: {} — \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} f filter \u{00b7} Esc close",
+                app.session_timeline.summary(),
+            )
+        };
+    } else {
+        app.status = "session timeline closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Session Timeline overlay (§12.2.6) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or global
+/// keymap). The toggle chord (`Alt+9`) and Esc close; Up/Down (and k/j) move the
+/// event cursor over the *visible* (filtered) list; `f` cycles the per-kind
+/// filter (re-parking the cursor on the new visible tail); Enter (and l/→) jumps
+/// the main view to the transcript row behind the selected event.
+fn handle_session_timeline_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.session_timeline_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+9` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleSessionTimeline) {
+        app.session_timeline_open = false;
+        app.status = "session timeline closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.session_timeline.visible_len();
+    match key.code {
+        KeyCode::Esc => {
+            app.session_timeline_open = false;
+            app.status = "session timeline closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.session_timeline_selected = app.session_timeline_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.session_timeline_selected = (app.session_timeline_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        // `f` cycles the per-kind filter (the spec's "filters"): show-all → each
+        // non-empty kind → show-all. Re-park the cursor on the new visible tail so
+        // a narrowed list never strands the cursor past its end.
+        KeyCode::Char('f') => {
+            app.session_timeline.cycle_filter();
+            let visible = app.session_timeline.visible_len();
+            app.session_timeline_selected = visible.saturating_sub(1);
+            app.status = match app.session_timeline.filter() {
+                Some(kind) => format!(
+                    "session timeline: filter [{}] ({} shown) — f next \u{00b7} Esc close",
+                    kind.label(),
+                    visible,
+                ),
+                None => format!(
+                    "session timeline: filter off ({} events) — f filter \u{00b7} Esc close",
+                    app.session_timeline.len(),
+                ),
+            };
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            session_timeline_jump_to_selected(app, true);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the transcript row behind the Session Timeline
+/// overlay's selected event (§12.2.6). Resolves the visible event at the cursor,
+/// scrolls to its source entry via the same `jump_to_entry_id` path the
+/// index/outline/minimap/jump-nav use, and reports the turn/kind in the status
+/// line. A no-op (status hint) when there is nothing to jump to.
+///
+/// `advance` controls the cursor afterward: the keyboard Enter verb passes `true`
+/// so a *repeated* Enter walks forward through the timeline (wrapping at the
+/// end); the mouse click passes `false` because a click is a precise pick that
+/// should land and stay on exactly the clicked row.
+fn session_timeline_jump_to_selected(app: &mut TuiApp, advance: bool) {
+    let Some((entry_id, kind, turn)) = app
+        .session_timeline
+        .visible_get(app.session_timeline_selected)
+        .map(|event| (event.entry_id, event.kind, event.turn))
+    else {
+        app.status = "session timeline: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, entry_id) {
+        let position = app.session_timeline_selected + 1;
+        let total = app.session_timeline.visible_len();
+        app.status = format!(
+            "session timeline {position}/{total} [turn {turn} \u{00b7} {}] — Enter for next \u{00b7} Esc close",
+            kind.label(),
+        );
+        // Walk the cursor forward to the next visible event so a repeated Enter
+        // steps through the whole timeline (wrapping). The mouse path skips this
+        // so a click stays put on the row it picked.
+        if advance
+            && let Some(next) = app
+                .session_timeline
+                .next_index(Some(app.session_timeline_selected))
+        {
+            app.session_timeline_selected = next;
+        }
+        app.needs_redraw = true;
+    } else {
+        app.status = "session timeline: could not jump".to_string();
     }
 }
 
@@ -7949,6 +8130,97 @@ fn refresh_turn_outline(app: &mut TuiApp) {
     app.turn_outline.rebuild_if_stale(fingerprint, &entries);
 }
 
+/// Fold one transcript entry into its Session Timeline (§12.2.6)
+/// [`session_timeline::TimelineKind`]. Built on the same `index_category_of`
+/// classification the index and outline use (so the timeline stays in lock-step
+/// with them), then refined to the timeline's higher-signal event kinds: a
+/// `/diff` snapshot reads as an `Edit`, a *denied* tool reads as an `Approval`
+/// (the user's accept/deny decision is the event, not the tool), and a user
+/// prompt reads as a `Prompt` / an assistant answer as a `Turn`. The category
+/// set is a superset of the timeline's kinds, so this is a total mapping.
+fn timeline_kind_of(entries: &[TranscriptEntry], index: usize) -> session_timeline::TimelineKind {
+    use session_timeline::TimelineKind;
+    use transcript_index::EntryCategory;
+    // High-signal refinements that the coarse category cannot express: a denied
+    // tool is the approval decision; a diff card is an edit.
+    if let Some(entry) = entries.get(index) {
+        match &entry.kind {
+            TranscriptEntryKind::ToolResult(tool) if tool.result.status == ToolStatus::Denied => {
+                return TimelineKind::Approval;
+            }
+            TranscriptEntryKind::Diff(_) => return TimelineKind::Edit,
+            _ => {}
+        }
+    }
+    match index_category_of(entries, index) {
+        EntryCategory::UserTurn => TimelineKind::Prompt,
+        EntryCategory::Assistant => TimelineKind::Turn,
+        EntryCategory::Reasoning => TimelineKind::Reasoning,
+        EntryCategory::ToolCall => TimelineKind::Tool,
+        EntryCategory::Error => TimelineKind::Error,
+        EntryCategory::Subagent => TimelineKind::Subagent,
+        EntryCategory::Plan => TimelineKind::Plan,
+        EntryCategory::Diff => TimelineKind::Edit,
+        EntryCategory::Note => TimelineKind::Note,
+    }
+}
+
+/// Build the per-entry classification slice the Session Timeline (§12.2.6)
+/// consumes from the active transcript. Events are grouped by turn: the 1-based
+/// turn ordinal bumps on each user prompt (so everything between two prompts —
+/// the model's reasoning, tools, and answer — shares a turn). Each entry
+/// contributes its stable id, content revision (so a mutation re-builds), event
+/// kind, error cross-cut flag (`entry_is_error`, the same failure predicate the
+/// renderer/jump-nav use), a pending flag for an in-flight (not-yet-settled,
+/// streaming) assistant turn, the turn it belongs to, an optional timestamp
+/// (`None` today — transcript entries carry no per-event clock, the spec's
+/// "missing timestamps" case), and its deterministic label source. Pure over the
+/// entry slice.
+fn build_timeline_sources(entries: &[TranscriptEntry]) -> Vec<session_timeline::TimelineSource> {
+    let mut turn: u32 = 0;
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            // A user prompt starts a new turn; the first prompt makes turn 1.
+            // Entries before any prompt belong to turn 0 (a pre-prompt preamble),
+            // which is grouped honestly rather than forced into turn 1.
+            if matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::User)
+            {
+                turn = turn.saturating_add(1);
+            }
+            session_timeline::TimelineSource {
+                id: entry.id,
+                revision: entry.revision,
+                kind: timeline_kind_of(entries, i),
+                is_error: entry_is_error(entries, i),
+                // Transcript entries are only pushed once finalized, so a settled
+                // entry is never pending; the streaming-in-flight turn is not yet
+                // an entry. The flag is wired (and unit-tested) so a future
+                // in-flight-turn event can mark itself pending without a schema
+                // change.
+                is_pending: false,
+                turn,
+                timestamp: None,
+                raw_label: outline_title_of(entry),
+            }
+        })
+        .collect()
+}
+
+/// Refresh the Session Timeline (§12.2.6) against the active transcript,
+/// rebuilding **only** when the entries' fingerprint has moved since the last
+/// refresh. Called lazily — right before the timeline overlay opens or renders —
+/// so an idle session that never opens the overlay pays nothing, and an open
+/// overlay re-builds only on a real transcript change (append, stream settle,
+/// revision bump, clear, compaction, fold/filter toggle, resume) rather than
+/// every frame. The active kind filter is preserved across the rebuild.
+fn refresh_session_timeline(app: &mut TuiApp) {
+    let sources = build_timeline_sources(active_transcript_entries(app));
+    let fingerprint = session_timeline::SessionTimeline::fingerprint_of(sources.iter());
+    app.session_timeline.rebuild_if_stale(fingerprint, &sources);
+}
+
 /// Count the non-blank lines in a text blob — the body row count a lane header
 /// advertises ("tool output (12 lines)"). Bounded by counting only what is
 /// present; an empty/blank blob yields 0.
@@ -9136,6 +9408,14 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::BookmarkSelectJump(index) => {
             app.bookmarks_selected = index;
             bookmark_jump_to_selected(app);
+        }
+        // A click on a Session Timeline event row (§12.2.6): move the cursor onto
+        // it and jump the main view to the transcript row the event stands for —
+        // the mouse twin of ↑↓ + Enter, in one go. The index is into the visible
+        // (filtered) event list, matching what the row registered.
+        interaction::Action::TimelineSelectJump(index) => {
+            app.session_timeline_selected = index;
+            session_timeline_jump_to_selected(app, false);
         }
     }
 }
@@ -15042,6 +15322,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_bookmarks_surface(frame, area, app);
         return;
     }
+    // The Session Timeline overlay (§12.2.6) paints as a fullscreen chronological
+    // rail/list over everything else while open, registering its per-event row
+    // click targets every frame. Checked beside the bookmarks overlay so its
+    // targets register and it owns the surface while open.
+    if app.session_timeline_open {
+        render_session_timeline_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -16497,6 +16785,153 @@ fn render_turn_outline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::TurnOutlineRow(index)),
             interaction::Action::TurnOutlineSelect(index),
+        );
+    }
+}
+
+/// Paint the Session Timeline overlay (§12.2.6) as a centered modal: a title (with
+/// the active filter shown when one is set), a one-line summary/navigation header
+/// (or an empty-state line), then one row per *visible* (filtered) event in
+/// chronological order — a clock column (`m:ss`, or `--:--` for a missing
+/// timestamp), a turn tag, a `[kind]` tag, a status tag (`failed` in red /
+/// `pending` in cyan — color *and* text, never color-only) and the event's short
+/// deterministic label. Each row is a [`interaction::ChromeKey::TimelineRow`]
+/// click target keyed by its *visible* index so a click reaches the same
+/// `session_timeline_jump_to_selected` path as ↑↓+Enter. Reads the
+/// already-refreshed timeline (kept current by the run loop while open), so
+/// painting is constant-time and does no transcript walk.
+fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let filter_note = match app.session_timeline.filter() {
+        Some(kind) => format!("\u{2014} filter [{}] ", kind.label()),
+        None => "\u{2014} jump by event ".to_string(),
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " Session timeline ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            filter_note,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 92, 26, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let total = app.session_timeline.len();
+    let visible = app.session_timeline.visible();
+    let visible_count = visible.len();
+
+    // Header: summary + navigation hint, or an empty-state line. A non-empty
+    // timeline that the active filter has emptied gets its own honest line.
+    let header = if total == 0 {
+        Line::from(Span::styled(
+            "No session events to show yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else if visible_count == 0 {
+        Line::from(Span::styled(
+            "No events match the active filter \u{00b7} f to cycle \u{00b7} Esc close",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} f filter \u{00b7} Esc close",
+                app.session_timeline.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if visible_count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the visible count so an event that vanished (e.g. after
+    // a filter change or refresh) can never leave the cursor past the end.
+    let selected = app.session_timeline_selected.min(visible_count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    // Scroll the event list so the selected event stays visible when the timeline
+    // is taller than the available rows — the rail must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, event) in visible.iter().enumerate().skip(first).take(rows) {
+        let index = offset;
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let caret = if is_selected { "\u{203a} " } else { "  " };
+        // A failed event carries a red `failed` tag, a pending one a cyan
+        // `pending` tag (color *and* text, no color-only meaning); an ok event
+        // leaves the tag column blank.
+        let status_span = match event.status {
+            session_timeline::TimelineStatus::Failed => Span::styled(
+                format!("{:<8} ", event.status.label()),
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            session_timeline::TimelineStatus::Pending => Span::styled(
+                format!("{:<8} ", event.status.label()),
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            session_timeline::TimelineStatus::Ok => Span::raw(format!("{:<8} ", "")),
+        };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:>6} ", event.clock()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(
+                format!("{:<7} ", format!("t{}", event.turn)),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(
+                format!("{:<11} ", format!("[{}]", event.kind.label())),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            status_span,
+            Span::styled(event.label.clone(), label_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its VISIBLE index so a
+        // click selects + jumps to exactly that event (matching the cursor model).
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::TimelineRow(index)),
+            interaction::Action::TimelineSelectJump(index),
         );
     }
 }
@@ -28668,6 +29103,25 @@ pub(crate) struct TuiApp {
     /// the user is typing a new name for the selected bookmark (Enter commits,
     /// Esc cancels). Only meaningful while the overlay is open.
     pub(crate) bookmark_rename: Option<String>,
+    /// Session Timeline model (§12.2.6): the compact chronological event view of
+    /// the session — one event per transcript entry (prompts, turns, tool runs,
+    /// approvals, edits, errors, plans, subagents, notes) carrying a short
+    /// deterministic label, an ok/failed/pending status, the turn it belongs to,
+    /// and an optional timestamp. Rebuilt incrementally — only when the entries'
+    /// (id, revision, kind, status, turn, label) fingerprint moves — by
+    /// `refresh_session_timeline`, so an idle session pays one `u64` comparison
+    /// per refresh. Drives the timeline overlay's rail/list and quick-jump
+    /// navigation; the active kind filter lives inside it.
+    pub(crate) session_timeline: session_timeline::SessionTimeline,
+    /// Whether the Session Timeline overlay (§12.2.6) is open. `false` = closed
+    /// (the resting state, paints nothing extra); `true` = the fullscreen
+    /// rail/list owns key/mouse routing. Toggled by the `ToggleSessionTimeline`
+    /// keymap action.
+    pub(crate) session_timeline_open: bool,
+    /// Cursor into the timeline overlay's *visible* (filtered) event list
+    /// (§12.2.6). Clamped to the visible count each render. Only meaningful while
+    /// the overlay is open.
+    pub(crate) session_timeline_selected: usize,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -29259,6 +29713,9 @@ impl TuiApp {
             bookmarks_open: false,
             bookmarks_selected: 0,
             bookmark_rename: None,
+            session_timeline: session_timeline::SessionTimeline::new(),
+            session_timeline_open: false,
+            session_timeline_selected: 0,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -31504,6 +31961,14 @@ impl TerminalGuard {
         // costs nothing (this branch is skipped entirely).
         if app.lane_fold_open {
             refresh_lane_fold(app);
+        }
+
+        // Keep the Session Timeline (§12.2.6) current while its overlay is open,
+        // on the same no-op-when-unchanged terms: an open-but-idle overlay costs
+        // one `u64` comparison and a closed overlay costs nothing (this branch is
+        // skipped entirely).
+        if app.session_timeline_open {
+            refresh_session_timeline(app);
         }
 
         let paint = self.paint_one_frame(app);

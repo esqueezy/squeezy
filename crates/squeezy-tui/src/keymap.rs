@@ -281,6 +281,16 @@ pub(crate) enum Action {
     /// stable across redraws and resize; an idle session that never opens it pays
     /// nothing.
     ToggleBookmarks,
+    /// Open / close the Session Timeline overlay (`Alt+9` default; §12.2.6). A
+    /// compact chronological event view of the session — prompts, turns, tool
+    /// runs, approvals, edits, errors, and other high-signal state changes —
+    /// rendered as a rail/list and grouped by turn, each with a short
+    /// deterministic label and an ok/failed/pending status. The cursor (↑↓/kj,
+    /// plus Enter/→/l to jump) scrolls the main view to the transcript row the
+    /// selected event stands for; `f` cycles a per-kind filter. The timeline
+    /// rebuilds incrementally only on a transcript revision bump, so an idle
+    /// session pays nothing.
+    ToggleSessionTimeline,
 }
 
 impl Action {
@@ -340,6 +350,7 @@ impl Action {
             Self::TogglePinnedCompare => "toggle_pinned_compare",
             Self::DropBookmark => "drop_bookmark",
             Self::ToggleBookmarks => "toggle_bookmarks",
+            Self::ToggleSessionTimeline => "toggle_session_timeline",
         }
     }
 
@@ -398,6 +409,7 @@ impl Action {
         Action::TogglePinnedCompare,
         Action::DropBookmark,
         Action::ToggleBookmarks,
+        Action::ToggleSessionTimeline,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -514,6 +526,10 @@ impl Action {
             // family.
             | Self::DropBookmark
             | Self::ToggleBookmarks
+            // Session Timeline overlay toggle is `Alt+9` — an Alt+digit chord,
+            // the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleSessionTimeline
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -702,6 +718,11 @@ impl Action {
             // taken; `q` and `;` are free.
             Self::DropBookmark => KeyBinding::new(KeyCode::Char(';'), KeyModifiers::ALT),
             Self::ToggleBookmarks => KeyBinding::new(KeyCode::Char('q'), KeyModifiers::ALT),
+            // Session Timeline (§12.2.6). `Alt+9` — every bare `Alt` letter in the
+            // nav/copy/overlay family is taken, so the timeline takes the next
+            // free `Alt`+digit after `Alt+8` (hyperlinks). `9` is mnemonic-free
+            // but unambiguous and stays clear of every composer chord.
+            Self::ToggleSessionTimeline => KeyBinding::new(KeyCode::Char('9'), KeyModifiers::ALT),
         }
     }
 }

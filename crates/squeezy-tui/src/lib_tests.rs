@@ -28830,6 +28830,375 @@ async fn turn_outline_renders_across_resizes() {
     );
 }
 
+// ---- Session Timeline (§12.2.6) ----
+
+/// Build a transcript spanning two turns with a full set of high-signal events:
+/// a user prompt, a successful tool, a FAILED tool, a failed subagent breadcrumb,
+/// an assistant answer, then a second user prompt — so the timeline lists several
+/// distinct, deterministically labelled events across two turns (including a
+/// failed one). Seeds a deterministic viewport so geometry is host-independent.
+fn app_with_session_timeline() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("refactor the parser".to_string()));
+    app.push_tool_result(sample_tool_result("read_file", "fn parse() {}\n"));
+    let mut failed = sample_tool_result("shell", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app.push_subagent_note("subagent research failed: could not reach host".to_string());
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Here is the refactored parser.".to_string(),
+    ));
+    app.push_transcript_item(TranscriptItem::user("now add tests".to_string()));
+    app
+}
+
+#[tokio::test]
+async fn session_timeline_alt_9_opens_overlay_and_lists_events() {
+    let mut app = app_with_session_timeline();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+9 opens the session-timeline overlay");
+
+    assert!(app.session_timeline_open, "Alt+9 opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Session timeline"), "header present:\n{out}");
+
+    // One event per transcript entry (prompt, tool, tool, subagent, turn, prompt).
+    assert_eq!(app.session_timeline.len(), 6, "one event per entry");
+    assert_eq!(
+        app.session_timeline
+            .count_of(session_timeline::TimelineKind::Prompt),
+        2,
+    );
+    assert_eq!(
+        app.session_timeline
+            .count_of(session_timeline::TimelineKind::Tool),
+        2,
+    );
+    assert_eq!(
+        app.session_timeline
+            .count_of(session_timeline::TimelineKind::Turn),
+        1,
+    );
+    // Two turns (two user prompts).
+    assert_eq!(
+        app.session_timeline.turn_count(),
+        2,
+        "events span two turns"
+    );
+    // At minimum the failed tool + failed subagent count as failures.
+    assert!(
+        app.session_timeline.failed_count() >= 2,
+        "failed tool + subagent both flagged: {}",
+        app.session_timeline.failed_count(),
+    );
+
+    // Deterministic labels, kind tags, turn tags, a missing-timestamp clock, and
+    // the failed status tag all paint.
+    assert!(
+        out.contains("refactor the parser"),
+        "prompt label from first line:\n{out}",
+    );
+    assert!(out.contains("[prompt]"), "kind tag:\n{out}");
+    assert!(out.contains("[tool]"), "tool kind tag:\n{out}");
+    assert!(out.contains("failed"), "failed status tag:\n{out}");
+    assert!(out.contains("--:--"), "missing-timestamp clock:\n{out}");
+    assert!(out.contains("t1"), "turn tag for turn 1:\n{out}");
+    assert!(out.contains("t2"), "turn tag for turn 2:\n{out}");
+}
+
+#[tokio::test]
+async fn session_timeline_keyboard_navigates_and_jumps() {
+    let mut app = app_with_session_timeline();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open timeline");
+    let _ = render_to_string(&app, 80, 24);
+    // The overlay opens parked on the newest event (the tail of the session).
+    assert_eq!(
+        app.session_timeline_selected,
+        app.session_timeline.visible_len() - 1,
+        "cursor parks on the most recent event",
+    );
+
+    // Up moves the cursor toward older events.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up moves cursor");
+    assert_eq!(
+        app.session_timeline_selected,
+        app.session_timeline.visible_len() - 2,
+        "Up retreats the event cursor",
+    );
+
+    // Down moves it back toward the newest.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(
+        app.session_timeline_selected,
+        app.session_timeline.visible_len() - 1,
+        "Down advances the event cursor",
+    );
+
+    // Park on the first event, then Enter jumps to its row and walks forward.
+    for _ in 0..app.session_timeline.visible_len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .await
+        .expect("up");
+    }
+    assert_eq!(
+        app.session_timeline_selected, 0,
+        "cursor at the first event"
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert!(
+        app.status.contains("session timeline"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+    assert_eq!(
+        app.session_timeline_selected, 1,
+        "Enter walks the cursor forward to the next event",
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.session_timeline_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn session_timeline_filter_cycles_and_renders_filtered() {
+    let mut app = app_with_session_timeline();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open timeline");
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(app.session_timeline.filter(), None, "starts unfiltered");
+    assert_eq!(app.session_timeline.visible_len(), 6);
+
+    // `f` narrows to the first present kind (Prompt).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("f cycles filter");
+    assert_eq!(
+        app.session_timeline.filter(),
+        Some(session_timeline::TimelineKind::Prompt),
+    );
+    assert_eq!(app.session_timeline.visible_len(), 2, "two prompts shown");
+
+    // The filtered render shows the active filter in the title and only prompts.
+    let filtered = render_to_string(&app, 80, 24);
+    assert!(
+        filtered.contains("filter [prompt]"),
+        "active filter in title:\n{filtered}",
+    );
+    assert!(
+        !filtered.contains("read_file"),
+        "the tool event is filtered out:\n{filtered}",
+    );
+
+    // The cursor is re-parked inside the filtered list, never past its end.
+    assert!(
+        app.session_timeline_selected < app.session_timeline.visible_len(),
+        "cursor stays within the filtered list",
+    );
+}
+
+#[tokio::test]
+async fn session_timeline_alt_9_toggles_closed_without_leaking() {
+    let mut app = app_with_session_timeline();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.session_timeline_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.session_timeline_open, "Alt+9 toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn session_timeline_mouse_click_selects_and_jumps() {
+    let mut app = app_with_session_timeline();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open timeline");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for a registered event-row target — the SECOND row so the click changes
+    // the cursor off whatever it parked on.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TimelineRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("an event row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.session_timeline_selected, 1,
+        "clicking an event row selects exactly that event (no auto-advance)",
+    );
+    assert!(
+        app.status.contains("session timeline"),
+        "click jumps and reports: {}",
+        app.status,
+    );
+    // The overlay stays open (the click jumped within it, not closed it).
+    assert!(app.session_timeline_open);
+}
+
+#[tokio::test]
+async fn session_timeline_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open timeline on an empty transcript");
+
+    assert!(app.session_timeline_open);
+    assert!(app.session_timeline.is_empty());
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("Session timeline"),
+        "header still paints:\n{out}",
+    );
+    assert!(
+        out.contains("No session events"),
+        "empty-state line:\n{out}"
+    );
+
+    // Enter and f on an empty overlay are harmless no-ops (no panic, nothing
+    // jumps, no filter strands the cursor).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty timeline");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("f on empty timeline");
+    assert!(app.session_timeline.is_empty());
+    assert_eq!(app.session_timeline.filter(), None);
+}
+
+#[tokio::test]
+async fn session_timeline_renders_across_resizes() {
+    let mut app = app_with_session_timeline();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open timeline");
+
+    // The first event's logical jump target must survive a resize: capture the
+    // event's entry id before the resize, render after, and confirm the same id
+    // is still resolvable (ids are width-independent).
+    let first_id = app.session_timeline.events().first().map(|e| e.entry_id);
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Session timeline"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+    assert_eq!(
+        app.session_timeline.events().first().map(|e| e.entry_id),
+        first_id,
+        "the first event's stable id survives every resize",
+    );
+}
+
 // ---- Collapsible Reasoning/Tool Lanes (§12.2.2) ----
 
 /// Build a transcript whose tail is a tool result carrying a call (so it

@@ -686,6 +686,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // keymap sees them, so a row click and the keyboard reach the same
         // `bookmark_jump_to_selected` handler.
         A::BookmarkSelectJump(_) => KeyboardPath::Always("bookmarks ↑↓/Enter"),
+        // Session Timeline overlay (§12.2.6) — the overlay's own key handler owns
+        // ↑↓/kj (move the event cursor), f (cycle the per-kind filter), and
+        // Enter/→/l (jump to the transcript row the selected event stands for)
+        // before the global keymap sees them, so a row click and the keyboard
+        // reach the same `session_timeline_jump_to_selected` handler.
+        A::TimelineSelectJump(_) => KeyboardPath::Always("session timeline ↑↓/Enter"),
     })
 }
 
