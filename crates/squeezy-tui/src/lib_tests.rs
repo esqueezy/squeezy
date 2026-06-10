@@ -6980,21 +6980,58 @@ fn width_audit_moon_status_glyph_is_overridden_to_two() {
 
 #[test]
 fn width_audit_spinner_status_glyphs_are_overridden_to_two() {
-    // The live `Scintillate` working-spinner frames (render/spinner.rs:41). Each
-    // is crate width 1 but drawn 2 cells wide, so the helper forces 2. Ties the
-    // helper's `0x2736..=0x273D` range to the actual spinner source — if the
-    // spinner glyphs change, this test flags the helper range to follow.
-    for frame in ['✶', '✷', '✸', '✹', '✺'] {
-        let s = frame.to_string();
-        assert_eq!(
-            s.as_str().width(),
-            1,
-            "the crate measures spinner {frame:?} as 1 cell"
-        );
+    use crate::render::spinner::SpinnerStyle;
+
+    // The intended *terminal* display width of each decorative spinner glyph. The
+    // dingbat/geometric stars are drawn 2 cells wide by xterm.js even though the
+    // crate measures them as 1, so the helper must force 2. `·` (EAW-Ambiguous)
+    // and `⋆` (Math-Operators, Neutral) are NOT in that double-wide family, so
+    // they stay at the crate's width — pinned here so the helper can't silently
+    // start (or stop) inflating them.
+    fn intended_cell_width(glyph: char) -> u16 {
+        match glyph {
+            '·' | '⋆' => glyph.to_string().as_str().width() as u16,
+            _ => 2,
+        }
+    }
+
+    // Iterate the REAL spinner-frame source (render/spinner.rs) for every style,
+    // plus the rail marker, so the helper's override ranges can't drift out of
+    // sync with the glyphs the spinner actually emits. Every non-space glyph an
+    // animation frame can show must measure at its intended cell width.
+    let mut decorative = std::collections::BTreeSet::new();
+    for style in [
+        SpinnerStyle::Scintillate,
+        SpinnerStyle::Twinkle,
+        SpinnerStyle::Drift,
+    ] {
+        for frame in style.frames() {
+            for glyph in frame.chars().filter(|c| *c != ' ') {
+                decorative.insert(glyph);
+            }
+        }
+        // `rail_marker` cycles its own glyph set over time; sample a span wide
+        // enough to surface every phase (Drift adds ✦/✧ here).
+        for ms in (0..4000).step_by(100) {
+            for glyph in style.rail_marker(ms).chars().filter(|c| *c != ' ') {
+                decorative.insert(glyph);
+            }
+        }
+    }
+
+    // Sanity: the source must actually include the alternate-style stars the
+    // override now covers, or this test would pass vacuously.
+    assert!(
+        decorative.contains(&'✦') && decorative.contains(&'✧'),
+        "spinner source must emit the Twinkle/Drift stars ✦/✧ (got {decorative:?})"
+    );
+
+    for glyph in decorative {
+        let s = glyph.to_string();
         assert_eq!(
             term_display_width(&s),
-            2,
-            "the helper overrides spinner {frame:?} to 2 cells"
+            intended_cell_width(glyph),
+            "spinner glyph {glyph:?} must measure at its intended cell width"
         );
     }
 }
@@ -10935,6 +10972,87 @@ fn emergency_drop_teardown_emits_no_transcript_mirror() {
     assert!(
         !drop_ansi.contains("\x1b[3J"),
         "Drop must not purge the user's pre-launch scrollback",
+    );
+}
+
+/// `buffer_used_height` returns 0 for a wholly-blank buffer (a blank cell is a
+/// space, default background, and no modifiers). This anchors the empty case
+/// that feeds the `.max(1)` clamp in `render_lines_to_owned_buffer`.
+#[test]
+fn buffer_used_height_all_blank_is_zero() {
+    let buf = Buffer::empty(Rect::new(0, 0, 8, 4));
+    assert_eq!(
+        buffer_used_height(&buf),
+        0,
+        "an all-blank buffer has no used rows"
+    );
+}
+
+/// Content on the LAST row makes the used height span the whole buffer — no
+/// trailing blank rows exist below it to trim.
+#[test]
+fn buffer_used_height_content_on_last_row_is_full_height() {
+    let mut buf = Buffer::empty(Rect::new(0, 0, 8, 4));
+    buf.set_string(0, 3, "hi", Style::default()); // last row (y = 3)
+    assert_eq!(
+        buffer_used_height(&buf),
+        4,
+        "content on the last row means the full height is used"
+    );
+}
+
+/// Trailing blank rows below the last content row are trimmed: content on row 1
+/// of a 5-row buffer yields a used height of 2.
+#[test]
+fn buffer_used_height_trims_trailing_blank_rows() {
+    let mut buf = Buffer::empty(Rect::new(0, 0, 8, 5));
+    buf.set_string(0, 1, "x", Style::default()); // y = 1; rows 2..5 stay blank
+    assert_eq!(
+        buffer_used_height(&buf),
+        2,
+        "trailing blank rows are dropped; used height stops after row 1"
+    );
+}
+
+/// The blank predicate also requires `modifier == Modifier::empty()`, so a row of
+/// spaces that carries a non-empty modifier (with the default background) counts
+/// as content — its used height is NOT trimmed away.
+#[test]
+fn buffer_used_height_space_with_modifier_counts_as_content() {
+    let mut buf = Buffer::empty(Rect::new(0, 0, 8, 3));
+    // Row 1: spaces only, default background, but a non-empty modifier.
+    let cell = buf.cell_mut((0, 1)).expect("cell in bounds");
+    assert_eq!(cell.symbol(), " ", "cell starts as a blank space");
+    cell.modifier = Modifier::BOLD;
+    assert_eq!(cell.bg, Color::Reset, "background stays the default");
+    assert_eq!(
+        buffer_used_height(&buf),
+        2,
+        "a space-only row with a modifier is content, not blank"
+    );
+}
+
+/// `render_lines_to_owned_buffer` clamps to at least one row even when fed empty
+/// or all-blank input, so the `.max(1)` never produces a zero-height buffer.
+#[test]
+fn render_lines_to_owned_buffer_clamps_empty_input_to_one_row() {
+    // No lines at all.
+    let empty: Vec<Line<'static>> = Vec::new();
+    let buf = render_lines_to_owned_buffer(&empty, 12);
+    assert_eq!(
+        buf.area.height, 1,
+        "empty input clamps to a single-row buffer"
+    );
+
+    // All-blank lines (whitespace only) — used height would be 0 without the clamp.
+    let blank = vec![
+        Line::from(vec![Span::raw("   ")]),
+        Line::from(vec![Span::raw("")]),
+    ];
+    let buf = render_lines_to_owned_buffer(&blank, 12);
+    assert_eq!(
+        buf.area.height, 1,
+        "all-blank lines clamp to a single-row buffer"
     );
 }
 

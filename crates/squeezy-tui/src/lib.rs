@@ -35946,8 +35946,13 @@ fn is_wide_rendered_glyph(c: char) -> bool {
         0x25CB | 0x25CF            // ○ ●
         | 0x25D0..=0x25D7          // ◐ ◑ ◒ ◓ ◔ ◕ ◖ ◗
         | 0x263D | 0x263E          // ☽ ☾
-        | 0x2736..=0x273D          // ✶ ✷ ✸ ✹ ✺ ✻ ✼ ✽ (spinner)
+        | 0x2726 | 0x2727          // ✦ ✧ (Twinkle/Drift spinner + Drift rail marker)
+        | 0x2736..=0x273D          // ✶ ✷ ✸ ✹ ✺ ✻ ✼ ✽ (Scintillate spinner)
     )
+    // The other two Twinkle frames stay narrow on purpose: `·` (U+00B7) is
+    // East-Asian-Width Ambiguous and `⋆` (U+22C6, Mathematical Operators) is
+    // Neutral — neither is in the geometric/dingbat double-wide family xterm.js
+    // inflates, and the override's policy is to defer such glyphs to the crate.
 }
 
 /// Display width of a grapheme as the TERMINAL is likely to render it: at least
