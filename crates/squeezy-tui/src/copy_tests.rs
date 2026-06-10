@@ -329,6 +329,43 @@ fn code_block_none_for_dangling_unclosed_fence() {
 }
 
 // ---------------------------------------------------------------------------
+// AllCode (§12.5.5 Code-Aware Copy) scope resolution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn all_code_scope_resolves_to_focused_entry_run() {
+    // The AllCode scope resolves to the SAME row range as FocusedEntry; the
+    // code-extraction itself lives in `copy_code` and runs over this range.
+    let rows = vec![
+        row(0, Some(1), Some(RowKind::Message), "intro"),
+        row(1, Some(2), Some(RowKind::Message), "```rust"),
+        row(2, Some(2), Some(RowKind::Message), "let x = 1;"),
+        row(3, Some(2), Some(RowKind::Message), "```"),
+    ];
+    let entry = resolve_scope(
+        &rows,
+        Some(RowId(2)),
+        CopyScope::FocusedEntry,
+        &never_assistant,
+        None,
+    );
+    let all_code = resolve_scope(
+        &rows,
+        Some(RowId(2)),
+        CopyScope::AllCode,
+        &never_assistant,
+        None,
+    );
+    assert_eq!(all_code, entry, "AllCode resolves to the focused entry run");
+    assert_eq!(all_code, Some((1, 3)));
+}
+
+#[test]
+fn all_code_scope_label_is_code() {
+    assert_eq!(CopyScope::AllCode.label(), "code");
+}
+
+// ---------------------------------------------------------------------------
 // Viewport / FullTranscript
 // ---------------------------------------------------------------------------
 

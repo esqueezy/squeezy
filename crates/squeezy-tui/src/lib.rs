@@ -88,6 +88,7 @@ mod commands;
 mod commands_style;
 mod config_screen;
 mod copy;
+mod copy_code;
 mod diff_detail_pane;
 mod dogfood;
 mod duplicate_fold;
@@ -2115,6 +2116,7 @@ fn classify_key_interaction(app: &TuiApp, key: KeyEvent) -> Option<latency::Inte
             | keymap::Action::CopyFocusedEntry
             | keymap::Action::CopyCurrentToolOutput
             | keymap::Action::CopyCodeBlock
+            | keymap::Action::CopyAllCode
             | keymap::Action::CopyViewport
             | keymap::Action::CopyFullTranscript
             | keymap::Action::CopySelection => InteractionKind::CopyAck,
@@ -5011,6 +5013,15 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             copy_transcript_scope(app, copy::CopyScope::CodeBlockUnderCursor, app.copy_format)
+        }
+        keymap::Action::CopyAllCode => {
+            // Code-Aware Copy/Export (§12.5.5): every fenced code block of the
+            // focused entry (languages preserved, rails stripped). Same screen
+            // guard as the other semantic copies.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_transcript_scope(app, copy::CopyScope::AllCode, app.copy_format)
         }
         keymap::Action::CopyViewport => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
@@ -10201,6 +10212,15 @@ fn build_scope_payload(
         None
     };
 
+    // Code-Aware Copy/Export (§12.5.5): the AllCode scope is not a plain text
+    // projection — it extracts every fenced code block (languages preserved,
+    // rails stripped) and re-emits clean fences. Resolve it to the focused
+    // entry's rows, then run the code extractor; if that entry carried NO code,
+    // widen the search to the whole transcript before giving up.
+    if scope == copy::CopyScope::AllCode {
+        return build_all_code_payload(&rows, app.copy_focus, &is_assistant, format);
+    }
+
     copy::gather(
         &rows,
         app.copy_focus,
@@ -10209,6 +10229,37 @@ fn build_scope_payload(
         &is_assistant,
         viewport,
     )
+}
+
+/// Code-Aware Copy (§12.5.5) payload: extract every fenced code block from the
+/// focused entry's rows, and — when that entry held none — from the WHOLE
+/// transcript, so an `Alt+j` parked on a user prompt still gathers the answer's
+/// code. `format` chooses the serialization: Markdown re-emits clean
+/// ```` ```lang ```` fences (the round-trippable form); every other format
+/// yields the bare interiors (paste-into-an-editor). `None` when the transcript
+/// holds no fenced block at all.
+fn build_all_code_payload(
+    rows: &[transcript_surface::TranscriptRow],
+    focus: Option<transcript_surface::RowId>,
+    is_assistant: &dyn Fn(transcript_surface::EntryId) -> bool,
+    format: copy::CopyFormat,
+) -> Option<String> {
+    let style = if format == copy::CopyFormat::Markdown {
+        copy_code::CodePayloadStyle::Fenced
+    } else {
+        copy_code::CodePayloadStyle::Bare
+    };
+
+    // First try the focused entry's run.
+    if let Some((lo, hi)) =
+        copy::resolve_scope(rows, focus, copy::CopyScope::AllCode, is_assistant, None)
+        && let Some(payload) = copy_code::gather_code(&rows[lo..=hi.min(rows.len() - 1)], style)
+    {
+        return Some(payload);
+    }
+    // Fall back to the whole transcript so a focus outside any code-bearing
+    // entry still finds the code.
+    copy_code::gather_code(rows, style)
 }
 
 /// The width to rebuild the row model at for an off-frame copy/export: the last

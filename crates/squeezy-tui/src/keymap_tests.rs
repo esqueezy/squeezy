@@ -144,6 +144,33 @@ fn queue_undo_action_round_trips_and_defaults_to_u() {
 }
 
 #[test]
+fn copy_all_code_action_round_trips_and_defaults_to_alt_j() {
+    // §12.5.5 Code-Aware Copy/Export: slug round-trips, is registered in `ALL`
+    // (so `/keymap` lists it and an override can target it), and defaults to
+    // `Alt+j` — next to the single-block `Alt+k`.
+    assert_eq!(
+        Action::from_slug("copy_all_code"),
+        Some(Action::CopyAllCode)
+    );
+    assert!(Action::ALL.contains(&Action::CopyAllCode));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::CopyAllCode),
+        KeyBinding::new(KeyCode::Char('j'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('j'), KeyModifiers::ALT),
+        Some(Action::CopyAllCode),
+    );
+    // `Alt+j` is a Meta/Alt chord — honestly terminal-dependent, like the rest
+    // of the semantic-copy family.
+    assert_eq!(
+        Action::CopyAllCode.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
 fn toggle_latency_overlay_round_trips_and_defaults_to_ctrl_alt_l() {
     // §12.10.1 latency overlay toggle: slug round-trips, is registered in `ALL`
     // (so `/keymap` lists it and overrides can target it), and defaults to the

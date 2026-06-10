@@ -54,6 +54,10 @@ pub(crate) enum Action {
     /// Copy the fenced code block under the cursor to the clipboard
     /// (`Alt+k` default).
     CopyCodeBlock,
+    /// Code-Aware Copy/Export (§12.5.5): copy EVERY fenced code block of the
+    /// focused entry (or, when it holds none, the whole transcript) to the
+    /// clipboard — languages preserved, UI rails stripped (`Alt+j` default).
+    CopyAllCode,
     /// Copy the rows visible in the main viewport to the clipboard
     /// (`Alt+v` default).
     CopyViewport,
@@ -229,6 +233,7 @@ impl Action {
             Self::CopyFocusedEntry => "copy_focused_entry",
             Self::CopyCurrentToolOutput => "copy_tool_output",
             Self::CopyCodeBlock => "copy_code_block",
+            Self::CopyAllCode => "copy_all_code",
             Self::CopyViewport => "copy_viewport",
             Self::CopyFullTranscript => "copy_full_transcript",
             Self::CopySelection => "copy_selection",
@@ -279,6 +284,7 @@ impl Action {
         Action::CopyFocusedEntry,
         Action::CopyCurrentToolOutput,
         Action::CopyCodeBlock,
+        Action::CopyAllCode,
         Action::CopyViewport,
         Action::CopyFullTranscript,
         Action::CopySelection,
@@ -356,6 +362,10 @@ impl Action {
             Self::CopyFocusedEntry
             | Self::CopyCurrentToolOutput
             | Self::CopyCodeBlock
+            // Code-Aware Copy is `Alt+j` — the same Meta/Alt encoding that is
+            // unreliable across Linux terminals, tmux, and SSH as the rest of
+            // the copy chords.
+            | Self::CopyAllCode
             | Self::CopyViewport
             | Self::CopyFullTranscript
             | Self::CopySelection
@@ -441,6 +451,9 @@ impl Action {
             Self::CopyFocusedEntry => KeyBinding::new(KeyCode::Char('c'), KeyModifiers::ALT),
             Self::CopyCurrentToolOutput => KeyBinding::new(KeyCode::Char('o'), KeyModifiers::ALT),
             Self::CopyCodeBlock => KeyBinding::new(KeyCode::Char('k'), KeyModifiers::ALT),
+            // Code-Aware Copy (§12.5.5). `Alt+j` sits next to the single-block
+            // `Alt+k`; `j` is free among the semantic-copy Alt letters.
+            Self::CopyAllCode => KeyBinding::new(KeyCode::Char('j'), KeyModifiers::ALT),
             Self::CopyViewport => KeyBinding::new(KeyCode::Char('v'), KeyModifiers::ALT),
             Self::CopyFullTranscript => KeyBinding::new(KeyCode::Char('a'), KeyModifiers::ALT),
             Self::CopySelection => KeyBinding::new(KeyCode::Char('y'), KeyModifiers::ALT),

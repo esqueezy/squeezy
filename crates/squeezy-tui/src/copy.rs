@@ -59,6 +59,13 @@ pub(crate) enum CopyScope {
     /// The fenced code block bracketing the focus row (interior only, fences
     /// excluded).
     CodeBlockUnderCursor,
+    /// Code-Aware Copy/Export (§12.5.5): EVERY fenced code block of the focused
+    /// entry, language tags preserved, rails stripped. Resolves to the same row
+    /// range as [`CopyScope::FocusedEntry`]; `lib.rs` then routes it through
+    /// [`crate::copy_code`] (not the plain formatters) so the payload is
+    /// code-only with clean fences. Falls back to the whole transcript when the
+    /// focused entry holds no fenced block.
+    AllCode,
     /// Every row currently visible in the main viewport.
     Viewport,
     /// Every row in the transcript.
@@ -73,6 +80,7 @@ impl CopyScope {
             CopyScope::LastAssistant => "assistant message",
             CopyScope::CurrentToolOutput => "tool output",
             CopyScope::CodeBlockUnderCursor => "code block",
+            CopyScope::AllCode => "code",
             CopyScope::Viewport => "viewport",
             CopyScope::FullTranscript => "transcript",
         }
@@ -157,6 +165,10 @@ pub(crate) fn resolve_scope(
         CopyScope::LastAssistant => resolve_last_assistant(rows, is_assistant),
         CopyScope::CurrentToolOutput => resolve_current_tool_output(rows, focus_idx),
         CopyScope::CodeBlockUnderCursor => resolve_code_block(rows, focus_idx),
+        // Code-Aware Copy (§12.5.5): resolve to the focused entry's run; the
+        // caller extracts its fenced blocks (and widens to the whole transcript
+        // when that entry carried no code).
+        CopyScope::AllCode => resolve_focused_entry(rows, focus_idx),
         CopyScope::Viewport => viewport
             .map(|(from, to)| {
                 let lo = from.0.min(last);

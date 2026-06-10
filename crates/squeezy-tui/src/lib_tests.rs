@@ -12685,6 +12685,154 @@ async fn alt_c_copies_focused_entry_through_row_model() {
 }
 
 // ---------------------------------------------------------------------------
+// Code-Aware Copy/Export (§12.5.5)
+// ---------------------------------------------------------------------------
+
+/// `Alt+j` (CopyAllCode) over a REAL transcript: a tool result whose output is a
+/// fenced `sh` code block. Tool-result rows preserve literal fences (unlike the
+/// markdown-styled message renderer, which drops them), so this drives the
+/// code-aware extractor end-to-end through `handle_key` → dispatch → the row
+/// model. Default copy format is Plain, so the payload is the BARE code interior
+/// — fences and rails stripped.
+#[tokio::test]
+async fn alt_j_copies_bare_code_from_tool_output() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("run it"));
+    app.push_tool_result(sample_tool_result(
+        "shell",
+        "```sh\necho fromtool\nls -la\n```",
+    ));
+    app.main_text_width.set(80);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write: {copied:?}");
+    // Bare code (Plain format): just the interior, fences + rails gone.
+    assert_eq!(copied[0], "echo fromtool\nls -la");
+    assert!(!copied[0].contains("```"), "bare style carries no fences");
+    assert_unit_copy_is_clean(&copied[0]);
+    assert!(app.status.contains("copied code"), "{}", app.status);
+}
+
+/// The Markdown copy format makes `Alt+j` re-emit a CLEAN ```` ```lang ````
+/// fence around the extracted code — language preserved, rails stripped — the
+/// round-trippable form the spec calls for. Same real tool-output pipeline.
+#[tokio::test]
+async fn alt_j_markdown_format_preserves_language_fence() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.copy_format = copy::CopyFormat::Markdown;
+    app.push_transcript_item(TranscriptItem::user("run it"));
+    app.push_tool_result(sample_tool_result("shell", "```sh\necho fromtool\n```"));
+    app.main_text_width.set(80);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write: {copied:?}");
+    // The language tag survived and the fence is clean (no rail gutter).
+    assert_eq!(copied[0], "```sh\necho fromtool\n```");
+    assert!(app.status.contains("copied code"), "{}", app.status);
+}
+
+/// Edge case: `Alt+j` with NO fenced code anywhere in the transcript is a
+/// handled no-op — it reports "nothing to copy for code" and never writes the
+/// clipboard. A rendered assistant message styles its fences away, so this is
+/// also the realistic "prose-only answer" case.
+#[tokio::test]
+async fn alt_j_with_no_code_is_a_handled_no_op() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("just chatting"));
+    app.push_transcript_item(TranscriptItem::assistant("no code here, only prose"));
+    app.main_text_width.set(80);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "no code → no clipboard write"
+    );
+    assert_eq!(app.status, "nothing to copy for code");
+}
+
+/// `Alt+j` survives a resize: the off-frame copy rebuilds the row model at the
+/// last painted width, so narrowing the surface (which re-wraps the tool output)
+/// still extracts the same fenced code. Drives the keyboard path after a width
+/// change to exercise the width-source the code copy reads.
+#[tokio::test]
+async fn alt_j_extracts_code_after_resize_rewraps_output() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("run it"));
+    app.push_tool_result(sample_tool_result("shell", "```sh\necho hi\n```"));
+
+    // Simulate a narrow terminal: the off-frame copy reads `main_text_width`.
+    app.main_text_width.set(20);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write: {copied:?}");
+    assert_eq!(copied[0], "echo hi");
+    assert_unit_copy_is_clean(&copied[0]);
+}
+
+// ---------------------------------------------------------------------------
 // Clipboard history (§12.6.1)
 // ---------------------------------------------------------------------------
 
