@@ -148,6 +148,17 @@ pub(crate) enum Action {
     /// and the current viewport band; clickable to jump when mouse capture is
     /// on. Off by default so an idle session paints nothing extra.
     ToggleMinimap,
+    /// Toggle the main view between soft-wrap (every line reflows to the column)
+    /// and no-wrap horizontal-scroll (`Alt+w` default; §11.2 / 11G.4). No-wrap
+    /// lets wide code/diff blocks and long command output pan left/right instead
+    /// of wrapping or being hidden. Paired with `ScrollBlockLeft`/`Right`.
+    ToggleSoftWrap,
+    /// Pan the no-wrap main view left one step (`Alt+h` default; §11G.4). The
+    /// keyboard twin of Shift+wheel-up. A no-op while soft-wrap is on.
+    ScrollBlockLeft,
+    /// Pan the no-wrap main view right one step (`Alt+l` default; §11G.4). The
+    /// keyboard twin of Shift+wheel-down. A no-op while soft-wrap is on.
+    ScrollBlockRight,
 }
 
 impl Action {
@@ -188,6 +199,9 @@ impl Action {
             Self::SetJumpMark => "set_jump_mark",
             Self::JumpToMark => "jump_to_mark",
             Self::ToggleMinimap => "toggle_minimap",
+            Self::ToggleSoftWrap => "toggle_soft_wrap",
+            Self::ScrollBlockLeft => "scroll_block_left",
+            Self::ScrollBlockRight => "scroll_block_right",
         }
     }
 
@@ -227,6 +241,9 @@ impl Action {
         Action::SetJumpMark,
         Action::JumpToMark,
         Action::ToggleMinimap,
+        Action::ToggleSoftWrap,
+        Action::ScrollBlockLeft,
+        Action::ScrollBlockRight,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -291,6 +308,12 @@ impl Action {
             | Self::JumpToMark
             // Minimap toggle is `Alt+r` — the same Meta/Alt encoding case.
             | Self::ToggleMinimap
+            // Wide-block horizontal-nav chords are `Alt`+key (`Alt+w`/`Alt+h`/
+            // `Alt+l`) — the same Meta/Alt encoding that is unreliable across
+            // Linux terminals, tmux, and SSH as the copy / jump-nav chords above.
+            | Self::ToggleSoftWrap
+            | Self::ScrollBlockLeft
+            | Self::ScrollBlockRight
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -402,6 +425,14 @@ impl Action {
             // c/o/k/v/a/y/m/' and punctuation ,/./[/] are taken; r is free
             // (`Ctrl+R` is the cancelled-prompt restore, a distinct chord).
             Self::ToggleMinimap => KeyBinding::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            // Wide-block horizontal navigation (§11.2 / 11G.4). `Alt`+key chords
+            // matching the rest of the navigation/copy family: `Alt+w` ("wrap")
+            // toggles soft-wrap, `Alt+h`/`Alt+l` (the vi left/right keys) pan the
+            // no-wrap view. Bare `Alt` letters c/o/k/v/a/y/m/r are taken; w/h/l are
+            // free.
+            Self::ToggleSoftWrap => KeyBinding::new(KeyCode::Char('w'), KeyModifiers::ALT),
+            Self::ScrollBlockLeft => KeyBinding::new(KeyCode::Char('h'), KeyModifiers::ALT),
+            Self::ScrollBlockRight => KeyBinding::new(KeyCode::Char('l'), KeyModifiers::ALT),
         }
     }
 }

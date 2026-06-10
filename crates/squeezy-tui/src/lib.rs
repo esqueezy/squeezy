@@ -125,6 +125,7 @@ mod streaming_patch;
 mod terminal_writer;
 mod toast;
 mod transcript_surface;
+mod wide_block;
 // Visual Diff Dashboard (§12.10.4). `cfg(test)`-gated so the dev-only cell-grid
 // diff / HTML-artifact harness never compiles into a shipped TUI binary; every
 // item is exercised by its sibling `visual_diff_tests.rs`, so the module
@@ -2404,6 +2405,33 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         }
     }
 
+    // Shift+wheel pans the no-wrap main view horizontally (§11G.4): the mouse
+    // affordance paired with the `Alt+h`/`Alt+l` keyboard pan (which stays the
+    // primary, reliable path — with mouse capture on, many terminals reserve
+    // Shift+wheel for their own native selection/scrollback and never forward it,
+    // so this fires only where the terminal does deliver it). Only on the main
+    // surface (the overlay/config own their own scrolling) and only while
+    // soft-wrap is off — otherwise the event falls through to the vertical wheel
+    // scroll below so Shift+wheel keeps scrolling vertically in the normal
+    // wrapped view. Shift+ScrollUp pans left (toward column 0), Shift+ScrollDown
+    // pans right (toward the line end), mirroring the vertical-wheel direction.
+    if mouse.modifiers.contains(KeyModifiers::SHIFT)
+        && app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        && app.status_line_setup.is_none()
+        && !app.wide_block.soft_wrap()
+        && matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        )
+    {
+        let dir = match mouse.kind {
+            MouseEventKind::ScrollUp => HorizontalDir::Left,
+            _ => HorizontalDir::Right,
+        };
+        return scroll_wide_block(app, dir);
+    }
+
     // Wheel scroll always scrolls the transcript — the inline viewport
     // disables the terminal's native wheel-to-arrow translation, so without
     // this the user would have no way to scroll once mouse capture was on.
@@ -2500,11 +2528,16 @@ fn main_scrollbar_from_bottom_from_mouse(app: &TuiApp, column: u16, row: u16) ->
 /// them faithfully. Rebuilt from the cached width + startup-card flag.
 fn main_surface_rows(app: &TuiApp) -> Vec<Line<'static>> {
     let cache = app.main_text_area_cache.get();
-    let (width, include_card) = match cache {
-        Some(c) => (c.text_area.width, c.include_startup_card),
-        None => (main_text_width(app), false),
+    // Rebuild the SAME row list the frame painted: wrapped to the text column when
+    // soft-wrap was on, unwrapped (one row per logical line) when off (§11G.4).
+    // Threading the cached `soft_wrap` keeps selection/copy row indices aligned
+    // with the painted rows in both modes.
+    let (build_width, include_card) = match cache {
+        Some(c) if c.soft_wrap => (Some(c.text_area.width.max(1)), c.include_startup_card),
+        Some(c) => (None, c.include_startup_card),
+        None => (Some(main_text_width(app).max(1)), false),
     };
-    transcript_lines_for_render(app, Some(width.max(1)), include_card)
+    transcript_lines_for_render(app, build_width, include_card)
 }
 
 /// The painted wrapped rows of the active selection surface (main or overlay).
@@ -2590,7 +2623,11 @@ fn main_pos_for_cell(
         .saturating_sub(cache.from_bottom);
     let row_idx = (top_row + local_row).min(last);
 
-    let display_col = usize::from(column.saturating_sub(cache.text_area.x));
+    // In no-wrap mode the viewport is panned right by `h_offset` columns, so the
+    // cell's display column maps to `h_offset + (column - x)` within the unwrapped
+    // line. `h_offset` is `0` while wrapping, so this is a no-op there (§11G.4).
+    let display_col =
+        usize::from(cache.h_offset) + usize::from(column.saturating_sub(cache.text_area.x));
     let col = rows
         .get(row_idx)
         .map(|line| {
@@ -4526,6 +4563,28 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_minimap(app);
             true
         }
+        keymap::Action::ToggleSoftWrap => {
+            // Main-surface view setting; config/setup screens own their routing,
+            // and the Ctrl+T overlay guard above already blocks this while the
+            // overlay (which has its own native wrapping) is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_soft_wrap(app);
+            true
+        }
+        keymap::Action::ScrollBlockLeft => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            scroll_wide_block(app, HorizontalDir::Left)
+        }
+        keymap::Action::ScrollBlockRight => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            scroll_wide_block(app, HorizontalDir::Right)
+        }
     }
 }
 
@@ -4540,6 +4599,85 @@ fn toggle_minimap(app: &mut TuiApp) {
         "minimap rail off".to_string()
     };
     app.needs_redraw = true;
+}
+
+/// Direction for a wide-block horizontal pan (§11G.4). `Left` pans toward the
+/// flush-left edge; `Right` toward the widest line's last column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HorizontalDir {
+    Left,
+    Right,
+}
+
+/// Flip the main view between soft-wrap and no-wrap horizontal-scroll, then
+/// surface the new mode in the status line. Re-enabling wrap drops any pan; the
+/// next render rebuilds the transcript at the new wrap setting.
+fn toggle_soft_wrap(app: &mut TuiApp) {
+    app.wide_block.toggle_wrap();
+    app.status = app.wide_block.status_hint().to_string();
+}
+
+/// Pan the no-wrap main view one step in `dir`, clamped to the widest painted
+/// line. A no-op while soft-wrap is on (returns `true` so the keystroke is still
+/// consumed and re-surfaces the "turn wrap off first" hint rather than leaking to
+/// the composer). Returns whether the dispatch consumed the key.
+fn scroll_wide_block(app: &mut TuiApp, dir: HorizontalDir) -> bool {
+    if app.wide_block.soft_wrap() {
+        // No horizontal axis while wrapping; consume the key and nudge the user
+        // toward the toggle so the chord never silently does nothing.
+        app.status = app.wide_block.status_hint().to_string();
+        return true;
+    }
+    let (content_width, viewport_width) = wide_block_horizontal_metrics(app);
+    // Re-clamp the stored offset against the live geometry first, so a pan after
+    // a resize (which the immutable render path could only clamp for paint, not
+    // for the stored value) starts from an in-range offset rather than a stale
+    // wide-block one.
+    app.wide_block.clamp(content_width, viewport_width);
+    let moved = match dir {
+        HorizontalDir::Left => app
+            .wide_block
+            .scroll_left(wide_block::HORIZONTAL_STEP_COLUMNS),
+        HorizontalDir::Right => app.wide_block.scroll_right(
+            wide_block::HORIZONTAL_STEP_COLUMNS,
+            content_width,
+            viewport_width,
+        ),
+    };
+    if moved {
+        app.status = app.wide_block.status_hint().to_string();
+    }
+    true
+}
+
+/// Measure the `(content_width, viewport_width)` the wide-block pan clamps
+/// against: the widest UNWRAPPED main-transcript line vs. the painted text
+/// column. `content_width` is computed from the no-wrap line build (`width =
+/// None`) so a pan can reach the last column of the widest line and no further;
+/// `viewport_width` is the live painted text width stamped each frame by
+/// `render_transcript`. Falls back to the live area width before the first paint.
+fn wide_block_horizontal_metrics(app: &TuiApp) -> (u16, u16) {
+    let viewport_width = app.main_text_width.get().max(1);
+    // The no-wrap (logical-line) build is the same one the renderer paints when
+    // soft-wrap is off, so its widest display column is exactly how far the pan
+    // can travel.
+    let lines = transcript_lines_for_render(app, None, true);
+    let content_width = lines
+        .iter()
+        .map(line_display_width)
+        .max()
+        .unwrap_or(0)
+        .min(u16::MAX as usize) as u16;
+    (content_width, viewport_width)
+}
+
+/// Display width (terminal columns) of a styled line: the sum of its spans'
+/// unicode display widths. Used to measure how far the no-wrap view can pan.
+fn line_display_width(line: &Line<'static>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 /// The category of transcript entry a jump command targets.
@@ -10980,6 +11118,7 @@ const CARD_CARET_WIDTH: u16 = 3;
 fn register_transcript_card_targets(
     app: &TuiApp,
     text_area: Rect,
+    build_width: Option<u16>,
     include_startup_card: bool,
     total_rows: usize,
     viewport_h: usize,
@@ -10997,8 +11136,11 @@ fn register_transcript_card_targets(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
+    // Build the entry offsets at the SAME width the frame painted with
+    // (`build_width`: `Some(width)` while wrapping, `None` no-wrap), so the
+    // offset units match `total_rows` and the screen `y` lands on the real row.
     let (_lines, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, Some(text_area.width), include_startup_card);
+        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -11053,7 +11195,35 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // Stamp the live text width so an off-frame copy/export rebuilds the row
     // model at the real painted width (see `copy_transcript_scope`).
     app.main_text_width.set(text_area.width);
-    let lines = transcript_lines_for_render(app, Some(text_area.width), include_startup_card);
+    // Horizontal navigation for wide blocks (§11G.4). Soft-wrap on (the default)
+    // wraps every line to the text column; soft-wrap off builds the lines
+    // UNWRAPPED (one visual row per logical line) and pans the viewport over them
+    // with a clamped horizontal offset, so wide code/diff blocks and long command
+    // output scroll horizontally instead of wrapping or being hidden.
+    let soft_wrap = app.wide_block.soft_wrap();
+    let build_width = if soft_wrap {
+        Some(text_area.width)
+    } else {
+        // `None` => logical (unwrapped) lines; the same set the pan clamps against.
+        None
+    };
+    let lines = transcript_lines_for_render(app, build_width, include_startup_card);
+    // Paint a pan offset clamped against the freshly measured content so a resize
+    // or a wide block scrolling off can never leave the view resting past all
+    // content. The render path holds `&TuiApp`, so the clamp is computed locally
+    // (non-mutating); the next keyboard/wheel pan re-clamps the stored offset.
+    let h_offset = if soft_wrap {
+        0
+    } else {
+        let content_width = lines
+            .iter()
+            .map(line_display_width)
+            .max()
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16;
+        app.wide_block
+            .painted_offset(content_width, text_area.width)
+    };
     let total_rows = lines.len();
     // Record the wrapped-row count this frame materialized for the main view so
     // the render-budget HUD can report "rows built". `draw_app` resets the
@@ -11081,15 +11251,20 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         viewport_h: text_area.height,
         from_bottom,
         include_startup_card,
+        soft_wrap,
+        h_offset,
     }));
 
     // Register each visible entry's card-header hit targets (caret → toggle
     // collapse, header remainder → focus) into the frame-local registry. Keyed
     // by the entry's stable EntryId so the target survives resize: the rect is
-    // recomputed here every frame from the live window, the key never is.
+    // recomputed here every frame from the live window, the key never is. Built
+    // at the SAME width the paint used (`build_width`) so the entry-offset units
+    // match the painted rows in both wrap and no-wrap mode.
     register_transcript_card_targets(
         app,
         text_area,
+        build_width,
         include_startup_card,
         total_rows,
         viewport_h,
@@ -11113,9 +11288,17 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         Some(state) => rows_with_search_highlight(lines, state, selection::SelectionSurface::Main),
         None => lines,
     };
-    let paragraph = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+    // Soft-wrap on: wrap each line to the column (the established behaviour).
+    // Soft-wrap off: no `.wrap()`, and the second `scroll` component pans the
+    // viewport horizontally over the unwrapped lines (§11G.4) so wide blocks
+    // scroll instead of wrapping. `h_offset` is `0` while wrapping.
+    let paragraph = if soft_wrap {
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(lines).scroll((scroll, h_offset))
+    };
     frame.render_widget(paragraph, text_area);
 
     // Scrollbar thumb in the gutter. `None` (content fits) clears the cache so
@@ -12019,6 +12202,15 @@ pub(crate) struct MainTextAreaCache {
     viewport_h: u16,
     from_bottom: usize,
     include_startup_card: bool,
+    /// Whether the painted lines were soft-wrapped to `text_area.width` (the
+    /// default) or built unwrapped for horizontal scroll (§11G.4). The cell→row
+    /// hit-test must rebuild the SAME row list, so it threads this through to
+    /// `main_surface_rows`.
+    soft_wrap: bool,
+    /// The horizontal pan offset the no-wrap frame painted with. `0` while
+    /// wrapping. Added to the mouse display column in `main_pos_for_cell` so a
+    /// click on a horizontally-scrolled line lands on the right character.
+    h_offset: u16,
 }
 
 /// How a keyboard extend moves the selection cursor (Shift+nav). The per-move
@@ -20815,6 +21007,12 @@ pub(crate) struct TuiApp {
     /// so an idle session paints nothing extra; clickable to jump when mouse
     /// capture is on.
     pub(crate) show_minimap: bool,
+    /// Horizontal navigation for wide blocks (§11.2 / 11G.4): the main view's
+    /// soft-wrap toggle plus its clamped horizontal pan offset. `Alt+w` flips
+    /// wrap; `Alt+h`/`Alt+l` and Shift+wheel pan the no-wrap view so wide
+    /// code/diff blocks and long command output scroll horizontally instead of
+    /// wrapping or being hidden.
+    pub(crate) wide_block: wide_block::WideBlockView,
     /// Timestamp + cell + running count of the last left press, for
     /// synthesising double/triple clicks (crossterm delivers no click-count). A
     /// press within the multi-click window at the same cell escalates word →
@@ -21447,6 +21645,7 @@ impl TuiApp {
             search: None,
             jump_marks: jump_marks::JumpMarkStack::new(),
             show_minimap: false,
+            wide_block: wide_block::WideBlockView::new(),
             last_click: None,
             wheel_accum: 0,
             main_scroll_anim: None,

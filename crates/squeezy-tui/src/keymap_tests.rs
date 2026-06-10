@@ -315,6 +315,67 @@ fn jump_mark_defaults_do_not_collide_with_other_actions() {
 }
 
 #[test]
+fn wide_block_actions_round_trip_and_default_to_alt_chords() {
+    // §11.2 / 11G.4 horizontal navigation: all three slugs round-trip, are
+    // registered in `ALL`, and default to `Alt+w` / `Alt+h` / `Alt+l`.
+    assert_eq!(
+        Action::from_slug("toggle_soft_wrap"),
+        Some(Action::ToggleSoftWrap)
+    );
+    assert_eq!(
+        Action::from_slug("scroll_block_left"),
+        Some(Action::ScrollBlockLeft)
+    );
+    assert_eq!(
+        Action::from_slug("scroll_block_right"),
+        Some(Action::ScrollBlockRight)
+    );
+    assert!(Action::ALL.contains(&Action::ToggleSoftWrap));
+    assert!(Action::ALL.contains(&Action::ScrollBlockLeft));
+    assert!(Action::ALL.contains(&Action::ScrollBlockRight));
+
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::ToggleSoftWrap),
+        KeyBinding::new(KeyCode::Char('w'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('w'), KeyModifiers::ALT),
+        Some(Action::ToggleSoftWrap),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('h'), KeyModifiers::ALT),
+        Some(Action::ScrollBlockLeft),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('l'), KeyModifiers::ALT),
+        Some(Action::ScrollBlockRight),
+    );
+    // Alt (Meta) chords are honestly classified terminal-dependent.
+    for action in [
+        Action::ToggleSoftWrap,
+        Action::ScrollBlockLeft,
+        Action::ScrollBlockRight,
+    ] {
+        assert_eq!(action.terminal_compat_note(), Some("terminal-dependent"));
+    }
+}
+
+#[test]
+fn wide_block_defaults_do_not_collide_with_other_actions() {
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::ToggleSoftWrap)
+                && !collision.1.contains(&Action::ScrollBlockLeft)
+                && !collision.1.contains(&Action::ScrollBlockRight),
+            "wide-block default collides: {:?}",
+            collision
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

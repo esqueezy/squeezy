@@ -22337,3 +22337,267 @@ fn minimap_too_narrow_to_host_a_rail_falls_back_gracefully() {
     assert_eq!(rail.x, 9, "rail sits on the right edge");
     assert_eq!(body.width, 9, "body wraps one column narrower");
 }
+
+// ---------------------------------------------------------------------------
+// Horizontal navigation for wide blocks (§11.2 / 11G.4)
+// ---------------------------------------------------------------------------
+
+/// An app whose transcript holds one very wide, unbreakable line plus some
+/// filler turns. The wide token has no spaces, so it cannot wrap-break on word
+/// boundaries — it is exactly the wide-block case the feature targets.
+fn wide_block_app() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    // A few filler turns first, then the wide line LAST so it sits at the
+    // tail-pinned bottom of the viewport and is reliably painted in the
+    // render-based assertions below.
+    for index in 0..6 {
+        app.push_transcript_item(TranscriptItem::user(format!("filler {index}")));
+    }
+    // 240 columns of distinct, position-revealing content with no break
+    // opportunity. `abc…xyzabc…` repeated lets a render assertion tell a
+    // left-edge paint from a panned one.
+    let wide: String = (0..240)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    app.push_transcript_item(TranscriptItem::assistant(wide));
+    app
+}
+
+#[tokio::test]
+async fn soft_wrap_toggle_through_keymap_flips_mode_and_status() {
+    // Keyboard path: `Alt+w` toggles the whole main view between soft-wrap and
+    // no-wrap horizontal scroll, driven through the real keymap dispatch.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = wide_block_app();
+    assert!(app.wide_block.soft_wrap(), "default is soft-wrap on");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-w toggles soft-wrap");
+    assert!(!app.wide_block.soft_wrap(), "Alt+w must turn soft-wrap off");
+    assert!(
+        app.status.contains("soft-wrap off"),
+        "status must report the new mode: {}",
+        app.status
+    );
+
+    // Survives the real fullscreen renderer in no-wrap mode.
+    let _ = render_to_string(&app, 80, 24);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-w toggles back");
+    assert!(app.wide_block.soft_wrap(), "second Alt+w restores wrap");
+    assert!(app.status.contains("soft-wrap on"), "{}", app.status);
+}
+
+#[tokio::test]
+async fn horizontal_pan_keys_scroll_the_no_wrap_view_and_clamp() {
+    // Keyboard pan path: with soft-wrap off, `Alt+l` pans right and `Alt+h` pans
+    // left. Driven through the real keymap so the dispatch arms are exercised.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = wide_block_app();
+    // Turn soft-wrap off so panning has an axis.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+    )
+    .await
+    .unwrap();
+    // Paint once so `main_text_width` is stamped for the pan clamp metrics.
+    let flush_left = render_to_string(&app, 80, 24);
+
+    // Pan right a few steps.
+    for _ in 0..3 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        app.wide_block.horizontal_offset() > 0,
+        "Alt+l must pan the no-wrap view right",
+    );
+    let panned = render_to_string(&app, 80, 24);
+    assert_ne!(
+        flush_left, panned,
+        "panning right must change the painted wide line",
+    );
+
+    // Pan all the way back left; offset saturates at 0.
+    for _ in 0..10 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        app.wide_block.horizontal_offset(),
+        0,
+        "Alt+h must pan back to the flush-left edge and saturate",
+    );
+    assert_eq!(
+        render_to_string(&app, 80, 24),
+        flush_left,
+        "back at the left edge the paint matches the flush-left frame",
+    );
+}
+
+#[tokio::test]
+async fn pan_keys_are_consumed_but_inert_while_wrapping() {
+    // Edge case: panning while soft-wrap is ON has no axis. The chord must still
+    // be consumed (so it never leaks to the composer) and must leave the offset
+    // at 0, surfacing the "turn wrap off" hint.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = wide_block_app();
+    assert!(app.wide_block.soft_wrap());
+
+    let consumed = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+    )
+    .await
+    .unwrap();
+    // `handle_key` returns whether the app should EXIT; the keymap dispatch
+    // consumes the key so nothing reached the composer.
+    assert!(!consumed, "pan key must not exit the app");
+    assert!(
+        app.input.is_empty(),
+        "pan key must not type into the composer"
+    );
+    assert_eq!(
+        app.wide_block.horizontal_offset(),
+        0,
+        "panning while wrapping is inert",
+    );
+    assert!(
+        app.status.contains("soft-wrap on"),
+        "inert pan must hint to toggle wrap: {}",
+        app.status
+    );
+}
+
+#[test]
+fn shift_wheel_pans_horizontally_only_in_no_wrap_mode() {
+    // Mouse path: Shift+wheel pans the no-wrap view horizontally; in the wrapped
+    // view the same event falls through to a normal vertical scroll.
+    let mut app = wide_block_app();
+
+    // While wrapping, Shift+ScrollUp must NOT touch the horizontal offset and
+    // must scroll vertically like a normal wheel event.
+    let before_scroll = app.transcript_scroll.from_bottom();
+    let _ = render_to_string(&app, 80, 24); // stamp geometry
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        },
+    );
+    assert_eq!(
+        app.wide_block.horizontal_offset(),
+        0,
+        "Shift+wheel must not pan while wrapping",
+    );
+    assert_ne!(
+        app.transcript_scroll.from_bottom(),
+        before_scroll,
+        "Shift+wheel while wrapping scrolls vertically",
+    );
+
+    // Now turn wrap off and re-pin to the tail; Shift+ScrollDown pans right.
+    app.wide_block.toggle_wrap();
+    app.transcript_scroll = scroll::ScrollState::pinned();
+    let _ = render_to_string(&app, 80, 24); // stamp the no-wrap metrics
+    let vscroll_before = app.transcript_scroll.from_bottom();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        },
+    );
+    assert!(
+        app.wide_block.horizontal_offset() > 0,
+        "Shift+ScrollDown must pan the no-wrap view right",
+    );
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        vscroll_before,
+        "horizontal pan must not move the vertical scroll",
+    );
+}
+
+#[test]
+fn no_wrap_view_renders_without_panic_at_narrow_and_wide_sizes() {
+    // Resize coverage: the no-wrap paint must hold at a very narrow width (where
+    // the wide line is mostly off-screen) and a wide one (where it fits), with no
+    // panic and a stable clamp.
+    let mut app = wide_block_app();
+    app.wide_block.toggle_wrap();
+
+    // Narrow: 20 columns. The painted offset clamps to the (large) content width.
+    let narrow = render_to_string(&app, 20, 12);
+    assert!(!narrow.is_empty());
+
+    // Pan deep, then render very wide (300 cols) where the whole line fits: the
+    // painted offset must clamp back to 0 (nothing to pan) without losing content.
+    for _ in 0..40 {
+        let _ = scroll_wide_block(&mut app, HorizontalDir::Right);
+    }
+    let wide = render_to_string(&app, 300, 12);
+    assert!(!wide.is_empty());
+    // The flush-left content (the wide line's first chars) is visible when the
+    // viewport is wider than the line — output is panned, never hidden.
+    assert!(
+        wide.contains("abcdefghij"),
+        "a viewport wider than the line shows its start: output is never hidden",
+    );
+}
+
+#[test]
+fn empty_transcript_soft_wrap_toggle_is_a_safe_noop_render() {
+    // Edge case: toggling wrap and panning on an empty transcript must not panic
+    // and must render cleanly through the real renderer.
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.transcript.is_empty());
+    // Paint once so the pan clamps against the real (narrow) startup-card width
+    // rather than the pre-frame default of 0.
+    let _ = render_to_string(&app, 80, 24);
+    toggle_soft_wrap(&mut app);
+    assert!(!app.wide_block.soft_wrap());
+    // Panning never panics. The empty view's only content is the startup card,
+    // which fits the 80-col viewport, so there is nothing to pan: the offset
+    // stays at 0.
+    let _ = scroll_wide_block(&mut app, HorizontalDir::Right);
+    assert_eq!(
+        app.wide_block.horizontal_offset(),
+        0,
+        "narrow chrome that fits the viewport leaves nothing to pan",
+    );
+    // A left-pan from the flush-left edge is a saturating no-op, never negative.
+    let _ = scroll_wide_block(&mut app, HorizontalDir::Left);
+    assert_eq!(app.wide_block.horizontal_offset(), 0);
+    let painted = render_to_string(&app, 80, 24);
+    assert!(!painted.is_empty());
+}
