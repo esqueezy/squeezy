@@ -16709,6 +16709,36 @@ fn resize_keeps_the_same_entry_anchored_across_a_wrap_reflow() {
 }
 
 #[test]
+fn tail_stays_visible_past_the_u16_row_ceiling() {
+    // The main view used to funnel the vertical scroll offset through
+    // `Paragraph::scroll`'s `u16`, capping the painted window at 65 535 rows: a
+    // transcript taller than that never showed its live tail. The renderer now
+    // slices the row Vec with `usize` math, so the tail (the newest content)
+    // stays visible no matter how tall the transcript grows (deep-review #57).
+    let mut app = test_app(SessionMode::Build);
+    // One assistant message whose body is > u16::MAX + viewport rows, with a
+    // unique sentinel on the FINAL line (the live tail).
+    const SENTINEL: &str = "TAIL_NEEDLE_57";
+    let row_target = u16::MAX as usize + 200;
+    let mut body = String::with_capacity(row_target * 2);
+    for _ in 0..(row_target - 1) {
+        body.push_str("x\n");
+    }
+    body.push_str(SENTINEL);
+    app.push_transcript_item(TranscriptItem::assistant(body));
+    // Pin to the live tail.
+    app.transcript_scroll = scroll::ScrollState::pinned();
+    assert!(app.transcript_scroll.is_following());
+
+    // Render one frame; the bottom rows must contain the tail sentinel.
+    let painted = render_transcript_to_string(&app, 40, 20);
+    assert!(
+        painted.contains(SENTINEL),
+        "the live tail past the u16 ceiling is painted, not clipped at row 65535",
+    );
+}
+
+#[test]
 fn no_wrap_geometry_counts_unwrapped_rows_matching_the_renderer() {
     // §11G.4: with soft-wrap OFF the renderer builds UNWRAPPED rows (one visual
     // row per logical line) and pans horizontally. The off-frame scroll geometry

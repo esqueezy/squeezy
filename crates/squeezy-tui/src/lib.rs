@@ -32656,11 +32656,14 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // smooth-scroll ease overrides only what is *painted* this frame. The ease
     // is computed off the same geometry the state uses, so the anchor stays put.
     let from_bottom = displayed_main_from_bottom(app, state, total_rows, viewport_h);
-    let scroll = scroll::to_u16_clamped(scroll_offset_for_from_bottom(
-        from_bottom,
-        total_rows,
-        viewport_h,
-    ));
+    // The first wrapped row drawn at the top of the viewport. Kept as `usize`:
+    // the painted window is sliced from the row Vec with this offset (below)
+    // instead of funneled through `Paragraph::scroll`'s `u16` vertical offset, so
+    // the live tail stays visible past the historical ~65k-row ceiling
+    // (deep-review #57). Selection/search highlight and card-target registration
+    // still key off `(total_rows, from_bottom, viewport_h)` against the FULL row
+    // set, so only the paint slice uses `top`.
+    let top = scroll_offset_for_from_bottom(from_bottom, total_rows, viewport_h);
 
     // Stamp the text rectangle + wrapped-row geometry so a mouse press/drag maps
     // a cell onto a surface-local `selection::Pos`. The painted lines ARE the
@@ -32722,16 +32725,22 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         Some(state) => rows_with_search_highlight(lines, state, selection::SelectionSurface::Main),
         None => lines,
     };
+    // Window the row Vec with `usize` math before constructing the Paragraph, so
+    // the vertical scroll never round-trips through `Paragraph::scroll`'s `u16`
+    // offset (the historical 65 535-row ceiling). After the slice the painted
+    // lines start at the viewport top, so the vertical scroll offset is always 0
+    // and only the horizontal pan (`h_offset`, no-wrap mode) remains. The
+    // highlight passes above ran against the full set so their absolute row
+    // indices are still valid; slicing here just drops the off-screen rows.
+    let lines: Vec<_> = lines.into_iter().skip(top).take(viewport_h).collect();
     // Soft-wrap on: wrap each line to the column (the established behaviour).
-    // Soft-wrap off: no `.wrap()`, and the second `scroll` component pans the
-    // viewport horizontally over the unwrapped lines (§11G.4) so wide blocks
-    // scroll instead of wrapping. `h_offset` is `0` while wrapping.
+    // Soft-wrap off: no `.wrap()`, and the `scroll` component pans the viewport
+    // horizontally over the unwrapped lines (§11G.4) so wide blocks scroll
+    // instead of wrapping. `h_offset` is `0` while wrapping.
     let paragraph = if soft_wrap {
-        Paragraph::new(lines)
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false })
+        Paragraph::new(lines).wrap(Wrap { trim: false })
     } else {
-        Paragraph::new(lines).scroll((scroll, h_offset))
+        Paragraph::new(lines).scroll((0, h_offset))
     };
     frame.render_widget(paragraph, text_area);
 
