@@ -16493,7 +16493,7 @@ fn main_scrollbar_click_maps_top_of_track_to_top_of_content() {
 }
 
 #[test]
-fn wheel_accumulator_sums_small_bursts_into_line_scroll() {
+fn wheel_burst_sums_into_fixed_line_scroll() {
     let mut app = test_app(SessionMode::Build);
     for index in 0..200 {
         app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
@@ -16516,9 +16516,12 @@ fn wheel_accumulator_sums_small_bursts_into_line_scroll() {
         after > before,
         "wheel-up must scroll the transcript up (from_bottom grew {before} -> {after})",
     );
+    // deep-review #126: each notch is a fixed 3-line step (no sub-line
+    // accumulator), so three notches sum to exactly 9 lines.
     assert_eq!(
-        app.wheel_accum, 0,
-        "whole-line deltas drain the accumulator"
+        after - before,
+        9,
+        "three fixed 3-line notches must scroll exactly 9 lines",
     );
 }
 
@@ -17010,10 +17013,10 @@ async fn home_and_end_are_inert_when_the_composer_has_text() {
 
 #[test]
 fn wheel_deltas_accumulate_without_dropping_fast_small_events() {
-    // Each wheel notch is a small fixed step; a fast burst of N notches must sum
-    // to N steps of movement, never collapsing multiple events into one. This is
-    // the "don't drop small fast events" contract: the accumulator drains whole
-    // lines and keeps any remainder.
+    // Each wheel notch is a fixed 3-line step; a fast burst of N notches sums to
+    // N steps of movement, never collapsing multiple events into one. This is
+    // the "don't drop small fast events" contract: deep-review #126 removed the
+    // dead sub-line accumulator, so each event simply scrolls a whole 3 lines.
     let mut app = app_with_user_turns(400);
     let mut last = app.transcript_scroll.from_bottom();
     let mut steps = Vec::new();
@@ -17036,17 +17039,13 @@ fn wheel_deltas_accumulate_without_dropping_fast_small_events() {
         steps.iter().all(|&d| d > 0),
         "every fast wheel notch must move the view, got per-notch deltas {steps:?}",
     );
-    // The deltas are uniform (the fixed notch step), and the total is their sum —
-    // i.e. nothing was lost to rounding across the burst.
+    // The deltas are uniform (the fixed 3-line notch step), and the total is
+    // their sum — i.e. nothing was lost to rounding across the burst.
     let total = app.transcript_scroll.from_bottom();
     assert_eq!(total, steps.iter().sum::<usize>());
     assert!(
-        steps.windows(2).all(|w| w[0] == w[1]),
-        "a steady burst yields a steady per-notch step, got {steps:?}",
-    );
-    assert_eq!(
-        app.wheel_accum, 0,
-        "whole-line deltas drain the accumulator"
+        steps.iter().all(|&d| d == 3),
+        "each notch is a fixed 3-line step, got {steps:?}",
     );
 
     // Wheel back down by the same number of notches returns to the tail and

@@ -3917,26 +3917,22 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // their own offset), not always main's, so wheeling a selected subagent
     // transcript still reports the change and triggers a redraw.
     //
-    // Trackpads emit many small high-frequency notches; accumulate them and
-    // apply whole lines while keeping the remainder, so a fast burst of small
-    // events sums instead of each rounding to the same fixed step. The notch
-    // step (3 lines) matches the previous fixed behavior for a single notch.
-    const WHEEL_STEP_LINES: i32 = 3;
+    // Each wheel notch moves a fixed 3 lines; a burst of N notches sums to N
+    // steps because each event scrolls independently.
+    const WHEEL_STEP_LINES: usize = 3;
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             // A wheel scroll is the pointer sweeping content, not dwelling on a
             // target: §12.1.3 says it must suppress (and hide) any hover reveal.
             hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
-            app.wheel_accum = app.wheel_accum.saturating_add(WHEEL_STEP_LINES);
-            apply_wheel_accumulated_scroll(app);
+            scroll_transcript_up(app, WHEEL_STEP_LINES);
             active_transcript_scroll(app) != before
         }
         MouseEventKind::ScrollDown => {
             hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
-            app.wheel_accum = app.wheel_accum.saturating_sub(WHEEL_STEP_LINES);
-            apply_wheel_accumulated_scroll(app);
+            scroll_transcript_down(app, WHEEL_STEP_LINES);
             active_transcript_scroll(app) != before
         }
         _ => false,
@@ -3959,22 +3955,6 @@ fn hover_suppress_scroll(app: &mut TuiApp) {
     }
     app.hover_intent.set_suppression(None);
     app.gestures.reset();
-}
-
-/// Drain the whole-line portion of the wheel accumulator into the transcript
-/// scroll, keeping the sub-line remainder for the next event. Positive sums
-/// scroll up (away from the tail); negative scroll down.
-fn apply_wheel_accumulated_scroll(app: &mut TuiApp) {
-    let lines = app.wheel_accum;
-    if lines == 0 {
-        return;
-    }
-    app.wheel_accum = 0;
-    if lines > 0 {
-        scroll_transcript_up(app, lines as usize);
-    } else {
-        scroll_transcript_down(app, lines.unsigned_abs() as usize);
-    }
 }
 
 /// Map an absolute `(column, row)` mouse position onto a `from_bottom` for the
@@ -44085,11 +44065,6 @@ pub(crate) struct TuiApp {
     /// press within the multi-click window at the same cell escalates word →
     /// row select.
     pub(crate) last_click: Option<(std::time::Instant, u16, u16, u8)>,
-    /// Sub-notch wheel/trackpad accumulator. Trackpads emit many small
-    /// high-frequency notches; summing them here (and applying whole lines while
-    /// keeping the remainder) means fast bursts of small events add up instead
-    /// of each rounding to the same fixed step.
-    pub(crate) wheel_accum: i32,
     /// In-flight main-view smooth-scroll ease for a large jump. `None` when no
     /// animation is running (the steady state). Display-only: the logical
     /// scroll state already holds the destination.
@@ -45529,7 +45504,6 @@ impl TuiApp {
             }),
             hyperlink_override: None,
             last_click: None,
-            wheel_accum: 0,
             main_scroll_anim: None,
             // Smooth/eased scroll for large jumps. Honour a reduced-motion /
             // instant-scroll switch: `SQUEEZY_REDUCE_MOTION` (truthy) and the
