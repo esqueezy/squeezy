@@ -22872,6 +22872,72 @@ fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
     );
 }
 
+#[test]
+fn scrollbar_drag_feature_is_reachable_because_motion_reporting_is_enabled() {
+    // deep-review #8: the transcript-overlay scrollbar-drag feature is only
+    // reachable if the terminal forwards `MouseEventKind::Drag(Left)` events,
+    // which requires button-event (motion) reporting — DEC private mode 1002. Pin
+    // the end-to-end contract: the production enter-setup must enable 1002, and a
+    // `Drag(Left)` in `ScrollbarDrag` mode must actually move the scroll. Before
+    // the fix the enter-setup only emitted 1000h/1006h, so a real terminal never
+    // produced the `Drag` events this handler consumes — the feature was dead.
+    let mut enter = Vec::new();
+    emit_terminal_enter_setup(&mut enter, /* mouse_capture = */ true)
+        .expect("emit fullscreen enter setup");
+    let enter = String::from_utf8(enter).expect("ansi");
+    assert!(
+        enter.contains("\x1b[?1000h"),
+        "enter-setup must enable button-press reporting"
+    );
+    assert!(
+        enter.contains("\x1b[?1002h"),
+        "enter-setup must enable button-event (drag) tracking so a real terminal \
+         forwards the Drag(Left) events the scrollbar-drag handler consumes, got {enter:?}"
+    );
+
+    // The handler the enabled drag events drive: a drag in ScrollbarDrag mode
+    // maps the cursor onto the cached scrollbar geometry and moves the scroll.
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
+    });
+    app.transcript_overlay_scrollbar_cache
+        .set(Some(TranscriptOverlayScrollbarCache {
+            scrollbar_area: Rect {
+                x: 79,
+                y: 1,
+                width: 1,
+                height: 10,
+            },
+            geometry: TranscriptScrollbarGeometry {
+                thumb_top: 0,
+                thumb_height: 2,
+                max_scroll: 100,
+            },
+        }));
+    let moved = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        moved,
+        "a Drag(Left) in ScrollbarDrag mode must drive the now-reachable drag handler"
+    );
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        "the scrollbar drag must move the overlay scroll"
+    );
+}
+
 #[tokio::test]
 async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
     let mut agent = test_agent(SessionMode::Build);
