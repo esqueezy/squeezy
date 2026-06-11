@@ -40752,3 +40752,267 @@ async fn keybinding_editor_survives_tiny_and_resized_frames() {
         }
     }
 }
+
+// ===========================================================================
+// Adaptive Density (§12.4.1)
+// ===========================================================================
+
+/// `Ctrl+Alt+X` — the default Adaptive Density cycle verb.
+fn cycle_density_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Point the app's persisted-settings path at a scratch file and return the
+/// guard + path, mirroring `glyph_mode_scratch`.
+fn density_scratch(app: &mut TuiApp, name: &str) -> (ScopedSettingsPath, PathBuf) {
+    let dir = temp_workspace(name);
+    let settings_path = dir.join("settings.toml");
+    let guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    (guard, settings_path)
+}
+
+/// Seed a few transcript turns so the transcript-to-prompt gap is actually
+/// wanted (an empty session wants no gap regardless of density).
+fn app_with_transcript_for_density() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..4 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {i}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("reply {i}")));
+    }
+    app
+}
+
+#[test]
+fn density_default_is_auto_and_pays_no_idle_cost() {
+    // A fresh app starts in Auto; an idle session resolves to whatever the
+    // painted size implies and paints no density badge (Auto is invisible).
+    let app = test_app(SessionMode::Build);
+    assert_eq!(app.density_override, density::DensityMode::Auto);
+
+    // The painted status line carries no density badge on an Auto session, so
+    // an existing session is byte-identical to before this landed.
+    let out = render_to_string(&app, 100, 30);
+    assert!(
+        !out.contains("[density:"),
+        "Auto paints no density badge:\n{out}"
+    );
+}
+
+#[test]
+fn density_layout_responds_to_the_pinned_mode_at_a_fixed_size() {
+    // At one fixed terminal size, the resolved layout differs by pinned density:
+    // the transcript-to-prompt gap scales 0 / 1 / 2 and the transcript reclaims
+    // the rows the gap would have spent. Scroll/selection/composer are untouched.
+    let mut app = app_with_transcript_for_density();
+    let area = Rect::new(0, 0, 100, 30);
+
+    app.density_override = density::DensityMode::Compact;
+    let compact = main_transcript_layout(&app, area, true);
+
+    app.density_override = density::DensityMode::Default;
+    let default = main_transcript_layout(&app, area, true);
+
+    app.density_override = density::DensityMode::Expanded;
+    let expanded = main_transcript_layout(&app, area, true);
+
+    assert_eq!(
+        compact.transcript_prompt_gap_height, 0,
+        "compact spends no gap",
+    );
+    assert_eq!(
+        default.transcript_prompt_gap_height, 1,
+        "default keeps the single-row gap",
+    );
+    assert_eq!(
+        expanded.transcript_prompt_gap_height, 2,
+        "expanded doubles the gap",
+    );
+    // The gap rows come out of the transcript viewport, so a roomier gap leaves
+    // fewer transcript rows at the same overall size.
+    assert!(
+        compact.transcript_height >= default.transcript_height,
+        "compact gives the transcript at least as many rows ({} vs {})",
+        compact.transcript_height,
+        default.transcript_height,
+    );
+    assert!(
+        default.transcript_height >= expanded.transcript_height,
+        "expanded yields transcript rows to its larger gap ({} vs {})",
+        default.transcript_height,
+        expanded.transcript_height,
+    );
+}
+
+#[test]
+fn density_startup_card_threshold_scales_with_mode() {
+    // At a height between the compact and expanded thresholds (16..20), the
+    // startup card is hidden under Compact density but shown under Expanded —
+    // the same `area`, a different density decision.
+    let mut app = test_app(SessionMode::Build);
+    let area = Rect::new(0, 0, 100, 17);
+
+    app.density_override = density::DensityMode::Compact;
+    assert!(
+        !include_startup_card_for(&app, area),
+        "compact hides the startup card at height 17",
+    );
+
+    app.density_override = density::DensityMode::Expanded;
+    assert!(
+        include_startup_card_for(&app, area),
+        "expanded shows the startup card at height 17",
+    );
+
+    // Default keeps the renderer's historical `>= 16` gate.
+    app.density_override = density::DensityMode::Default;
+    assert!(include_startup_card_for(&app, Rect::new(0, 0, 100, 16)));
+    assert!(!include_startup_card_for(&app, Rect::new(0, 0, 100, 15)));
+}
+
+#[tokio::test]
+async fn density_cycle_key_rotates_persists_and_survives_restart() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = density_scratch(&mut app, "density_cycle");
+    app.set_test_frame_size(100, 30);
+
+    // Auto -> Compact (the first cycle step). The status reports the new density
+    // and it is persisted to `[tui].density`.
+    handle_key(&mut app, &mut agent, cycle_density_key())
+        .await
+        .unwrap();
+    assert_eq!(
+        app.density_override,
+        density::DensityMode::Compact,
+        "Ctrl+Alt+V cycles Auto -> Compact",
+    );
+    assert!(
+        app.status.contains("density: compact"),
+        "status reports the new density: {}",
+        app.status
+    );
+    let written = std::fs::read_to_string(&settings_path).expect("settings written");
+    assert!(
+        written.contains("density = \"compact\""),
+        "the mode persists under [tui]: {written}"
+    );
+
+    // Walk the rest of the cycle: Compact -> Default -> Expanded -> Auto.
+    for expected in [
+        density::DensityMode::Default,
+        density::DensityMode::Expanded,
+        density::DensityMode::Auto,
+    ] {
+        handle_key(&mut app, &mut agent, cycle_density_key())
+            .await
+            .unwrap();
+        assert_eq!(app.density_override, expected);
+    }
+
+    // Persistence round-trip: a fresh session restores the last-saved mode at
+    // startup (the cycle wrapped back to Auto, so the file holds "auto").
+    handle_key(&mut app, &mut agent, cycle_density_key())
+        .await
+        .unwrap();
+    assert_eq!(app.density_override, density::DensityMode::Compact);
+    let mut fresh = test_app(SessionMode::Build);
+    fresh.set_settings_path_override(Some(settings_path.clone()));
+    assert_eq!(
+        fresh.density_override,
+        density::DensityMode::Auto,
+        "a fresh app starts on Auto before restore runs",
+    );
+    restore_density(&mut fresh);
+    assert_eq!(
+        fresh.density_override,
+        density::DensityMode::Compact,
+        "the persisted mode is restored at startup",
+    );
+}
+
+#[test]
+fn density_restore_ignores_a_malformed_config() {
+    // An unrecognised slug collapses to None so the session keeps its value.
+    // Point at an isolated scratch settings file holding a malformed density so
+    // the read is deterministic regardless of any concurrent settings-path test.
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = density_scratch(&mut app, "density_malformed");
+    std::fs::write(&settings_path, "[tui]\ndensity = \"roomy\"\n")
+        .expect("write malformed settings");
+    assert_eq!(
+        read_persisted_density(&app),
+        None,
+        "an unrecognised slug reads as no override",
+    );
+
+    // restore is a no-op for the unrecognised slug, leaving the in-session value.
+    app.density_override = density::DensityMode::Expanded;
+    restore_density(&mut app);
+    assert_eq!(app.density_override, density::DensityMode::Expanded);
+
+    // A missing field also reads as None (the table exists but has no density).
+    std::fs::write(&settings_path, "[tui]\nglyph_mode = \"ascii\"\n")
+        .expect("write settings without density");
+    assert_eq!(read_persisted_density(&app), None);
+}
+
+#[tokio::test]
+async fn density_badge_paints_and_click_cycles() {
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = density_scratch(&mut app, "density_badge");
+    // Pin a non-Auto density so the badge paints.
+    app.density_override = density::DensityMode::Compact;
+    app.set_test_frame_size(100, 30);
+
+    // Render so the badge + its click target register on the status row.
+    let out = render_to_string(&app, 100, 30);
+    assert!(
+        out.contains("[density: compact]"),
+        "the density badge paints on the status line:\n{out}"
+    );
+
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::DensityIndicator,
+        ))
+        .expect("the badge registers a click target while painted");
+
+    // A click on the badge cycles the override forward (Compact -> Default),
+    // the mouse twin of the keyboard verb.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.density_override,
+        density::DensityMode::Default,
+        "clicking the badge cycles the density forward",
+    );
+}
+
+#[test]
+fn density_survives_tiny_and_resized_frames() {
+    // Density resolves + paints without panic across a range of sizes for every
+    // pinned mode, including a frame too small to host the status badge.
+    for mode in [
+        density::DensityMode::Auto,
+        density::DensityMode::Compact,
+        density::DensityMode::Default,
+        density::DensityMode::Expanded,
+    ] {
+        let mut app = app_with_transcript_for_density();
+        app.density_override = mode;
+        for (w, h) in [(3u16, 2u16), (20, 6), (80, 24), (120, 40), (200, 60)] {
+            let _ = render_to_string(&app, w, h);
+        }
+    }
+}

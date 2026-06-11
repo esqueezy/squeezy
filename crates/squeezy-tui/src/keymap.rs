@@ -181,6 +181,16 @@ pub(crate) enum Action {
     /// Pan the no-wrap main view right one step (`Alt+l` default; §11G.4). The
     /// keyboard twin of Shift+wheel-down. A no-op while soft-wrap is on.
     ScrollBlockRight,
+    /// Cycle the Adaptive Density override (`Ctrl+Alt+X` default; §12.4.1).
+    /// Rotates the density knob `auto → compact → default → expanded → auto`:
+    /// `auto` (the default) derives a compact/default/expanded layout from the
+    /// painted terminal size; the three pinned modes force that layout regardless
+    /// of size (the explicit user override). Density only scales the
+    /// transcript-to-prompt gap, the startup-card threshold, and the status detail
+    /// level — it preserves scroll, selection, focus, the queue, and the composer.
+    /// The pick is persisted to `[tui].density` so it survives a restart. The
+    /// mouse twin is a click on the status-line density indicator.
+    CycleDensity,
     /// Cycle the OSC 8 hyperlink mode for rendered URLs/file paths (`Alt+8`
     /// default; §11.5 / 11G.5). Rotates auto (the startup terminal probe) → on
     /// (force click-to-open escapes) → off (force plain text), so a user whose
@@ -611,6 +621,7 @@ impl Action {
             Self::ToggleSoftWrap => "toggle_soft_wrap",
             Self::ScrollBlockLeft => "scroll_block_left",
             Self::ScrollBlockRight => "scroll_block_right",
+            Self::CycleDensity => "cycle_density",
             Self::ToggleHyperlinks => "toggle_hyperlinks",
             Self::ToggleClipboardHistory => "toggle_clipboard_history",
             Self::BuildSessionBundle => "build_session_bundle",
@@ -703,6 +714,7 @@ impl Action {
         Action::ToggleSoftWrap,
         Action::ScrollBlockLeft,
         Action::ScrollBlockRight,
+        Action::CycleDensity,
         Action::ToggleHyperlinks,
         Action::ToggleClipboardHistory,
         Action::BuildSessionBundle,
@@ -835,6 +847,12 @@ impl Action {
             | Self::ToggleSoftWrap
             | Self::ScrollBlockLeft
             | Self::ScrollBlockRight
+            // Adaptive Density cycle (§12.4.1) is `Ctrl+Alt+X` — a Ctrl+Alt/Meta
+            // chord, the same classically-unreliable Meta encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family. The always-available equivalent is a click on the
+            // status-line density indicator.
+            | Self::CycleDensity
             // Hyperlink-mode toggle is `Alt+8` — the same Meta/Alt encoding case.
             | Self::ToggleHyperlinks
             // Clipboard-history picker toggle is `Alt+p` — the same Meta/Alt
@@ -1166,6 +1184,15 @@ impl Action {
             Self::ToggleSoftWrap => KeyBinding::new(KeyCode::Char('w'), KeyModifiers::ALT),
             Self::ScrollBlockLeft => KeyBinding::new(KeyCode::Char('h'), KeyModifiers::ALT),
             Self::ScrollBlockRight => KeyBinding::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            // Adaptive Density cycle (§12.4.1). `Ctrl+Alt+X` — every bare
+            // `Alt+letter` in the nav/view family is taken (`Alt+v` is Copy
+            // Viewport) and `Ctrl+Alt+V` is the §12.4.2 Smart Split overlay, so
+            // the cycle takes the next free `Ctrl+Alt` letter (`C`, `F`, and `X`
+            // are the only ones left) while staying clear of every composer chord.
+            Self::CycleDensity => KeyBinding::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
             // Hyperlink-mode cycle (§11.5 / 11G.5). `Alt+8` — the `8` recalls
             // "OSC 8". Bare `Alt` letters in the nav/copy family are taken;
             // `Alt`+digit is free and mnemonic.

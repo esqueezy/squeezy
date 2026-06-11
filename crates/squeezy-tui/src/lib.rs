@@ -96,6 +96,7 @@ mod commands_style;
 mod config_screen;
 mod copy;
 mod copy_code;
+mod density;
 mod diff_detail_pane;
 mod dogfood;
 mod duplicate_fold;
@@ -943,6 +944,12 @@ async fn run_inner_with_terminal(
     // session that never picked one keeps the built-in Unicode default; a malformed
     // value is ignored.
     restore_glyph_mode(&mut app);
+    // Adaptive Density (§12.4.1): restore the density override the user pinned in
+    // a prior session from the user-scope config before the first paint, so a
+    // session opens at the chosen density (or `Auto`, the default) without
+    // re-cycling. A session that never set one keeps `Auto`; a malformed value is
+    // ignored.
+    restore_density(&mut app);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -3283,6 +3290,21 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((
             interaction::TargetKey::Chrome(interaction::ChromeKey::AttentionIndicator),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // Status-line Adaptive Density indicator (§12.4.1): a left-click cycles the
+    // density override — the mouse twin of the `CycleDensity` (`Ctrl+Alt+X`)
+    // keyboard verb. Like the attention indicator above, the badge is painted on
+    // the footer status row in ABSOLUTE screen coordinates, so it is hit-tested in
+    // absolute coordinates here.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::DensityIndicator),
             action,
         )) = app.click_target_at(mouse.column, mouse.row)
     {
@@ -5940,6 +5962,67 @@ fn smart_split_drag_ratio(app: &mut TuiApp, widen: bool) {
     app.smart_split_rect_cache.set(None);
     app.status = smart_split_status(app);
     app.needs_redraw = true;
+}
+
+/// Cycle the Adaptive Density override (§12.4.1) one step
+/// (`auto → compact → default → expanded → auto`), apply it in-session, persist
+/// the new mode to the user-scope config, and surface the resolved density in
+/// the status line. The mouse twin (a click on the status-line density
+/// indicator) routes here too. Density only scales spacing/chrome, so the
+/// session's scroll, selection, focus, queue, and composer state are untouched —
+/// the next frame just relays out the same model at the new density.
+fn cycle_density(app: &mut TuiApp) {
+    let next = app.density_override.next();
+    app.density_override = next;
+    // Persist first; a write failure overwrites the status with its own note, so
+    // resolve + set the success status *after* the persist attempt only when it
+    // did not already report an error.
+    persist_density(app, next);
+    if !app.status.contains("save failed") {
+        // Resolve against the live frame size so the toast names the tier the
+        // user will actually see (e.g. "auto (compact)" on a small terminal).
+        let resolved = app.effective_density();
+        app.status = format!("\u{2713} density: {}", resolved.describe());
+    }
+    app.needs_redraw = true;
+}
+
+/// Persist the Adaptive Density mode (§12.4.1) to the user-scope config at
+/// `[tui].density`. Best-effort: a write failure leaves the in-session value in
+/// place and notes it in the status line, mirroring the glyph-mode commit path.
+fn persist_density(app: &mut TuiApp, mode: density::DensityMode) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edit = SettingsEdit {
+        path: &["tui", "density"],
+        op: EditOp::SetString(mode.as_str().to_string()),
+    };
+    if let Err(err) = apply_edits(&scope_target, &[edit]) {
+        app.status = format!("density set, but save failed: {err}");
+    }
+}
+
+/// Read the persisted Adaptive Density (§12.4.1) from the user-scope settings
+/// TOML, if any. The pick lives at `[tui].density` as one of the bounded slugs
+/// (`auto` / `compact` / `default` / `expanded`); an absent file / table /
+/// field, or an unrecognised slug, collapses to `None` so the session keeps the
+/// built-in `Auto` default. Best-effort, pure read — safe to call at startup.
+fn read_persisted_density(app: &TuiApp) -> Option<density::DensityMode> {
+    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let slug = doc.get("tui")?.as_table()?.get("density")?.as_str()?;
+    density::DensityMode::from_slug(slug)
+}
+
+/// Restore the persisted Adaptive Density (§12.4.1) onto a freshly-built app at
+/// startup, so a mode the user picked in a prior session survives a restart. A
+/// no-op when nothing is persisted (the app keeps the built-in `Auto` default).
+fn restore_density(app: &mut TuiApp) {
+    if let Some(mode) = read_persisted_density(app) {
+        app.density_override = mode;
+    }
 }
 
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
@@ -8707,6 +8790,17 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             scroll_wide_block(app, HorizontalDir::Right)
+        }
+        keymap::Action::CycleDensity => {
+            // Main-surface layout setting; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay (which has its own native layout) is open. Density
+            // scales only spacing/chrome on the main surface.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            cycle_density(app);
+            true
         }
         keymap::Action::ToggleHyperlinks => {
             // A render/output setting, not surface-specific — it is fine to flip
@@ -14208,7 +14302,10 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
         width,
         height,
     };
-    let include_startup_card = area.height >= 16;
+    // Adaptive Density (§12.4.1): match the render path's density-scaled
+    // startup-card gate so this off-frame scroll geometry counts the same rows
+    // the renderer paints.
+    let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
     let text_width = area.width.saturating_sub(1).max(1);
     let (rows, entry_offsets) =
@@ -14259,7 +14356,10 @@ fn jump_nav_geometry(app: &TuiApp) -> Option<(Vec<usize>, usize, usize)> {
         width,
         height,
     };
-    let include_startup_card = area.height >= 16;
+    // Adaptive Density (§12.4.1): match the render path's density-scaled
+    // startup-card gate so this off-frame scroll geometry counts the same rows
+    // the renderer paints.
+    let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
     let text_width = area.width.saturating_sub(1).max(1);
     let (rows, entry_offsets) =
@@ -16399,6 +16499,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::JumpToAttention => {
             jump_to_attention(app);
         }
+        // A click on the status-line Adaptive Density indicator (§12.4.1): cycle
+        // the density override forward — the mouse twin of the `CycleDensity`
+        // (`Ctrl+Alt+X`) keyboard verb, driving the same `cycle_density` handler
+        // so mouse/keyboard parity holds by construction.
+        interaction::Action::CycleDensity => {
+            cycle_density(app);
+        }
         // A click on a Local Transcript Index category row (§12.5.1): move the
         // cursor onto it and jump the main view to the next entry in it — the
         // mouse twin of ↑↓ + Enter, in one go. Selecting a *different* category
@@ -17257,8 +17364,10 @@ fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
         height,
     };
     // `render()` renders the main transcript only when no overlay/setup/config
-    // screen is up and includes the startup card on a tall enough terminal.
-    let include_startup_card = area.height >= 16;
+    // screen is up and includes the startup card on a tall enough terminal. The
+    // Adaptive Density (§12.4.1) height gate is shared with the render path so
+    // this off-frame geometry counts the same rows.
+    let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card);
     // Wrap at the text width the renderer actually uses: `render_transcript`
     // reserves a 1-cell scrollbar gutter and wraps at `width - 1`. Measuring at
@@ -22552,6 +22661,26 @@ struct MainTranscriptLayout {
     input_height: u16,
 }
 
+/// Resolve the Adaptive Density (§12.4.1) for a concrete render `area`. The
+/// render path knows the exact rect it is painting, so it resolves against that
+/// rather than the stamped frame size (which it is about to overwrite). Routes
+/// through the same [`density::DensityMode::resolve`] as the off-frame
+/// [`TuiApp::effective_density`], so the layout the renderer paints and the tier
+/// a dispatch/status read reports never disagree.
+fn resolved_density_for(app: &TuiApp, area: Rect) -> density::ResolvedDensity {
+    app.density_override.resolve(area.width, area.height)
+}
+
+/// Whether the welcome / startup card is included for a render `area`, under the
+/// Adaptive Density (§12.4.1) height gate. The single policy the render path and
+/// the off-frame scroll-geometry paths share, so a density change moves the
+/// card threshold for *both* together (the painted card decision and the
+/// scroll-math card decision stay in lock-step). `Default` density keeps the
+/// renderer's historical `>= 16` threshold.
+fn include_startup_card_for(app: &TuiApp, area: Rect) -> bool {
+    area.height >= resolved_density_for(app, area).startup_card_min_height()
+}
+
 /// Compute the main-view layout heights for `area`. Extracted from `render()`
 /// so the scroll commands can recompute the transcript viewport height
 /// off-frame without re-running a full frame.
@@ -22598,7 +22727,14 @@ fn main_transcript_layout(
         .saturating_add(2);
     let optional_height = area.height.saturating_sub(required_height);
     let attachment_height = attachment_panel_height(app, optional_height);
-    let requested_transcript_gap_height = transcript_prompt_gap_height(app);
+    // Adaptive Density (§12.4.1): the base call decides *whether* a
+    // transcript-to-prompt breather is wanted at all (0 on an empty session,
+    // 1 otherwise); the resolved density scales it — compact spends none,
+    // default keeps the single row, expanded doubles it. Multiplying keeps an
+    // empty session at zero regardless of density.
+    let density = resolved_density_for(app, area);
+    let requested_transcript_gap_height =
+        transcript_prompt_gap_height(app).saturating_mul(density.transcript_prompt_gap());
     let reserved_height = required_height.saturating_add(attachment_height);
     let transcript_visual_height =
         transcript_visual_line_count(app, area.width, include_startup_card);
@@ -22940,7 +23076,12 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         config_screen::render(frame, area, state);
         return;
     }
-    let include_startup_card = area.height >= 16;
+    // Adaptive Density (§12.4.1): the welcome / startup card is informational
+    // chrome, so its minimum-height gate scales with density — a compact (short)
+    // terminal drops it sooner to spend rows on content, an expanded one keeps it
+    // even on a slightly shorter window. `Default` keeps the renderer's prior
+    // hard-coded `>= 16` threshold, so the default-density build is unchanged.
+    let include_startup_card = include_startup_card_for(app, area);
     let layout = main_transcript_layout(app, area, include_startup_card);
     let MainTranscriptLayout {
         task_height,
@@ -39506,7 +39647,54 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         // detail line is not occupying the overview row), so a calm session
         // registers nothing.
         register_attention_indicator_target(app, status_area);
+        // Adaptive Density (§12.4.1): register a click target over the density
+        // badge on the bottom (hints) row so a click cycles the override — the
+        // mouse twin of the `CycleDensity` (`Ctrl+Alt+X`) keyboard verb. Only
+        // registered when the badge is actually painted (a non-`Auto` override and
+        // no attention indicator owning the slot), so a default-density session
+        // registers nothing.
+        register_density_indicator_target(app, status_area);
     }
+}
+
+/// Register the Adaptive Density indicator's click rect on the status block's
+/// bottom (hints) row (§12.4.1). [`format_status_lines`] prepends the density
+/// badge to that row's left edge exactly when [`density_indicator`] is `Some`
+/// *and* no attention indicator owns the slot, so the click span mirrors that:
+/// `[x, x + badge width)` on the last status row, clamped to the row width. A
+/// click there reaches the same `cycle_density` handler as the `CycleDensity`
+/// keyboard verb. A no-op when the badge is not painted (an `Auto` override, an
+/// attention indicator present, or a one-row footer).
+fn register_density_indicator_target(app: &TuiApp, status_area: Rect) {
+    // Suppressed whenever the attention indicator owns the left edge — it is
+    // registered there first and the badge is not painted, so the two click
+    // targets never overlap.
+    if !app.attention_route.indicator().is_empty() {
+        return;
+    }
+    let Some(badge) = density_indicator(app) else {
+        return;
+    };
+    if status_area.width == 0 || status_area.height < 2 {
+        return;
+    }
+    let row_right = (status_area.x + status_area.width) as usize;
+    let abs_start = status_area.x as usize;
+    let abs_end = (abs_start + badge.chars().count()).min(row_right);
+    if abs_end <= abs_start {
+        return;
+    }
+    let rect = Rect {
+        x: status_area.x,
+        y: status_area.y + status_area.height - 1,
+        width: (abs_end - abs_start) as u16,
+        height: 1,
+    };
+    app.register_click(
+        rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::DensityIndicator),
+        interaction::Action::CycleDensity,
+    );
 }
 
 /// Register the Attention Routing indicator's click rect on the status block's
@@ -39975,9 +40163,19 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         format_status_hints(app),
         Style::default().fg(crate::render::theme::quiet()),
     );
-    let detail = configured_status_line_items(app).and_then(|items| {
-        status::render_status_detail_line(app, &items, app.status_line_use_colors)
-    });
+    // Adaptive Density (§12.4.1): compact density drops the richer configured
+    // status detail items in favour of the terse `dir … · git …` overview to
+    // spend the scarce width on essentials; default/expanded keep the detail
+    // line. `shows_status_detail` is the single ceiling — it never *forces* a
+    // detail line the session has nothing to put in (the `and_then` below still
+    // collapses an empty item list to the overview).
+    let detail = if app.effective_density().shows_status_detail() {
+        configured_status_line_items(app).and_then(|items| {
+            status::render_status_detail_line(app, &items, app.status_line_use_colors)
+        })
+    } else {
+        None
+    };
     // Active detail items (configured, or the built-in default list) take the
     // place of `dir … · git …` on row 1; otherwise both rows duplicate the
     // same data. Mode label stays right-aligned. An explicit empty list, or a
@@ -40023,8 +40221,40 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         ));
         spans.append(&mut bottom.spans);
         bottom = Line::from(spans);
+    } else if let Some(badge) = density_indicator(app) {
+        // Adaptive Density (§12.4.1): when the user pinned a non-`Auto` override,
+        // prepend a small density badge to the hints row at the left edge so the
+        // active density is visible at a glance and a click cycles it. Suppressed
+        // while an attention indicator owns the left edge (attention wins the
+        // slot; the `Ctrl+Alt+X` verb still cycles). `Auto` (the default) paints
+        // nothing, so a default-density session's status line is byte-identical.
+        let mut spans = Vec::with_capacity(bottom.spans.len() + 2);
+        spans.push(Span::styled(
+            badge,
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.append(&mut bottom.spans);
+        bottom = Line::from(spans);
     }
     vec![top, bottom]
+}
+
+/// The Adaptive Density (§12.4.1) status badge, or `None` when the override is
+/// `Auto` (the default — nothing is painted so the status line is unchanged). A
+/// short ASCII-only readout of the resolved density (e.g. `[density: compact]`)
+/// resolved against the painted frame size, so the badge names the tier actually
+/// in effect. Drives both the painted badge and its click-target width.
+fn density_indicator(app: &TuiApp) -> Option<String> {
+    if app.density_override == density::DensityMode::Auto {
+        return None;
+    }
+    Some(format!("[density: {}]", app.effective_density().describe()))
 }
 
 /// Right-align the mode label on a status row whose left side is the
@@ -41501,6 +41731,15 @@ pub(crate) struct TuiApp {
     /// paints so the wheel/click hit-test can route a pointer to the previewed pane
     /// without re-solving. Cleared on close.
     pub(crate) smart_split_rect_cache: std::cell::Cell<Option<(Rect, Rect)>>,
+    /// Adaptive Density (§12.4.1): the user's density knob. Defaults to
+    /// [`density::DensityMode::Auto`] (the renderer derives compact/default/
+    /// expanded from the painted terminal size); `Ctrl+Alt+X` cycles it through
+    /// the pinned overrides and back, and a value restored from `[tui].density`
+    /// at startup pins it across restarts. Resolved against the painted frame
+    /// size via [`TuiApp::effective_density`] only while a frame is laid out (and
+    /// when cycled), so an idle session pays nothing — one enum-tag read on
+    /// resolve, no background work.
+    pub(crate) density_override: density::DensityMode,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -42158,6 +42397,18 @@ impl TuiApp {
         self.last_frame_size.set(Some((width, height)));
     }
 
+    /// The Adaptive Density (§12.4.1) resolved against the size of the most
+    /// recently painted frame. Used by off-frame consumers (the dispatch handler
+    /// and the status readout) that need the same tier the renderer will paint
+    /// with, without re-running a frame. The render path resolves against the
+    /// live `area` instead (see [`resolved_density_for`]); both go through the
+    /// one [`density::DensityMode::resolve`], so they never disagree. Pure and
+    /// allocation-free — an idle session that never resolves pays nothing.
+    pub(crate) fn effective_density(&self) -> density::ResolvedDensity {
+        let (width, height) = self.off_frame_terminal_size();
+        self.density_override.resolve(width, height)
+    }
+
     /// The OSC 8 hyperlink capability actually in effect (§11G.5): the runtime
     /// `hyperlink_override` when the user has forced a state, otherwise the
     /// startup environment probe. The exit-mirror row emitter reads this to
@@ -42495,6 +42746,7 @@ impl TuiApp {
             glyph_mode: glyph_mode::GlyphMode::DEFAULT,
             smart_split: None,
             smart_split_rect_cache: std::cell::Cell::new(None),
+            density_override: density::DensityMode::default(),
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

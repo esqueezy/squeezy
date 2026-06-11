@@ -193,6 +193,11 @@ pub(crate) enum ChromeKey {
     /// subagent that most needs attention — the mouse twin of the `JumpToAttention`
     /// (`Ctrl+Alt+Z`) verb.
     AttentionIndicator,
+    /// The Adaptive Density indicator painted on the status line (§12.4.1). A
+    /// single affordance with no identity of its own; a click cycles the density
+    /// override `auto → compact → default → expanded → auto` — the mouse twin of
+    /// the `CycleDensity` (`Ctrl+Alt+X`) verb.
+    DensityIndicator,
     /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
     /// 0-based index in the annotation list so a click selects + jumps the main
     /// view to the entry that exact annotation anchors.
@@ -413,6 +418,11 @@ pub(crate) enum Action {
     /// status-line attention indicator; both land on the single highest-priority
     /// attention target.
     JumpToAttention,
+    /// Cycle the Adaptive Density override (§12.4.1). Mouse twin of the
+    /// `CycleDensity` (`Ctrl+Alt+X`) keyboard verb / a click on the status-line
+    /// density indicator; both step the override `auto → compact → default →
+    /// expanded → auto`, persist it, and request a redraw.
+    CycleDensity,
     /// Select the given category row in the Local Transcript Index overlay
     /// (§12.5.1) and jump the main view to the next entry in it. Mouse twin of
     /// moving the cursor with ↑↓ and pressing Enter; a click both selects and
@@ -729,6 +739,7 @@ impl Action {
         Action::ReviewBoardSelectJump(0),
         Action::JumpToAttention,
         Action::SmartSplitAdjustField(0),
+        Action::CycleDensity,
     ];
 }
 
