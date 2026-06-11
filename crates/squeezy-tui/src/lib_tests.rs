@@ -33999,6 +33999,49 @@ async fn temp_file_action_writes_a_file_and_inserts_a_reference_token() {
     }
 }
 
+/// deep-review #35/#58: two consecutive "Temp file" stagings with no
+/// intervening queue activity must write DISTINCT files. The old code reused
+/// `next_queue_id` (which only advances on enqueue/sync) as the leaf nonce, so
+/// the second staging reused the first's path and `fs::write` truncated paste
+/// A's body to paste B's. A dedicated per-staging counter keeps them distinct.
+#[test]
+fn consecutive_temp_file_stagings_write_distinct_files() {
+    let mut app = test_app(SessionMode::Build);
+
+    let body_a = "AAAA paste A body".to_string();
+    let body_b = "BBBB a different paste B body, longer".to_string();
+
+    stage_paste_to_temp_file(&mut app, paste_staging::StagedPaste::new(body_a.clone()));
+    let path_a = staged_paste_path(&app, 0);
+
+    stage_paste_to_temp_file(&mut app, paste_staging::StagedPaste::new(body_b.clone()));
+    let path_b = staged_paste_path(&app, 1);
+
+    assert_ne!(
+        path_a, path_b,
+        "two consecutive temp-file stagings must land on distinct paths"
+    );
+
+    let read_a = fs::read_to_string(&path_a).expect("paste A file exists");
+    let read_b = fs::read_to_string(&path_b).expect("paste B file exists");
+    assert_eq!(read_a, body_a, "paste A survives B's staging");
+    assert_eq!(read_b, body_b, "paste B has its own body");
+
+    let _ = fs::remove_file(&path_a);
+    let _ = fs::remove_file(&path_b);
+}
+
+/// Pull the on-disk path out of the Nth inserted "Staged paste → <path>"
+/// reference token's attachment replacement.
+fn staged_paste_path(app: &TuiApp, idx: usize) -> String {
+    match &app.prompt_attachments[idx].payload {
+        PromptAttachmentPayload::Text { replacement, .. } => replacement
+            .trim_start_matches("Staged paste written to ")
+            .to_string(),
+        other => panic!("expected a text token, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn staging_overlay_renders_estimates_and_a_sanitized_escape_dump() {
     let mut app = test_app(SessionMode::Build);

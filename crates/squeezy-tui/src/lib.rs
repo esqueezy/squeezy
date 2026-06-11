@@ -8538,8 +8538,13 @@ fn resolve_paste_staging(app: &mut TuiApp) -> bool {
 /// nothing enters the composer.
 fn stage_paste_to_temp_file(app: &mut TuiApp, paste: paste_staging::StagedPaste) {
     let text = paste.into_text();
-    let nonce = app.next_queue_id; // a monotonic per-app counter, fine for uniqueness
-    let file_name = format!("squeezy_paste_{}_{}.txt", std::process::id(), nonce);
+    // Dedicated monotonic counter bumped per staging so two consecutive
+    // "Temp file" actions land on distinct leaf names. The queue id counter is
+    // unsuitable here — it only advances on enqueue/sync, so reusing it let the
+    // second staging reuse the first's path and truncate it.
+    let seq = app.next_temp_file_nonce;
+    app.next_temp_file_nonce += 1;
+    let file_name = format!("squeezy_paste_{}_{}.txt", std::process::id(), seq);
     let path = std::env::temp_dir().join(file_name);
     match std::fs::write(&path, text.as_bytes()) {
         Ok(()) => {
@@ -44221,6 +44226,12 @@ pub(crate) struct TuiApp {
     /// Monotonic source for `prompt_queue_ids`. Never reused, so an id
     /// uniquely names one queued prompt for its whole lifetime.
     pub(crate) next_queue_id: u64,
+    /// Dedicated monotonic source for temp-file leaf names (staged pastes and
+    /// editor-handoff buffers). Bumped on every staging so consecutive temp
+    /// files get distinct paths; the queue id counter is unsuitable because it
+    /// only advances on enqueue/sync, so reusing it let two back-to-back
+    /// stagings collide and truncate each other.
+    pub(crate) next_temp_file_nonce: u64,
     /// Bounded undo stack for queue mutations (delete / reorder). Each push
     /// records enough to reverse the op exactly; `QUEUE_UNDO_CAP` caps it.
     pub(crate) prompt_queue_undo: Vec<QueueMutation>,
@@ -44903,6 +44914,7 @@ impl TuiApp {
             prompt_queue: VecDeque::new(),
             prompt_queue_ids: VecDeque::new(),
             next_queue_id: 0,
+            next_temp_file_nonce: 0,
             prompt_queue_undo: Vec::new(),
             prompt_queue_drag: None,
             prompt_queue_overlay: None,
@@ -47120,8 +47132,11 @@ impl TerminalGuard {
         signal_teardown::set_alt_screen_active(false);
 
         // 2. Run the editor on a temp file under the platform temp dir (never a
-        //    hardcoded /tmp). A monotonic nonce + the pid keep the leaf unique.
-        let nonce = app.next_queue_id;
+        //    hardcoded /tmp). A dedicated monotonic counter + the pid keep the
+        //    leaf unique; it is bumped per staging so back-to-back handoffs do
+        //    not collide (the queue id counter only advances on enqueue/sync).
+        let seq = app.next_temp_file_nonce;
+        app.next_temp_file_nonce += 1;
         let dir = std::env::temp_dir();
         let outcome = editor_handoff::run_handoff(
             &request.command,
@@ -47129,7 +47144,7 @@ impl TerminalGuard {
             &request.initial_text,
             &dir,
             std::process::id(),
-            nonce,
+            seq,
             |command, path| {
                 let status = std::process::Command::new(&command.program)
                     .args(&command.args)
