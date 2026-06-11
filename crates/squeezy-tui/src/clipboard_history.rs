@@ -203,10 +203,26 @@ impl ClipboardHistoryStore {
         self.clamp_selection();
     }
 
-    /// Remove the oldest (highest-index) unpinned entry. Returns `true` when one
-    /// was removed, `false` when every remaining entry is pinned.
+    /// Remove the oldest (highest-index) unpinned entry, **never** the just-
+    /// recorded front entry at index 0. Returns `true` when one was removed,
+    /// `false` when every entry below the front is pinned (or only the front
+    /// remains).
+    ///
+    /// `record` inserts the new copy at index 0 and then enforces the caps; if
+    /// eviction could pick index 0 (the case where every *other* entry is
+    /// pinned), `record` would drop the very entry it just made and return a
+    /// dangling id (deep-review #22). Constraining the scan to index ≥ 1 keeps
+    /// the cursor pointing at a live row, while pinned entries above the cap are
+    /// (legitimately) kept rather than dropping a pin.
     fn evict_oldest_unpinned(&mut self) -> bool {
-        if let Some(pos) = self.entries.iter().rposition(|e| !e.pinned) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .enumerate()
+            .skip(1)
+            .rev()
+            .find_map(|(idx, e)| (!e.pinned).then_some(idx))
+        {
             self.entries.remove(pos);
             true
         } else {

@@ -96,6 +96,67 @@ fn single_oversized_payload_is_still_recorded() {
 }
 
 #[test]
+fn record_into_full_pinned_store_keeps_the_fresh_entry() {
+    // deep-review #22: when the entry-count cap is reached and *every*
+    // existing entry is pinned, recording a new copy must not evict the very
+    // entry it just inserted at the front. Before the fix, `evict_oldest_unpinned`
+    // could pick index 0 (the only unpinned row), so `record` returned a dangling
+    // id and the cursor pointed at nothing the user copied.
+    let mut store = ClipboardHistoryStore::new();
+    for i in 0..MAX_ENTRIES {
+        let id = store.record(&format!("pinned-{i}"), "entry");
+        assert_eq!(store.toggle_pin(id), Some(true), "pin every seeded entry");
+    }
+    assert_eq!(store.len(), MAX_ENTRIES, "store is full and fully pinned");
+
+    let fresh = store.record("fresh", "entry");
+    assert_eq!(
+        store.text_of(fresh),
+        Some("fresh"),
+        "the just-recorded id must point at a live entry, not a dangling row",
+    );
+    assert_eq!(
+        store.selected_entry().map(|e| e.id),
+        Some(fresh),
+        "the cursor follows the fresh copy to the front",
+    );
+    assert_eq!(
+        store.selected_entry().map(|e| e.text.as_str()),
+        Some("fresh"),
+    );
+}
+
+#[test]
+fn record_into_byte_full_pinned_store_keeps_the_fresh_entry() {
+    // Byte-cap variant of deep-review #22: pinned payloads summing over the
+    // byte cap must not cause the freshly-recorded unpinned entry at index 0
+    // to be evicted by the byte loop.
+    let mut store = ClipboardHistoryStore::new();
+    let chunk = "z".repeat(MAX_TOTAL_BYTES / 2 + 1);
+    // Two pinned chunks already exceed MAX_TOTAL_BYTES on their own.
+    for i in 0..2 {
+        let id = store.record(&format!("{chunk}{i}"), "viewport");
+        assert_eq!(store.toggle_pin(id), Some(true), "pin the oversized chunk");
+    }
+    assert!(
+        store.total_bytes() > MAX_TOTAL_BYTES,
+        "pinned payloads already exceed the byte cap",
+    );
+
+    let fresh = store.record("fresh-copy", "entry");
+    assert_eq!(
+        store.text_of(fresh),
+        Some("fresh-copy"),
+        "the fresh unpinned copy survives even though pins blow the byte cap",
+    );
+    assert_eq!(
+        store.selected_entry().map(|e| e.id),
+        Some(fresh),
+        "the cursor points at the surviving fresh copy",
+    );
+}
+
+#[test]
 fn select_up_and_down_saturate_and_track_rows() {
     let mut store = ClipboardHistoryStore::new();
     store.record("oldest", "entry");
