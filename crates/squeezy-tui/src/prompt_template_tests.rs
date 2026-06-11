@@ -65,6 +65,40 @@ fn slot_names_caps_at_max_slots() {
 }
 
 #[test]
+fn card_with_more_than_max_slots_distinct_is_resolvable() {
+    // A body with one more distinct slot than the cap: `{s0}`..`{s16}` is
+    // MAX_SLOTS + 1 (== 17) distinct names. The overflow `{s16}` must fold to
+    // literal text rather than enter the focus ring as an unfillable slot, or
+    // the card would block forever (deep-review #114).
+    let mut body = String::new();
+    for i in 0..=MAX_SLOTS {
+        body.push_str(&format!("{{s{i}}} "));
+    }
+    let mut card = TemplateCard::new(0, "t".to_string(), &body);
+    // Only MAX_SLOTS slots are exposed; the overflow name is not one of them.
+    assert_eq!(card.slot_count(), MAX_SLOTS);
+    assert!(
+        !card.slots().iter().any(|n| n == &format!("s{MAX_SLOTS}")),
+        "overflow slot is not in the focus ring"
+    );
+    // Fill every slot the card actually exposes.
+    for i in 0..card.slot_count() {
+        card.focus_index(i);
+        card.insert_char('x');
+    }
+    // With every reachable slot filled the card resolves — no unfillable slot
+    // left blocking it.
+    let resolved = card
+        .resolved()
+        .expect("card resolves once every exposed slot is filled");
+    // The overflow slot survives as literal `{s16}` text (no body text lost).
+    assert!(
+        resolved.contains(&format!("{{s{MAX_SLOTS}}}")),
+        "overflow slot appears literally: {resolved:?}"
+    );
+}
+
+#[test]
 fn resolve_substitutes_filled_slots_and_trims() {
     let segs = parse("Review {file}.");
     let out = resolve(&segs, |name| {

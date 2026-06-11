@@ -79,6 +79,11 @@ pub(crate) enum Segment {
 pub(crate) fn parse(body: &str) -> Vec<Segment> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut literal = String::new();
+    // Distinct slot names emitted so far, in first-appearance order. Past
+    // `MAX_SLOTS` distinct names a further *new* name folds into literal text
+    // (see [`MAX_SLOTS`]) so `segments` and the slot list / focus ring stay
+    // consistent; a name already declared keeps resolving as a slot.
+    let mut distinct: Vec<String> = Vec::new();
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < body.len() {
@@ -92,6 +97,18 @@ pub(crate) fn parse(body: &str) -> Vec<Segment> {
             }
             // Try to read a well-formed `{name}` slot.
             if let Some((name, consumed)) = read_slot(&body[i..]) {
+                let known = distinct.iter().any(|n| n == &name);
+                // Fold the overflow distinct slot to literal `{name}` text once
+                // the cap is reached, so it never enters the slot list as an
+                // unfillable slot.
+                if !known && distinct.len() >= MAX_SLOTS {
+                    literal.push_str(&body[i..i + consumed]);
+                    i += consumed;
+                    continue;
+                }
+                if !known {
+                    distinct.push(name.clone());
+                }
                 if !literal.is_empty() {
                     segments.push(Segment::Literal(std::mem::take(&mut literal)));
                 }
