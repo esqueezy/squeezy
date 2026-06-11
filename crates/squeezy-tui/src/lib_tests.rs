@@ -31592,6 +31592,131 @@ async fn manual_condition_blocks_drain_until_run_next() {
 }
 
 #[tokio::test]
+async fn run_selected_next_bypasses_manual_condition_and_runs_the_chosen_prompt() {
+    // Run-Selected-Next on an explicitly-chosen `Manual` prompt must RUN it, not
+    // park it: the user's deliberate choice bypasses the condition gate. Before
+    // the fix the promoted item stayed `Manual`, so the drain pump evaluated it as
+    // Blocked and `plan_drain` returned Stop — the chosen prompt never ran.
+    let mut app = queue_app(&["manual-only"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    let id = queue_id_at(&app, 0);
+    // Cycle to Manual (5 presses round the 6-state ring from Always).
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle to manual");
+    }
+    assert_eq!(
+        app.prompt_queue_conditions.get(id),
+        queue_conditions::QueueCondition::Manual
+    );
+    // An outcome is present but irrelevant: Manual never auto-drains on its own.
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+
+    // The user runs the focused prompt next: it must bypass the Manual gate.
+    assert!(
+        queue_run_selected_next(&mut app),
+        "run-selected-next on a Manual front prompt should act"
+    );
+    assert!(
+        app.prompt_queue_conditions.get(id).is_always(),
+        "the chosen prompt's Manual condition is cleared so the pump runs it"
+    );
+    assert!(app.auto_drain_queue, "idle run-selected-next arms the pump");
+
+    // Drive the real pump: the (now unconditional) front prompt is dispatched
+    // rather than parked — the queue empties and a turn starts.
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(
+        app.prompt_queue.is_empty(),
+        "the chosen Manual prompt was submitted, not left parked",
+    );
+    assert!(
+        app.turn_rx.is_some(),
+        "submitting the chosen prompt started a user turn",
+    );
+}
+
+#[tokio::test]
+async fn condition_skip_drop_is_recoverable_via_queue_undo() {
+    // A condition-skip drop (an `IfPrevFailed` prompt after a SUCCEEDED turn)
+    // silently removes a prompt the user wrote. The drain pump must record it on
+    // the undo stack so QueueUndo can bring the dropped recovery prompt back.
+    // Before the fix the Drop arm removed it with no undo entry — unrecoverable.
+    let mut app = queue_app(&["recover-on-failure", "park-me"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // Condition the FRONT prompt on "if previous failed" (2 cycles from Always).
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle front to if-failed");
+    }
+    let id_front = queue_id_at(&app, 0);
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_front),
+        queue_conditions::QueueCondition::IfPrevFailed
+    );
+    // Make the SECOND prompt Manual so the pump parks after the drop (no turn).
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle second to manual");
+    }
+    // Close the overlay so the drain runs, and record a SUCCEEDED outcome so the
+    // "if previous failed" front prompt is skip-bound.
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    let undo_before = app.prompt_queue_undo.len();
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert_eq!(
+        queue_texts(&app),
+        vec!["park-me".to_string()],
+        "the skip-bound front prompt was dropped",
+    );
+    assert!(app.turn_rx.is_none(), "no turn spawned by a skip-drop");
+    // The drop is recorded as a recoverable Deleted mutation.
+    assert_eq!(
+        app.prompt_queue_undo.len(),
+        undo_before + 1,
+        "the condition-skip drop is pushed onto the undo stack",
+    );
+    // QueueUndo restores the dropped recovery prompt at its former front slot.
+    assert!(queue_undo(&mut app), "the dropped prompt is undoable");
+    assert_eq!(
+        queue_texts(&app),
+        vec!["recover-on-failure".to_string(), "park-me".to_string()],
+        "undo brings the silently-skipped prompt back",
+    );
+}
+
+#[tokio::test]
 async fn record_turn_outcome_captures_success_and_edits() {
     // The turn-finish capture stores the success flag + the edits flag for the
     // condition gate.

@@ -17240,6 +17240,16 @@ fn queue_run_selected_next(app: &mut TuiApp) -> bool {
     else {
         return false;
     };
+    // The user explicitly chose THIS prompt to run next, so it must bypass the
+    // condition gate: a `Manual` item (or an unsatisfied "if previous X") would
+    // otherwise be parked or dropped by `plan_drain` and never run. Clear the
+    // promoted item's run-condition (id-keyed, captured before any move) so the
+    // drain pump dispatches the chosen prompt rather than silently substituting a
+    // different runnable one. A no-op when the item is already unconditional.
+    if let Some(id) = app.prompt_queue_ids.get(plan.from).copied() {
+        app.prompt_queue_conditions
+            .set(id, queue_conditions::QueueCondition::Always);
+    }
     let mut changed = false;
     if plan.moves {
         // Record the undo BEFORE moving: `prev` is the id that sat immediately
@@ -22734,12 +22744,19 @@ async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
                 // carry the id sidecar with the slot and loop without running a
                 // turn, so a run of skip-bound prompts clears in order.
                 let skipped = app.prompt_queue.remove(index);
-                app.prompt_queue_ids.remove(index);
+                let skipped_id = app.prompt_queue_ids.remove(index);
                 if let Some(text) = skipped {
                     let preview = text.lines().next().unwrap_or("").trim();
                     app.push_log(format!(
                         "skipped queued prompt (condition not met): {preview}"
                     ));
+                    // A condition-skip silently removes a queued prompt the user
+                    // wrote, so record it on the undo stack (mirroring a manual
+                    // delete) — QueueUndo can then recover an `IfPrevFailed`
+                    // recovery prompt that was dropped after a success, etc.
+                    if let Some(id) = skipped_id {
+                        push_queue_undo(app, QueueMutation::Deleted { index, id, text });
+                    }
                 }
                 app.status = format!("skipped queued prompt ({} left)", app.prompt_queue.len());
                 app.needs_redraw = true;
