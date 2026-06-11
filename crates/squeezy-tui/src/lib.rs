@@ -13647,7 +13647,9 @@ fn tool_actions_copy_selected(app: &mut TuiApp) {
         .tool_actions
         .as_ref()
         .and_then(|a| a.selected_item())
-        .map(|item| (item.kind, item.text.clone(), item.primary_action()))
+        // The clipboard payload is the untruncated `copy_text`, never the capped
+        // display `text` — copying must never deliver a `\u{2026}`-ellipsized slice.
+        .map(|item| (item.kind, item.copy_text.clone(), item.primary_action()))
     else {
         app.status = "tool actions: nothing to copy".to_string();
         app.needs_redraw = true;

@@ -173,6 +173,23 @@ fn item_text_is_bounded() {
 }
 
 #[test]
+fn copy_payload_is_untruncated_even_when_label_is_capped() {
+    // A URL longer than TEXT_CAP: the display label is capped + ellipsized, but the
+    // copy payload must carry the full, uncorrupted match (deep-review #49 — the
+    // clipboard used to receive the capped `\u{2026}`-suffixed slice).
+    let url = format!("https://example.test/{}", "a".repeat(200));
+    assert!(url.chars().count() > TEXT_CAP);
+    let items = detect_actionable_items(1, &format!("see {url} for more"));
+    assert_eq!(items.len(), 1);
+    // Display label is capped and ellipsized.
+    assert!(items[0].text.chars().count() <= TEXT_CAP + 1);
+    assert!(items[0].text.ends_with('\u{2026}'));
+    // Copy payload is the full match, with no ellipsis.
+    assert_eq!(items[0].copy_text, url);
+    assert!(!items[0].copy_text.contains('\u{2026}'));
+}
+
+#[test]
 fn line_index_orders_items_by_output_line() {
     let text = "/first/path.rs\nplain prose\n$ run me";
     let items = detect_actionable_items(1, text);

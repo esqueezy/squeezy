@@ -135,16 +135,24 @@ impl WorkflowAction {
 /// One detected actionable element inside a tool result's output (§12.3.1).
 ///
 /// `entry_id` is the stable `TranscriptEntry::id` of the tool result it lives in
-/// (the jump target); `kind` classifies it; `text` is the exact matched element
-/// (the path, URL, line, command, or hunk header) used both for the row label and
-/// as the copy payload — bounded by [`TEXT_CAP`]; `line_index` is the 0-based line
-/// offset within the output for stable ordering.
+/// (the jump target); `kind` classifies it; `text` is the row *label* — the matched
+/// element (path, URL, line, command, or hunk header) bounded by [`TEXT_CAP`] — while
+/// `copy_text` holds the same match *untruncated* so the clipboard never receives a
+/// capped, ellipsized payload; `line_index` is the 0-based line offset within the
+/// output for stable ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActionableItem {
     pub(crate) entry_id: u64,
     pub(crate) line_index: usize,
     pub(crate) kind: ActionableKind,
+    /// The display label shown on the overlay row: the matched slice capped to
+    /// [`TEXT_CAP`] chars with a trailing ellipsis when it was cut, so a giant
+    /// path/URL can never blow up the row width.
     pub(crate) text: String,
+    /// The full, untruncated matched slice delivered to the clipboard when the row
+    /// is copied. Kept separate from `text` so the display cap never corrupts the
+    /// payload (a 200-char URL copies whole, not capped + `\u{2026}`).
+    pub(crate) copy_text: String,
 }
 
 impl ActionableItem {
@@ -384,11 +392,13 @@ pub(crate) fn detect_actionable_items(entry_id: u64, text: &str) -> Vec<Actionab
         let Some((kind, matched)) = classify_line(&clean) else {
             continue;
         };
+        let trimmed = matched.trim();
         items.push(ActionableItem {
             entry_id,
             line_index,
             kind,
-            text: cap_text(matched.trim()),
+            text: cap_text(trimmed),
+            copy_text: trimmed.to_string(),
         });
         if items.len() >= ITEMS_CAP {
             break;
