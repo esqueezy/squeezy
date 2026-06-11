@@ -196,6 +196,26 @@ fn transform_strip_ansi_drops_trailing_bare_escape() {
     assert_eq!(out, "text");
 }
 
+/// deep-review #128: an OSC sequence's whole body — including its BEL or ST
+/// terminator — must be discarded. Before the OSC arm was added, `ESC ] 0 ;
+/// title BEL` leaked the `0;title` payload and the raw BEL into the output.
+#[test]
+fn transform_strip_ansi_discards_osc_window_title() {
+    let out = apply_transform("\x1b]0;title\x07text", PasteTransform::StripAnsi);
+    assert_eq!(out, "text");
+}
+
+/// deep-review #128: an OSC-8 hyperlink wrapper (ST-terminated, `ESC \`) is
+/// stripped down to just its visible label.
+#[test]
+fn transform_strip_ansi_discards_osc8_hyperlink_wrapper() {
+    let out = apply_transform(
+        "\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\",
+        PasteTransform::StripAnsi,
+    );
+    assert_eq!(out, "link");
+}
+
 #[test]
 fn transform_cancel_yields_empty_and_does_not_insert() {
     assert_eq!(apply_transform("anything", PasteTransform::Cancel), "");

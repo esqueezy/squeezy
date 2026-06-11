@@ -216,6 +216,23 @@ fn strip_ansi(text: &str) -> String {
             Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
                 let _ = chars.next();
             }
+            // OSC / DCS / SOS / PM / APC: a string-terminated control whose body
+            // must be discarded up to its terminator — either a BEL (`\x07`) or
+            // an ST (`ESC \`). Without this, `ESC ] 0 ; title BEL` leaks the
+            // `0;title` payload and the raw BEL into the output.
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                while let Some(next) = chars.next() {
+                    if next == '\x07' {
+                        break;
+                    }
+                    if next == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
             // Any other ESC X pair (and a trailing bare ESC): drop it.
             Some(_) | None => {}
         }

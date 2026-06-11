@@ -144,6 +144,23 @@ fn preview_drops_nul_bytes() {
     assert_eq!(lines[0], "abc");
 }
 
+/// deep-review #128: the "preview can never inject control sequences" invariant
+/// must drop ALL C0 controls (BEL/BS/VT/FF and friends), not just NUL, and must
+/// discard an OSC payload outright. Before the fix, only NUL was removed and the
+/// OSC payload + BEL survived.
+#[test]
+fn preview_drops_all_c0_controls_and_osc_payloads() {
+    let sanitized = sanitize_preview_line("a\x07b\x08c\x0bd\x0ce\x1b]0;evil\x07f");
+    assert!(
+        sanitized.chars().all(|c| (c as u32) >= 0x20 && c != '\x7f'),
+        "no byte below 0x20 (or DEL) may survive sanitization: {sanitized:?}"
+    );
+    assert_eq!(
+        sanitized, "abcdef",
+        "controls dropped, visible text preserved"
+    );
+}
+
 #[test]
 fn preview_clips_long_lines_to_width_with_an_ellipsis() {
     let paste = StagedPaste::new("abcdefghij".to_string());

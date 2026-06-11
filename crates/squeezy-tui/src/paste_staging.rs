@@ -513,12 +513,16 @@ fn detect_warnings(text: &str, has_ansi: bool) -> Vec<StagingWarning> {
 }
 
 /// Sanitize a single preview line: strip ANSI/terminal escape sequences and
-/// drop NUL bytes so the staged preview can never inject control sequences into
+/// drop ALL remaining C0 control characters (including a stray BEL/BS/VT/FF and
+/// NUL) plus DEL, so the staged preview can never inject control sequences into
 /// the display. Reuses the §12.6.2 ANSI stripper so a pasted log previews as the
 /// same plain text the transcript would show.
 fn sanitize_preview_line(raw: &str) -> String {
     let stripped = paste_transform::apply_transform(raw, PasteTransform::StripAnsi);
-    stripped.replace('\0', "")
+    stripped
+        .chars()
+        .filter(|&c| (c as u32) >= 0x20 && c != '\x7f')
+        .collect()
 }
 
 /// Clip `raw` to `width` characters, appending a `…` when truncated. Operates on
