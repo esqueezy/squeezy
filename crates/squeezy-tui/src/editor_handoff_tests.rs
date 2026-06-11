@@ -117,8 +117,10 @@ fn classify_result_ignores_a_trailing_newline_added_by_the_editor() {
 
 #[test]
 fn classify_result_reports_a_real_change() {
+    // A real change is carried verbatim — including the editor's trailing
+    // newline — so an intentional final newline survives the round-trip.
     match classify_result("hello", "hello world\n") {
-        HandoffOutcome::Changed(text) => assert_eq!(text, "hello world"),
+        HandoffOutcome::Changed(text) => assert_eq!(text, "hello world\n"),
         other => panic!("expected a change, got {other:?}"),
     }
 }
@@ -130,9 +132,31 @@ fn classify_result_unchanged_on_identical_text() {
 
 #[test]
 fn classify_result_interior_newlines_preserved() {
-    // Only the single trailing newline is trimmed; interior structure stays.
+    // A real change is returned verbatim; interior and trailing structure stay.
     match classify_result("a", "a\n\nb\n") {
-        HandoffOutcome::Changed(text) => assert_eq!(text, "a\n\nb"),
+        HandoffOutcome::Changed(text) => assert_eq!(text, "a\n\nb\n"),
+        other => panic!("expected a change, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_result_no_phantom_change_when_original_already_ends_in_newline() {
+    // Regression (deep-review #119): when the original already carried a
+    // trailing newline, trimming only the edited side reported a phantom
+    // `Changed("hello")` and silently stripped the composer's newline. The
+    // symmetric comparison treats an unchanged buffer as unchanged.
+    assert_eq!(
+        classify_result("hello\n", "hello\n"),
+        HandoffOutcome::Unchanged
+    );
+}
+
+#[test]
+fn classify_result_real_change_preserves_a_deliberate_trailing_newline() {
+    // Regression (deep-review #119): a genuine edit that ends in a newline must
+    // round-trip the newline verbatim rather than have it stripped.
+    match classify_result("hello", "hello\nworld\n") {
+        HandoffOutcome::Changed(text) => assert_eq!(text, "hello\nworld\n"),
         other => panic!("expected a change, got {other:?}"),
     }
 }
@@ -162,7 +186,9 @@ fn run_handoff_modify_reads_back_the_edit_and_cleans_up() {
     )
     .expect("handoff runs");
     match outcome {
-        HandoffOutcome::Changed(text) => assert_eq!(text, "after"),
+        // A real change is carried back verbatim, including the newline the fake
+        // editor saved (deep-review #119).
+        HandoffOutcome::Changed(text) => assert_eq!(text, "after\n"),
         other => panic!("expected a change, got {other:?}"),
     }
     // The temp file is always cleaned up.
@@ -246,7 +272,9 @@ fn run_handoff_slow_editor_completes_after_the_closure_returns() {
         },
     )
     .expect("handoff runs");
-    assert_eq!(outcome, HandoffOutcome::Changed("y".to_string()));
+    // The change is carried back verbatim, including the editor's newline
+    // (deep-review #119).
+    assert_eq!(outcome, HandoffOutcome::Changed("y\n".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

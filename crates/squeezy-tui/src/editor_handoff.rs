@@ -192,17 +192,24 @@ pub(crate) enum HandoffOutcome {
     Unchanged,
 }
 
-/// Compare the edited buffer against the original and classify the result. The
-/// only normalization is a trailing-newline trim on the *edited* side: most
-/// editors append a final newline on save, so `"hello"` handed off and saved as
-/// `"hello\n"` reads as unchanged rather than a spurious edit. Interior content
-/// is compared verbatim.
+/// Compare the edited buffer against the original and classify the result.
+///
+/// Normalization is symmetric on the trailing newline so it is only ever used to
+/// suppress a *spurious* edit, never to fabricate one: most editors append a
+/// final newline on save, so `"hello"` handed off and saved as `"hello\n"` reads
+/// as unchanged. But if the original *already* carried a trailing newline
+/// (`"hello\n"` → `"hello\n"`), trimming only the edited side would report a
+/// phantom `Changed("hello")` and silently strip the composer's newline — so the
+/// edit counts as unchanged when the edited text matches the original either
+/// verbatim or modulo a single trailing newline. On a *real* change the edited
+/// buffer is returned verbatim (interior content and any intentional trailing
+/// newline preserved), never re-normalized.
 pub(crate) fn classify_result(original: &str, edited: &str) -> HandoffOutcome {
     let normalized = edited.strip_suffix('\n').unwrap_or(edited);
-    if normalized == original {
+    if edited == original || normalized == original {
         HandoffOutcome::Unchanged
     } else {
-        HandoffOutcome::Changed(normalized.to_string())
+        HandoffOutcome::Changed(edited.to_string())
     }
 }
 
