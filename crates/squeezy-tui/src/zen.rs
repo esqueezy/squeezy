@@ -66,8 +66,8 @@ impl ZenMode {
     /// Whether the minimap turn rail / breadcrumbs / dock panel / non-essential
     /// status detail should be suppressed this frame. Today this is exactly
     /// [`is_active`], but routing every chrome gate through one named predicate
-    /// keeps "what zen hides" in one place — a future presentation mode can layer
-    /// on top without re-deciding the policy at each call site.
+    /// keeps "what zen hides" in one place — another distraction-reducing mode can
+    /// layer on top without re-deciding the policy at each call site.
     ///
     /// [`is_active`]: ZenMode::is_active
     #[must_use]

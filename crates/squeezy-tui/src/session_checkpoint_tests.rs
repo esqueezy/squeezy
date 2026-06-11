@@ -33,7 +33,7 @@ impl ScopedCheckpointDir {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
         ));
-        // SAFETY: serialized by `ENV_LOCK`; no other thread reads the var while held.
+        // SAFETY: serialized by `TEST_ENV_LOCK`; no other thread reads the var while held.
         unsafe {
             std::env::set_var(CHECKPOINT_DIR_ENV, &dir);
         }
@@ -47,7 +47,7 @@ impl ScopedCheckpointDir {
 
 impl Drop for ScopedCheckpointDir {
     fn drop(&mut self) {
-        // SAFETY: serialized by `ENV_LOCK`; restoring the prior value on drop.
+        // SAFETY: serialized by `TEST_ENV_LOCK`; restoring the prior value on drop.
         unsafe {
             match &self.prior {
                 Some(prev) => std::env::set_var(CHECKPOINT_DIR_ENV, prev),

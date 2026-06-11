@@ -659,7 +659,7 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // default). The docked panel's header click and the keyboard verb both
         // drive the same `cycle_dock_panel` handler.
         A::CycleDockPanel => KeyboardPath::Keymap(Action::CycleDockPanel),
-        // Zen Mode minimal status line (§12.4.5) — `ToggleZenMode` (`Ctrl+Alt+C`
+        // Zen Mode minimal status line (§12.4.5) — `ToggleZenMode` (`Ctrl+Alt+.`
         // default). The status-line click and the keyboard verb both drive the same
         // `toggle_zen_mode` handler.
         A::ToggleZenMode => KeyboardPath::Keymap(Action::ToggleZenMode),

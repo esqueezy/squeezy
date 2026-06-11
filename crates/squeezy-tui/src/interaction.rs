@@ -326,7 +326,7 @@ pub(crate) enum ChromeKey {
     /// The Zen Mode (§12.4.5) minimal status line painted where the detailed
     /// status block would sit while zen is on. A single affordance with no identity
     /// of its own; a click anywhere on it leaves zen — the mouse twin of the
-    /// `ToggleZenMode` (`Ctrl+Alt+C`) verb.
+    /// `ToggleZenMode` (`Ctrl+Alt+.`) verb.
     ZenStatusLine,
     /// The `[restore]` affordance painted in the Session Auto-Save Checkpoints
     /// overlay (§12.9.5). A single affordance with no identity of its own; a click
@@ -460,7 +460,7 @@ pub(crate) enum Action {
     /// panel's header; both step the panel `left → right → bottom → undocked`,
     /// persist it, and request a redraw.
     CycleDockPanel,
-    /// Toggle Zen Mode (§12.4.5). Mouse twin of the `ToggleZenMode` (`Ctrl+Alt+C`)
+    /// Toggle Zen Mode (§12.4.5). Mouse twin of the `ToggleZenMode` (`Ctrl+Alt+.`)
     /// keyboard verb / a click on the minimal zen status line; both flip the
     /// distraction-free latch, persist it, and request a redraw.
     ToggleZenMode,

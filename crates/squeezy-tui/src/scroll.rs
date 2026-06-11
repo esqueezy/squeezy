@@ -74,19 +74,18 @@ impl ScrollState {
     /// The raw `from_bottom` distance (unclamped, as stored).
     // This is a field getter named after the `from_bottom` field, not a
     // `from_*` converter; the conventional "no `self`" rule does not apply.
-    // Production reads the geometry-clamped `offset_from_bottom`; this raw
-    // accessor is exercised by the unit tests.
+    // Production reads it when capturing the Session Auto-Save Checkpoint anchor
+    // (`capture_session_checkpoint`); the render path uses the geometry-clamped
+    // `offset_from_bottom` instead.
     #[allow(clippy::wrong_self_convention)]
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn from_bottom(&self) -> usize {
         self.from_bottom
     }
 
-    /// Whether the view is currently following the tail.
-    // Production compares the whole `ScrollState` via its derived `PartialEq`
-    // rather than this flag accessor, so it is test-only today.
-    #[allow(dead_code)]
+    /// Whether the view is currently following the tail. Read when capturing the
+    /// Session Auto-Save Checkpoint anchor (`capture_session_checkpoint`); the
+    /// render path compares the whole `ScrollState` via its derived `PartialEq`.
     #[must_use]
     pub(crate) fn is_following(&self) -> bool {
         self.follow_tail

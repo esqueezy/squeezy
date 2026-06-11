@@ -17701,6 +17701,15 @@ async fn zen_keyboard_toggle_hides_chrome_but_keeps_transcript() {
         !after.contains('\u{25b8}'),
         "breadcrumbs strip is suppressed in zen: {after}"
     );
+    // And it registers no click target — a precise assertion that the suppressed
+    // strip is non-interactive (not just visually absent from the global frame).
+    assert!(
+        app.registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::BreadcrumbCrumb(0),
+        ))
+        .is_none(),
+        "the suppressed breadcrumb strip registers no click target in zen",
+    );
 
     // Toggling again restores the chrome (idempotent round-trip).
     handle_key(&mut app, &mut agent, toggle_zen_key())
@@ -17792,6 +17801,143 @@ fn zen_survives_resize_where_the_minimal_status_paints() {
             "transcript survives resize to {w}x{h}: {output}"
         );
     }
+}
+
+/// Pin the user-scope settings to a scratch file so the Zen persistence
+/// round-trip is isolated, returning the guard plus the scratch path. Mirrors
+/// `glyph_mode_scratch` / the density on-disk pattern.
+fn zen_scratch(app: &mut TuiApp, name: &str) -> (ScopedSettingsPath, PathBuf) {
+    let dir = temp_workspace(name);
+    let settings_path = dir.join("settings.toml");
+    let guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    (guard, settings_path)
+}
+
+#[tokio::test]
+async fn zen_toggle_persists_true_then_clears_the_key_on_exit() {
+    // The material on-disk paths: toggling zen ON writes `[tui] zen = true`;
+    // toggling it OFF clears the key entirely via `EditOp::Unset` (never `false`),
+    // so a never-zen-again session leaves no stale `true` behind.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = zen_scratch(&mut app, "zen_persist_toggle");
+
+    handle_key(&mut app, &mut agent, toggle_zen_key())
+        .await
+        .unwrap();
+    assert!(app.zen.is_active(), "zen turned on");
+    let written = std::fs::read_to_string(&settings_path).expect("settings written on zen-on");
+    let table = written.parse::<toml::Table>().expect("valid TOML");
+    assert_eq!(
+        table
+            .get("tui")
+            .and_then(|t| t.as_table())
+            .and_then(|t| t.get("zen"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "zen-on persisted `[tui] zen = true`: {written}"
+    );
+
+    // Toggle off: the key is CLEARED, not written as `false`.
+    handle_key(&mut app, &mut agent, toggle_zen_key())
+        .await
+        .unwrap();
+    assert!(!app.zen.is_active(), "zen turned off");
+    let cleared = std::fs::read_to_string(&settings_path).unwrap_or_default();
+    let cleared_zen = cleared
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|t| t.get("tui").and_then(|x| x.as_table()).cloned())
+        .and_then(|t| t.get("zen").cloned());
+    assert!(
+        cleared_zen.is_none(),
+        "zen-off cleared the key (no stale `zen = ...` left): {cleared}"
+    );
+}
+
+#[tokio::test]
+async fn zen_restore_reads_a_persisted_true_and_ignores_malformed_values() {
+    // `restore_zen` reads `[tui].zen` as a bool at startup. A real `true` restores
+    // zen; a non-bool / unset value (`"yes"`, `1`, missing) collapses to the
+    // chrome-on default rather than panicking.
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = zen_scratch(&mut app, "zen_persist_restore");
+
+    std::fs::write(&settings_path, "[tui]\nzen = true\n").unwrap();
+    restore_zen(&mut app);
+    assert!(
+        app.zen.is_active(),
+        "a persisted `zen = true` restores zen at startup"
+    );
+
+    for bad in [
+        "[tui]\nzen = \"yes\"\n",
+        "[tui]\nzen = 1\n",
+        "[other]\nk = 1\n",
+    ] {
+        std::fs::write(&settings_path, bad).unwrap();
+        let mut fresh = test_app(SessionMode::Build);
+        fresh.set_settings_path_override(Some(settings_path.clone()));
+        restore_zen(&mut fresh);
+        assert!(
+            !fresh.zen.is_active(),
+            "a malformed / non-bool / missing zen value yields the default (off): {bad:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn zen_persist_failure_notes_status_but_keeps_the_latch() {
+    // Best-effort persistence: if the settings file cannot be written, the toggle
+    // still flips the in-session latch and the status reports the save failure.
+    // Point the settings "file" at a DIRECTORY so the write fails deterministically.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("zen_persist_failure");
+    let unwritable = dir.join("settings-is-a-dir.toml");
+    std::fs::create_dir_all(&unwritable).expect("create the blocking directory");
+    let _guard = ScopedSettingsPath::new(unwritable.clone());
+    app.set_settings_path_override(Some(unwritable));
+
+    handle_key(&mut app, &mut agent, toggle_zen_key())
+        .await
+        .unwrap();
+    assert!(
+        app.zen.is_active(),
+        "the in-session zen latch still flips even when the save fails"
+    );
+    assert!(
+        app.status.contains("save failed"),
+        "the status reports the persist failure: {}",
+        app.status
+    );
+}
+
+#[test]
+fn zen_registers_status_and_click_target_at_the_smallest_nondegenerate_size() {
+    // The tiny-terminal boundary: at the smallest size that still has a status row,
+    // zen must paint its minimal status line AND register the click target (not just
+    // avoid a panic).
+    let mut app = zen_test_app();
+    app.zen.toggle();
+    assert!(app.zen.is_active());
+    // 20x4 is the smallest non-degenerate frame the existing no-panic test
+    // exercises. The full "… click to exit" cue clips at this width, but the line's
+    // leading "zen" mode marker survives, and — load-bearing — the whole line still
+    // registers its click target so the mouse exit stays reachable.
+    let output = render_to_string(&app, 20, 4);
+    assert!(
+        output.contains("zen"),
+        "the minimal zen status line paints (its leading marker survives) at 20x4: {output}"
+    );
+    assert!(
+        app.registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::ZenStatusLine,
+        ))
+        .is_some(),
+        "the zen status line registers a click target even at the smallest size",
+    );
 }
 
 fn test_app(mode: SessionMode) -> TuiApp {
@@ -26892,15 +27038,22 @@ async fn restore_on_launch_applies_a_saved_checkpoint_clamped_to_the_transcript(
 
     // The minimap pane state was restored.
     assert!(app.show_minimap, "restore re-showed the minimap pane");
-    // The out-of-range focused entry (8) was CLAMPED away rather than misapplied.
+    // The out-of-range focused entry (200) was CLAMPED away rather than misapplied.
     assert_eq!(
         app.selected_entry, None,
         "a stale focused entry past the transcript is dropped on restore"
     );
-    // The scroll anchor was applied (no longer following the tail).
+    // The scroll anchor was applied (no longer following the tail) AND the exact
+    // `from_bottom` distance survived (the 60-turn transcript has the scrollback to
+    // hold a 2-row anchor through the geometry clamp).
     assert!(
         !app.transcript_scroll.is_following(),
         "the restored non-following scroll anchor was applied"
+    );
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        2,
+        "the exact restored from_bottom distance was applied, not just any non-zero",
     );
     // The persisted search query was reopened + seeded into the live search.
     assert_eq!(
@@ -27041,6 +27194,76 @@ async fn overlay_forget_removes_the_saved_checkpoint() {
         app.status
     );
     assert!(!path.exists(), "forget removed the checkpoint file");
+
+    // The overlay stays open but its snapshot resets to empty: a re-render reports
+    // "no checkpoint saved yet" and drops the `[restore]` affordance + its click
+    // target (so a click can't restore a checkpoint that no longer exists).
+    assert!(
+        app.session_checkpoint_overlay.is_some(),
+        "forget leaves the overlay open"
+    );
+    let after = render_to_string(&app, 100, 30);
+    assert!(
+        after.contains("no checkpoint saved yet"),
+        "the overlay resets to the empty header after forget:\n{after}"
+    );
+    assert!(
+        !after.contains("[restore]"),
+        "the [restore] affordance is gone after forget:\n{after}"
+    );
+    assert!(
+        app.registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::CheckpointRestore,
+        ))
+        .is_none(),
+        "no [restore] click target registers once the checkpoint is forgotten",
+    );
+}
+
+#[tokio::test]
+async fn overlay_status_distinguishes_on_disk_from_live_auto_save() {
+    // The overlay header has three lead phrases: "no checkpoint saved yet" (nothing
+    // on disk, store idle), "checkpoint saved" (a prior run wrote one, this run has
+    // not auto-saved yet), and "checkpoint auto-saving" (this run's background save
+    // recorded a write). Cover the latter two branches the open test does not.
+    let mut app = app_with_user_turns(4);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "status_branches");
+    let session_id = app.session_id.clone().unwrap();
+
+    // A checkpoint persisted in a PRIOR run, with the in-memory store still idle.
+    let saved = crate::session_checkpoint::UiStateCheckpoint::new(
+        session_id.clone(),
+        4,
+        0,
+        true,
+        None,
+        None,
+        false,
+    );
+    crate::session_checkpoint::save(&saved).expect("save");
+    app.session_checkpoint_overlay = Some(saved);
+    assert!(
+        !app.session_checkpoint.has_saved(),
+        "precondition: the in-memory store has not recorded a save this run",
+    );
+    assert!(
+        session_checkpoint_status(&app).contains("checkpoint saved"),
+        "an on-disk checkpoint with an idle store reads 'checkpoint saved': {}",
+        session_checkpoint_status(&app),
+    );
+
+    // Now this run's background auto-save records a write: the lead flips to the
+    // live "auto-saving" phrasing so the user can tell auto-save is active.
+    auto_save_session_checkpoint(&mut app, std::time::Instant::now());
+    assert!(
+        app.session_checkpoint.has_saved(),
+        "precondition: the auto-save recorded a write this run",
+    );
+    assert!(
+        session_checkpoint_status(&app).contains("checkpoint auto-saving"),
+        "a live auto-save reads 'checkpoint auto-saving': {}",
+        session_checkpoint_status(&app),
+    );
 }
 
 #[tokio::test]
