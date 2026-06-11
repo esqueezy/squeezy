@@ -14,7 +14,8 @@ use crate::{
     TranscriptItem, TuiApp, TurnVisualState, compaction_status_line, context_window_pct,
     dedupe_assistant_repeated_tool_output, format_approval_status_line, format_error_status,
     format_mcp_elicitation_status_line, format_mcp_status_snapshot, input, is_control_tool_name,
-    proposed_plan, render, strip_plan_handoff_prefix, tool_call_label, tool_result_status_text,
+    proposed_plan, refresh_search, render, strip_plan_handoff_prefix, tool_call_label,
+    tool_result_status_text,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -638,6 +639,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
         }
         if processed {
             app.needs_redraw = true;
+            // Streaming events append/coalesce/remove transcript entries, which
+            // shifts the absolute painted-row indices the open search's matches
+            // are anchored to (deep-review #68). Re-anchor against the live rows
+            // so the highlight keeps covering the matching text. No-op when
+            // search is closed.
+            refresh_search(app);
         }
     }
 }

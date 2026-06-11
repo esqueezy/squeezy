@@ -32365,8 +32365,11 @@ fn search_row_kinds(
 
 /// Re-run the search find pass against the live painted rows of `state.surface`
 /// and re-anchor the current match, then scroll it into view. Called after every
-/// query edit, toggle flip, surface switch, or resize while search is open.
-fn refresh_search(app: &mut TuiApp) {
+/// query edit, toggle flip, surface switch, or resize while search is open — and
+/// after a transcript mutation from `drain_agent_events`, since streaming
+/// appends/removals shift the absolute painted-row indices the matches are
+/// anchored to (deep-review #68). A no-op when search is closed.
+pub(crate) fn refresh_search(app: &mut TuiApp) {
     let Some(surface) = app.search.as_ref().map(|s| s.surface) else {
         return;
     };

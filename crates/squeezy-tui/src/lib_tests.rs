@@ -46434,3 +46434,81 @@ fn overlay_search_rows_wrap_at_the_overlay_width_not_the_main_width() {
         "refresh_search anchors the overlay search at the overlay text width",
     );
 }
+
+#[tokio::test]
+async fn streaming_mutation_reanchors_open_search_onto_the_shifted_rows() {
+    // deep-review #68: an open search's matches are anchored to ABSOLUTE painted-
+    // row indices. When `drain_agent_events` mutates the transcript the way a
+    // stream does — appending entries and, via the edit-failure retain at
+    // `push_tool_result_with_call`, removing an earlier entry — every later row
+    // shifts. Without re-anchoring the match keeps its stale row index and the
+    // highlight lands on whatever content now occupies that row, not the query.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 40);
+    for i in 0..4 {
+        app.push_transcript_item(TranscriptItem::user(format!("entry number {i} body")));
+    }
+    app.push_transcript_item(TranscriptItem::user("UNIQUEZEBRA target line".to_string()));
+
+    // Paint so the row model is stamped, then open search and anchor the match on
+    // the target line's row.
+    let _ = render_to_string(&app, 80, 40);
+    open_search(&mut app);
+    if let Some(state) = app.search.as_mut() {
+        state.query = "UNIQUEZEBRA".to_string();
+    }
+    refresh_search(&mut app);
+    let match_row_before = app
+        .search
+        .as_ref()
+        .and_then(|s| search::current_match(s).map(|m| m.row))
+        .expect("the query matches the target line");
+    let rows_before = selection_surface_rows(&app, selection::SelectionSurface::Main);
+    assert!(
+        rendered_line_text(&rows_before[match_row_before]).contains("UNIQUEZEBRA"),
+        "sanity: the anchored match row covers the query before the mutation",
+    );
+
+    // Mimic the stream's mid-transcript removal (the retain at
+    // `push_tool_result_with_call`): drop an earlier entry so the target line
+    // shifts UP, then drive a processed agent event through the same drain pass
+    // that the streaming mutation would arrive on.
+    app.transcript.remove(0);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::UserMessage {
+        message: TranscriptItem::user("a freshly streamed user line".to_string()),
+        turn_id: TurnId::new(9),
+    })
+    .await
+    .expect("send streamed user message");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    // The match must be re-anchored: its (now-shifted) row still covers the query
+    // text. Pre-fix the row index stays stale and lands on different content.
+    let match_row_after = app
+        .search
+        .as_ref()
+        .and_then(|s| search::current_match(s).map(|m| m.row))
+        .expect("the match survives the re-anchor");
+    let rows_after = selection_surface_rows(&app, selection::SelectionSurface::Main);
+    let highlighted = rows_after
+        .get(match_row_after)
+        .map(rendered_line_text)
+        .unwrap_or_default();
+    assert!(
+        highlighted.contains("UNIQUEZEBRA"),
+        "after a streaming transcript mutation the search match must re-anchor \
+         onto the shifted row that still holds the query (deep-review #68); \
+         instead row {match_row_after} holds {highlighted:?}",
+    );
+
+    // And the recorded match positions match a fresh recompute against live rows.
+    let recomputed = search::find(&rows_after, &[], "UNIQUEZEBRA", true, true).len();
+    assert_eq!(
+        app.search.as_ref().map(|s| s.matches.len()),
+        Some(recomputed),
+        "the re-anchored match count equals a fresh find against the live rows",
+    );
+}
