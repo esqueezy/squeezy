@@ -4,13 +4,9 @@
 //! overlay's keyboard/mouse/render integration through the real `render()` is
 //! covered by the capture-sink suite in `lib_tests.rs`.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 use super::*;
-
-/// The profile-dir override env var is process-global; serialize the tests that
-/// set it so they don't clobber each other under the test runner's threads.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Pin [`PROFILE_DIR_ENV`] to a fresh scratch dir for the duration of the guard,
 /// restoring the prior value on drop so no test leaks the override into another.
@@ -22,7 +18,13 @@ struct ScopedProfileDir {
 
 impl ScopedProfileDir {
     fn new(name: &str) -> Self {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Serialize against the SINGLE shared `PROFILE_DIR_TEST_LOCK` (the same
+        // lock `lib_tests.rs::ScopedWorkspaceProfile` takes), so a unit test and
+        // an integration test never both mutate the process-global
+        // `SQUEEZY_UI_PROFILE_DIR` at once under threaded `cargo test`.
+        let guard = PROFILE_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var_os(PROFILE_DIR_ENV);
         let dir = std::env::temp_dir().join(format!(
             "squeezy-ui-profile-test-{name}-{}-{}",
@@ -32,7 +34,8 @@ impl ScopedProfileDir {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
         ));
-        // SAFETY: serialized by `ENV_LOCK`; no other thread reads the var while held.
+        // SAFETY: serialized by the shared `PROFILE_DIR_TEST_LOCK` held in
+        // `_guard`; no other env-mutating test runs while it is held.
         unsafe {
             std::env::set_var(PROFILE_DIR_ENV, &dir);
         }
@@ -46,7 +49,8 @@ impl ScopedProfileDir {
 
 impl Drop for ScopedProfileDir {
     fn drop(&mut self) {
-        // SAFETY: serialized by `ENV_LOCK`; restoring the prior value on drop.
+        // SAFETY: serialized by the shared `PROFILE_DIR_TEST_LOCK` held in
+        // `_guard`; restoring the prior value on drop.
         unsafe {
             match &self.prior {
                 Some(prev) => std::env::set_var(PROFILE_DIR_ENV, prev),
@@ -55,6 +59,22 @@ impl Drop for ScopedProfileDir {
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// deep-review #50: `ScopedProfileDir` (unit tests) and `ScopedWorkspaceProfile`
+/// (integration tests) both mutate the process-global `SQUEEZY_UI_PROFILE_DIR`,
+/// so they must serialise against the SAME lock. This asserts the unit-side
+/// helper acquires the shared `PROFILE_DIR_TEST_LOCK`: while its guard is alive
+/// the shared lock cannot be taken again. Before the consolidation the helper
+/// held a private `ENV_LOCK`, so `PROFILE_DIR_TEST_LOCK.try_lock()` would have
+/// succeeded here — the two helpers did not serialise against each other.
+#[test]
+fn scoped_profile_dir_holds_the_shared_profile_dir_lock() {
+    let _scope = ScopedProfileDir::new("lock-identity");
+    assert!(
+        PROFILE_DIR_TEST_LOCK.try_lock().is_err(),
+        "ScopedProfileDir must hold the shared PROFILE_DIR_TEST_LOCK while alive"
+    );
 }
 
 #[test]

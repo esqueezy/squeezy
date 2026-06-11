@@ -321,6 +321,18 @@ pub(crate) fn clear(root: impl AsRef<Path>) -> std::io::Result<()> {
     }
 }
 
+/// One shared lock serialising every test that mutates the process-global
+/// [`PROFILE_DIR_ENV`] override — both the unit tests in
+/// `workspace_profile_tests.rs` AND the end-to-end tests in `lib_tests.rs`.
+/// They share this single mutex (rather than each owning a private one) so a
+/// unit test never clobbers the env dir out from under a concurrently-running
+/// integration test on the test runner's threads — under threaded `cargo test`
+/// two file-local mutexes did not serialise against each other, so concurrent
+/// `set_var`/`getenv` on the shared var was genuine UB. Mirrors
+/// `session_checkpoint::TEST_ENV_LOCK`. Test-only; no runtime weight.
+#[cfg(test)]
+pub(crate) static PROFILE_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 #[path = "workspace_profile_tests.rs"]
 mod tests;

@@ -26938,10 +26938,6 @@ fn workspace_profile_key() -> KeyEvent {
     )
 }
 
-/// Serialize the workspace-profile tests that mutate the process-global
-/// `SQUEEZY_UI_PROFILE_DIR` so concurrent runs don't clobber each other.
-static WORKSPACE_PROFILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Pin the per-workspace profile store to a fresh scratch dir and point the app
 /// at a fresh scratch workspace root, returning the guard plus the workspace root.
 /// The guard restores the prior env on drop and removes the scratch tree.
@@ -26953,7 +26949,11 @@ struct ScopedWorkspaceProfile {
 
 impl ScopedWorkspaceProfile {
     fn new(app: &mut TuiApp, name: &str) -> Self {
-        let lock = WORKSPACE_PROFILE_LOCK
+        // Serialize against the SINGLE shared `PROFILE_DIR_TEST_LOCK` (the same
+        // lock `workspace_profile_tests.rs::ScopedProfileDir` takes), so the
+        // unit and integration tests never both mutate the process-global
+        // `SQUEEZY_UI_PROFILE_DIR` at once under threaded `cargo test`.
+        let lock = crate::workspace_profile::PROFILE_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let dir = temp_workspace(&format!("ui_profile_store_{name}"));
