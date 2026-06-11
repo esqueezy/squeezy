@@ -11594,6 +11594,75 @@ fn mirror_buffer_for(app: &TuiApp, width: u16) -> Buffer {
 }
 
 #[test]
+fn finish_fullscreen_mirror_wraps_at_the_painted_text_width_not_raw_terminal_width() {
+    // The live frame reserves a scrollbar gutter (and a minimap rail when shown),
+    // so the painted text column is narrower than the raw terminal width. The exit
+    // mirror must re-flow at THAT painted width, not the raw terminal width, or the
+    // persisted rows wrap at a different column than every painted frame
+    // (deep-review #79).
+    let raw_width = 120u16;
+    let painted_width = raw_width - 2; // minimap rail + scrollbar gutter
+    let mut app = test_app(SessionMode::Build);
+    // The assistant message prefix indents content, so the effective wrap column
+    // is narrower than the frame width. Measure the longest content-marker run a
+    // single mirror row holds at the painted vs the raw width — through the SAME
+    // `render_lines_to_owned_buffer` pipeline finish_fullscreen uses — and pick a
+    // content length that sits BETWEEN them: it spills onto a second row at the
+    // painted width (shorter longest run) but fits one row at the raw width.
+    let longest_run_at = |w: u16, len: usize| -> usize {
+        let mut probe = test_app(SessionMode::Build);
+        probe.push_transcript_item(TranscriptItem::assistant("Q".repeat(len)));
+        let lines = transcript_lines_for_render(&probe, Some(w), true);
+        let buf = render_lines_to_owned_buffer(&lines, w);
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter(|&x| buf.cell((x, y)).map(|c| c.symbol()) == Some("Q"))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    // A run that fills exactly one raw-width row: at the raw width its longest row
+    // run is the whole run; at the painted width it must be strictly shorter.
+    let run_len = longest_run_at(raw_width, 500);
+    let painted_longest = longest_run_at(painted_width, run_len);
+    assert!(
+        painted_longest < run_len,
+        "calibration: the run wraps to a shorter row at the painted width \
+         (painted {painted_longest} < raw {run_len})",
+    );
+    app.push_transcript_item(TranscriptItem::assistant("Q".repeat(run_len)));
+    // Stamp the painted text width the live frame would have left behind (a frame
+    // with the minimap rail on). `finish_fullscreen` reads this.
+    app.main_text_width.set(painted_width);
+
+    let (mut guard, sink) = TerminalGuard::for_capture_test(raw_width, 40);
+    guard.finish_fullscreen(&app).expect("leave the alt screen");
+    let ansi = sink_to_string(&sink);
+
+    // The longest content-marker run on any mirrored row must reflect the
+    // PAINTED-width wrap (longest run no longer than `painted_longest`), not the
+    // raw-width wrap (which keeps the whole `run_len` on one row). The painted
+    // bound is strictly below the raw run, so this cleanly separates the two.
+    let longest_q_run = ansi
+        .split("\r\n")
+        .map(|row| row.chars().filter(|&c| c == 'Q').count())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest_q_run > 0,
+        "the mirror emitted the content row at all:\n{ansi:?}",
+    );
+    assert!(
+        longest_q_run <= painted_longest,
+        "the mirror wraps at the painted width {painted_width} (longest run \
+         {longest_q_run} must be <= {painted_longest}), not the raw terminal \
+         width (which would keep {run_len} on one row)",
+    );
+}
+
+#[test]
 fn finish_fullscreen_leaves_alt_screen_before_mirror_rows() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("find getFoo"));
@@ -44890,4 +44959,5 @@ fn dock_restore_ignores_a_malformed_config() {
         .expect("write bare-panel settings");
     assert_eq!(read_persisted_dock(&app), None);
 }
+
 

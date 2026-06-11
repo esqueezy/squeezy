@@ -47269,13 +47269,34 @@ impl TerminalGuard {
         // `render()` draws — so the mirrored rows match what the user saw. Built
         // AFTER the restore above so an allocation failure here cannot strand the
         // terminal.
-        let lines = transcript_lines_for_render(app, Some(width), true);
-        let mirror = render_lines_to_owned_buffer(&lines, width);
+        //
+        // Wrap at the session's PAINTED text width (the live frame reserves a
+        // scrollbar gutter, and a minimap rail when shown, so the text column is
+        // narrower than the raw terminal width). Wrapping at the raw width here
+        // re-flows long lines at a different column than every painted frame and
+        // misses the warm Main/EntryWrap caches. `main_text_width` is stamped each
+        // frame; fall back to the raw terminal width before the first paint (it
+        // returns 0 then, which `main_text_width` maps to 80). (deep-review #79)
+        let painted_width = app.main_text_width.get();
+        let mirror_width = if painted_width > 0 {
+            painted_width
+        } else {
+            width
+        };
+        let lines = transcript_lines_for_render(app, Some(mirror_width), true);
+        let mirror = render_lines_to_owned_buffer(&lines, mirror_width);
         let backend = self.term().backend_mut();
         // Emit the mirror into the now-restored normal buffer: the CRLF mirror
         // rows (with OSC 8 hyperlinks when capable) and the resume hint, all
-        // becoming native scrollback.
-        emit_finish_fullscreen_mirror(backend, &mirror, width, exit_hint.as_deref(), links)?;
+        // becoming native scrollback. Emit at the mirror buffer's own (painted)
+        // width so the per-row column scan matches the buffer it built.
+        emit_finish_fullscreen_mirror(
+            backend,
+            &mirror,
+            mirror_width,
+            exit_hint.as_deref(),
+            links,
+        )?;
         // The alternate screen has been left; record it so `Drop` won't leave it
         // again. Set BEFORE the trailing fallible calls so an error here still
         // prevents a double-leave. Mirror the same fact into the crash-path flag
