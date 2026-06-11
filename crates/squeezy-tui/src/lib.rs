@@ -146,6 +146,7 @@ mod quote_compose;
 mod rename_labels;
 mod render;
 mod resume_picker;
+mod review_board;
 mod scratchpad;
 mod scroll;
 mod search;
@@ -1865,6 +1866,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.bookmarks_open
         || app.session_timeline_open
         || app.subagent_timeline_open
+        || app.review_board_open
         || app.annotations_open
         || app.changes_since_open
         || app.action_palette.is_some()
@@ -1961,6 +1963,12 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.subagent_compare_marks.clear();
             app.subagent_compare = None;
             app.subagent_compare_rect_cache.set(None);
+            // The Live Review Board (§12.8.5) cursor references the prior session's
+            // subagent ids, which are now gone — drop it so a stale cursor can never
+            // point the board at a vanished worker. The board itself rebuilds lazily
+            // from the new (empty) record set on its next refresh.
+            app.review_board_open = false;
+            app.review_board_cursor = None;
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => {
@@ -3020,6 +3028,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             return consumed;
         }
         // View is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Live Review Board (§12.8.5) owns the pointer while open: a left-click on a
+    // worker card selects it and jumps the main view to that worker's conversation;
+    // every other click is swallowed so a stray press can't fall through to the
+    // surface beneath. Hit-tested in ABSOLUTE screen coordinates against the card
+    // targets `render_review_board_surface` registered this frame.
+    if app.review_board_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ReviewBoardCard(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Board is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -6564,6 +6590,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Live Review Board (§12.8.5) is modal while open: it owns the keyboard
+    // (↑↓/kj/n/p walk the cursor across the lanes by stable id, Enter/→/l open the
+    // selected worker's conversation, Esc/Ctrl+Alt+O close) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.review_board_open && handle_review_board_key(app, key) {
+        return Ok(false);
+    }
+
     // The What Changed Since Here? overlay (§12.2.7) is modal while open: it owns
     // the keyboard (↑↓/kj/n/p move the change cursor, Enter/→/l jump to the
     // change's entry, m re-marks the anchor, Esc/Alt+0 close) BEFORE any
@@ -8767,6 +8803,16 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             toggle_subagent_compare(app);
             true
         }
+        keymap::Action::ToggleReviewBoard => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_review_board(app);
+            true
+        }
         keymap::Action::ToggleToolActions => {
             // Main-surface overlay; the config/setup screens own their own
             // routing, and the Ctrl+T overlay guard above already blocks this
@@ -10501,6 +10547,164 @@ fn subagent_timeline_jump_to_selected(app: &mut TuiApp, advance: bool) {
             .next_index(Some(app.subagent_timeline_selected))
     {
         app.subagent_timeline_selected = next;
+    }
+    app.needs_redraw = true;
+}
+
+// ---- Live Review Board (§12.8.5) ----
+
+/// Re-park the Live Review Board cursor onto a live worker after a (re)build:
+/// keep the current worker if it is still on the board, else heal to the first
+/// worker, else `None` when the board is empty. Id-addressed so a pruned record or
+/// an emptied lane never strands the cursor on a vanished worker.
+fn review_board_reconcile_cursor(app: &mut TuiApp) {
+    let still_present = app
+        .review_board_cursor
+        .is_some_and(|id| app.review_board.index_of(id).is_some());
+    if !still_present {
+        app.review_board_cursor = app.review_board.card_at(0).map(|card| card.id);
+    }
+}
+
+/// Open / close the Live Review Board (§12.8.5). On open it refreshes the board
+/// from the live records, parks the cursor on the first worker (id-addressed), and
+/// reports a one-line summary (or an honest empty-state line); on close it clears
+/// the status. Toggled by `ToggleReviewBoard` (`Ctrl+Alt+O`).
+fn toggle_review_board(app: &mut TuiApp) {
+    app.review_board_open = !app.review_board_open;
+    if app.review_board_open {
+        refresh_review_board(app);
+        // Park on the first worker (board order: running → blocked → capped →
+        // completed) so the board opens on the live end of the fan-out.
+        app.review_board_cursor = app.review_board.card_at(0).map(|card| card.id);
+        app.status = if app.review_board.is_empty() {
+            "review board (no workers yet) — Esc to close".to_string()
+        } else {
+            let attention = app.review_board.attention_count();
+            let attention_note = if attention > 0 {
+                format!(" ({attention} need a look)")
+            } else {
+                String::new()
+            };
+            format!(
+                "review board: {}{attention_note} — \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} Esc close",
+                app.review_board.summary(),
+            )
+        };
+    } else {
+        app.status = "review board closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Close the Live Review Board (§12.8.5) without leaking the key to the surface
+/// beneath. Shared by the Esc and toggle-chord paths.
+fn close_review_board(app: &mut TuiApp) {
+    app.review_board_open = false;
+    app.status = "review board closed".to_string();
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Live Review Board (§12.8.5) is open. Returns `true` when
+/// the key was consumed (so it never leaks to the composer or global keymap). The
+/// toggle chord (`Ctrl+Alt+O`) and Esc close; Up/Down (and k/j, plus n/p) walk the
+/// cursor over the flattened lanes by stable id; Enter (and l/→) jumps the main
+/// view to the selected worker's conversation. Every other key is swallowed so the
+/// board is modal.
+fn handle_review_board_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.review_board_open {
+        return false;
+    }
+    // The board's own toggle chord closes it, so the same key both opens and closes
+    // — without leaking to the global keymap, which the modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleReviewBoard) {
+        close_review_board(app);
+        return true;
+    }
+    // Heal the cursor against the current board before moving it, so a worker that
+    // vanished between frames never strands navigation.
+    review_board_reconcile_cursor(app);
+    let current = app
+        .review_board_cursor
+        .and_then(|id| app.review_board.index_of(id));
+    match key.code {
+        KeyCode::Esc => {
+            close_review_board(app);
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+            if let Some(prev) = app.review_board.prev_index(current) {
+                app.review_board_cursor = app.review_board.card_at(prev).map(|card| card.id);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+            if let Some(next) = app.review_board.next_index(current) {
+                app.review_board_cursor = app.review_board.card_at(next).map(|card| card.id);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            review_board_jump_to_cursor(app, true);
+        }
+        // Swallow every other key so the board is modal: a stray keystroke cannot
+        // leak into the composer underneath while the board owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the conversation behind the Live Review Board's selected
+/// worker (§12.8.5). Resolves the cursor's stable id to its subagent-pane row,
+/// makes that subagent the active conversation (selecting its pane row and pinning
+/// its scroll), opens the transcript overlay on it, and reports the worker in the
+/// status line. A no-op (status hint) when there is nothing to jump to or the
+/// worker's record has gone (a capped worker has no transcript and heals to a
+/// select-only hint).
+///
+/// `advance` walks the cursor forward to the next worker afterward (keyboard Enter)
+/// so a repeated Enter steps through the board; the mouse path passes `false` so a
+/// click lands and stays on exactly the clicked worker.
+fn review_board_jump_to_cursor(app: &mut TuiApp, advance: bool) {
+    review_board_reconcile_cursor(app);
+    let Some(id) = app.review_board_cursor else {
+        app.status = "review board: nothing to open".to_string();
+        return;
+    };
+    let Some(lane) = app
+        .review_board
+        .index_of(id)
+        .and_then(|i| app.review_board.card_at(i))
+        .map(|card| card.lane)
+    else {
+        app.status = "review board: nothing to open".to_string();
+        return;
+    };
+    // Resolve the id to its pane row (row 0 is `main`; record N lives on row
+    // N + 1). A vanished record (pruned/cleared) or a capped worker that never ran
+    // means there is no transcript to open — a select-only honest hint.
+    let Some(pos) = subagent_record_index(app, id) else {
+        app.status = format!(
+            "review board: {} worker has no conversation to open",
+            lane.title().to_lowercase(),
+        );
+        return;
+    };
+    app.subagent_pane.selected = pos + 1;
+    app.subagent_pane.active = ConversationSource::Subagent(id);
+    active_transcript_scroll_mut(app).pin_to_bottom();
+    open_subagent_transcript_overlay(app);
+    // Opening the transcript overlay closes the board: it now owns the surface.
+    app.review_board_open = false;
+    app.status = format!(
+        "review board: opened {} worker — {} to expand, Esc to close",
+        lane.title().to_lowercase(),
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay),
+    );
+    if advance && let Some(next_idx) = app.review_board.index_of(id) {
+        let next = app.review_board.next_index(Some(next_idx));
+        if let Some(next) = next {
+            app.review_board_cursor = app.review_board.card_at(next).map(|card| card.id);
+        }
     }
     app.needs_redraw = true;
 }
@@ -14456,6 +14660,22 @@ fn refresh_subagent_timeline(app: &mut TuiApp) {
         .rebuild_if_stale(fingerprint, &sources);
 }
 
+/// Refresh the Live Review Board (§12.8.5) against the live subagent-pane records,
+/// rebuilding **only** when the records' fingerprint has moved since the last
+/// refresh. Reuses the SAME `build_subagent_timeline_sources` projection the
+/// Subagent Timeline Panel consumes, so the board and the panel can never disagree
+/// about a worker's state. Called lazily — right before the board opens and once a
+/// frame while it is open — so an idle session that never opens it pays nothing,
+/// and an open board re-builds only on a real subagent event (start, activity,
+/// tool result, completion, failure, cap rejection). Same zero-idle-cost shape as
+/// `refresh_subagent_timeline`: a running worker moves the fingerprint at most once
+/// a wall-clock second, never per frame.
+fn refresh_review_board(app: &mut TuiApp) {
+    let sources = build_subagent_timeline_sources(app);
+    let fingerprint = review_board::ReviewBoard::fingerprint_of(sources.iter());
+    app.review_board.rebuild_if_stale(fingerprint, &sources);
+}
+
 /// Count the non-blank lines in a text blob — the body row count a lane header
 /// advertises ("tool output (12 lines)"). Bounded by counting only what is
 /// present; an empty/blank blob yields 0.
@@ -15919,6 +16139,14 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // 0-based pane index, matching what the cell registered.
         interaction::Action::SubagentCompareMark(index) => {
             toggle_subagent_compare_mark(app, index);
+        }
+        // A click on a Live Review Board worker card (§12.8.5): park the cursor on
+        // it (by stable id) and jump the main view to that worker's conversation —
+        // the mouse twin of ↑↓ + Enter, in one go. No auto-advance (a click is a
+        // precise pick that stays on the card it landed on).
+        interaction::Action::ReviewBoardSelectJump(id) => {
+            app.review_board_cursor = Some(id);
+            review_board_jump_to_cursor(app, false);
         }
         // A click on an Entry Annotations row (§12.2.5): move the cursor onto it
         // and jump the main view to the entry that annotation anchors — the mouse
@@ -22230,6 +22458,16 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_subagent_compare_surface(frame, area, app);
         return;
     }
+    // The Live Review Board (§12.8.5) paints as a fullscreen fan-out orchestration
+    // dashboard — status lanes (running / blocked / capped / completed) of the
+    // session's workers — over everything else while open, registering each worker
+    // card's click target every frame. Checked beside the subagent timeline panel
+    // (its sibling: the panel lists, this groups into lanes) so its targets register
+    // and it owns the surface while open.
+    if app.review_board_open {
+        render_review_board_surface(frame, area, app);
+        return;
+    }
     // The What Changed Since Here? overlay (§12.2.7) paints as a fullscreen grouped
     // delta list over everything else while open, registering its per-change row
     // click targets every frame. Checked beside the session-timeline overlay (its
@@ -26112,6 +26350,180 @@ fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             interaction::TargetKey::Chrome(interaction::ChromeKey::TimelineRow(index)),
             interaction::Action::TimelineSelectJump(index),
         );
+    }
+}
+
+/// The accent color for a Live Review Board lane (§12.8.5): running reads silver,
+/// blocked red, capped quiet, completed green — color *and* the lane title text, so
+/// a monochrome terminal still reads the lane. Attention lanes (blocked/capped)
+/// bold. Kept beside the board surface so the lane headers and worker rows share
+/// one mapping.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn review_lane_style(lane: review_board::ReviewLane) -> Style {
+    use review_board::ReviewLane as L;
+    let color = match lane {
+        L::Running => crate::render::theme::muted(),
+        L::Blocked => crate::render::theme::red(),
+        L::Capped => crate::render::theme::quiet(),
+        L::Completed => crate::render::theme::green(),
+    };
+    let base = Style::default().fg(color);
+    if lane.is_attention() {
+        base.add_modifier(Modifier::BOLD)
+    } else {
+        base
+    }
+}
+
+/// Paint the Live Review Board (§12.8.5) as a fullscreen fan-out orchestration
+/// dashboard: a title, a one-line summary / navigation header (or an honest
+/// empty-state line), then the workers grouped under their status lanes (running →
+/// blocked → capped → completed). Each present lane gets a bold, color-coded header
+/// ("Blocked (1)") and one selectable worker row under it — a caret on the cursor's
+/// worker, the worker's `agent #ordinal` label, its elapsed clock, tool count,
+/// cost, and a short deterministic latest-activity label. Each worker row is a
+/// [`interaction::ChromeKey::ReviewBoardCard`] click target keyed by the worker's
+/// stable id so a click reaches the same `review_board_jump_to_cursor` path as
+/// ↑↓+Enter. Reads the already-refreshed board (kept current by the run loop while
+/// open), so painting is constant-time and does no record walk. The cursor is
+/// healed to a live worker before painting so a vanished worker can never strand
+/// the caret.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn render_review_board_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Live review board ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} fan-out orchestration ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 100, 28, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // The cursor's worker id, healed to a live worker (the run-loop reconcile keeps
+    // this current; recompute defensively here so a direct render call in a test is
+    // also correct).
+    let cursor_id = app
+        .review_board_cursor
+        .filter(|id| app.review_board.index_of(*id).is_some())
+        .or_else(|| app.review_board.card_at(0).map(|card| card.id));
+
+    // Header: summary + navigation hint, or an honest empty-state line.
+    let header = if app.review_board.is_empty() {
+        Line::from(Span::styled(
+            "No workers in this session yet \u{00b7} Esc close",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} Esc close",
+                app.review_board.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if app.review_board.is_empty() {
+        return;
+    }
+
+    // Lay the lanes out top-to-bottom: a bold lane header, then its worker rows,
+    // then a blank spacer. The cursor row gets a caret + emphasis. Every row is
+    // clamped to the inner rect so a tall fan-out never paints past the box.
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let mut y = list_top;
+    'lanes: for lane in app.review_board.present_lanes() {
+        if y >= list_bottom {
+            break;
+        }
+        // Lane header: "Running (2)" — color *and* the title text + count.
+        let count = app.review_board.count_in(lane);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{} ({count})", lane.title()),
+                review_lane_style(lane).add_modifier(Modifier::BOLD),
+            ))),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        y = y.saturating_add(1);
+
+        for card in app.review_board.cards_in(lane) {
+            if y >= list_bottom {
+                break 'lanes;
+            }
+            let is_selected = Some(card.id) == cursor_id;
+            let row_rect = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let caret = if is_selected { "  \u{203a} " } else { "    " };
+            let label_style = if is_selected {
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(crate::render::theme::foreground())
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    caret,
+                    Style::default().fg(if is_selected {
+                        crate::render::theme::secondary()
+                    } else {
+                        crate::render::theme::quiet()
+                    }),
+                ),
+                Span::styled(
+                    format!("{:<16} ", format!("{} #{}", card.agent, card.ordinal)),
+                    label_style,
+                ),
+                Span::styled(
+                    format!("{:>6} ", card.elapsed_clock()),
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+                Span::styled(
+                    format!("{:<9} ", format!("tools {}", card.tool_count)),
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+                Span::styled(
+                    format!("{:<13} ", card.cost_label()),
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+                Span::styled(card.latest.clone(), label_style),
+            ]);
+            frame.render_widget(Paragraph::new(line), row_rect);
+
+            // Register the whole row as a click target keyed by the worker's STABLE
+            // id (not a flattened index) so a click selects + opens exactly that
+            // worker even as lanes change between frames.
+            app.register_click(
+                row_rect,
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ReviewBoardCard(card.id)),
+                interaction::Action::ReviewBoardSelectJump(card.id),
+            );
+            y = y.saturating_add(1);
+        }
+        // Blank spacer between lanes (when there is room).
+        y = y.saturating_add(1);
     }
 }
 
@@ -40593,6 +41005,24 @@ pub(crate) struct TuiApp {
     /// the pane the pointer is over (mirrors `pinned_compare_rect_cache`). `None`
     /// when the view is closed or too small to paint two bodies.
     pub(crate) subagent_compare_rect_cache: std::cell::Cell<Option<(Rect, Rect)>>,
+    /// Live Review Board model (§12.8.5): the fan-out orchestration dashboard that
+    /// groups the session's subagents/workers into status lanes (running, blocked,
+    /// capped, completed), projected from the SAME live `subagent_pane` records the
+    /// Subagent Timeline Panel (§12.8.1) reads. Rebuilt incrementally — only when
+    /// the records' fingerprint moves — by `refresh_review_board`, so an idle
+    /// session pays one `u64` comparison per refresh. Drives the board's lanes and
+    /// the flattened id-navigation cursor.
+    pub(crate) review_board: review_board::ReviewBoard,
+    /// Whether the Live Review Board (§12.8.5) is open. `false` = closed (the
+    /// resting state, paints nothing extra); `true` = the fullscreen board owns
+    /// key/mouse routing. Toggled by the `ToggleReviewBoard` keymap action.
+    pub(crate) review_board_open: bool,
+    /// Stable `id` of the worker the Live Review Board cursor is parked on
+    /// (§12.8.5), or `None` when the board is empty / nothing is selected.
+    /// Id-addressed (never a flattened index) so a pruned/cleared record or a lane
+    /// that empties never repoints the cursor at the wrong worker; the cursor heals
+    /// to a surviving worker each render. Only meaningful while the board is open.
+    pub(crate) review_board_cursor: Option<SubagentId>,
     /// Entry Annotations (§12.2.5): the durable set of private notes the user has
     /// attached to transcript entries, each keyed by a stable transcript entry id
     /// so it survives appends, resize, folds, and filters. Lives here (session UI
@@ -41382,6 +41812,9 @@ impl TuiApp {
             subagent_compare_marks: subagent_compare::SubagentCompareMarks::new(),
             subagent_compare: None,
             subagent_compare_rect_cache: std::cell::Cell::new(None),
+            review_board: review_board::ReviewBoard::new(),
+            review_board_open: false,
+            review_board_cursor: None,
             annotations: annotations::AnnotationStore::new(),
             annotations_open: false,
             annotations_selected: 0,
@@ -43727,6 +44160,18 @@ impl TerminalGuard {
         // re-paints at most once a second while a subagent runs — never per frame.
         if app.subagent_timeline_open {
             refresh_subagent_timeline(app);
+        }
+
+        // Keep the Live Review Board (§12.8.5) current while it is open, on the same
+        // no-op-when-unchanged terms: an open-but-idle (all workers finished) board
+        // costs one `u64` comparison and a closed board costs nothing (this branch
+        // is skipped entirely). A running worker's elapsed column advances at most
+        // once a wall-clock second, so the board re-paints at most once a second
+        // while a worker runs — never per frame. The cursor is healed to a surviving
+        // worker right after the rebuild so a pruned record never strands it.
+        if app.review_board_open {
+            refresh_review_board(app);
+            review_board_reconcile_cursor(app);
         }
 
         // Heal the Compare Subagent Outputs view (§12.8.3) when one of its two

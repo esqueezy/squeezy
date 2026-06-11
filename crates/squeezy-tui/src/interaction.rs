@@ -184,6 +184,10 @@ pub(crate) enum ChromeKey {
     /// subagent's 0-based pane index, so a click marks / unmarks that subagent for
     /// the Compare Subagent Outputs view (§12.8.3).
     SubagentCompareMark(usize),
+    /// A worker card on the Live Review Board (§12.8.5), keyed by the worker's
+    /// stable subagent id (NOT a flattened index) so a click selects + jumps the
+    /// main view to that worker's conversation even as lanes change between frames.
+    ReviewBoardCard(u64),
     /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
     /// 0-based index in the annotation list so a click selects + jumps the main
     /// view to the entry that exact annotation anchors.
@@ -458,6 +462,12 @@ pub(crate) enum Action {
     /// Timeline Panel. Marking two subagents lets the compare view open over them.
     /// The index is the 0-based pane index of the subagent record.
     SubagentCompareMark(usize),
+    /// Select the given worker card on the Live Review Board (§12.8.5): park the
+    /// cursor on it (by stable id) and jump the main view to that worker's
+    /// conversation. Mouse twin of walking the cursor with ↑↓ and pressing Enter; a
+    /// click both selects and jumps in one go. Keyed by the worker's stable subagent
+    /// id, matching the card's click target.
+    ReviewBoardSelectJump(u64),
     /// Select the given annotation row in the Entry Annotations overlay (§12.2.5):
     /// move the cursor onto it and jump the main view to the entry that annotation
     /// anchors. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click
@@ -695,6 +705,7 @@ impl Action {
         Action::SubagentJump(0),
         Action::SubagentTimelinePromote(0),
         Action::SubagentCompareMark(0),
+        Action::ReviewBoardSelectJump(0),
     ];
 }
 

@@ -708,6 +708,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // before the global keymap sees it, so a `[mark]` cell click and the
         // keyboard reach the same `toggle_subagent_compare_mark` handler.
         A::SubagentCompareMark(_) => KeyboardPath::Always("subagent timeline c"),
+        // Live Review Board (§12.8.5) — the board's own key handler owns ↑↓/kj/n/p
+        // (walk the cursor across the lanes by stable id) and Enter/→/l (open the
+        // selected worker's conversation) before the global keymap sees them, so a
+        // worker-card click and the keyboard reach the same
+        // `review_board_jump_to_cursor` handler.
+        A::ReviewBoardSelectJump(_) => KeyboardPath::Always("review board ↑↓/Enter"),
         // Entry Annotations overlay (§12.2.5) — the overlay's own key handler owns
         // ↑↓/kj/n/p (move the annotation cursor / next-previous) and Enter (jump to
         // the entry behind the selected annotation) before the global keymap sees

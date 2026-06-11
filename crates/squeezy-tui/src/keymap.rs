@@ -438,6 +438,19 @@ pub(crate) enum Action {
     /// §12.2.3 Pinned Compare View split + diff machinery. Costs nothing until two
     /// are marked and the view is opened.
     ToggleSubagentCompare,
+    /// Open / close the Live Review Board overlay (`Ctrl+Alt+O` default; §12.8.5).
+    /// A fan-out orchestration dashboard that groups the session's in-flight and
+    /// finished subagents/workers into status lanes — running, blocked (failed),
+    /// capped (cap-rejected, kept visible), and completed — so a glance reads
+    /// "what is running, what needs a look, what finished" across a parallel
+    /// delegation. The board is derived from the same live subagent-pane records the
+    /// Subagent Timeline Panel (§12.8.1) projects, so the two views never disagree;
+    /// it never infers a runtime "queued" lane from cap rejection. The cursor (↑↓/kj,
+    /// plus n/p) walks the flattened lanes by stable id and Enter/→/l jumps the main
+    /// view to that worker's conversation; a row click selects + jumps. The board
+    /// rebuilds incrementally only on a subagent event, so an idle session pays
+    /// nothing.
+    ToggleReviewBoard,
     /// Open / close the Actionable Tool Outputs overlay (`Ctrl+Alt+A` default;
     /// §12.3.1) for the focused (or top-visible) tool result. It scans that result's
     /// output for actionable elements — file paths, URLs, error lines, diff hunks,
@@ -611,6 +624,7 @@ impl Action {
             Self::JumpToSubagent => "jump_to_subagent",
             Self::PromoteSubagentResult => "promote_subagent_result",
             Self::ToggleSubagentCompare => "toggle_subagent_compare",
+            Self::ToggleReviewBoard => "toggle_review_board",
             Self::ToggleToolActions => "toggle_tool_actions",
             Self::ToggleScratchpad => "toggle_scratchpad",
             Self::ToggleTemplates => "toggle_templates",
@@ -700,6 +714,7 @@ impl Action {
         Action::JumpToSubagent,
         Action::PromoteSubagentResult,
         Action::ToggleSubagentCompare,
+        Action::ToggleReviewBoard,
         Action::ToggleToolActions,
         Action::ToggleScratchpad,
         Action::ToggleTemplates,
@@ -910,6 +925,13 @@ impl Action {
             // always-available equivalent is marking two rows + opening from the
             // subagent timeline panel's own keys.
             | Self::ToggleSubagentCompare
+            // Live Review Board overlay toggle is `Ctrl+Alt+O` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family. The always-available equivalent is the §12.8.1 subagent
+            // timeline panel's own ↑↓ select + Enter open keys over the same
+            // workers.
+            | Self::ToggleReviewBoard
             // Actionable Tool Outputs overlay toggle is `Ctrl+Alt+A` — a Ctrl+Alt
             // (Meta) chord, the same classically-unreliable encoding across Linux
             // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P`/
@@ -1293,6 +1315,17 @@ impl Action {
             // changes-since. Every bare `Alt` letter in the nav/copy/overlay
             // family is taken, so the digit is the free, composer-clear pick.
             Self::ToggleSubagentCompare => KeyBinding::new(KeyCode::Char('7'), KeyModifiers::ALT),
+            // Live Review Board (§12.8.5). `Ctrl+Alt+O` — `O` recalls
+            // "Orchestration" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+A`/`Ctrl+Alt+D`/`Ctrl+Alt+Q`/`Ctrl+Alt+H`). It is free:
+            // bare `Alt+o` is the copy-current-tool-output verb and bare `Ctrl+O` is
+            // the fold toggle, so the Ctrl+Alt modifier keeps the board distinct and
+            // clear of every composer chord. The §12.8.1 timeline panel reaches the
+            // same workers for terminals that swallow the Meta chord.
+            Self::ToggleReviewBoard => KeyBinding::new(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
             // Actionable Tool Outputs (§12.3.1). `Ctrl+Alt+A` — `A` recalls
             // "Actions" and follows the existing `Ctrl+Alt+letter` style
             // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`/`Ctrl+Alt+R`/

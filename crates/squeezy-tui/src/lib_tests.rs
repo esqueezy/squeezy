@@ -35129,6 +35129,309 @@ async fn subagent_timeline_renders_across_resizes() {
     assert_eq!(app.subagent_timeline.len(), 4, "rows stable across resize");
 }
 
+// ---- Live Review Board (§12.8.5) ----
+
+/// `Ctrl+Alt+O` opens the board and groups the four `app_with_subagents` workers
+/// into their lanes; the lane headers, the worker labels, and the metrics all paint
+/// (color *and* text). Reuses the §12.8.1 `app_with_subagents` fan-out.
+#[tokio::test]
+async fn review_board_ctrl_alt_o_opens_and_groups_workers_into_lanes() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+O opens the review board");
+
+    assert!(app.review_board_open, "Ctrl+Alt+O opens the board");
+    let out = render_to_string(&app, 96, 28);
+    assert!(out.contains("Live review board"), "header present:\n{out}");
+
+    // One card per worker, grouped lane-major: running, blocked, capped, completed.
+    assert_eq!(app.review_board.len(), 4, "one card per worker");
+    assert_eq!(
+        app.review_board.count_in(review_board::ReviewLane::Running),
+        1,
+    );
+    assert_eq!(
+        app.review_board.count_in(review_board::ReviewLane::Blocked),
+        1,
+    );
+    assert_eq!(
+        app.review_board.count_in(review_board::ReviewLane::Capped),
+        1,
+    );
+    assert_eq!(
+        app.review_board
+            .count_in(review_board::ReviewLane::Completed),
+        1,
+    );
+    // Blocked (failed) + capped (rejected) both want a look — never inferred as
+    // "queued" from the cap rejection.
+    assert_eq!(app.review_board.attention_count(), 2);
+
+    // The lane headers, worker labels, tool count, and cost all paint.
+    assert!(out.contains("Running"), "running lane header:\n{out}");
+    assert!(out.contains("Blocked"), "blocked lane header:\n{out}");
+    assert!(out.contains("Capped"), "capped lane header:\n{out}");
+    assert!(out.contains("Completed"), "completed lane header:\n{out}");
+    assert!(out.contains("explore"), "completed worker label:\n{out}");
+    assert!(out.contains("tools 4"), "child tool count:\n{out}");
+    assert!(out.contains("$1.500000"), "child-reported cost:\n{out}");
+    // The capped worker has no honest timing/cost: a dash, never a fake number.
+    assert!(out.contains('-'), "dash for missing metrics:\n{out}");
+}
+
+/// The keyboard path: ↑↓ walk the cursor across the lanes by stable id, and Enter
+/// opens the selected worker's conversation (overlay), leaving a return anchor.
+#[tokio::test]
+async fn review_board_keyboard_navigates_and_opens_conversation() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("open board");
+    let _ = render_to_string(&app, 96, 28);
+
+    // Cursor opens on the first board card (board order: running first → the running
+    // worker id 2).
+    assert_eq!(
+        app.review_board_cursor,
+        Some(2),
+        "opens on the first worker"
+    );
+
+    // Down walks to the next card (blocked → failed worker id 3).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+    assert_eq!(
+        app.review_board_cursor,
+        Some(3),
+        "↓ walks to the next worker"
+    );
+
+    // Up walks back to the first card.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up");
+    assert_eq!(app.review_board_cursor, Some(2), "↑ walks back");
+
+    // Enter opens the running worker's conversation and closes the board.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter opens the worker");
+    assert!(
+        matches!(app.subagent_pane.active, ConversationSource::Subagent(2)),
+        "Enter opens the cursor's worker: {:?}",
+        app.subagent_pane.active,
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "the conversation overlay opens"
+    );
+    assert!(
+        !app.review_board_open,
+        "opening the worker closes the board"
+    );
+}
+
+/// The mouse path: a left-click on a worker card selects it and opens its
+/// conversation — the mouse twin of ↑↓+Enter, in one go.
+#[tokio::test]
+async fn review_board_mouse_click_selects_and_opens() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("open board");
+    let _ = render_to_string(&app, 96, 28);
+
+    // Scan for the registered card target of the completed worker (id 1).
+    let mut hit_cell = None;
+    'scan: for row in 0..28u16 {
+        for col in 0..96u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ReviewBoardCard(id)),
+                _,
+            )) = app.click_target_at(col, row)
+                && id == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a worker-card target is registered for id 1");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    // The click selects + opens exactly worker id 1 and opens the overlay onto it.
+    assert_eq!(app.review_board_cursor, Some(1), "the click parks on id 1");
+    assert!(
+        matches!(app.subagent_pane.active, ConversationSource::Subagent(1)),
+        "clicking the card opens worker id 1: {:?}",
+        app.subagent_pane.active,
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "the conversation overlay opens"
+    );
+}
+
+/// `Ctrl+Alt+O` a second time closes the board without leaking the key to the
+/// composer underneath.
+#[tokio::test]
+async fn review_board_toggle_closes_without_leaking() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    let composer_before = app.input.clone();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("open");
+    assert!(app.review_board_open);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("close");
+    assert!(!app.review_board_open, "second Ctrl+Alt+O closes the board");
+    assert_eq!(
+        app.input, composer_before,
+        "the toggle key never leaked into the composer",
+    );
+}
+
+/// The empty/edge case: a session with no workers opens to an honest empty-state
+/// line, and Up/Down/Enter on the empty board are harmless no-ops (no panic,
+/// nothing opens).
+#[tokio::test]
+async fn review_board_empty_shows_empty_state_and_navigation_is_inert() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(96, 28);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("open empty board");
+
+    assert!(app.review_board_open);
+    assert!(app.review_board.is_empty());
+    assert_eq!(app.review_board_cursor, None, "no worker to park on");
+    let out = render_to_string(&app, 96, 28);
+    assert!(
+        out.contains("Live review board"),
+        "header still paints:\n{out}"
+    );
+    assert!(out.contains("No workers"), "empty-state line:\n{out}");
+
+    // Up/Down/Enter on an empty board are harmless no-ops.
+    for code in [KeyCode::Down, KeyCode::Up, KeyCode::Enter] {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(code, KeyModifiers::NONE),
+        )
+        .await
+        .expect("nav on empty board");
+    }
+    assert!(app.review_board.is_empty());
+    assert_eq!(app.review_board_cursor, None);
+    assert!(app.transcript_overlay.is_none(), "nothing opened");
+}
+
+/// The board paints across resizes: the header and the lanes survive a narrow,
+/// default, and wide frame; the worker count is width-independent.
+#[tokio::test]
+async fn review_board_renders_across_resizes() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("open board");
+
+    for (w, h) in [(96u16, 28u16), (140, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Live review board"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+    // The worker ids are width-independent: the same four cards survive resize.
+    assert_eq!(app.review_board.len(), 4, "cards stable across resize");
+}
+
 // ---- Promote Subagent Result To Prompt (§12.8.4) ----
 
 /// Open the Subagent Timeline Panel and park the cursor on the first (completed)
