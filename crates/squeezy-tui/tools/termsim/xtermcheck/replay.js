@@ -145,33 +145,16 @@ function main() {
     scrollback: 10000,
   });
 
-  let start = 0;
-  for (let i = 0; i < frames.length; i++) {
-    const frame = frames[i];
-    const end = frame.byte_offset;
-    if (end < start || end > bytes.length) {
-      fail(
-        `${file}: frame ${i} byte_offset ${end} is out of range ` +
-          `(prev=${start}, len=${bytes.length})`,
-      );
-    }
-    // Per-frame resize reproduces the FixedSize the harness drove for this
-    // paint. xterm.js applies the resize before we feed the frame's bytes,
-    // exactly mirroring the Rust replay legs.
-    if (term.cols !== frame.w || term.rows !== frame.h) {
-      term.resize(frame.w, frame.h);
-    }
-    const slice = bytes.subarray(start, end);
-    if (slice.length > 0) {
-      // Uint8Array write path keeps raw bytes intact (no utf-8 re-encode).
-      term.write(Uint8Array.from(slice));
-    }
-    start = end;
-  }
-
-  // xterm.js parses writes asynchronously; drain with a final empty write whose
-  // callback fires once the parser has consumed everything queued above.
-  term.write(new Uint8Array(0), () => {
+  // Replay each frame at its own geometry. xterm.js parses term.write() bytes
+  // ASYNCHRONOUSLY, so a synchronous for-loop that calls term.resize() between
+  // writes would apply every resize up front and then parse the whole queued
+  // stream at the FINAL geometry — collapsing any mid-stream reflow and hiding
+  // exactly the resize-tearing / divider-stacking regression this oracle
+  // exists to catch. To make per-frame reflow actually happen we chain each
+  // frame's resize+write inside the PRIOR frame's write callback, so the
+  // parser has fully consumed frame i at its (w, h) before we resize for frame
+  // i+1. The divider drain runs only in the final frame's callback.
+  function finish() {
     const lines = readViewportLines(term);
     let dividerCount = 0;
     const matched = [];
@@ -201,7 +184,41 @@ function main() {
 
     process.stdout.write('xtermcheck: OK — no divider stacking\n');
     process.exit(0);
-  });
+  }
+
+  function step(i, start) {
+    if (i >= frames.length) {
+      // Final drain: an empty write whose callback fires once the parser has
+      // consumed everything queued above.
+      term.write(new Uint8Array(0), finish);
+      return;
+    }
+    const frame = frames[i];
+    const end = frame.byte_offset;
+    if (end < start || end > bytes.length) {
+      fail(
+        `${file}: frame ${i} byte_offset ${end} is out of range ` +
+          `(prev=${start}, len=${bytes.length})`,
+      );
+    }
+    // Per-frame resize reproduces the FixedSize the harness drove for this
+    // paint. We resize, then write this frame's slice, and only advance to the
+    // next frame once xterm.js has parsed the slice at this geometry.
+    if (term.cols !== frame.w || term.rows !== frame.h) {
+      term.resize(frame.w, frame.h);
+    }
+    const slice = bytes.subarray(start, end);
+    if (slice.length > 0) {
+      // Uint8Array write path keeps raw bytes intact (no utf-8 re-encode).
+      term.write(Uint8Array.from(slice), () => step(i + 1, end));
+    } else {
+      // Empty slice: nothing to parse, but still drain to preserve ordering
+      // before moving on to the next frame's resize.
+      term.write(new Uint8Array(0), () => step(i + 1, end));
+    }
+  }
+
+  step(0, 0);
 }
 
 try {
