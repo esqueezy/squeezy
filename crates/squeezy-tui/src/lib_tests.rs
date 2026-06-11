@@ -10618,6 +10618,33 @@ async fn dogfood_overlay_keymap_chord_toggles_through_dispatch() {
 }
 
 #[tokio::test]
+async fn ctrl_alt_m_via_handle_key_reaches_dogfood_not_render_metrics() {
+    // Regression for deep-review #29: a hardcoded Ctrl+Alt+M intercept at the front
+    // of handle_key used to flip only show_render_metrics and return before
+    // dispatch_keymap_action ever ran, leaving the ToggleDogfoodMetrics default
+    // binding dead and the chord un-capturable in the editor. Driving the real
+    // handle_key path must now reach the keymap action and toggle the dogfood
+    // overlay on (which forces the host render HUD visible).
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(!app.show_dogfood_metrics, "dogfood overlay off by default");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("handle_key");
+    assert!(
+        app.show_dogfood_metrics,
+        "Ctrl+Alt+M must reach ToggleDogfoodMetrics through dispatch"
+    );
+}
+
+#[tokio::test]
 async fn keypress_through_event_loop_increments_dogfood_input_counter() {
     // End to end: a key event flows through the real `dispatch_input_events`,
     // which bumps the dogfood key-input counter, and the subsequent painted

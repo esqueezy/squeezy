@@ -7335,18 +7335,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // "Ctrl+E does nothing", "Ctrl+X Q types Q" class of bugs.
     let key = normalise_control_byte(key);
 
-    // Hidden render-budget HUD toggle (`Ctrl+Alt+M`). A deliberately obscure
-    // chord — never a normal composer keystroke — so it stays out of the way
-    // while still being reachable at runtime for a quick perf glance, alongside
-    // the `SQUEEZY_RENDER_METRICS` env opt-in. Handled before every other
-    // dispatch so no surface can swallow it.
-    if key.code == KeyCode::Char('m')
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT)
-    {
-        app.toggle_render_metrics();
-        return Ok(false);
-    }
+    // NOTE: `Ctrl+Alt+M` is intentionally NOT intercepted here. It is owned by the
+    // rebindable `ToggleDogfoodMetrics` keymap action (its default chord), which
+    // flows through `dispatch_keymap_action` and forces the render-budget HUD
+    // visible as part of the dogfood overlay. A hardcoded front-of-loop intercept
+    // would have swallowed the chord before dispatch, leaving the keymap binding
+    // dead and the chord un-capturable in the keybinding editor. The render HUD on
+    // its own stays reachable via the `SQUEEZY_RENDER_METRICS` env opt-in.
 
     // Any keypress while a turn-done notification is up counts as the
     // user acknowledging it — drop the title back to cleared so the
