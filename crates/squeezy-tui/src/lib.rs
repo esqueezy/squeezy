@@ -22195,14 +22195,13 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     };
     rows.push(("synchronized output", sync_out));
 
-    // Mouse capture
-    let mouse = if env::var_os("SQUEEZY_MOUSE_CAPTURE")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
-    {
-        "enabled (SQUEEZY_MOUSE_CAPTURE=1)"
+    // Mouse capture — report the SAME resolution the renderer actually uses
+    // (`resolve_mouse_capture`: on by default, only `SQUEEZY_MOUSE_CAPTURE=0`
+    // disables) so diagnostics never contradict the live behavior.
+    let mouse = if resolve_mouse_capture(|k| env::var_os(k)) {
+        "enabled by default (set SQUEEZY_MOUSE_CAPTURE=0 to disable)"
     } else {
-        "disabled (set SQUEEZY_MOUSE_CAPTURE=1 to enable)"
+        "disabled (SQUEEZY_MOUSE_CAPTURE=0)"
     };
     rows.push(("mouse capture", mouse.to_string()));
 
@@ -22245,7 +22244,10 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     lines.push(String::new());
     lines.push("Remedies:".to_string());
     lines.push("  - tmux OSC52: `set-option -g allow-passthrough on`".to_string());
-    lines.push("  - mouse: set SQUEEZY_MOUSE_CAPTURE=1".to_string());
+    lines.push(
+        "  - native text selection: mouse capture is on by default; SQUEEZY_MOUSE_CAPTURE=0 to free it (or Shift+drag)"
+            .to_string(),
+    );
     lines.push("  - shell: set SQUEEZY_SHELL (e.g. SQUEEZY_SHELL=/bin/bash)".to_string());
     lines.join("\n")
 }
