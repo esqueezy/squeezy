@@ -6507,6 +6507,64 @@ async fn keybinding_editor_swallows_paste_instead_of_leaking_to_composer() {
     );
 }
 
+/// deep-review #59: a second paste while a paste/editor overlay is open must be
+/// REJECTED, not silently overwrite the staged paste. With paste A staged, a
+/// huge paste B must leave A's content intact and the composer untouched.
+#[tokio::test]
+async fn paste_while_staging_overlay_open_is_rejected_and_keeps_paste_a() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // A half-typed draft already in the composer — the rejected paste must not
+    // touch it.
+    app.input = "draft prompt".to_string();
+    app.input_cursor = app.input.len();
+
+    // Paste A: a huge block, staged. Distinct length so we can tell it apart.
+    let paste_a = "a".repeat(paste_staging::HUGE_PASTE_CHAR_THRESHOLD + 11);
+    app.paste_staging = Some(paste_staging::PasteStaging::new(
+        paste_staging::StagedPaste::new(paste_a.clone()),
+    ));
+    let chars_a = app
+        .paste_staging
+        .as_ref()
+        .unwrap()
+        .paste()
+        .estimates()
+        .chars;
+
+    // Paste B: a different huge block. The old code would replace A via
+    // open_paste_staging; the gate must reject it instead.
+    let paste_b = "b".repeat(paste_staging::HUGE_PASTE_CHAR_THRESHOLD + 999);
+    handle_paste(&mut app, &mut agent, paste_b)
+        .await
+        .expect("handle paste");
+
+    // The staging overlay still holds paste A (its char count is unchanged).
+    assert!(
+        app.paste_staging.is_some(),
+        "the staging overlay stays open"
+    );
+    assert_eq!(
+        app.paste_staging
+            .as_ref()
+            .unwrap()
+            .paste()
+            .estimates()
+            .chars,
+        chars_a,
+        "paste A's content must survive — B must NOT replace it"
+    );
+    // The composer draft is untouched and the rejection is surfaced.
+    assert_eq!(app.input, "draft prompt", "the composer draft is unchanged");
+    assert!(
+        app.status
+            .contains("paste unavailable while a paste/editor overlay is open"),
+        "the rejection is surfaced in the status: {}",
+        app.status
+    );
+}
+
 #[test]
 fn keybinding_editor_persist_honors_path_override_and_spares_real_file() {
     // §12.7.1 + deep-review #71: a fixture-driven rebind must write the pinned

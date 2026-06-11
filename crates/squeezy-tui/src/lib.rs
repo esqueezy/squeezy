@@ -8326,6 +8326,19 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
         app.status = "paste unavailable while a modal prompt is open".to_string();
         return Ok(());
     }
+    // The paste/editor overlays (§12.6.3 staging, §11G.6 preview, §12.6.4
+    // transform, §12.6.5 editor handoff) are themselves modal. A second paste
+    // while one is open must be REJECTED, not silently overwrite the staged
+    // paste (open_paste_staging replaces app.paste_staging) or leak a small
+    // paste into the composer beneath / get wiped by the editor-handoff Accept.
+    if app.paste_staging.is_some()
+        || app.paste_preview.is_some()
+        || app.paste_transform.is_some()
+        || app.editor_handoff.is_some()
+    {
+        app.status = "paste unavailable while a paste/editor overlay is open".to_string();
+        return Ok(());
+    }
 
     if let Some(status) = insert_pasted_image_path_token(app, &normalized) {
         app.status = status;
