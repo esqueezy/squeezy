@@ -10144,6 +10144,144 @@ async fn draw_app_stamps_render_metrics_for_a_painted_frame() {
     );
 }
 
+// ---- Stuck-Render Watchdog (§12.9.1) integration ----
+
+#[tokio::test]
+async fn force_full_redraw_clears_and_repaints_through_real_render() {
+    // The recovery path end to end through the production `TerminalGuard`: a
+    // forced full redraw must scrub the screen (`Clear(All)`) and then commit a
+    // fresh frame through the single fullscreen `render()` — the composer
+    // horizon is the proof the main view actually repainted.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
+    guard
+        .force_full_redraw(&mut app)
+        .expect("forced full redraw commits a frame");
+    let ansi = sink_to_string(&sink);
+
+    // The recovery scrubs the visible screen before the replacement frame.
+    assert!(
+        ansi.contains("\x1b[2J"),
+        "forced redraw must emit Clear(All) to scrub stale pixels: {ansi:?}"
+    );
+    // And it repaints the real main view through `render()`.
+    assert!(
+        row_is_composer_horizon(&strip_ansi(&ansi)),
+        "forced redraw must repaint the fullscreen main view"
+    );
+    // A frame committed, so the render-metrics ordinal advanced.
+    assert_eq!(
+        app.render_metrics.get().frame,
+        1,
+        "the forced redraw counts as a painted frame"
+    );
+}
+
+#[tokio::test]
+async fn force_full_redraw_recovers_an_empty_app() {
+    // Edge case: a fresh app with no transcript must still recover cleanly —
+    // the forced redraw never panics on an empty surface and still scrubs the
+    // screen. (The blank-transcript main view paints no horizon, so we assert on
+    // the scrub + a committed frame rather than specific content.)
+    let mut app = test_app(SessionMode::Build);
+    let (mut guard, sink) = TerminalGuard::for_capture_test(80, 24);
+    guard
+        .force_full_redraw(&mut app)
+        .expect("forced redraw on an empty app");
+    let ansi = sink_to_string(&sink);
+    assert!(
+        ansi.contains("\x1b[2J"),
+        "even an empty recovery scrubs the screen: {ansi:?}"
+    );
+    assert_eq!(
+        app.render_metrics.get().frame,
+        1,
+        "the empty forced redraw still commits a frame"
+    );
+}
+
+#[tokio::test]
+async fn force_full_redraw_repaints_at_a_narrow_size() {
+    // Resize where the feature paints: a recovery on a narrow viewport must
+    // still scrub and repaint, with the horizon reflowed to the smaller width.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    let (mut guard, sink) = TerminalGuard::for_capture_test(40, 12);
+    guard
+        .force_full_redraw(&mut app)
+        .expect("forced redraw at a narrow size");
+    let ansi = sink_to_string(&sink);
+    assert!(ansi.contains("\x1b[2J"), "narrow recovery scrubs: {ansi:?}");
+    assert!(
+        row_is_composer_horizon(&strip_ansi(&ansi)),
+        "the narrow recovery repaints the horizon main view"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_decision_then_recovery_surfaces_a_toast_and_paints() {
+    // The whole automatic loop in one shot: drive the watchdog past its stall
+    // budget so it decides to recover, then run the production recovery side
+    // effects the loop performs — a forced full redraw plus a low-priority
+    // recovery toast — and confirm both the screen and the toast surface.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    // Stamp a wanted-but-uncommitted frame older than the stall budget so the
+    // watchdog reports `Recover`. `checked_sub` keeps this clock-safe on Windows
+    // CI runners whose monotonic clock can be younger than the offset.
+    let now = std::time::Instant::now();
+    let stale = now
+        .checked_sub(render_health::STALL_BUDGET + Duration::from_millis(500))
+        .or_else(|| now.checked_sub(Duration::from_millis(1)))
+        .unwrap_or(now);
+    app.render_health.note_state_change(stale);
+    assert_eq!(
+        app.render_health.poll(now, true),
+        render_health::RenderHealthAction::Recover,
+        "a frame wanted past the stall budget must trigger recovery"
+    );
+
+    // Perform the loop's recovery side effects against the capture guard.
+    let (mut guard, sink) = TerminalGuard::for_capture_test(120, 40);
+    guard
+        .force_full_redraw(&mut app)
+        .expect("recovery forced redraw");
+    app.render_health.note_recovery(now);
+    app.toasts.push(
+        "Recovered a stalled screen — forced a full redraw.",
+        toast::ToastVariant::Info,
+    );
+
+    // The watchdog counted the stall, and the recovery is throttled so it does
+    // not immediately fire again on the next still-wanted iteration.
+    assert_eq!(app.render_health.stalled_count(), 1);
+    assert_eq!(
+        app.render_health.poll(now, true),
+        render_health::RenderHealthAction::Healthy,
+        "the throttle prevents an immediate re-fire while the frame settles"
+    );
+
+    // The recovery toast is queued, and a second draw paints it on screen.
+    let recovered = app
+        .toasts
+        .visible()
+        .iter()
+        .any(|t| t.message.contains("Recovered a stalled screen"));
+    assert!(recovered, "a low-priority recovery toast must be queued");
+
+    guard.draw_app(&mut app).expect("post-recovery paint");
+    let painted = render_to_string(&app, 120, 40);
+    assert!(
+        painted.contains("Recovered a stalled screen"),
+        "the recovery toast must paint through the real render(): {painted}"
+    );
+    let _ = sink;
+}
+
 #[tokio::test]
 async fn render_metrics_hud_paints_only_when_toggled_on() {
     // The HUD is hidden by default and shows the `render` box only after the

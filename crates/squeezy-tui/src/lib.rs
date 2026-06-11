@@ -150,6 +150,7 @@ mod queue_run_next;
 mod quote_compose;
 mod rename_labels;
 mod render;
+mod render_health;
 mod resume_picker;
 mod review_board;
 mod scratchpad;
@@ -1136,6 +1137,14 @@ async fn run_inner_with_terminal(
         // 60 FPS so bursts of events do not produce a draw storm.
         let wants_draw = app.needs_redraw || app.pending_resize || app.has_active_animation();
         let now = Instant::now();
+        // Stuck-Render Watchdog (§12.9.1): a wanted frame means the screen is
+        // behind the model, so start (or keep) the stall clock running. This is
+        // the single "visible state change" hook — it bumps the state revision
+        // and stamps `wanted_since` on the first wanted frame since the last
+        // commit. An idle iteration (`!wants_draw`) skips it entirely.
+        if wants_draw {
+            app.render_health.note_state_change(now);
+        }
         if wants_draw && !frame_limiter.allow(now) {
             // The frame limiter held this redraw back — it will be emitted on a
             // later iteration once the rate gate opens, coalescing the requests
@@ -1143,10 +1152,49 @@ async fn run_inner_with_terminal(
             // §12.10.3 dogfood "skipped frames" counter (zero-cost otherwise).
             app.dogfood_metrics.record_skipped_frame();
         }
+        // Watchdog decision. Polled every iteration so a stall is caught even
+        // while the frame-rate gate is holding the redraw back. When the render
+        // has been wanted-but-uncommitted past the stall budget, force one clean
+        // full redraw (invalidate the ratatui buffer, Clear(All) + MoveTo(0,0) +
+        // full render + flush) and surface a low-priority recovery toast. The
+        // throttle inside `poll` stops this from recursing while the replacement
+        // frame settles. No-op (one `Option` reset) on a healthy/idle session.
+        if app.render_health.poll(now, wants_draw) == render_health::RenderHealthAction::Recover {
+            tracing::warn!(
+                target: "squeezy_tui::render_health",
+                "{}",
+                app.render_health.diagnostics(now)
+            );
+            // Best-effort recovery: a failure here just leaves the stall for the
+            // next iteration to retry, so never propagate it as a loop error.
+            let recovered = terminal.force_full_redraw(&mut app).is_ok();
+            app.render_health.note_recovery(now);
+            if recovered {
+                // The forced redraw committed a fresh frame, so catch the drawn
+                // revision up; the throttle (not a lingering stall) governs the
+                // next decision.
+                app.render_health
+                    .record_frame_committed(now, app.render_metrics.get().frame);
+            }
+            app.toasts.push(
+                "Recovered a stalled screen — forced a full redraw.",
+                toast::ToastVariant::Info,
+            );
+            // The forced redraw committed the frame, so the normal gate below
+            // should not immediately repaint on top of it.
+            app.needs_redraw = false;
+            frame_limiter.mark_emitted(now);
+        }
         if wants_draw && frame_limiter.allow(now) {
             terminal.draw_app(&mut app)?;
             app.needs_redraw = false;
             frame_limiter.mark_emitted(now);
+            // Record the committed frame so the watchdog's drawn revision catches
+            // up to the state revision and the stall clock resets. The frame
+            // ordinal is the cheap per-frame signature — already stamped by
+            // `draw_app` — so the watchdog never recomputes a buffer hash.
+            app.render_health
+                .record_frame_committed(now, app.render_metrics.get().frame);
             if !interactive_marked {
                 interactive_marked = true;
                 squeezy_core::startup_trace::mark("interactive_ready");
@@ -42334,6 +42382,13 @@ pub(crate) struct TuiApp {
     /// `SQUEEZY_DOGFOOD_METRICS` at startup and flipped at runtime by the
     /// `toggle_dogfood_metrics` keymap action. A normal session never shows it.
     pub(crate) show_dogfood_metrics: bool,
+    /// Stuck-Render Watchdog state (§12.9.1). Tracks the gap between visible
+    /// state changes and committed frames so the draw loop can detect a wedged
+    /// render (a `draw` that never commits while frames are wanted) and self-heal
+    /// with one forced full redraw plus a low-priority recovery toast. Driven
+    /// entirely off timing the loop already computes, so an idle session never
+    /// trips it and pays only an `Option` reset per iteration.
+    pub(crate) render_health: render_health::RenderHealth,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
     /// Elapsed time on the currently-running tool, sourced from the
@@ -43538,6 +43593,7 @@ impl TuiApp {
             // `SQUEEZY_DOGFOOD_METRICS` is set to a non-empty, non-`0` value.
             dogfood_metrics: build_dogfood_metrics(|key| std::env::var(key).ok()),
             show_dogfood_metrics: resolve_dogfood_metrics(|key| std::env::var_os(key)),
+            render_health: render_health::RenderHealth::default(),
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             active_tool_elapsed_ms: None,
@@ -46091,6 +46147,46 @@ impl TerminalGuard {
         });
 
         paint
+    }
+
+    /// Stuck-Render Watchdog recovery (§12.9.1): force one clean full redraw
+    /// after the watchdog has decided the render is stuck.
+    ///
+    /// A wedged frame can leave ratatui's internal "previous buffer" out of sync
+    /// with what is actually on the terminal — its cell-diffing then emits only
+    /// the (empty) delta and the screen stays frozen. So this:
+    ///
+    /// 1. Invalidates the diff baseline with `Terminal::clear`, which marks the
+    ///    whole buffer dirty so the next `draw` repaints **every** cell (no diff
+    ///    shortcut that could re-skip the stuck region).
+    /// 2. Writes `Clear(All)` + `MoveTo(0,0)` straight to the backend and flushes
+    ///    them, scrubbing whatever stale pixels the terminal is showing and
+    ///    homing the cursor before the replacement frame lands.
+    /// 3. Runs a full `draw_app` (the normal instrumented paint) to commit a
+    ///    fresh frame, and flushes the backend so the bytes leave immediately.
+    ///
+    /// Recovery stays inside the alternate screen — it never leaves/re-enters or
+    /// purges scrollback (that is the terminal guard's teardown responsibility).
+    /// Best-effort: callers treat a returned error as "retry next iteration"
+    /// rather than a fatal loop error.
+    fn force_full_redraw(&mut self, app: &mut TuiApp) -> Result<()> {
+        // (1) Drop ratatui's diff baseline so the next draw is a full repaint.
+        self.term()
+            .clear()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        // (2) Scrub the visible screen and home the cursor at the backend layer.
+        {
+            let backend = self.term().backend_mut();
+            queue!(backend, Clear(ClearType::All), MoveTo(0, 0))
+                .and_then(|_| backend.flush())
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        // (3) Commit a fresh frame through the normal instrumented paint, then
+        //     flush so the recovery bytes are not held back behind the gate.
+        app.pending_resize = true;
+        let result = self.draw_app(app);
+        let _ = self.term().backend_mut().flush();
+        result
     }
 
     /// Paint exactly one frame through the fullscreen `render()` path. Factored
