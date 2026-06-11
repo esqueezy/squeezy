@@ -14949,6 +14949,53 @@ fn resolve_workspace_path_expands_leading_tilde_to_home() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// deep-review #127: (a) a rename failure must not leave the tmp file behind,
+/// and (b) `.md` and `.json` targets that share a stem must NOT collide on a
+/// single tmp path.
+#[test]
+fn write_export_atomically_cleans_up_on_failure_and_avoids_tmp_collision() {
+    let root = temp_workspace("export_atomic");
+
+    // (a) Make `target` an existing DIRECTORY so the rename fails.
+    let dir_target = root.join("transcript-1.md");
+    fs::create_dir_all(&dir_target).expect("create dir target");
+    let result = write_export_atomically(&dir_target, "x");
+    assert!(result.is_err(), "rename onto an existing dir must fail");
+    // No leftover *.squeezy-export-tmp litters the workspace.
+    let leftover: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(".squeezy-export-tmp")
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "no tmp file must remain after a failed rename: {leftover:?}"
+    );
+
+    // (b) `.md` and `.json` with the same stem must derive DISTINCT tmp paths —
+    // the old `with_extension` collapsed both to one
+    // `transcript-2.squeezy-export-tmp`, so two concurrent exports would clobber
+    // each other.
+    let md = root.join("transcript-2.md");
+    let json = root.join("transcript-2.json");
+    assert_ne!(
+        export_tmp_path(&md),
+        export_tmp_path(&json),
+        ".md and .json must not share a tmp path"
+    );
+    // And both still write/round-trip.
+    write_export_atomically(&md, "markdown body").expect("md export");
+    write_export_atomically(&json, "json body").expect("json export");
+    assert_eq!(fs::read_to_string(&md).unwrap(), "markdown body");
+    assert_eq!(fs::read_to_string(&json).unwrap(), "json body");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A traversal attempt via `dir:` is rejected at the command boundary: no file
 /// is written and the status surfaces the rejection.
 #[tokio::test]

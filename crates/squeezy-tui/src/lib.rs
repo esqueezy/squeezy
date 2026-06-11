@@ -21209,6 +21209,22 @@ fn default_export_path(app: &TuiApp, agent: &Agent, format: copy::CopyFormat) ->
         .join(format!("transcript-{ts}.{}", format.file_extension()))
 }
 
+/// Derive the atomic-write tmp path for an export `target`.
+///
+/// Built from the FULL file name (not `Path::with_extension`, which strips the
+/// format extension) so `transcript-<ts>.md` and `transcript-<ts>.json` get
+/// DISTINCT tmp paths instead of colliding on a single
+/// `transcript-<ts>.squeezy-export-tmp`.
+fn export_tmp_path(target: &Path) -> PathBuf {
+    target.with_file_name(format!(
+        "{}.squeezy-export-tmp",
+        target
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("export")
+    ))
+}
+
 /// Write `content` to `target` atomically (write to `<target>.tmp` then
 /// rename), creating the parent directory if missing. Mirrors the best-effort
 /// atomic-write pattern used for plan pointers.
@@ -21216,9 +21232,15 @@ fn write_export_atomically(target: &Path, content: &str) -> std::io::Result<()> 
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = target.with_extension("squeezy-export-tmp");
+    let tmp = export_tmp_path(target);
     std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, target)
+    // On a rename failure (e.g. `target` is an existing directory), remove the
+    // tmp file so a failed export never litters the workspace.
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Handle `/bundle [md|json] [no-redact]` (§12.6.6): build a self-contained,
