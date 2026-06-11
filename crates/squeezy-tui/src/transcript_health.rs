@@ -30,7 +30,10 @@
 //! on the next rebuild.
 //!
 //! **Zero idle cost, incremental rebuild.** The model carries a `fingerprint`
-//! folded over every candidate `(id, revision)`. The caller feeds the same
+//! folded over every candidate `(id, revision)` plus its elision facts
+//! (`elided`, `hidden_lines`, `output_bytes`) — those are derived from the
+//! verbosity / preview-cap settings rather than `revision`, so they must be
+//! hashed explicitly or a verbosity cycle would not re-detect. The caller feeds the same
 //! fingerprint each refresh via [`HealthMarkers::rebuild_if_stale`]; when it
 //! matches the stored one the call returns immediately and touches nothing. The
 //! detectors only re-run when the transcript actually changed — exactly the
@@ -281,9 +284,12 @@ impl HealthMarkers {
     /// content-sensitive: id and revision both participate, so an append, a
     /// revision bump, a reorder, or a drop all move the value. Pure and
     /// standalone so the caller can compute it cheaply each refresh and compare
-    /// before deciding to recompute. (The measured facts are *not* hashed — a
-    /// revision bump already accompanies any change to them, so hashing the
-    /// id+revision is both cheaper and sufficient.)
+    /// before deciding to recompute. The elision facts (`elided`,
+    /// `hidden_lines`, `output_bytes`) are also folded in: they are derived from
+    /// the verbosity / preview-cap settings, *not* from `entry.revision`, so a
+    /// verbosity cycle that keeps an entry elided while changing its hidden count
+    /// must still move the value or the overlay would keep showing a stale
+    /// "+N lines hidden in preview".
     pub(crate) fn fingerprint_of<'a>(
         candidates: impl IntoIterator<Item = &'a HealthCandidate>,
     ) -> u64 {
@@ -291,6 +297,9 @@ impl HealthMarkers {
         for c in candidates {
             c.id.hash(&mut hasher);
             c.revision.hash(&mut hasher);
+            c.elided.hash(&mut hasher);
+            c.hidden_lines.hash(&mut hasher);
+            c.output_bytes.hash(&mut hasher);
         }
         hasher.finish()
     }

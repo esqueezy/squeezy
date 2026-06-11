@@ -164,6 +164,25 @@ fn rebuild_recomputes_when_revision_moves() {
 }
 
 #[test]
+fn fingerprint_moves_when_hidden_count_changes_at_same_revision() {
+    // A verbosity / preview-cap cycle keeps an entry elided but changes how many
+    // lines are hidden, all without bumping `revision`. The fingerprint must move
+    // so `rebuild_if_stale` re-detects rather than showing a stale "+N hidden".
+    let mut a = healthy(1);
+    a.elided = true;
+    a.hidden_lines = 3;
+    let mut b = a.clone();
+    b.hidden_lines = 7; // same id + revision, different hidden count.
+
+    let fp_a = HealthMarkers::fingerprint_of(std::slice::from_ref(&a).iter());
+    let fp_b = HealthMarkers::fingerprint_of(std::slice::from_ref(&b).iter());
+    assert_ne!(
+        fp_a, fp_b,
+        "hidden_lines change at the same revision must move the fingerprint"
+    );
+}
+
+#[test]
 fn empty_transcript_builds_without_re_scanning() {
     let mut model = HealthMarkers::new();
     let candidates: Vec<HealthCandidate> = Vec::new();
