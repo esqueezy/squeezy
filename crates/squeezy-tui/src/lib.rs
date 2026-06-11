@@ -2060,6 +2060,13 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // Entry Annotations (§12.2.5) are keyed by entry id too, so they would
             // likewise re-anchor to unrelated new entries — drop them.
             app.annotations = annotations::AnnotationStore::new();
+            // Search matches and text selections are anchored by raw painted-row
+            // indices, so a full-transcript replacement re-anchors them to
+            // unrelated content even more readily than the id-keyed stores above —
+            // reset them too (deep-review #74).
+            app.search = None;
+            app.selection = None;
+            app.selection_set = multi_selection::SelectionSet::new();
             app.clear_turn_divider();
             for item in transcript {
                 hydrate_transcript_item(app, item);
@@ -20093,6 +20100,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 // Entry Annotations (§12.2.5) are keyed by entry id too, so they
                 // would likewise re-anchor to unrelated entries — drop them.
                 app.annotations = annotations::AnnotationStore::new();
+                // Search matches and text selections are anchored by raw painted-
+                // row indices, so a full-transcript replacement re-anchors them to
+                // unrelated content even more readily than the id-keyed stores
+                // above — reset them too (deep-review #74).
+                app.search = None;
+                app.selection = None;
+                app.selection_set = multi_selection::SelectionSet::new();
                 app.clear_turn_divider();
                 app.render_cache_session = render::cache::next_session_id();
                 app.attachments = agent.context_attachments_snapshot().await;

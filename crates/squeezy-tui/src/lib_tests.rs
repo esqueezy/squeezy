@@ -32755,6 +32755,49 @@ fn jump_marks_cleared_on_transcript_clear() {
     );
 }
 
+#[tokio::test]
+async fn clear_resets_row_indexed_search_and_selection() {
+    // `/clear` already drops the id-keyed jump-marks/bookmarks/annotations. The
+    // row-indexed search matches and text selections re-anchor to unrelated
+    // content on a full-transcript replacement even more readily, so the clear
+    // path must reset them too (deep-review #74).
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("a question about the build"));
+    app.push_transcript_item(TranscriptItem::assistant("a detailed answer about it"));
+    let _ = render_to_string(&app, 80, 24);
+    let captured_width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .expect("a painted frame stamps the text-area cache");
+
+    // An open search and a committed selection range.
+    open_search(&mut app);
+    assert!(app.search.is_some());
+    let mut set = multi_selection::SelectionSet::new();
+    let mut committed = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos { row: 0, col: 0 },
+        selection::SelectionMode::Cell,
+        captured_width,
+    );
+    committed.cursor = selection::Pos { row: 0, col: 5 };
+    assert!(set.add(committed));
+    app.selection_set = set;
+
+    apply_dispatch_command(&mut app, &mut agent, DispatchCommand::Clear).await;
+
+    assert!(
+        app.search.is_none(),
+        "search is reset when the transcript is replaced",
+    );
+    assert!(
+        app.selection_set.is_empty(),
+        "the row-indexed selection_set is reset when the transcript is replaced",
+    );
+}
+
 // ---- Minimap turn rail (§11.2 / 11G.3) ------------------------------
 
 /// Seed a transcript with mixed user turns, tool calls, and a failure so the
