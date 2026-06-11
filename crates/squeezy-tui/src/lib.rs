@@ -1100,6 +1100,15 @@ async fn run_inner_with_terminal(
         drain_pending_diff(&mut app);
         drain_pending_mention_walk(&mut app);
 
+        // Replayable Interaction Macros (§12.3.7): advance an in-flight replay by
+        // exactly ONE step per loop iteration so it unfolds across frames — the
+        // progress strip repaints between steps, the Esc / toggle cancel stays
+        // reachable (input is polled below), and a step that opened a modal overlay
+        // consumes the following steps the way live input would, rather than the
+        // whole macro draining synchronously inside the triggering key event
+        // (deep-review #32). A no-op single discriminant check when not replaying.
+        pump_macro_replay(&mut app, &mut agent);
+
         // Skip the animation-tick driver while the host terminal is
         // unfocused. Freezing the counter pins the spinner glyph and
         // the title clock, which removes the per-frame draw work that
@@ -5008,15 +5017,14 @@ fn toggle_macro_record(app: &mut TuiApp) {
     }
 }
 
-/// `Ctrl+Alt+J`: replay the most recently recorded macro (§12.3.7). Re-dispatches
-/// each recorded logical command through the SAME dispatcher a live keyboard/mouse
-/// press uses (`dispatch_keymap_action_inner`), so replay never bypasses an
-/// approval gate and is indistinguishable from the user performing the steps. The
-/// replay is bounded by the macro length and pumped step-by-step so the recorder's
-/// progress is observable; it returns to idle when the macro is exhausted. A no-op
-/// (with a hint) when nothing has been recorded, or when a record/replay is already
-/// in flight.
-fn replay_macro(app: &mut TuiApp, agent: &mut Agent) {
+/// `Ctrl+Alt+J`: begin replaying the most recently recorded macro (§12.3.7). This
+/// only ARMS the replay; the main loop then advances it one step per iteration via
+/// [`pump_macro_replay`], so the recorder's progress is observable (the §12.3.7
+/// strip repaints between steps), the toggle/Esc cancel arm stays reachable, and a
+/// step that opens a modal overlay consumes the following steps exactly as live
+/// input would (deep-review #32). A no-op (with a hint) when nothing has been
+/// recorded, or when a record/replay is already in flight.
+fn replay_macro(app: &mut TuiApp, _agent: &mut Agent) {
     if app.macro_recorder.is_recording() {
         app.status = "stop recording before replaying".to_string();
         app.needs_redraw = true;
@@ -5036,26 +5044,105 @@ fn replay_macro(app: &mut TuiApp, agent: &mut Agent) {
     if !app.macro_recorder.begin_replay() {
         return;
     }
-    // Pump every recorded command through the real dispatcher. The loop is bounded
-    // by the macro length (`next_replay_command` returns `None` once exhausted and
-    // returns the recorder to idle), so it always terminates. The recorder stores
-    // the canonical `Action`, so we dispatch it DIRECTLY (no synthesized key /
-    // reverse lookup) — a rebind between record and replay still replays the same
-    // logical command, and a chord collision can never re-resolve the replayed
-    // action to a different winner (deep-review #109).
-    let mut steps = 0usize;
-    while let Some(action) = app.macro_recorder.next_replay_command() {
-        let _ = dispatch_keymap_action_inner(app, agent, action);
-        steps += 1;
-        // Hard ceiling mirrors the recorder cap so a corrupted state can never
-        // spin: the recorder caps a macro at `macros::MAX_MACRO_LEN`, so a replay
-        // can never legitimately exceed it.
-        if steps >= macros::MAX_MACRO_LEN {
-            break;
-        }
-    }
-    app.status = format!("replayed macro ({steps} step(s))");
+    // Replay is now armed; the main loop drives it one step per frame through
+    // `pump_macro_replay`. Request a repaint so the progress strip shows the first
+    // "▶ replay macro — 0/N" before the first step lands.
     app.needs_redraw = true;
+}
+
+/// Advance an in-flight macro replay by EXACTLY ONE step. Called once per main-loop
+/// iteration (and from `pump_until_idle` in the test harness), so replay unfolds
+/// across frames rather than draining synchronously inside the triggering key event
+/// (deep-review #32). Returning to the loop after each step keeps three live-input
+/// invariants the old synchronous drain broke:
+///   * progress is observable — the §12.3.7 strip repaints "done/total" between steps;
+///   * the toggle/Esc cancel arm stays reachable — the loop polls input between steps;
+///   * a step that opened a §12 modal overlay consumes the following steps the way
+///     live input would — a replayed action that arrives while a key-swallowing modal
+///     overlay is open is DROPPED (consumed by the modal), so replay can never stack
+///     overlays a live user could never reach (the front-of-loop modal guards in
+///     `handle_key` swallow every key, returning before `dispatch_keymap_action`).
+///
+/// The recorder stores the canonical `Action`, so a step that DOES reach the
+/// dispatcher is dispatched DIRECTLY (no synthesized key / reverse lookup) — a
+/// rebind between record and replay still replays the same logical command, and a
+/// chord collision can never re-resolve the replayed action to a different winner
+/// (deep-review #109). A no-op when not replaying.
+fn pump_macro_replay(app: &mut TuiApp, agent: &mut Agent) {
+    if !app.macro_recorder.is_replaying() {
+        return;
+    }
+    let Some(action) = app.macro_recorder.next_replay_command() else {
+        // Exhausted (or just exhausted by this pump) — the recorder has already
+        // returned itself to Idle; surface the completion once.
+        app.status = "macro replay complete".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    // Consume — but do NOT globally dispatch — a step that arrives while a modal
+    // overlay owns the keyboard. A live chord here would be swallowed by the
+    // front-of-loop modal guard in `handle_key` (every picker handler returns
+    // `true` for an unrecognized key, never reaching `dispatch_keymap_action`), so
+    // routing the replayed action through the global dispatcher would let it punch
+    // through the modal and stack overlays a live user could never reach.
+    if !replay_step_consumed_by_modal(app) {
+        let _ = dispatch_keymap_action_inner(app, agent, action);
+    }
+    // Repaint every step so the progress strip advances and, while still replaying,
+    // the loop keeps iterating (and polling input for the cancel chord).
+    app.needs_redraw = true;
+    if !app.macro_recorder.is_replaying() {
+        // This step was the last one; report completion on the next idle frame.
+        app.status = "macro replay complete".to_string();
+    }
+}
+
+/// True when a modal overlay currently owns the keyboard, so a replayed macro step
+/// must be CONSUMED (dropped) rather than dispatched globally — mirroring how the
+/// front-of-loop modal guards in `handle_key` swallow every key before the global
+/// keymap dispatch (deep-review #32). Read-only over `app`. Lists the §12 picker /
+/// editor overlays whose key handlers return `true` for any key (i.e. fully modal);
+/// the transcript-overlay and prompt-queue-overlay cases are NOT listed here because
+/// `dispatch_keymap_action_inner` already guards those internally.
+fn replay_step_consumed_by_modal(app: &TuiApp) -> bool {
+    app.config_screen.is_some()
+        || app.status_line_setup.is_some()
+        || app.paste_preview.is_some()
+        || app.paste_transform.is_some()
+        || app.paste_staging.is_some()
+        || app.clipboard_history_open
+        || app.keybinding_editor.is_some()
+        || app.snippets_open
+        || app.templates_open
+        || app.transcript_index_open
+        || app.related_links_open
+        || app.duplicate_folds_open
+        || app.error_lens_open
+        || app.health_markers_open
+        || app.turn_outline_open
+        || app.rename_edit.is_some()
+        || app.lane_fold_open
+        || app.bookmarks_open
+        || app.session_timeline_open
+        || app.subagent_timeline_open
+        || app.subagent_compare.is_some()
+        || app.review_board_open
+        || app.changes_since_open
+        || app.action_palette.is_some()
+        || app.tool_actions.is_some()
+        || app.scratchpad_open
+        || app.theme_editor.is_some()
+        || app.workspace_profile.is_some()
+        || app.session_checkpoint_overlay.is_some()
+        || app.annotations_open
+        || app.command_palette.is_some()
+        || app.terminal_profile_editor.is_some()
+        || app.gesture_settings_editor.is_some()
+        || app.glyph_mode_editor.is_some()
+        || app.smart_split.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+        || app.pending_request_user_input.is_some()
 }
 
 // ===========================================================================

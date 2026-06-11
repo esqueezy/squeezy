@@ -27415,16 +27415,136 @@ async fn macro_record_then_replay_re_runs_the_logical_command() {
     assert!(!app.macro_recorder.is_recording(), "second press stops");
     assert!(app.macro_recorder.has_replayable(), "macro stored");
 
-    // Reset the observable state, then replay: it must flip again.
+    // Reset the observable state, then arm replay. The replay chord now only ARMS
+    // the replay (deep-review #32); the main loop advances it one step per frame
+    // via `pump_macro_replay`. Pumping one tick re-runs the single recorded verb.
     app.show_minimap = false;
     handle_key(&mut app, &mut agent, macro_replay_key())
         .await
         .unwrap();
     assert!(
-        app.show_minimap,
-        "replay re-ran the recorded ToggleMinimap through the same dispatcher"
+        app.macro_recorder.is_replaying(),
+        "the replay chord armed a step-wise replay"
     );
-    assert!(!app.macro_recorder.is_active(), "replay completes to idle");
+    assert!(
+        !app.show_minimap,
+        "arming alone does not drain the macro synchronously"
+    );
+    pump_macro_replay(&mut app, &mut agent);
+    assert!(
+        app.show_minimap,
+        "one pump re-ran the recorded ToggleMinimap through the same dispatcher"
+    );
+    assert!(
+        !app.macro_recorder.is_active(),
+        "the single-step replay completes to idle"
+    );
+}
+
+#[tokio::test]
+async fn replay_pumps_one_step_per_tick_and_a_modal_step_consumes_the_next() {
+    // deep-review #32: macro replay used to drain the WHOLE macro synchronously
+    // inside the triggering key event, so a first step that opened a modal overlay
+    // did not consume the second step the way a live key would — replay could stack
+    // overlays a live user could never reach. Now replay is pumped ONE step per
+    // loop iteration, and a step that arrives while a modal owns the keyboard is
+    // consumed (dropped), not dispatched globally.
+    //
+    // Build a two-step macro directly through the recorder so the steps are exact:
+    //   step 1: ToggleSnippets  — opens the modal snippets picker
+    //   step 2: ToggleBookmarks — a global verb the open picker would swallow live
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(
+        !app.snippets_open && !app.bookmarks_open,
+        "both start closed"
+    );
+
+    app.macro_recorder.start_recording();
+    app.macro_recorder
+        .note_command(keymap::Action::ToggleSnippets);
+    app.macro_recorder
+        .note_command(keymap::Action::ToggleBookmarks);
+    assert!(matches!(
+        app.macro_recorder.stop_recording(),
+        macros::StopOutcome::Stored { len: 2, .. }
+    ));
+
+    // Arm the replay via the real chord; arming alone must NOT run either step.
+    handle_key(&mut app, &mut agent, macro_replay_key())
+        .await
+        .unwrap();
+    assert!(app.macro_recorder.is_replaying(), "replay armed");
+    assert_eq!(
+        app.macro_recorder.replay_progress(),
+        (0, 2),
+        "nothing has run yet — arming does not drain"
+    );
+    assert!(!app.snippets_open, "no step has executed synchronously");
+
+    // Tick 1: exactly one step runs — the snippets picker opens. Progress is
+    // observable as 1/2, so the §12.3.7 strip can paint forward motion.
+    pump_macro_replay(&mut app, &mut agent);
+    assert!(app.snippets_open, "tick 1 executed exactly the first step");
+    assert!(
+        !app.bookmarks_open,
+        "the second step did NOT also run this tick"
+    );
+    assert_eq!(
+        app.macro_recorder.replay_progress(),
+        (1, 2),
+        "one step per tick — progress advanced to 1/2"
+    );
+
+    // Tick 2: the second step (ToggleBookmarks) arrives while the snippets modal
+    // owns the keyboard. A live Alt+q here is swallowed by the front-of-loop
+    // snippets guard and never reaches the global dispatcher, so the replayed step
+    // must be CONSUMED — bookmarks must stay closed and snippets stays open.
+    pump_macro_replay(&mut app, &mut agent);
+    assert!(
+        !app.bookmarks_open,
+        "the global step was consumed by the open modal, not dispatched through it"
+    );
+    assert!(
+        app.snippets_open,
+        "the modal that swallowed the step is untouched"
+    );
+    assert!(
+        !app.macro_recorder.is_active(),
+        "the macro is exhausted and the recorder returned to idle"
+    );
+}
+
+#[tokio::test]
+async fn replay_without_a_modal_runs_both_steps_across_two_ticks() {
+    // Control for deep-review #32: with NO modal open, both recorded global verbs
+    // run — one per tick — so the modal-consume guard never suppresses a step that
+    // a live user could legitimately reach. Two independent observable flags.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(!app.show_minimap && !app.bookmarks_open);
+
+    app.macro_recorder.start_recording();
+    app.macro_recorder
+        .note_command(keymap::Action::ToggleMinimap);
+    app.macro_recorder
+        .note_command(keymap::Action::ToggleBookmarks);
+    app.macro_recorder.stop_recording();
+
+    handle_key(&mut app, &mut agent, macro_replay_key())
+        .await
+        .unwrap();
+
+    pump_macro_replay(&mut app, &mut agent);
+    assert!(app.show_minimap, "tick 1 ran the first global verb");
+    assert!(!app.bookmarks_open, "the second verb has not run yet");
+
+    pump_macro_replay(&mut app, &mut agent);
+    assert!(
+        app.bookmarks_open,
+        "tick 2 ran the second global verb (no modal suppressed it)"
+    );
+    assert!(!app.macro_recorder.is_active(), "replay completed to idle");
 }
 
 #[tokio::test]
