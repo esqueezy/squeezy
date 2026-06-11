@@ -67,6 +67,7 @@ use squeezy_tools::{
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 // Accessibility Quality Gate (§12.10.5). `cfg(test)`-gated so the audit harness
@@ -34192,9 +34193,26 @@ fn split_spans_at_column(
 /// overlay.
 fn wrap_cells_preserving(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
-    let cells: Vec<(char, Style)> = spans
+    // Pack by grapheme cluster keyed to the originating span's style, measuring
+    // each cluster by its Unicode *display* width (the same basis ratatui's
+    // WordWrapper uses). Char-count packing desynced the pre-wrap row count from
+    // the painted rows on CJK/wide glyphs (2 cols) and split combining-mark / ZWJ
+    // clusters across rows.
+    let cells: Vec<GraphemeCell> = spans
         .iter()
-        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+        .flat_map(|span| {
+            span.content
+                .graphemes(true)
+                .map(move |g| GraphemeCell {
+                    text: g.to_string(),
+                    style: span.style,
+                    // A zero-width cluster (lone combining mark) still occupies a
+                    // cell-step of at least 1 so it never collapses the row math.
+                    display_width: UnicodeWidthStr::width(g).max(1),
+                    is_space: g == " ",
+                })
+                .collect::<Vec<_>>()
+        })
         .collect();
     if cells.is_empty() {
         return vec![Vec::new()];
@@ -34202,38 +34220,85 @@ fn wrap_cells_preserving(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
     let mut rows = Vec::new();
     let mut start = 0;
     while start < cells.len() {
-        if cells.len() - start <= width {
-            rows.push(coalesce_cells_to_spans(cells[start..].to_vec()));
+        // Walk forward accumulating display width; stop at the last cluster that
+        // still fits within `width`. A cluster wider than the whole row (a wide
+        // glyph in a 1-col gutter) is hard-placed alone rather than looping.
+        let mut end = start;
+        let mut row_width = 0usize;
+        while end < cells.len() {
+            let next = row_width.saturating_add(cells[end].display_width);
+            if next > width && end > start {
+                break;
+            }
+            row_width = next;
+            end += 1;
+        }
+        if end == cells.len() {
+            rows.push(coalesce_grapheme_cells(&cells[start..]));
             break;
         }
-        let hard = start + width;
         // Prefer the last space inside the row so words stay intact; the space
         // itself stays at the end of this row, never leading the next one.
-        let mut brk = hard;
-        let mut k = hard;
+        let mut brk = end;
+        let mut k = end;
         while k > start {
-            if cells[k - 1].0 == ' ' {
+            if cells[k - 1].is_space {
                 brk = k;
                 break;
             }
             k -= 1;
         }
         if k == start {
-            brk = hard;
+            brk = end;
         }
-        rows.push(coalesce_cells_to_spans(cells[start..brk].to_vec()));
+        rows.push(coalesce_grapheme_cells(&cells[start..brk]));
         start = brk;
     }
     rows
+}
+
+/// One grapheme cluster carried through display-width wrapping with its
+/// originating style and measured cell width.
+struct GraphemeCell {
+    text: String,
+    style: Style,
+    display_width: usize,
+    is_space: bool,
+}
+
+/// Merge a row of grapheme cells back into the fewest `Span`s, joining runs that
+/// share a style. Clusters are never split, so combining marks / ZWJ emoji stay
+/// intact.
+fn coalesce_grapheme_cells(cells: &[GraphemeCell]) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for cell in cells {
+        if cur == Some(cell.style) {
+            buf.push_str(&cell.text);
+        } else {
+            if let Some(prev) = cur.take() {
+                spans.push(Span::styled(std::mem::take(&mut buf), prev));
+            }
+            buf.push_str(&cell.text);
+            cur = Some(cell.style);
+        }
+    }
+    if let Some(style) = cur {
+        spans.push(Span::styled(buf, style));
+    }
+    spans
 }
 
 fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
     let width = width.max(1);
     let line = flatten_embedded_line_breaks(line);
     let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    if full.chars().count() <= width {
+    if UnicodeWidthStr::width(full.as_str()) <= width {
         // Fits as-is — pass it through untouched so the gutter and any inner
-        // whitespace are preserved exactly.
+        // whitespace are preserved exactly. Measured by *display* width so the
+        // fits-check matches ratatui's grapheme-width re-wrap (CJK/wide glyphs
+        // count as 2 cols), keeping the pre-wrap row count aligned with paint.
         rows.push(line);
         return;
     }
@@ -36147,13 +36212,17 @@ fn visual_line_count(lines: &[Line<'_>], width: u16) -> u16 {
     lines
         .iter()
         .map(|line| {
-            let chars = line
+            // Measure by Unicode *display* width, not char count, so the row
+            // estimate matches ratatui's grapheme-width re-wrap on CJK/wide
+            // glyphs (2 cols each). A char-count basis under-counted wide content
+            // and desynced every row-indexed mapping built on this total.
+            let display = line
                 .spans
                 .iter()
-                .map(|span| span.content.chars().count())
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
                 .sum::<usize>()
                 .max(1);
-            chars.div_ceil(content_width)
+            display.div_ceil(content_width)
         })
         .sum::<usize>()
         .min(u16::MAX as usize) as u16
@@ -38086,29 +38155,6 @@ fn assistant_text_lines(
         out.push(marker_head(Vec::new()));
     }
     out
-}
-
-/// Merge a row of per-`char` styled cells back into the fewest `Span`s, joining
-/// runs that share a style.
-fn coalesce_cells_to_spans(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut cur: Option<Style> = None;
-    for (ch, style) in cells {
-        if cur == Some(style) {
-            buf.push(ch);
-        } else {
-            if let Some(prev) = cur.take() {
-                spans.push(Span::styled(std::mem::take(&mut buf), prev));
-            }
-            buf.push(ch);
-            cur = Some(style);
-        }
-    }
-    if let Some(style) = cur {
-        spans.push(Span::styled(buf, style));
-    }
-    spans
 }
 
 fn detail_text_lines(selected: bool, color: Color, content: &str) -> Vec<Line<'static>> {

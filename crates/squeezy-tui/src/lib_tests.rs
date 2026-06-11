@@ -12634,6 +12634,79 @@ fn finish_fullscreen_mirror_height_covers_wrapped_rows_not_visual_estimate() {
     );
 }
 
+/// Deep-review #17: the transcript pre-wrap measured the fits-check by char
+/// count, but ratatui's `Paragraph::wrap` re-flows by grapheme *display* width.
+/// On CJK/wide glyphs (2 cols each) the char-count pre-wrap returned ONE row
+/// while ratatui painted TWO, desyncing `total_rows` from the rows actually
+/// drawn and throwing off every row-indexed mapping (card targets, markers,
+/// scrollbar geometry). The pre-wrap row count must equal the painted row count.
+#[test]
+fn transcript_prewrap_row_count_matches_painted_rows_on_wide_glyphs() {
+    let width = 80u16;
+    // 60 full-width CJK glyphs = 120 display columns => must wrap to >= 2 rows at
+    // width 80. Char-count sees only 60 "columns" and (pre-fix) keeps it on one
+    // row.
+    let cjk = "好".repeat(60);
+    let line = Line::from(vec![Span::raw(cjk)]);
+
+    // Pre-wrap row count N.
+    let mut rows = Vec::new();
+    wrap_transcript_overlay_line(&line, width as usize, &mut rows);
+    let n = rows.len();
+
+    // Ground-truth painted row count M: render the SAME logical line through the
+    // word-wrapping `Paragraph` and count the rows that carry glyphs.
+    let m = {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 64));
+        Paragraph::new(vec![line.clone()])
+            .wrap(Wrap { trim: false })
+            .render(buf.area, &mut buf);
+        buffer_used_height(&buf) as usize
+    };
+
+    assert!(
+        m >= 2,
+        "fixture must actually wrap to multiple painted rows (M={m})",
+    );
+    assert_eq!(
+        n, m,
+        "pre-wrap row count must equal the rows ratatui paints (N={n} vs M={m})",
+    );
+
+    // A ZWJ emoji cluster (family: man-woman-girl) is a single grapheme; it must
+    // never be split across two wrapped rows. Pad so the cluster straddles the
+    // width boundary, then assert every wrapped row's text holds the cluster
+    // whole (either entirely present or entirely absent — never a fragment).
+    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    let padded = format!("{}{family}{}", "a".repeat(78), "b".repeat(40));
+    let zwj_line = Line::from(vec![Span::raw(padded)]);
+    let mut zwj_rows = Vec::new();
+    wrap_transcript_overlay_line(&zwj_line, width as usize, &mut zwj_rows);
+    let cluster_rows = zwj_rows
+        .iter()
+        .filter(|row| {
+            let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.contains(family)
+        })
+        .count();
+    // The intact cluster appears in exactly one row; no row carries a fragment.
+    assert_eq!(
+        cluster_rows, 1,
+        "the ZWJ emoji cluster must stay intact in exactly one wrapped row",
+    );
+    let any_fragment = zwj_rows.iter().any(|row| {
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        // A fragment contains one of the cluster's component scalars but not the
+        // whole cluster.
+        (text.contains('\u{1F468}') || text.contains('\u{1F469}') || text.contains('\u{1F467}'))
+            && !text.contains(family)
+    });
+    assert!(
+        !any_fragment,
+        "no wrapped row may carry a partial ZWJ emoji cluster",
+    );
+}
+
 /// Driver-level clean-exit test: drive a settled session through the real
 /// `finish_fullscreen` against the `for_capture_test` `Capture` seam, then assert
 /// on the captured byte stream that `LeaveAlternateScreen` precedes the mirrored

@@ -71,6 +71,7 @@ tree-sitter-sequel.workspace = true
 tree-sitter-toml-updated.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-yaml.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
