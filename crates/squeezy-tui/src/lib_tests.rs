@@ -14915,6 +14915,40 @@ async fn export_configured_dir_writes_under_named_workspace_dir() {
     );
 }
 
+/// deep-review #60: `/export md ~/notes.md` must expand the leading `~` to the
+/// home dir, NOT create a literal `~` directory inside the workspace. We assert
+/// `resolve_workspace_path` against the same home resolver the production code
+/// uses so the result is `<home>/notes.md`, not `root/~/notes.md`.
+#[test]
+fn resolve_workspace_path_expands_leading_tilde_to_home() {
+    let root = temp_workspace("resolve_tilde");
+    let home = squeezy_core::cached_home_dir().expect("a home dir resolves in the test env");
+
+    let resolved = resolve_workspace_path(&root, "~/notes.md");
+    assert_eq!(
+        resolved,
+        home.join("notes.md"),
+        "~/notes.md must expand to <home>/notes.md"
+    );
+    assert_ne!(
+        resolved,
+        root.join("~/notes.md"),
+        "~/notes.md must NOT land literally inside the workspace"
+    );
+
+    // A bare `~` expands to the home dir itself.
+    assert_eq!(resolve_workspace_path(&root, "~"), home);
+
+    // A non-tilde relative path is still joined onto the workspace root.
+    assert_eq!(
+        resolve_workspace_path(&root, "sub/notes.md"),
+        root.join("sub/notes.md"),
+        "ordinary relative paths still resolve under the workspace root"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A traversal attempt via `dir:` is rejected at the command boundary: no file
 /// is written and the status surfaces the rejection.
 #[tokio::test]

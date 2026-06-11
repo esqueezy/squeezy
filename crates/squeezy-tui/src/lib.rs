@@ -8783,6 +8783,20 @@ fn insert_file_prompt_attachment(app: &mut TuiApp, path: &str) -> Result<String>
 }
 
 fn resolve_workspace_path(root: &Path, path: &str) -> PathBuf {
+    // A leading `~`/`~/` is a home-relative path the user expects expanded, not
+    // a literal directory named `~` created inside the workspace (which is what
+    // `root.join("~/notes.md")` would do via write_export_atomically's
+    // create_dir_all). Expand against the home dir before the absolute/relative
+    // branch; if the home dir is unresolvable, fall through to the literal path.
+    if (path == "~" || path == "~/")
+        && let Some(home) = squeezy_core::cached_home_dir()
+    {
+        return home;
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = squeezy_core::cached_home_dir()
+    {
+        return home.join(rest);
+    }
     let path = PathBuf::from(path);
     if path.is_absolute() {
         path
