@@ -357,15 +357,19 @@ fn utf8_char_len(b: u8) -> usize {
 
 /// The OSC 8 *open* sequence for `uri`: `ESC ] 8 ; ; <uri> ST`.
 ///
-/// The uri is sanitised: any byte below 0x20 (a control, including ESC itself)
-/// or 0x7f is dropped, so a control character that slipped into the detected
-/// run can never terminate the escape early or inject a second escape. The
-/// visible text is emitted separately by the caller and is unaffected.
+/// The uri is sanitised: any control character is dropped — an ASCII C0 control
+/// (below 0x20, including ESC itself), 0x7f (DEL), or a C1 control
+/// (U+0080..=U+009F). C1 controls matter because a terminal in 8-bit mode (or
+/// one that decodes the UTF-8 form `0xC2 0x9C`) treats U+009C as a String
+/// Terminator and U+009B as a CSI introducer, so a C1 byte that slipped into the
+/// detected run could terminate the escape early or inject a second escape just
+/// as a C0 control would. The visible text is emitted separately by the caller
+/// and is unaffected.
 pub(crate) fn open_sequence(uri: &str) -> String {
     let mut clean = String::with_capacity(uri.len());
     for ch in uri.chars() {
         let c = ch as u32;
-        if c >= 0x20 && c != 0x7f {
+        if (0x20..0x7f).contains(&c) || c >= 0xa0 {
             clean.push(ch);
         }
     }

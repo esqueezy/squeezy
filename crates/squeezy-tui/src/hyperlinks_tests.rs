@@ -263,6 +263,25 @@ fn open_sequence_strips_control_bytes_from_uri() {
 }
 
 #[test]
+fn open_sequence_strips_c1_controls_from_uri() {
+    // C1 controls (U+0080..=U+009F) must be stripped too: a terminal in 8-bit
+    // mode decodes U+009C (String Terminator) and U+009B (CSI) as escape-control
+    // bytes, so a C1 codepoint that slipped into the uri could terminate the
+    // OSC 8 escape early or inject a second escape just like a C0 control.
+    let seq = open_sequence("http://a\u{009c}b\u{009d}c");
+    assert!(
+        !seq.contains('\u{009c}'),
+        "the C1 String-Terminator codepoint is stripped: {seq:?}"
+    );
+    assert!(
+        !seq.contains('\u{009d}'),
+        "the C1 codepoint is stripped: {seq:?}"
+    );
+    // The surrounding printable ASCII survives unchanged.
+    assert_eq!(seq, "\u{1b}]8;;http://abc\u{1b}\\");
+}
+
+#[test]
 fn round_trip_encode_a_detected_link() {
     // Detection + encoding compose: a detected link's uri encodes to a
     // well-formed OSC 8 open sequence whose payload is exactly the uri.
