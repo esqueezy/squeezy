@@ -28452,7 +28452,10 @@ async fn alt_d_with_nonempty_composer_deletes_word_not_commits_selection() {
 
     // Arm a lingering main-surface selection (the state that triggers the bug).
     triple_click_row(&mut app, "alpha row text");
-    assert!(app.selection.is_some(), "triple-click armed a row selection");
+    assert!(
+        app.selection.is_some(),
+        "triple-click armed a row selection"
+    );
     assert!(app.selection_set.is_empty(), "set starts empty");
 
     // Now edit a prompt with the cursor before a word to delete.
@@ -38978,6 +38981,64 @@ async fn command_palette_enter_runs_a_keymap_action() {
     assert!(
         app.session_timeline_open,
         "the palette ran the session-timeline toggle, opening its overlay",
+    );
+}
+
+#[tokio::test]
+async fn command_palette_runs_the_named_action_even_on_a_chord_collision() {
+    // deep-review #109: the palette must run the action the user picked BY NAME,
+    // not whatever wins the reverse-lookup for that action's chord. Bind two
+    // actions onto the same chord so one is the reverse-lookup loser, arm the
+    // LOSER as a palette run, and assert the loser's effect fires (not the
+    // winner's).
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert("toggle_scratchpad".to_string(), "Alt+k".to_string());
+    overrides.insert("toggle_session_timeline".to_string(), "Alt+k".to_string());
+
+    let mut app = test_app(SessionMode::Build);
+    app.keymap = keymap::KeymapResolver::from_overrides(&overrides);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Confirm the collision really exists and capture which action is the
+    // reverse-lookup WINNER for Alt+k; the OTHER action is the loser whose chord
+    // re-resolves to the wrong action when run by name.
+    let winner = app
+        .keymap
+        .lookup(KeyCode::Char('k'), KeyModifiers::ALT)
+        .expect("Alt+k resolves to one of the two colliding actions");
+    assert!(
+        winner == keymap::Action::ToggleScratchpad
+            || winner == keymap::Action::ToggleSessionTimeline,
+        "precondition: Alt+k resolves to one of the colliding actions, got {winner:?}",
+    );
+    // The loser is the one the reverse lookup does NOT return.
+    let loser = if winner == keymap::Action::ToggleScratchpad {
+        keymap::Action::ToggleSessionTimeline
+    } else {
+        keymap::Action::ToggleScratchpad
+    };
+    assert!(!app.scratchpad_open && !app.session_timeline_open);
+
+    // Arm the LOSER as a palette run and drain it.
+    app.command_palette_pending = Some(command_palette::PaletteRun::Action(loser));
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the armed loser action");
+
+    // The loser's effect fired; the winner's did not — proving the palette ran the
+    // NAMED action rather than re-resolving the shared chord to the winner.
+    let (loser_open, winner_open) = if loser == keymap::Action::ToggleScratchpad {
+        (app.scratchpad_open, app.session_timeline_open)
+    } else {
+        (app.session_timeline_open, app.scratchpad_open)
+    };
+    assert!(
+        loser_open,
+        "the palette ran the NAMED loser action ({loser:?})"
+    );
+    assert!(
+        !winner_open,
+        "the palette must NOT run the reverse-lookup winner ({winner:?})",
     );
 }
 

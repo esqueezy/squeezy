@@ -4972,15 +4972,14 @@ fn replay_macro(app: &mut TuiApp, agent: &mut Agent) {
     }
     // Pump every recorded command through the real dispatcher. The loop is bounded
     // by the macro length (`next_replay_command` returns `None` once exhausted and
-    // returns the recorder to idle), so it always terminates. A synthesized key
-    // event carrying the recorded action's default binding is unnecessary — we
-    // re-resolve through the dispatcher by the action's CURRENT binding, so a
-    // rebound key still replays the same logical command. We feed the action's
-    // bound key so the dispatcher's `lookup` resolves it back to the same action.
+    // returns the recorder to idle), so it always terminates. The recorder stores
+    // the canonical `Action`, so we dispatch it DIRECTLY (no synthesized key /
+    // reverse lookup) — a rebind between record and replay still replays the same
+    // logical command, and a chord collision can never re-resolve the replayed
+    // action to a different winner (deep-review #109).
     let mut steps = 0usize;
     while let Some(action) = app.macro_recorder.next_replay_command() {
-        let key = macro_replay_key_event(app, action);
-        let _ = dispatch_keymap_action_inner(app, agent, key);
+        let _ = dispatch_keymap_action_inner(app, agent, action);
         steps += 1;
         // Hard ceiling mirrors the recorder cap so a corrupted state can never
         // spin: the recorder caps a macro at `macros::MAX_MACRO_LEN`, so a replay
@@ -4991,16 +4990,6 @@ fn replay_macro(app: &mut TuiApp, agent: &mut Agent) {
     }
     app.status = format!("replayed macro ({steps} step(s))");
     app.needs_redraw = true;
-}
-
-/// Build the synthetic [`KeyEvent`] that re-dispatches a recorded macro command
-/// (§12.3.7) through the keymap. The recorder stores the canonical
-/// [`keymap::Action`]; replay feeds the action's CURRENTLY-bound key back through
-/// `dispatch_keymap_action_inner` so `lookup` resolves it to the same action — a
-/// rebind between record and replay still replays the same logical command.
-fn macro_replay_key_event(app: &TuiApp, action: keymap::Action) -> KeyEvent {
-    let binding = app.keymap.binding(action);
-    KeyEvent::new(binding.code, binding.modifiers)
 }
 
 // ===========================================================================
@@ -9058,7 +9047,23 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
     let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
         return false;
     };
-    let handled = dispatch_keymap_action_inner(app, agent, key);
+    dispatch_resolved_keymap_action(app, agent, action)
+}
+
+/// Run an already-resolved keymap `action` (the body every keyboard chord and the
+/// command palette both reach), routing it through `note_command` for macro
+/// capture. Taking the resolved `Action` directly — rather than re-deriving it
+/// from a synthesized key event — means the command palette runs EXACTLY the named
+/// command even when its chord collides with another action (deep-review #109):
+/// the reverse-lookup `by_key` table keeps only one winner per chord, so
+/// re-looking up a synthesized key would silently run the colliding winner instead
+/// of the action the user picked by name.
+fn dispatch_resolved_keymap_action(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    action: keymap::Action,
+) -> bool {
+    let handled = dispatch_keymap_action_inner(app, agent, action);
     if handled && is_macro_recordable(action) {
         app.macro_recorder.note_command(action);
     }
@@ -9075,10 +9080,11 @@ fn is_macro_recordable(action: keymap::Action) -> bool {
     )
 }
 
-fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
-    let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
-        return false;
-    };
+fn dispatch_keymap_action_inner(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    action: keymap::Action,
+) -> bool {
     if app.transcript_overlay.is_some()
         && action != keymap::Action::ToggleTranscriptOverlay
         && action != keymap::Action::OpenSearch
@@ -13902,13 +13908,13 @@ async fn drain_command_palette_run(app: &mut TuiApp, agent: &mut Agent) -> Resul
     };
     match run {
         command_palette::PaletteRun::Action(action) => {
-            let binding = app.keymap.binding(action);
-            let key = KeyEvent::new(binding.code, binding.modifiers);
-            // Re-enter the SAME dispatch the keybinding uses, so a palette run and a
-            // pressed key are byte-identical. A guard that blocks the action in the
-            // current context (e.g. a foreground config screen) makes this a no-op,
-            // exactly as pressing the key would.
-            let _ = dispatch_keymap_action(app, agent, key);
+            // Dispatch the SELECTED action directly (not via a synthesized key).
+            // The reverse-lookup `by_key` table keeps only one winner per chord, so
+            // re-deriving the action from the chord would silently run the colliding
+            // WINNER when the user picked the LOSER by name (deep-review #109).
+            // Routing through `dispatch_resolved_keymap_action` still applies the
+            // same context guards and macro capture a pressed key would.
+            let _ = dispatch_resolved_keymap_action(app, agent, action);
             app.needs_redraw = true;
         }
         command_palette::PaletteRun::Slash {
@@ -45130,8 +45136,12 @@ impl TuiApp {
     }
 
     /// Flip the hidden render-budget HUD on/off and request a repaint so the
-    /// change shows immediately. Wired to a debug key path; the HUD also emits
-    /// the per-frame trace line while on.
+    /// change shows immediately. The HUD also emits the per-frame trace line while
+    /// on. Production reaches the render HUD via the `SQUEEZY_RENDER_METRICS` env
+    /// opt-in or by toggling the dogfood overlay (which forces it visible); the
+    /// standalone keyboard toggle was retired with the Ctrl+Alt+M intercept
+    /// (deep-review #29). Kept as a direct test/dev affordance.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn toggle_render_metrics(&mut self) {
         self.show_render_metrics = !self.show_render_metrics;
         self.needs_redraw = true;
