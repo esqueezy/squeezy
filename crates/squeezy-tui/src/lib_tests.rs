@@ -19236,6 +19236,72 @@ fn deliver_copy_routes_oversized_payload_to_injected_recording_sink() {
     );
 }
 
+/// deep-review #11: on a terminal that does NOT honour OSC 52, a *small* copy
+/// (≤ the OSC 52 cap) must still route through the capability-aware chain to
+/// the platform sink — not take the OSC 52-only fast path, whose `Ok` is
+/// unobservable and would falsely report "copied N chars" with an empty
+/// clipboard. We pin an OSC 52-less chain (platform command → temp file) over a
+/// recording sink and assert `deliver_copy` delivered the exact small payload
+/// to the platform command, never an OSC 52 terminal write.
+#[test]
+fn deliver_copy_routes_small_payload_to_platform_sink_when_osc52_unsupported() {
+    // Primary OSC 52 sink reports success unconditionally (the real-world
+    // false-success: the write to stdout "succeeds" but the terminal ignores
+    // it). If the fast path were taken, the platform sink would never run.
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: Arc::new(StdMutex::new(Vec::new())),
+            error: None,
+        }),
+    );
+
+    // An OSC 52-less chain (caps.osc52 == false): platform command first, then
+    // the temp-file fallback. Drive it with a recording sink we can read back.
+    let sink = crate::clipboard::RecordingSink::new();
+    let calls = sink.handle();
+    let chain = crate::clipboard::ClipboardChain::with_providers(
+        Box::new(sink) as Box<dyn crate::clipboard::ClipboardSink + Send>,
+        vec![
+            crate::clipboard::ClipboardProvider::PlatformCommand(
+                crate::clipboard::PlatformCommand {
+                    program: "pbcopy",
+                    args: &[],
+                },
+            ),
+            crate::clipboard::ClipboardProvider::TempFile,
+        ],
+    );
+    assert!(
+        !chain.has_osc52(),
+        "the pinned chain must model an OSC 52-ignoring terminal"
+    );
+    app.set_clipboard_chain_for_test(chain);
+
+    // A small payload (well under the OSC 52 cap) — the common case the feature
+    // targets and the one the false-success bug silently dropped.
+    let payload = "small clipboard payload";
+    deliver_copy(&mut app, payload, "assistant message");
+
+    assert!(
+        app.status.starts_with("copied assistant message"),
+        "expected a copied-status from the platform sink, got {:?}",
+        app.status
+    );
+    let recorded = calls.lock().unwrap().clone();
+    let landed_on_platform = recorded.iter().any(|call| match call {
+        crate::clipboard::SinkCall::Command { payload: p, .. } => p == payload.as_bytes(),
+        _ => false,
+    });
+    assert!(
+        landed_on_platform,
+        "the small payload must reach the platform sink, not the OSC 52 fast \
+         path; recorded calls: {recorded:?}"
+    );
+    // And the in-app history records the landed copy just like any other.
+    assert_eq!(app.clipboard_history.len(), 1, "the copy was recorded");
+}
+
 // ===========================================================================
 // Zen Mode (§12.4.5)
 // ===========================================================================

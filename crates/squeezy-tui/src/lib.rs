@@ -21413,7 +21413,23 @@ fn main_text_width(app: &TuiApp) -> u16 {
 /// path and large ones degrade gracefully instead of silently failing. Any
 /// other primary failure (e.g. the terminal clipboard genuinely unavailable)
 /// is reported as-is — the fallback chain only earns its keep for the cap case.
+///
+/// CRITICAL (deep-review #11): the fast OSC 52-only write reports `Ok` as soon
+/// as the escape is flushed to stdout — it cannot observe whether the terminal
+/// honoured it. On a terminal that ignores OSC 52 (Apple Terminal, GNOME/VTE)
+/// that would surface a false "copied N chars" while the clipboard stays empty
+/// and the `pbcopy`/`xclip`/`wl-copy` sinks this PR added are never consulted.
+/// So when the env probe says the host is *not* believed to honour OSC 52
+/// (`!clipboard_chain.has_osc52()`), we skip the OSC 52 fast path entirely and
+/// route every payload — including the common ≤8 KiB case — through the
+/// capability-aware chain, which goes straight to the platform sink.
 fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
+    // On OSC 52-ignoring terminals the fast path's `Ok` is unobservable and
+    // would falsely report success; route through the platform-sink chain.
+    if !app.clipboard_chain.has_osc52() {
+        deliver_copy_via_chain(app, text, label, None);
+        return;
+    }
     let chars = text.chars().count();
     match app.clipboard.copy_text(text) {
         Ok(()) => {
@@ -21443,46 +21459,64 @@ fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
                     .push(app.status.clone(), toast::ToastVariant::Error);
                 return;
             }
-            // TODO(copy-confirm): when the large-payload confirmation gate is
-            // wired (see the TODO in `build_clipboard_chain`), pass
-            // `request.confirmed` through from a pending-confirm app state and
-            // add a `CopyOutcome::NeedsConfirmation` arm here that sets that
-            // state + an info toast and confirms on a repeat/confirm key. Until
-            // then the threshold is unset, so `copy` never returns
-            // `NeedsConfirmation` and it falls into the generic failure arm.
-            let request = clipboard::CopyRequest::new(text, label);
-            let outcome = app.clipboard_chain.copy(&request);
-            let (toast_msg, variant) = outcome.toast();
-            match &outcome {
-                clipboard::CopyOutcome::Copied { provider, .. } => {
-                    app.status = format!("copied {label} ({chars} chars)");
-                    // Dogfood telemetry (§12.10.3): bucket the copy by the
-                    // bounded provider kind that serviced it (never the bytes).
-                    app.dogfood_metrics
-                        .record_copy(dogfood_copy_provider(*provider));
-                    // In-app clipboard history (§12.6.1): the large-payload chain
-                    // landed it too, so record it for recovery just like the
-                    // fast-path success above.
-                    app.clipboard_history.record(text, label);
-                }
-                clipboard::CopyOutcome::WroteTempFile { .. } => {
-                    app.status = toast_msg.clone();
-                    // The temp-file fallback is itself a (degraded) copy outcome.
-                    app.dogfood_metrics
-                        .record_copy(dogfood::CopyProvider::TempFile);
-                    // Still a delivered payload (to a durable file); record it so
-                    // the user can re-copy it from the in-app history (§12.6.1).
-                    app.clipboard_history.record(text, label);
-                }
-                _ => {
-                    // Even the fallback chain failed: surface the original
-                    // sink's reason, which is the most actionable.
-                    app.status = format!("copy failed: {primary_err}");
-                }
-            }
-            app.toasts.push(toast_msg, variant);
+            deliver_copy_via_chain(app, text, label, Some(primary_err));
         }
     }
+}
+
+/// Deliver `text` through the capability-aware [`clipboard::ClipboardChain`]
+/// (platform command `pbcopy`/`wl-copy`/… → durable temp file) and report the
+/// outcome on the status line + a toast, recording a landed copy in the in-app
+/// history. Shared by the two routes into the chain: an OSC 52-ignoring
+/// terminal (where the fast OSC 52-only write would falsely report success —
+/// deep-review #11) and an oversized payload that overflowed the OSC 52 cap.
+///
+/// `primary_err` carries the original OSC 52 sink's failure reason for the
+/// oversized-payload route, surfaced if even the chain fails (it is the most
+/// actionable message). It is `None` on the OSC 52-unsupported route, where no
+/// fast-path write was attempted; that route reports the chain's own reason.
+fn deliver_copy_via_chain(app: &mut TuiApp, text: &str, label: &str, primary_err: Option<String>) {
+    let chars = text.chars().count();
+    // TODO(copy-confirm): when the large-payload confirmation gate is
+    // wired (see the TODO in `build_clipboard_chain`), pass
+    // `request.confirmed` through from a pending-confirm app state and
+    // add a `CopyOutcome::NeedsConfirmation` arm here that sets that
+    // state + an info toast and confirms on a repeat/confirm key. Until
+    // then the threshold is unset, so `copy` never returns
+    // `NeedsConfirmation` and it falls into the generic failure arm.
+    let request = clipboard::CopyRequest::new(text, label);
+    let outcome = app.clipboard_chain.copy(&request);
+    let (toast_msg, variant) = outcome.toast();
+    match &outcome {
+        clipboard::CopyOutcome::Copied { provider, .. } => {
+            app.status = format!("copied {label} ({chars} chars)");
+            // Dogfood telemetry (§12.10.3): bucket the copy by the
+            // bounded provider kind that serviced it (never the bytes).
+            app.dogfood_metrics
+                .record_copy(dogfood_copy_provider(*provider));
+            // In-app clipboard history (§12.6.1): the chain landed it too, so
+            // record it for recovery just like the fast-path success above.
+            app.clipboard_history.record(text, label);
+        }
+        clipboard::CopyOutcome::WroteTempFile { .. } => {
+            app.status = toast_msg.clone();
+            // The temp-file fallback is itself a (degraded) copy outcome.
+            app.dogfood_metrics
+                .record_copy(dogfood::CopyProvider::TempFile);
+            // Still a delivered payload (to a durable file); record it so
+            // the user can re-copy it from the in-app history (§12.6.1).
+            app.clipboard_history.record(text, label);
+        }
+        _ => {
+            // Even the fallback chain failed: surface the original sink's
+            // reason when we have one (most actionable), else the chain's.
+            app.status = match &primary_err {
+                Some(err) => format!("copy failed: {err}"),
+                None => toast_msg.clone(),
+            };
+        }
+    }
+    app.toasts.push(toast_msg, variant);
 }
 
 /// Handle `/export <md|txt|json> [destination]` (§12.6.4): render the full
@@ -45410,6 +45444,20 @@ impl TuiApp {
         sink: Box<dyn clipboard::ClipboardSink + Send>,
     ) {
         self.clipboard_chain = build_clipboard_chain(sink);
+    }
+
+    /// Install a fully-built semantic copy/export chain, so a copy test can pin
+    /// the exact provider set (e.g. an OSC 52-less chain to exercise the
+    /// platform-sink routing in `deliver_copy`) rather than depending on the
+    /// host's env probe. Consumed only by the in-crate copy suite; see
+    /// `set_clipboard_sink_for_test` for the dead-code cfg rationale.
+    #[cfg(any(test, feature = "testing"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_clipboard_chain_for_test(
+        &mut self,
+        chain: clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink + Send>>,
+    ) {
+        self.clipboard_chain = chain;
     }
 
     fn new_with_startup(

@@ -561,6 +561,18 @@ impl<S: ClipboardSink> ClipboardChain<S> {
         &self.sink
     }
 
+    /// Whether OSC 52 is in this chain's provider list, i.e. the host terminal
+    /// is believed to honour OSC 52 clipboard writes (`caps.osc52`). The
+    /// semantic-copy funnel consults this to decide whether the fast OSC 52-only
+    /// write can be trusted, or whether it must route the copy through this
+    /// capability-aware chain so the platform sink (`pbcopy`/`wl-copy`/…)
+    /// actually lands it on OSC 52-ignoring terminals.
+    pub(crate) fn has_osc52(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| matches!(p, ClipboardProvider::Osc52))
+    }
+
     /// The single entry point. Walks the provider chain in order, returning on
     /// the first success; on each failure it records the reason and falls
     /// through. Enforces the confirmation gate before touching any provider.
