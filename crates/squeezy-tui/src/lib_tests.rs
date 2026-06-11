@@ -15581,7 +15581,7 @@ fn reanchor_on_resize_re_pins_following_and_clamps_scrolled_up() {
     // anchor. Geometry here resolves through the 80x24 fallback.
     let mut app = app_with_user_turns(200);
     // Following: stays pinned.
-    reanchor_active_scroll_on_resize(&mut app);
+    reanchor_active_scroll_on_resize(&mut app, None);
     assert_eq!(app.transcript_scroll.from_bottom(), 0);
     assert!(app.transcript_scroll.is_following());
     // Scrolled up beyond what the (clamped) geometry allows: the reanchor caps
@@ -15589,13 +15589,217 @@ fn reanchor_on_resize_re_pins_following_and_clamps_scrolled_up() {
     let (line_count, viewport_h) = active_transcript_geometry(&app);
     let max_scroll = line_count.saturating_sub(viewport_h);
     app.transcript_scroll = scroll::ScrollState::scrolled_up(max_scroll + 1_000);
-    reanchor_active_scroll_on_resize(&mut app);
+    reanchor_active_scroll_on_resize(&mut app, None);
     assert_eq!(
         app.transcript_scroll.from_bottom(),
         max_scroll,
         "a resize clamps an over-scrolled anchor to the content top",
     );
     assert!(!app.transcript_scroll.is_following());
+}
+
+// ---- Focus-Preserving Resize (§12.4.3) ---------------------------------
+
+/// Long, wrap-prone user prompts so a width change reflows each entry to a
+/// different number of rows — the situation that makes a bare `from_bottom`
+/// point at the wrong entry without the §12.4.3 re-anchor.
+fn app_with_wrapping_turns(count: usize) -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    for index in 0..count {
+        app.push_transcript_item(TranscriptItem::user(format!(
+            "turn {index}: a deliberately long prompt that wraps across several \
+             rows at a narrow width so the resize reflow changes its height and \
+             the scroll anchor must follow the entry, not the row count"
+        )));
+    }
+    app
+}
+
+#[test]
+fn resize_keeps_the_same_entry_anchored_across_a_wrap_reflow() {
+    // The core §12.4.3 behavior: scroll up so a known entry sits at the top, then
+    // a resize narrows the width (each entry now wraps to MORE rows). The same
+    // entry must stay anchored at the top rather than the view jumping to a
+    // different entry because the stale `from_bottom` indexes new geometry.
+    let mut app = app_with_wrapping_turns(40);
+    app.set_test_frame_size(80, 20);
+    // Scroll up off the tail to a mid-transcript position.
+    scroll_transcript_up(&mut app, 60);
+    let anchored_before = current_top_entry_id(&app).expect("a top entry while scrolled up");
+    assert!(
+        !app.transcript_scroll.is_following(),
+        "the view is scrolled up, not following the tail",
+    );
+
+    // Resize to a much narrower width: every entry reflows to more rows. Capture
+    // runs against the still-current 80x20 (`off_frame`) geometry; the new size
+    // is passed in just as the `Event::Resize` arm does, so the re-pin measures
+    // the 40-wide geometry. The next painted frame is 40 wide too.
+    reanchor_active_scroll_on_resize(&mut app, Some((40, 20)));
+    app.set_test_frame_size(40, 20);
+
+    let anchored_after = current_top_entry_id(&app).expect("a top entry after the reflow");
+    assert_eq!(
+        anchored_after, anchored_before,
+        "the same logical entry stays at the top across the wrap reflow",
+    );
+}
+
+#[test]
+fn resize_keeps_a_following_view_pinned_to_the_tail() {
+    // A live (tail-following) view must stay pinned to the tail across a resize —
+    // the anchor logic never freezes a live view onto a stale entry.
+    let mut app = app_with_wrapping_turns(30);
+    assert!(app.transcript_scroll.is_following());
+    reanchor_active_scroll_on_resize(&mut app, Some((48, 18)));
+    assert!(
+        app.transcript_scroll.is_following(),
+        "a following view re-pins to the tail, not to a captured anchor",
+    );
+    assert_eq!(app.transcript_scroll.from_bottom(), 0);
+}
+
+#[test]
+fn resize_clamps_a_dangling_focus_index_to_a_visible_row() {
+    // A focus index left past the end of a transcript that shrank (a prune
+    // between a resize-storm burst) must clamp to a visible row, never dangle.
+    let mut app = app_with_user_turns(10);
+    app.selected_entry = Some(9);
+    app.transcript.truncate(4); // the focused row no longer exists
+
+    reanchor_active_scroll_on_resize(&mut app, None);
+
+    let index = app
+        .selected_entry
+        .expect("a non-empty transcript keeps a visible focus");
+    assert!(
+        index < app.transcript.len(),
+        "focus clamps to a valid, visible row, not a dangling index",
+    );
+    assert_eq!(index, 3, "clamps to the new last row");
+}
+
+#[test]
+fn resize_on_empty_transcript_clears_focus() {
+    // Every entry vanished under the resize: there is no row to fall back to, so
+    // focus clears rather than dangling at a phantom index.
+    let mut app = app_with_user_turns(3);
+    app.selected_entry = Some(1);
+    app.transcript.clear();
+
+    reanchor_active_scroll_on_resize(&mut app, None);
+
+    assert_eq!(
+        app.selected_entry, None,
+        "no visible row remains, so focus clears",
+    );
+}
+
+#[test]
+fn resize_leaves_unfocused_view_unfocused() {
+    // A resize must never conjure a selection out of an unfocused transcript.
+    let mut app = app_with_user_turns(8);
+    assert_eq!(app.selected_entry, None, "starts unfocused");
+    reanchor_active_scroll_on_resize(&mut app, None);
+    assert_eq!(app.selected_entry, None, "still unfocused after resize");
+}
+
+#[test]
+fn resize_does_not_touch_main_focus_while_subagent_active() {
+    // The subagent view has no main-view focus; a resize while it is active must
+    // leave the main transcript's `selected_entry` exactly as the user left it
+    // (so returning to main restores the same focused entry).
+    let mut app = app_with_two_subagents();
+    for index in 0..6 {
+        app.push_transcript_item(TranscriptItem::user(format!("main turn {index}")));
+    }
+    app.selected_entry = Some(2);
+    app.subagent_pane.active = ConversationSource::Subagent(1);
+
+    reanchor_active_scroll_on_resize(&mut app, None);
+
+    assert_eq!(
+        app.selected_entry,
+        Some(2),
+        "main focus is untouched while a subagent conversation is active",
+    );
+}
+
+#[tokio::test]
+async fn resize_storm_through_dispatch_keeps_anchor_stable() {
+    // Drive the feature through the REAL input path: a burst of `Event::Resize`
+    // events (a window-drag storm) flows through `dispatch_input_events`, which
+    // runs the production `reanchor_active_scroll_on_resize` hook. Scrolled up,
+    // the same logical entry stays anchored at the top across the whole storm of
+    // different widths.
+    let mut app = app_with_wrapping_turns(50);
+    let mut agent = test_agent(SessionMode::Build);
+    app.set_test_frame_size(80, 20);
+    scroll_transcript_up(&mut app, 80);
+    let anchored = current_top_entry_id(&app).expect("a top entry while scrolled up");
+
+    for (w, h) in [(60_u16, 24_u16), (40, 30), (100, 16), (52, 22)] {
+        dispatch_input_events(&mut app, &mut agent, vec![Event::Resize(w, h)])
+            .await
+            .expect("dispatch resize");
+        // The painted size is what the next off-frame geometry measures against.
+        app.set_test_frame_size(w, h);
+        assert_eq!(
+            current_top_entry_id(&app),
+            Some(anchored),
+            "the anchored entry survives every resize in the storm ({w}x{h})",
+        );
+    }
+}
+
+#[tokio::test]
+async fn resize_keeps_anchored_entry_painted_after_reflow() {
+    // The "resize where the feature paints" case: scrolled up onto a known entry,
+    // a resize fires through the real input path, then the production `render()`
+    // is driven via a `TestBackend`. The anchored entry's content is still on
+    // screen after the reflow (the feature did not strand the user's anchor
+    // off-view).
+    let mut app = app_with_wrapping_turns(40);
+    let mut agent = test_agent(SessionMode::Build);
+    app.set_test_frame_size(72, 20);
+    scroll_transcript_up(&mut app, 50);
+    let anchored = current_top_entry_id(&app).expect("a top entry while scrolled up");
+    let anchored_index = app
+        .transcript
+        .iter()
+        .position(|entry| entry.id == anchored)
+        .expect("anchored id is live");
+
+    dispatch_input_events(&mut app, &mut agent, vec![Event::Resize(50, 20)])
+        .await
+        .expect("dispatch resize");
+    app.set_test_frame_size(50, 20);
+
+    assert_eq!(
+        current_top_entry_id(&app),
+        Some(anchored),
+        "the same entry is anchored at the top after the reflow",
+    );
+    // The real renderer paints the anchored region — the anchored entry (or its
+    // immediate neighbour at the top boundary) is on screen — and the view did
+    // NOT jump to the tail: the last turn is nowhere near the top of the frame.
+    let frame = render_to_string(&app, 50, 20);
+    let anchor_region_painted = frame.contains(&format!("turn {anchored_index}:"))
+        || frame.contains(&format!("turn {}:", anchored_index + 1));
+    assert!(
+        anchor_region_painted,
+        "the anchored entry's region is painted after the resize:\n{frame}",
+    );
+    let last_turn = app.transcript.len() - 1;
+    assert!(
+        !frame.contains(&format!("turn {last_turn}:")),
+        "the view stayed anchored mid-transcript, it did not jump to the tail:\n{frame}",
+    );
+    assert!(
+        !app.transcript_scroll.is_following(),
+        "the resize kept the scrolled-up anchor, it did not re-pin to the tail",
+    );
 }
 
 // ---- scrolled-vs-live indicator ----------------------------------------
@@ -30277,7 +30481,7 @@ fn jump_marks_survive_resize_and_repaint() {
 
     // Re-clamp scroll to a fresh geometry (as a real resize does), then jump
     // back: the mark is still resolvable.
-    reanchor_active_scroll_on_resize(&mut app);
+    reanchor_active_scroll_on_resize(&mut app, None);
     app.transcript_scroll = scroll::ScrollState::pinned();
     jump_to_jump_mark(&mut app);
     assert_eq!(app.jump_marks.mark_count(), 0);

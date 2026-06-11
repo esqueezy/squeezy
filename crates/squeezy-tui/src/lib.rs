@@ -106,6 +106,7 @@ mod error_lens;
 mod events;
 mod export_destination;
 mod first_run_hints;
+mod focus_resize;
 mod fuzzy;
 mod gesture_settings;
 mod glyph_mode;
@@ -2373,7 +2374,7 @@ async fn handle_input_event(
             app.needs_redraw = true;
             Ok(false)
         }
-        Event::Resize(_, _) => {
+        Event::Resize(width, height) => {
             tag_interaction(app, Some(latency::InteractionKind::ResizeRedraw));
             // Dogfood telemetry (§12.10.3): count the resize input and detect
             // resize storms (a rapid burst of resizes during a window drag).
@@ -2381,12 +2382,15 @@ async fn handle_input_event(
             app.pending_resize = true;
             app.needs_redraw = true;
             // A live (following) view re-pins to the tail; a scrolled-up view
-            // keeps its logical anchor, clamped to the reflowed geometry so the
-            // stored `from_bottom` never points past the new content. Any
-            // in-flight ease was computed against the old geometry, so cancel it
-            // and let the new geometry govern the painted position.
+            // keeps its logical anchor (Focus-Preserving Resize, §12.4.3): the
+            // entry at the top before the reflow is re-pinned to the top after
+            // it, measured against the new `(width, height)` so the same content
+            // stays in view instead of the stale `from_bottom` indexing the
+            // reflowed rows. Any in-flight ease was computed against the old
+            // geometry, so cancel it and let the new geometry govern the painted
+            // position.
             cancel_main_scroll_anim(app);
-            reanchor_active_scroll_on_resize(app);
+            reanchor_active_scroll_on_resize(app, Some((width, height)));
             // Search match (row,col) positions were taken at the old painted
             // width; after a reflow they index the wrong cells. Re-run the find
             // pass at the new width so highlights re-anchor. No-op when search
@@ -14455,6 +14459,20 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
 /// a degenerate zero-height viewport).
 fn jump_nav_geometry(app: &TuiApp) -> Option<(Vec<usize>, usize, usize)> {
     let (width, height) = app.off_frame_terminal_size();
+    transcript_nav_geometry_at(app, width, height)
+}
+
+/// Same per-entry offset / total-row / viewport geometry as [`jump_nav_geometry`],
+/// but measured against an explicit `(width, height)` instead of the
+/// last-painted size. The Focus-Preserving Resize re-anchor (§12.4.3) uses this
+/// to measure the *post*-resize geometry from the `Event::Resize` dimensions
+/// before that frame has actually painted (so `off_frame_terminal_size` still
+/// reports the old size).
+fn transcript_nav_geometry_at(
+    app: &TuiApp,
+    width: u16,
+    height: u16,
+) -> Option<(Vec<usize>, usize, usize)> {
     let area = Rect {
         x: 0,
         y: 0,
@@ -17490,13 +17508,92 @@ fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
     (lines.len(), viewport_h as usize)
 }
 
-/// Re-clamp the active transcript scroll to the current (post-resize) geometry.
-/// A following view re-pins to the tail; a scrolled-up view keeps its stored
-/// `from_bottom` clamped into the new `[0, max_scroll]` so the logical anchor
-/// survives the reflow without pointing past the content.
-fn reanchor_active_scroll_on_resize(app: &mut TuiApp) {
+/// Re-anchor the active transcript scroll + focus to the current (post-resize)
+/// geometry (Focus-Preserving Resize, §12.4.3).
+///
+/// A bare `from_bottom` line count is only meaningful against a fixed wrap
+/// geometry, so a reflow that changes how many rows each entry occupies would
+/// otherwise leave the same `from_bottom` pointing at a *different entry* — the
+/// view jumps. Instead this captures the top-visible entry as a stable id
+/// *before* the reflow and re-pins the scroll so that same entry stays at the
+/// top *after* it. A following view stays pinned to the tail; an anchored entry
+/// that was pruned/coalesced falls back to the plain clamp (no dangling anchor).
+/// It also re-validates the keyboard focus so a transcript that shrank under a
+/// stale `selected_entry` index never leaves a hidden/dangling focus.
+fn reanchor_active_scroll_on_resize(app: &mut TuiApp, new_size: Option<(u16, u16)>) {
+    // Snapshot the logical scroll anchor (entry id at the top, or "following")
+    // against the geometry as it stands *before* the reflow — i.e. the
+    // last-painted (old) size, the row units the current `from_bottom` is in.
+    let anchor = capture_scroll_anchor_for_resize(app);
+
     let (line_count, viewport_h) = active_transcript_geometry(app);
     active_transcript_scroll_mut(app).clamp(line_count, viewport_h);
+
+    // Re-pin the captured anchor against the *post*-resize geometry so the user
+    // keeps looking at the same entry rather than a row that now wraps
+    // differently. The new size comes from the `Event::Resize` payload because
+    // `off_frame_terminal_size` still reports the old (last-painted) size until
+    // the next frame lands; without it, capture and re-pin would both measure the
+    // old geometry and the re-pin would be a no-op. Falls through to the clamp
+    // above when the anchored entry is gone (no dangling anchor).
+    let post_geometry = match new_size {
+        Some((width, height)) => transcript_nav_geometry_at(app, width, height),
+        None => jump_nav_geometry(app),
+    };
+    if let Some((entry_offsets, total_rows, viewport_h)) = post_geometry
+        && let Some(entry_ids) = active_entry_ids(app)
+        && let Some(from_bottom) = focus_resize::reanchor_from_bottom(
+            anchor,
+            &entry_offsets,
+            &entry_ids,
+            total_rows,
+            viewport_h,
+        )
+    {
+        active_transcript_scroll_mut(app).set_from_bottom(from_bottom, total_rows, viewport_h);
+    }
+
+    // Re-validate the keyboard focus index so a shrunk transcript never leaves a
+    // dangling/hidden focus (the spec's `resolve_focus_after_layout`).
+    reanchor_focus_on_resize(app);
+}
+
+/// The logical scroll anchor (top-visible entry id, or "following the tail") of
+/// the active transcript as it stands *now*, for [`reanchor_active_scroll_on_resize`]
+/// to re-pin after the reflow. Returns [`focus_resize::ScrollAnchor::Following`]
+/// when there is nothing to anchor (empty transcript / degenerate geometry).
+fn capture_scroll_anchor_for_resize(app: &TuiApp) -> focus_resize::ScrollAnchor {
+    let following = active_transcript_scroll(app).is_following();
+    let (Some((entry_offsets, total_rows, viewport_h)), Some(entry_ids)) =
+        (jump_nav_geometry(app), active_entry_ids(app))
+    else {
+        return focus_resize::ScrollAnchor::Following;
+    };
+    let top_row = active_transcript_scroll(app).offset(total_rows, viewport_h);
+    focus_resize::ScrollAnchor::capture(following, top_row, &entry_offsets, &entry_ids)
+}
+
+/// The stable ids of the active transcript's entries, in row order. `None` when
+/// the active transcript is empty (no anchor to take).
+fn active_entry_ids(app: &TuiApp) -> Option<Vec<u64>> {
+    let ids: Vec<u64> = active_transcript_entries(app)
+        .iter()
+        .map(|entry| entry.id)
+        .collect();
+    if ids.is_empty() { None } else { Some(ids) }
+}
+
+/// Re-validate the main-view keyboard focus index after a reflow (§12.4.3): an
+/// index that now dangles past a shrunk transcript clamps to the last row (or
+/// clears on an empty transcript), so focus is never hidden. The subagent view
+/// has no main-view focus (`active_selected_entry` returns `None` there), so
+/// this only touches the main transcript's `selected_entry`.
+fn reanchor_focus_on_resize(app: &mut TuiApp) {
+    if active_subagent_record(app).is_some() {
+        return;
+    }
+    app.selected_entry =
+        focus_resize::resolve_focus_index(app.selected_entry, app.transcript.len());
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: usize) {
@@ -44901,7 +44998,10 @@ fn mark_full_redraw_after_resume(app: &mut TuiApp) {
     // in-flight ease (its start anchor is stale) and clamp the stored `from_bottom`
     // to the new max_scroll. Mirrors the `Event::Resize` arm.
     cancel_main_scroll_anim(app);
-    reanchor_active_scroll_on_resize(app);
+    // No explicit new size here: a suspend/resume re-anchor measures against the
+    // last-painted size (`off_frame_terminal_size`), so the anchor capture and
+    // re-pin use the same geometry — equivalent to the prior clamp-only behavior.
+    reanchor_active_scroll_on_resize(app, None);
 }
 
 /// Pre-flight check for the conditions [`TerminalGuard::enter`] refuses on:
