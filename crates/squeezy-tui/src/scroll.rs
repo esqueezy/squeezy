@@ -176,8 +176,11 @@ impl ScrollState {
                 .min(max_scroll)
         } else {
             // delta_lines is negative; magnitude moves us toward the tail.
+            // Clamp the (possibly stale/over-max) stored value to `max_scroll`
+            // first so a single scroll-down can reach the tail instead of
+            // chipping the page size off a phantom distance.
             let down = delta_lines.unsigned_abs();
-            self.from_bottom.saturating_sub(down)
+            self.from_bottom.min(max_scroll).saturating_sub(down)
         };
         self.from_bottom = next;
         self.follow_tail = next == 0;

@@ -209,6 +209,29 @@ fn scroll_when_content_fits_is_noop() {
     assert!(s.is_following());
 }
 
+#[test]
+fn scroll_down_clamps_over_max_from_bottom_before_subtracting() {
+    // A stored from_bottom that exceeds the current max_scroll (e.g. after the
+    // content shrank under the view) must be clamped to max_scroll BEFORE the
+    // downward delta is applied, so one scroll-down lands inside the live range
+    // rather than chipping the page size off a phantom distance.
+    let line_count = 34usize;
+    let viewport_h = 24usize;
+    // max_scroll = 34 - 24 = 10.
+    let mut s = ScrollState::scrolled_up(40); // stale, over-max
+    s.scroll_by(-8, line_count, viewport_h);
+    assert_eq!(
+        s.offset_from_bottom(line_count, viewport_h),
+        2,
+        "10 (clamped) - 8 = 2, not 32"
+    );
+    assert!(!s.is_following());
+    // A second scroll-down reaches the tail and re-pins.
+    s.scroll_by(-8, line_count, viewport_h);
+    assert_eq!(s.from_bottom(), 0);
+    assert!(s.is_following());
+}
+
 // ---- Phase 4: page-sized scrolls land exactly --------------------------
 
 #[test]
