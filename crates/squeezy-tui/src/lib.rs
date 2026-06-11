@@ -41462,24 +41462,6 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if let Some(line) = indicator_line {
         lines.push(line);
     }
-    if indicator_present {
-        // Indicator sits on `area.y + indicator_row_offset`, spanning
-        // the full width. Registered with the per-frame click registry
-        // so `handle_mouse` hit-tests it on left-click.
-        let row = area.y.saturating_add(indicator_row_offset);
-        if row < area.y.saturating_add(area.height) {
-            app.register_click(
-                Rect {
-                    x: area.x,
-                    y: row,
-                    width: area.width,
-                    height: 1,
-                },
-                interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
-                interaction::Action::ToggleQueueOverlay,
-            );
-        }
-    }
     // Record where the queue overlay block starts in `lines` so the per-item
     // delete/drag hit targets can be registered at their true screen rows
     // (after the paragraph scroll is known). The header is the first overlay
@@ -41490,6 +41472,29 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.extend(mention_lines);
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
+    if indicator_present {
+        // The footer Paragraph applies `.scroll((scroll, 0))`, so the strip is
+        // PAINTED at `area.y + (indicator_row_offset - scroll)`. Register the click
+        // target at that same scrolled row (mirroring `register_queue_item_targets`)
+        // so the hit rect tracks the painted strip rather than sitting `scroll` rows
+        // too low. When the strip scrolls off the top (`indicator_row_offset <
+        // scroll`) it isn't painted, so skip registration entirely.
+        if indicator_row_offset >= scroll {
+            let row = area.y.saturating_add(indicator_row_offset - scroll);
+            if row < area.y.saturating_add(area.height) {
+                app.register_click(
+                    Rect {
+                        x: area.x,
+                        y: row,
+                        width: area.width,
+                        height: 1,
+                    },
+                    interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+                    interaction::Action::ToggleQueueOverlay,
+                );
+            }
+        }
+    }
     if let Some(base) = queue_overlay_base {
         register_queue_item_targets(app, area, base, scroll);
     }

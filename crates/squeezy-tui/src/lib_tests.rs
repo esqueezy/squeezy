@@ -1912,6 +1912,69 @@ async fn left_click_on_indicator_rect_toggles_queue_overlay() {
 }
 
 #[tokio::test]
+async fn queue_strip_click_target_tracks_the_painted_row_under_footer_scroll() {
+    // The footer Paragraph scrolls when its lines exceed the area height. The
+    // QueueStrip click target must be registered at the SCROLLED row the strip is
+    // painted on, not at its unscrolled line offset (which would sit `scroll` rows
+    // too low). Open the overlay with a full window of items + a multi-line
+    // composer in a short area so `scroll > 0`, render the real `render_input`,
+    // then assert the registered rect's `y` matches the painted `queued:` row.
+    let mut app = queue_app(&["a", "b", "c", "d", "e", "f"]);
+    // A multi-line composer combined with the open overlay overflows a short
+    // footer area: the overlay block (header + a full window of item rows) makes
+    // `prompt_height` underflow to 0, so the composer paints its raw lines and the
+    // total footer height exceeds the area — the Paragraph scrolls (scroll > 0).
+    app.input = "line1\nline2\nline3".to_string();
+
+    // height 7: overlay block = 1 header + 5 windowed rows = 6 lines, +1 strip =
+    // extra_height 7 == area height, so the composer height clamps to 0 and its 3
+    // raw lines push the footer past the area, forcing a non-zero scroll.
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 7,
+    };
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_input(frame, area, &app))
+        .expect("draw footer");
+
+    // Locate the painted strip row by scanning the buffer for the "queued:" label.
+    let buffer = terminal.backend().buffer().clone();
+    let mut painted_strip_row = None;
+    for row in area.y..area.y + area.height {
+        let mut line = String::new();
+        for col in area.x..area.x + area.width {
+            line.push_str(buffer[(col, row)].symbol());
+        }
+        if line.contains("queued:") {
+            painted_strip_row = Some(row);
+            break;
+        }
+    }
+    let painted_strip_row =
+        painted_strip_row.expect("the queue indicator strip is painted somewhere in the footer");
+
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::QueueStrip,
+        ))
+        .expect("the queue strip registers a click target");
+    // The strip scrolled UP from its unscrolled line offset, so the painted row is
+    // strictly above the composer-line offset where the buggy code registered it.
+    assert!(
+        painted_strip_row < 3,
+        "the footer scrolled the strip up above its line offset (row {painted_strip_row})",
+    );
+    assert_eq!(
+        rect.y, painted_strip_row,
+        "the QueueStrip hit rect must sit on the painted (scrolled) strip row",
+    );
+}
+
+#[tokio::test]
 async fn topmost_overlapping_click_target_wins() {
     let app = test_app(SessionMode::Build);
     // Two overlapping rects registered in render order: the second
