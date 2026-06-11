@@ -151,8 +151,13 @@ fn parse_destination(tail: &str) -> Result<(ExportDestination, bool), String> {
         "stdout" | "-" => return Ok((ExportDestination::Stdout, false)),
         _ => {}
     }
-    if let Some(name) = tail.strip_prefix("dir:") {
-        let name = name.trim();
+    // Detect the `dir:` prefix case-insensitively (matching the keyword
+    // contract), but slice the directory name from the *original-case* tail so
+    // the configured directory keeps its real casing. `dir:` is ASCII, so the
+    // byte length of the lowercased remainder equals the original tail's
+    // remainder — `tail[tail.len() - rest.len()..]` recovers the verbatim name.
+    if let Some(rest) = lowered.strip_prefix("dir:") {
+        let name = tail[tail.len() - rest.len()..].trim();
         validate_configured_dir(name)?;
         return Ok((ExportDestination::ConfiguredDir(name.to_string()), false));
     }

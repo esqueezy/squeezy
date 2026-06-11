@@ -127,6 +127,32 @@ fn configured_dir_rejects_dot_only_name() {
 }
 
 #[test]
+fn configured_dir_prefix_is_case_insensitive() {
+    // Regression (deep-review #120): the `dir:` prefix is documented as a
+    // case-insensitive keyword, but detection used the original-case tail, so
+    // `DIR:notes` / `Dir:notes` fell through to a literal `File("DIR:notes")`,
+    // bypassing the traversal guard. The prefix is now matched case-insensitively
+    // while the directory NAME keeps its original casing.
+    for input in ["md DIR:notes", "md Dir:notes", "md dIr:notes"] {
+        let req = parse_export_request(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+        assert_eq!(
+            req.destination,
+            ExportDestination::ConfiguredDir("notes".to_string()),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn configured_dir_uppercase_prefix_still_rejects_traversal() {
+    // Regression (deep-review #120): an upper-cased `DIR:` prefix must run the
+    // same path-traversal guard as the lower-cased form — it previously slipped
+    // through as a literal file name, escaping the workspace check entirely.
+    let err = parse_export_request("md DIR:../escape").expect_err("traversal must be rejected");
+    assert!(err.contains(".."), "{err}");
+}
+
+#[test]
 fn plain_path_is_preserved_verbatim() {
     let req = parse_export_request("md ./out/notes.md").expect("path parses");
     assert_eq!(
