@@ -10372,7 +10372,7 @@ fn cycle_main_semantic_filter(app: &mut TuiApp, backward: bool) {
 fn toggle_hyperlinks(app: &mut TuiApp) {
     let (next, label) = match app.hyperlink_override {
         // auto -> on
-        None => (Some(true), "on (forced)"),
+        None => (Some(true), "on (exit-mirror links)"),
         // on -> off
         Some(true) => (Some(false), "off (plain text)"),
         // off -> auto

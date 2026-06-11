@@ -12345,6 +12345,27 @@ fn toggle_hyperlinks_cycles_auto_on_off_and_back() {
 }
 
 #[test]
+fn toggle_hyperlinks_on_label_scopes_to_the_exit_mirror() {
+    // No live frame emits OSC 8 — the escapes ride only on the persisted
+    // exit-mirror rows — so the `on` status must scope the claim to
+    // `exit-mirror links` and must NOT imply a live click-to-open capability.
+    let mut app = test_app(SessionMode::Build);
+    app.hyperlink_caps = hyperlinks::HyperlinkCapabilities::disabled();
+
+    toggle_hyperlinks(&mut app); // auto -> on
+    assert_eq!(app.hyperlink_override, Some(true), "auto -> on");
+    assert_eq!(
+        app.status, "hyperlinks: on (exit-mirror links)",
+        "the on label scopes to the exit-mirror, not a live capability",
+    );
+    assert!(
+        !app.status.contains("forced") && !app.status.contains("click-to-open"),
+        "the on label drops the misleading live wording: {}",
+        app.status,
+    );
+}
+
+#[test]
 fn effective_caps_force_on_over_an_incapable_probe() {
     let mut app = test_app(SessionMode::Build);
     app.hyperlink_caps = hyperlinks::HyperlinkCapabilities::disabled();

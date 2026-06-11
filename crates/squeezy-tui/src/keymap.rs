@@ -204,8 +204,10 @@ pub(crate) enum Action {
     CycleDockPanel,
     /// Cycle the OSC 8 hyperlink mode for rendered URLs/file paths (`Alt+8`
     /// default; §11.5 / 11G.5). Rotates auto (the startup terminal probe) → on
-    /// (force click-to-open escapes) → off (force plain text), so a user whose
-    /// terminal was mis-detected either way can correct it without restarting.
+    /// (exit-mirror links) → off (force plain text), so a user whose terminal was
+    /// mis-detected either way can correct it without restarting. The escapes ride
+    /// only on the persisted exit-mirror rows today — no live frame emits OSC 8 —
+    /// so the `on` label says `exit-mirror links`, not a live click-to-open claim.
     ToggleHyperlinks,
     /// Open / close the in-app clipboard-history picker (`Alt+p` default;
     /// §12.6.1). A bounded ring of Squeezy's own recent copies — never the OS
