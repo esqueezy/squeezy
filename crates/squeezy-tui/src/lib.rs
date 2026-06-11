@@ -47308,6 +47308,14 @@ impl TerminalGuard {
         let viewport = Viewport::Fixed(Rect::new(0, 0, w.max(1), h.max(1)));
         let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
             .expect("capture terminal builds with a fixed viewport");
+        // Publish the shared crash-path alt-screen flag exactly as the real
+        // `enter()` does (which sets the local field AND calls
+        // `set_alt_screen_active(true)`). `Drop` now consults the shared flag to
+        // decide whether to leave the alternate screen (deep-review #27), so a
+        // capture guard that only set the local field would not match production
+        // — its `Drop` would skip the leave whenever a prior test left the shared
+        // flag clear. Keeping the two in sync makes the capture guard faithful.
+        signal_teardown::set_alt_screen_active(true);
         let guard = Self {
             terminal: Some(terminal),
             alt_screen_active: true,
@@ -48430,18 +48438,31 @@ impl Drop for TerminalGuard {
             // Dogfood telemetry (§12.10.3): a Drop that still finds the alternate
             // screen active means the clean-exit `finish_fullscreen` never ran —
             // i.e. an emergency (panic / abnormal) teardown. A clean exit clears
-            // the flag first, so this never double-counts a normal shutdown.
+            // the flag first, so this never double-counts a normal shutdown. This
+            // reads the guard-LOCAL field deliberately: it is the "was this a
+            // clean exit?" telemetry signal, independent of who left the screen.
             if self.alt_screen_active {
                 dogfood::record_emergency_teardown();
             }
+            // Decide whether to leave the alternate screen from the SHARED
+            // crash-path flag, read-and-cleared, ANDed with the guard-local field
+            // — NOT the local field alone. A `panic!` runs the panic hook's
+            // `run_emergency_teardown` BEFORE the stack unwinds into this `Drop`;
+            // that hook already swapped the shared flag to `false` and emitted one
+            // `LeaveAlternateScreen`. The guard-local `alt_screen_active` is still
+            // `true` here, so leaving on the local field alone double-emits the
+            // leave. Consulting the shared read-and-clear suppresses the second
+            // leave (the mode restores re-emit harmlessly). (deep-review #27)
+            let still_in_alt_screen =
+                self.alt_screen_active && signal_teardown::take_alt_screen_active();
             let backend = terminal.backend_mut();
             // Single-source the teardown bytes through the shared free helper so
             // a test asserts the exact `LeaveAlternateScreen` + mode-restore
             // stream (and the absence of a transcript mirror / `\x1b[3J`) against
-            // a `Capture` sink. `alt_screen_active` is the idempotence contract
-            // so the alt-screen is left exactly once even when a clean-exit path
-            // already ran.
-            let _ = emit_terminal_emergency_teardown(backend, self.alt_screen_active);
+            // a `Capture` sink. The shared-flag AND above is the idempotence
+            // contract so the alt-screen is left exactly once even when a panic
+            // hook or clean-exit path already left it.
+            let _ = emit_terminal_emergency_teardown(backend, still_in_alt_screen);
             self.alt_screen_active = false;
             // Keep the crash-path flag in sync: the alternate screen (if any) has
             // now been left, so a panic hook / signal handler firing during or

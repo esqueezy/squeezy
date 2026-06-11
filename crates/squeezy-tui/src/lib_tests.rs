@@ -11697,6 +11697,13 @@ fn dropping_fullscreen_guard_emits_leave_alt_screen_and_no_mirror() {
     // sink, then drop it and inspect the teardown bytes. Proves the production
     // `Drop` (which delegates to `emit_terminal_emergency_teardown`) leaves the
     // alternate screen exactly once and writes no transcript mirror.
+    //
+    // `Drop` now read-and-clears the SHARED alt-screen flag (deep-review #27);
+    // serialize against the process-global flag so a concurrent test cannot steal
+    // it between `for_capture_test` setting it and this `drop`.
+    let _flag_guard = crate::signal_teardown::ALT_SCREEN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (guard, sink) = TerminalGuard::for_capture_test(80, 24);
     drop(guard);
     let ansi = sink_to_string(&sink);
@@ -11714,6 +11721,44 @@ fn dropping_fullscreen_guard_emits_leave_alt_screen_and_no_mirror() {
     assert!(
         !ansi.contains("hello from the model"),
         "Drop is emergency-only and must not mirror transcript content"
+    );
+}
+
+/// (deep-review #27) A `panic!` runs the panic hook's emergency teardown BEFORE
+/// the stack unwinds into `TerminalGuard::Drop`. The hook read-and-clears the
+/// SHARED `ALT_SCREEN_ACTIVE` flag and leaves the alternate screen once; the
+/// guard-local `alt_screen_active` is still `true` when `Drop` then runs. If
+/// `Drop` left the screen off its LOCAL field it would emit a SECOND
+/// `LeaveAlternateScreen`. The fix makes `Drop` AND its local field with the
+/// shared read-and-clear, so the second leave is suppressed. Here we model the
+/// desync by clearing the shared flag (as the hook would) while the guard's local
+/// field stays true, then assert `Drop` emits NO `LeaveAlternateScreen`.
+#[test]
+fn drop_consults_shared_flag_and_does_not_re_leave_alt_screen() {
+    let _flag_guard = crate::signal_teardown::ALT_SCREEN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let (guard, sink) = TerminalGuard::for_capture_test(80, 24);
+    // Simulate the panic hook having already left the alternate screen: it
+    // read-and-clears the shared flag. The guard's LOCAL `alt_screen_active` is
+    // deliberately left `true` (the panic hook never touches the guard).
+    assert!(
+        crate::signal_teardown::take_alt_screen_active(),
+        "for_capture_test must have published the shared alt-screen flag",
+    );
+
+    drop(guard);
+    let ansi = sink_to_string(&sink);
+    assert!(
+        !ansi.contains("\x1b[?1049l"),
+        "Drop must NOT re-leave the alternate screen the panic hook already left \
+         (shared flag cleared) — got a second LeaveAlternateScreen: {ansi:?}",
+    );
+    // The mode restores still re-emit harmlessly (idempotent) on the Drop path.
+    assert!(
+        ansi.contains(DISABLE_MOUSE_MODES),
+        "Drop still re-emits the idempotent mode restores even when not re-leaving",
     );
 }
 
@@ -12233,6 +12278,13 @@ fn emergency_drop_teardown_emits_no_transcript_mirror() {
     // Full lifecycle proof through the real `Drop`: build a fullscreen guard on a
     // capture sink with a settled transcript reachable to the renderer, drop it,
     // and confirm no transcript text was mirrored by the emergency path.
+    //
+    // `Drop` now read-and-clears the SHARED alt-screen flag (deep-review #27);
+    // serialize against the process-global flag so a concurrent test cannot steal
+    // it between `for_capture_test` setting it and this `drop`.
+    let _flag_guard = crate::signal_teardown::ALT_SCREEN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (guard, sink) = TerminalGuard::for_capture_test(80, 24);
     drop(guard);
     let drop_ansi = sink_to_string(&sink);

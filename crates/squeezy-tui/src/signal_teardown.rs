@@ -88,6 +88,18 @@ pub(crate) fn set_alt_screen_active(active: bool) {
     ALT_SCREEN_ACTIVE.store(active, Ordering::SeqCst);
 }
 
+/// Read-and-clear the shared crash-path alt-screen flag, returning its previous
+/// value. This is the same `swap(false)` [`run_emergency_teardown`] performs, so
+/// the alternate screen is left EXACTLY once across the panic-hook and `Drop`
+/// paths even when both run (a `panic!` fires the hook — which clears this flag
+/// and leaves the alt screen — and then the stack unwinds into
+/// `TerminalGuard::Drop`, whose guard-local `alt_screen_active` is still `true`).
+/// `Drop` ANDs this read-and-clear with its local flag so it does NOT re-leave a
+/// screen the hook already left. (deep-review #27)
+pub(crate) fn take_alt_screen_active() -> bool {
+    ALT_SCREEN_ACTIVE.swap(false, Ordering::SeqCst)
+}
+
 /// Run the idempotent emergency teardown against the real `stdout`, then disable
 /// raw mode. This is the crash-path equivalent of `TerminalGuard::Drop`'s body,
 /// but it owns its own `stdout` handle because the panic hook and signal handlers
@@ -323,6 +335,17 @@ pub(crate) fn install_signal_handlers() {}
 pub(crate) fn panic_hook_installed_for_test() -> bool {
     HOOKS_INSTALLED.load(Ordering::SeqCst)
 }
+
+/// Test-only serialization lock for any test that asserts on the SHARED
+/// crash-path [`ALT_SCREEN_ACTIVE`] flag interacting with `TerminalGuard::Drop`
+/// (which now read-and-clears that flag, deep-review #27). The flag is
+/// process-global, so two such tests racing in the parallel test pool could have
+/// one's `Drop` (or `run_emergency_teardown`) steal the flag the other set —
+/// flipping a `LeaveAlternateScreen` count. Tests that build a capture guard and
+/// assert its `Drop` leaves the alternate screen (or drive the panic-hook /
+/// emergency interleaving) hold this lock so the set→drop window is exclusive.
+#[cfg(test)]
+pub(crate) static ALT_SCREEN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 #[path = "signal_teardown_tests.rs"]
