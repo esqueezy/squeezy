@@ -428,6 +428,16 @@ pub(crate) enum Action {
     /// no-op (status hint) when no subagent row is selected, so the chord never
     /// steals a key from the composer.
     PromoteSubagentResult,
+    /// Open the Compare Subagent Outputs view over the two marked subagents
+    /// (`Alt+7` default; §12.8.3). Two subagents are marked from the Subagent
+    /// Timeline Panel (the `c` key there, or a marked-row click); this verb opens
+    /// the side-by-side (wide) / stacked (narrow) compare view over them — each
+    /// pane independently scrolled, `Tab` (or a click) flips which pane the
+    /// keyboard/wheel drives, and `x` toggles a line-based clean-text diff. A
+    /// no-op (status hint) when fewer than two subagents are marked. Reuses the
+    /// §12.2.3 Pinned Compare View split + diff machinery. Costs nothing until two
+    /// are marked and the view is opened.
+    ToggleSubagentCompare,
     /// Open / close the Actionable Tool Outputs overlay (`Ctrl+Alt+A` default;
     /// §12.3.1) for the focused (or top-visible) tool result. It scans that result's
     /// output for actionable elements — file paths, URLs, error lines, diff hunks,
@@ -600,6 +610,7 @@ impl Action {
             Self::PreviewSubagent => "preview_subagent",
             Self::JumpToSubagent => "jump_to_subagent",
             Self::PromoteSubagentResult => "promote_subagent_result",
+            Self::ToggleSubagentCompare => "toggle_subagent_compare",
             Self::ToggleToolActions => "toggle_tool_actions",
             Self::ToggleScratchpad => "toggle_scratchpad",
             Self::ToggleTemplates => "toggle_templates",
@@ -688,6 +699,7 @@ impl Action {
         Action::PreviewSubagent,
         Action::JumpToSubagent,
         Action::PromoteSubagentResult,
+        Action::ToggleSubagentCompare,
         Action::ToggleToolActions,
         Action::ToggleScratchpad,
         Action::ToggleTemplates,
@@ -892,6 +904,12 @@ impl Action {
             // Ctrl+Alt overlay/picker family. The always-available equivalent is the
             // subagent timeline panel's own `y` promote key.
             | Self::PromoteSubagentResult
+            // Compare Subagent Outputs (§12.8.3) opens with `Alt+7` — an Alt+digit
+            // chord, the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family. The
+            // always-available equivalent is marking two rows + opening from the
+            // subagent timeline panel's own keys.
+            | Self::ToggleSubagentCompare
             // Actionable Tool Outputs overlay toggle is `Ctrl+Alt+A` — a Ctrl+Alt
             // (Meta) chord, the same classically-unreliable encoding across Linux
             // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P`/
@@ -1268,6 +1286,13 @@ impl Action {
                 KeyCode::Char('q'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
+            // Compare Subagent Outputs (§12.8.3). `Alt+7` — the next free
+            // `Alt`+digit after `Alt+6` (subagent hover preview) and beside
+            // `Alt+5` (the §12.8.1 subagent-timeline panel its marks come from);
+            // `Alt+8`/`Alt+9`/`Alt+0` are hyperlinks / session timeline /
+            // changes-since. Every bare `Alt` letter in the nav/copy/overlay
+            // family is taken, so the digit is the free, composer-clear pick.
+            Self::ToggleSubagentCompare => KeyBinding::new(KeyCode::Char('7'), KeyModifiers::ALT),
             // Actionable Tool Outputs (§12.3.1). `Ctrl+Alt+A` — `A` recalls
             // "Actions" and follows the existing `Ctrl+Alt+letter` style
             // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`/`Ctrl+Alt+R`/

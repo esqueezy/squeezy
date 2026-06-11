@@ -35393,6 +35393,391 @@ async fn promote_affordance_paints_across_resizes() {
     }
 }
 
+// ---- Compare Subagent Outputs (§12.8.3) ----
+
+/// Open the Subagent Timeline Panel and mark the visible rows at `indices` (0-based
+/// visible positions) by parking the cursor there and pressing `c` — the keyboard
+/// path the production user takes.
+async fn mark_subagents_for_compare(app: &mut TuiApp, agent: &mut Agent, indices: &[usize]) {
+    handle_key(
+        app,
+        agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+5 opens the subagent-timeline panel");
+    for &index in indices {
+        app.subagent_timeline_selected = index;
+        handle_key(
+            app,
+            agent,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("c marks the selected subagent");
+    }
+}
+
+#[tokio::test]
+async fn subagent_compare_marks_two_and_alt_7_opens_side_by_side() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Mark the completed subagent (#1, "found the bug") and the failed one (#3).
+    mark_subagents_for_compare(&mut app, &mut agent, &[0, 2]).await;
+    assert_eq!(
+        app.subagent_compare_marks.len(),
+        2,
+        "two subagents are marked",
+    );
+
+    // Alt+7 opens the compare view over the two marked subagents and closes the
+    // timeline panel (the compare view owns the surface).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+7 opens the compare view");
+    assert!(app.subagent_compare.is_some(), "compare view opened");
+    assert!(!app.subagent_timeline_open, "the panel closed behind it");
+
+    // Both subagents' outputs paint side-by-side with attribution, in a wide frame.
+    let out = render_to_string(&app, 160, 40);
+    assert!(out.contains("Compare subagents"), "header present:\n{out}");
+    assert!(out.contains("pinned"), "left pane role label:\n{out}");
+    assert!(out.contains("compare"), "right pane role label:\n{out}");
+    assert!(out.contains("explore #1"), "left attribution:\n{out}");
+    assert!(out.contains("reviewer #3"), "right attribution:\n{out}");
+    // The actual findings of each subagent are visible in their panes.
+    assert!(
+        out.contains("found the bug"),
+        "left subagent output:\n{out}"
+    );
+    assert!(
+        out.contains("could not reach host"),
+        "right subagent output:\n{out}",
+    );
+}
+
+#[tokio::test]
+async fn subagent_compare_x_toggles_clean_text_diff() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    mark_subagents_for_compare(&mut app, &mut agent, &[0, 2]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open compare");
+
+    assert_eq!(
+        app.subagent_compare.unwrap().mode,
+        subagent_compare::CompareMode::Content,
+        "opens in content mode",
+    );
+
+    // `x` flips to the line-based clean-text diff.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("x toggles diff mode");
+    assert_eq!(
+        app.subagent_compare.unwrap().mode,
+        subagent_compare::CompareMode::Diff,
+    );
+    let out = render_to_string(&app, 160, 40);
+    assert!(out.contains("diff"), "diff title present:\n{out}");
+    // A removal (left-only) and an addition (right-only) both appear: the two
+    // subagents' distinct summaries differ, so the diff carries +/- gutter rows.
+    assert!(
+        out.contains('+') && out.contains('-'),
+        "diff shows added + removed gutter rows:\n{out}",
+    );
+
+    // `x` again returns to content.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("x toggles back");
+    assert_eq!(
+        app.subagent_compare.unwrap().mode,
+        subagent_compare::CompareMode::Content,
+    );
+}
+
+#[tokio::test]
+async fn subagent_compare_tab_focuses_and_panes_scroll_independently() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    mark_subagents_for_compare(&mut app, &mut agent, &[0, 2]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open compare");
+    // Paint once so the geometry cache is populated for the scroll clamp.
+    let _ = render_to_string(&app, 160, 40);
+
+    assert_eq!(
+        app.subagent_compare.unwrap().focus,
+        subagent_compare::ComparePane::Pinned,
+        "opens focused on the left pane",
+    );
+
+    // Scrolling moves the FOCUSED (left) pane only; the right stays at the top.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll left pane");
+    let after_left = app.subagent_compare.unwrap();
+    assert_eq!(after_left.right_scroll, 0, "right pane untouched");
+
+    // Tab flips focus to the right pane; scrolling now moves the right pane only.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Tab flips focus");
+    assert_eq!(
+        app.subagent_compare.unwrap().focus,
+        subagent_compare::ComparePane::Compare,
+        "Tab focuses the right pane",
+    );
+    let left_before = app.subagent_compare.unwrap().left_scroll;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll right pane");
+    let after_right = app.subagent_compare.unwrap();
+    assert_eq!(
+        after_right.left_scroll, left_before,
+        "left pane offset is independent of the right's scroll",
+    );
+
+    // Esc closes the view.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Esc closes compare");
+    assert!(
+        app.subagent_compare.is_none(),
+        "Esc closes the compare view"
+    );
+}
+
+#[tokio::test]
+async fn subagent_compare_mouse_mark_cell_marks_and_pane_click_focuses() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Open the panel and render so the per-row `[mark]` click targets register.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open panel");
+    let _ = render_to_string(&app, 96, 24);
+
+    // Click the `[mark]` cells of the first two records (pane indices 0 and 1).
+    for target_index in [0usize, 1usize] {
+        let mut hit = None;
+        'scan: for row in 0..24u16 {
+            for col in 0..96u16 {
+                if let Some((
+                    interaction::TargetKey::Chrome(interaction::ChromeKey::SubagentCompareMark(
+                        idx,
+                    )),
+                    _,
+                )) = app.click_target_at(col, row)
+                    && idx == target_index
+                {
+                    hit = Some((col, row));
+                    break 'scan;
+                }
+            }
+        }
+        let (col, row) = hit.expect("a mark cell target is registered");
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: col,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        let _ = render_to_string(&app, 96, 24);
+    }
+    assert_eq!(
+        app.subagent_compare_marks.len(),
+        2,
+        "two mark-cell clicks mark two subagents",
+    );
+
+    // Alt+7 opens the compare view over the two marked subagents.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open compare");
+    let _ = render_to_string(&app, 160, 40);
+    assert_eq!(
+        app.subagent_compare.unwrap().focus,
+        subagent_compare::ComparePane::Pinned,
+    );
+
+    // A left-click inside the right (non-active) pane focuses it — the mouse twin
+    // of Tab. The painted pane rects are cached active-first; the second is the
+    // non-active pane.
+    let (_, second) = app
+        .subagent_compare_rect_cache
+        .get()
+        .expect("pane rects cached after paint");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: second.x + second.width / 2,
+            row: second.y + second.height / 2,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.subagent_compare.unwrap().focus,
+        subagent_compare::ComparePane::Compare,
+        "clicking the other pane focuses it",
+    );
+}
+
+#[tokio::test]
+async fn subagent_compare_alt_7_with_too_few_marks_is_a_no_op_hint() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // No marks: Alt+7 opens nothing and leaves an honest hint.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+7 with no marks");
+    assert!(
+        app.subagent_compare.is_none(),
+        "nothing opens with zero marks"
+    );
+    assert!(
+        app.status.contains("two marked subagents"),
+        "honest hint: {}",
+        app.status,
+    );
+
+    // One mark is still not enough.
+    mark_subagents_for_compare(&mut app, &mut agent, &[0]).await;
+    assert_eq!(app.subagent_compare_marks.len(), 1);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+7 with one mark");
+    assert!(app.subagent_compare.is_none(), "one mark is not enough");
+}
+
+#[tokio::test]
+async fn subagent_compare_renders_stacked_on_a_narrow_terminal() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    mark_subagents_for_compare(&mut app, &mut agent, &[0, 2]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open compare");
+
+    // Wide (160x40) split and narrow (80x24, stacked) both paint without panic and
+    // keep both subagents' attribution visible. The narrow path exercises the
+    // stacked fallback; a tiny frame exercises the "needs a larger terminal" hint.
+    for (w, h) in [(160u16, 40u16), (80, 24), (40, 12)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Compare subagents"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+    // The compared pair is stable across resize (addressed by id, not row).
+    let state = app.subagent_compare.unwrap();
+    assert_eq!(state.left_id, 1, "left subagent stable across resize");
+    assert_eq!(state.right_id, 3, "right subagent stable across resize");
+}
+
+#[tokio::test]
+async fn subagent_compare_heals_closed_when_a_marked_subagent_vanishes() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    mark_subagents_for_compare(&mut app, &mut agent, &[0, 2]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open compare");
+    assert!(app.subagent_compare.is_some());
+
+    // Clearing the finished subagents drops the completed (#1) and failed (#3)
+    // records the compare view pinned. The render path must not paint over a
+    // vanished record — `subagent_compare_records_present` now returns false.
+    app.clear_finished_subagents();
+    assert!(
+        !subagent_compare_records_present(&app),
+        "a marked subagent is gone, so the present-check fails",
+    );
+    // Clearing also drops their marks, so a stale mark can't reopen the view.
+    assert_eq!(
+        app.subagent_compare_marks.len(),
+        0,
+        "marks for cleared subagents are forgotten",
+    );
+    // Rendering with the marked records gone falls through to the main surface
+    // rather than panicking on an empty pane.
+    let out = render_to_string(&app, 160, 40);
+    assert!(
+        !out.contains("Compare subagents"),
+        "the healed view no longer paints its modal:\n{out}",
+    );
+}
+
 // ---- Universal Command Palette (§12.1.1) ----
 
 /// Open the Universal Command Palette via its `Ctrl+Alt+P` default chord. Returns a

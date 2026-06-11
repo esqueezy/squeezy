@@ -180,6 +180,10 @@ pub(crate) enum ChromeKey {
     /// follow-up prompt (composer when idle / queue when a turn runs) rather than
     /// jumping — the mouse twin of the panel's `y` key.
     SubagentTimelinePromoteButton(usize),
+    /// The small `[mark]` cell on a Subagent Timeline Panel row, keyed by the
+    /// subagent's 0-based pane index, so a click marks / unmarks that subagent for
+    /// the Compare Subagent Outputs view (§12.8.3).
+    SubagentCompareMark(usize),
     /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
     /// 0-based index in the annotation list so a click selects + jumps the main
     /// view to the entry that exact annotation anchors.
@@ -449,6 +453,11 @@ pub(crate) enum Action {
     /// `promote_subagent_timeline_row` handler. The index is into the *visible*
     /// (filtered) subagent list, matching the row's select target.
     SubagentTimelinePromote(usize),
+    /// Toggle the given subagent's mark for the Compare Subagent Outputs view
+    /// (§12.8.3): the mouse twin of pressing `c` on the row in the Subagent
+    /// Timeline Panel. Marking two subagents lets the compare view open over them.
+    /// The index is the 0-based pane index of the subagent record.
+    SubagentCompareMark(usize),
     /// Select the given annotation row in the Entry Annotations overlay (§12.2.5):
     /// move the cursor onto it and jump the main view to the entry that annotation
     /// anchors. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click
@@ -685,6 +694,7 @@ impl Action {
         Action::SubagentSelect(0),
         Action::SubagentJump(0),
         Action::SubagentTimelinePromote(0),
+        Action::SubagentCompareMark(0),
     ];
 }
 

@@ -162,6 +162,7 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod subagent_compare;
 mod subagent_preview;
 mod subagent_promote;
 mod subagent_timeline;
@@ -1954,6 +1955,12 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
                 next_synthetic_id: app.subagent_pane.next_synthetic_id,
                 ..SubagentPaneState::default()
             };
+            // The Compare Subagent Outputs marks/state (§12.8.3) reference the
+            // prior session's subagent ids, which are now gone — forget them so a
+            // stale mark can never reopen the compare view over a vanished record.
+            app.subagent_compare_marks.clear();
+            app.subagent_compare = None;
+            app.subagent_compare_rect_cache.set(None);
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => {
@@ -2975,10 +2982,11 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
 
     // The Subagent Timeline Panel (§12.8.1) owns the pointer while open: a
     // left-click on a subagent row selects it and jumps the main view to that
-    // subagent's conversation; every other click is swallowed so a stray press
-    // can't fall through to the surface beneath. Hit-tested in ABSOLUTE screen
-    // coordinates against the row targets `render_subagent_timeline_surface`
-    // registered this frame.
+    // subagent's conversation, and a click on a row's `[mark]` cell marks /
+    // unmarks that subagent for the Compare Subagent Outputs view (§12.8.3); every
+    // other click is swallowed so a stray press can't fall through to the surface
+    // beneath. Hit-tested in ABSOLUTE screen coordinates against the row targets
+    // `render_subagent_timeline_surface` registered this frame.
     if app.subagent_timeline_open {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
@@ -2987,7 +2995,10 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                     // §12.8.4: the `[promote]` affordance on the selected row is its
                     // own click target (topmost on its cells) routed to the promote
                     // handler; the rest of the row still jumps.
-                    | interaction::ChromeKey::SubagentTimelinePromoteButton(_),
+                    | interaction::ChromeKey::SubagentTimelinePromoteButton(_)
+                    // §12.8.3: the `[mark]` cell on a row marks / unmarks that
+                    // subagent for the Compare Subagent Outputs view.
+                    | interaction::ChromeKey::SubagentCompareMark(_),
                 ),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
@@ -2995,6 +3006,20 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             dispatch_click_action(app, action);
         }
         // Panel is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Compare Subagent Outputs view (§12.8.3) owns the pointer while open: a
+    // left-click inside a pane focuses it (the mouse twin of `Tab`), and the wheel
+    // scrolls whichever pane the pointer is over; every other click is swallowed so
+    // a stray press can't fall through to the surface beneath. Routed via the
+    // last-painted pane rects cached in `subagent_compare_rect_cache` (active-pane
+    // first), mirroring the §12.2.3 pinned compare's wheel/click routing.
+    if app.subagent_compare.is_some() {
+        if let Some(consumed) = handle_subagent_compare_mouse(app, mouse) {
+            return consumed;
+        }
+        // View is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -6529,6 +6554,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Compare Subagent Outputs view (§12.8.3) is modal while open: it owns the
+    // keyboard (Tab flips the focused pane, ↑↓/kj/PgUp/PgDn scroll the focused pane
+    // independently, x toggles content/diff, Esc/Alt+7 close) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.subagent_compare.is_some() && handle_subagent_compare_key(app, key) {
+        return Ok(false);
+    }
+
     // The What Changed Since Here? overlay (§12.2.7) is modal while open: it owns
     // the keyboard (↑↓/kj/n/p move the change cursor, Enter/→/l jump to the
     // change's entry, m re-marks the anchor, Esc/Alt+0 close) BEFORE any
@@ -8722,6 +8757,16 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             promote_selected_subagent_result(app);
             true
         }
+        keymap::Action::ToggleSubagentCompare => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_subagent_compare(app);
+            true
+        }
         keymap::Action::ToggleToolActions => {
             // Main-surface overlay; the config/setup screens own their own
             // routing, and the Ctrl+T overlay guard above already blocks this
@@ -10318,6 +10363,16 @@ fn handle_subagent_timeline_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         app.needs_redraw = true;
         return true;
     }
+    // The Compare Subagent Outputs chord (`Alt+7` by default; §12.8.3) opens the
+    // side-by-side compare view over the two marked subagents directly from the
+    // panel — `toggle_subagent_compare` closes the panel and opens the view (or
+    // leaves an honest hint when fewer than two are marked). Handled here so the
+    // chord works without first closing the panel, since this modal swallows the
+    // global keymap below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleSubagentCompare) {
+        toggle_subagent_compare(app);
+        return true;
+    }
     let count = app.subagent_timeline.visible_len();
     match key.code {
         KeyCode::Esc => {
@@ -10355,6 +10410,23 @@ fn handle_subagent_timeline_key(app: &mut TuiApp, key: KeyEvent) -> bool {
                 ),
             };
             app.needs_redraw = true;
+        }
+        // `c` marks / unmarks the selected subagent for the Compare Subagent
+        // Outputs view (§12.8.3). Resolve the visible row to its subagent id, then
+        // its pane index, so the mark survives a filtered list. Marking two opens
+        // the compare view (Alt+7).
+        KeyCode::Char('c') => {
+            if let Some(id) = app
+                .subagent_timeline
+                .visible_get(app.subagent_timeline_selected)
+                .map(|entry| entry.id)
+                && let Some(index) = subagent_record_index(app, id)
+            {
+                toggle_subagent_compare_mark(app, index);
+            } else {
+                app.status = "compare: nothing to mark".to_string();
+                app.needs_redraw = true;
+            }
         }
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
             subagent_timeline_jump_to_selected(app, true);
@@ -10431,6 +10503,416 @@ fn subagent_timeline_jump_to_selected(app: &mut TuiApp, advance: bool) {
         app.subagent_timeline_selected = next;
     }
     app.needs_redraw = true;
+}
+
+// ---- Compare Subagent Outputs (§12.8.3) ----
+
+/// The 0-based pane index of the subagent record with stable `id`, or `None` when
+/// no live record holds it (pruned / cleared). The single id→record resolver the
+/// compare view uses, so a vanished id never repoints a pane.
+fn subagent_record_index(app: &TuiApp, id: SubagentId) -> Option<usize> {
+    app.subagent_pane.records.iter().position(|r| r.id == id)
+}
+
+/// Whether both subagents the compare view (§12.8.3) pins are still present in the
+/// live record list. The crate root closes the view when an id has disappeared so
+/// the render path never paints an empty pane (mirrors
+/// `pinned_compare_entries_present`).
+fn subagent_compare_records_present(app: &TuiApp) -> bool {
+    let Some(state) = app.subagent_compare else {
+        return false;
+    };
+    subagent_record_index(app, state.left_id).is_some()
+        && subagent_record_index(app, state.right_id).is_some()
+}
+
+/// Mark / unmark the subagent at 0-based pane `index` for comparison (§12.8.3) —
+/// the `c` key in the timeline panel and a marked-row click both reach here.
+/// Toggling a third subagent's mark rolls the oldest mark off (the two-slot cap).
+/// Reports the mark state + a hint to open the compare view once two are marked.
+/// A no-op (status hint) when the index has no live record.
+fn toggle_subagent_compare_mark(app: &mut TuiApp, index: usize) {
+    let Some(record) = app.subagent_pane.records.get(index) else {
+        app.status = "compare: nothing to mark".to_string();
+        return;
+    };
+    let id = record.id;
+    let agent = record.agent.clone();
+    let now_marked = app.subagent_compare_marks.toggle(id);
+    let count = app.subagent_compare_marks.len();
+    app.status = if now_marked {
+        if count >= 2 {
+            format!(
+                "compare: marked {agent} #{} ({count} marked) — {} to compare",
+                index + 1,
+                key_hint(app, keymap::Action::ToggleSubagentCompare),
+            )
+        } else {
+            format!(
+                "compare: marked {agent} #{} ({count}/2) — mark one more (c)",
+                index + 1,
+            )
+        }
+    } else {
+        format!("compare: unmarked {agent} #{} ({count} marked)", index + 1,)
+    };
+    app.needs_redraw = true;
+}
+
+/// `Alt+7`: open / close the Compare Subagent Outputs view (§12.8.3). When the
+/// view is open it closes (and forgets the painted-rect cache). When closed it
+/// opens over the two marked subagents — but only when *exactly two distinct*
+/// subagents are marked and both still live; otherwise it leaves an honest hint
+/// telling the user to mark two from the timeline panel. Opening closes the
+/// timeline panel so the two never fight for key/mouse routing.
+fn toggle_subagent_compare(app: &mut TuiApp) {
+    if app.subagent_compare.is_some() {
+        close_subagent_compare(app);
+        return;
+    }
+    let Some((left_id, right_id)) = app.subagent_compare_marks.pair() else {
+        let marked = app.subagent_compare_marks.len();
+        app.status = format!(
+            "compare needs two marked subagents ({marked}/2) — open the subagent timeline (Alt+5), press c on two rows",
+        );
+        app.needs_redraw = true;
+        return;
+    };
+    // Both marks must still resolve to live records; a pruned/cleared subagent
+    // can't be compared. Heal the stale mark away and report it.
+    if subagent_record_index(app, left_id).is_none()
+        || subagent_record_index(app, right_id).is_none()
+    {
+        app.subagent_compare_marks.clear();
+        app.status = "compare: a marked subagent is no longer tracked — re-mark two".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    app.subagent_compare = Some(subagent_compare::SubagentCompareState::new(
+        left_id, right_id,
+    ));
+    app.subagent_compare_rect_cache.set(None);
+    // Opening the compare view closes the timeline panel: the compare view owns
+    // the surface, so leaving the panel open behind it would fight for routing.
+    app.subagent_timeline_open = false;
+    app.status =
+        "compare subagents: Tab focus \u{00b7} scroll keys move active pane \u{00b7} x diff \u{00b7} Alt+7/Esc close"
+            .to_string();
+    app.needs_redraw = true;
+}
+
+/// Close the Compare Subagent Outputs view (§12.8.3), clearing the painted-rect
+/// cache and leaving the marks intact (so a re-open compares the same pair). The
+/// single close path the Esc key, the toggle, and a vanished-record heal share.
+fn close_subagent_compare(app: &mut TuiApp) {
+    app.subagent_compare = None;
+    app.subagent_compare_rect_cache.set(None);
+    app.status = "compare view closed".to_string();
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Compare Subagent Outputs view (§12.8.3) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or global
+/// keymap). The toggle chord (`Alt+7`) and Esc close; `Tab` flips the focused
+/// pane; the scroll keys (↑↓/kj, PgUp/PgDn) move the FOCUSED pane independently;
+/// `x` toggles the verbatim-content vs. clean-text-diff mode. Every other key is
+/// swallowed so the view is modal.
+fn handle_subagent_compare_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.subagent_compare.is_none() {
+        return false;
+    }
+    // The view's own toggle chord (`Alt+7` by default) closes it, so the same key
+    // both opens and closes — without leaking to the global keymap, which this
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleSubagentCompare) {
+        close_subagent_compare(app);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => close_subagent_compare(app),
+        KeyCode::Tab | KeyCode::BackTab => {
+            toggle_subagent_compare_focus(app);
+        }
+        KeyCode::Char('x') => {
+            toggle_subagent_compare_mode(app);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            scroll_subagent_compare(app, VerticalScrollDir::Up, 1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            scroll_subagent_compare(app, VerticalScrollDir::Down, 1);
+        }
+        KeyCode::PageUp => {
+            scroll_subagent_compare(app, VerticalScrollDir::Up, 10);
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            scroll_subagent_compare(app, VerticalScrollDir::Down, 10);
+        }
+        // Swallow every other key so the view is modal: a stray keystroke cannot
+        // leak into the composer underneath while the view owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Flip which compare pane the keyboard / wheel drives (the `Tab` key and a click
+/// on a pane). Returns `true` when a view was open (so the caller redraws).
+fn toggle_subagent_compare_focus(app: &mut TuiApp) -> bool {
+    let Some(state) = app.subagent_compare.as_mut() else {
+        return false;
+    };
+    state.focus = state.focus.toggled();
+    let label = state.focus.label();
+    // The cached rects are active-pane-first, so a focus flip invalidates them
+    // until the next paint re-stamps the new ordering.
+    app.subagent_compare_rect_cache.set(None);
+    app.status = format!("compare focus: {label} pane");
+    app.needs_redraw = true;
+    true
+}
+
+/// Focus a specific compare pane (the mouse twin of `Tab`): a click inside a pane
+/// makes it the active one. Returns `true` when the focus actually changed.
+fn focus_subagent_compare_pane(app: &mut TuiApp, pane: subagent_compare::ComparePane) -> bool {
+    let Some(state) = app.subagent_compare.as_mut() else {
+        return false;
+    };
+    if state.focus == pane {
+        return false;
+    }
+    state.focus = pane;
+    let label = pane.label();
+    app.subagent_compare_rect_cache.set(None);
+    app.status = format!("compare focus: {label} pane");
+    app.needs_redraw = true;
+    true
+}
+
+/// Toggle the compare view between verbatim content and a line-based clean-text
+/// diff (the `x` key). Returns `true` when a view was open.
+fn toggle_subagent_compare_mode(app: &mut TuiApp) -> bool {
+    let Some(state) = app.subagent_compare.as_mut() else {
+        return false;
+    };
+    state.mode = state.mode.toggled();
+    // The diff column has a different total height than either content pane, so
+    // reset both offsets to the top to avoid stranding past the end.
+    state.left_scroll = 0;
+    state.right_scroll = 0;
+    let label = state.mode.label();
+    app.subagent_compare_rect_cache.set(None);
+    app.status = format!("compare mode: {label}");
+    app.needs_redraw = true;
+    true
+}
+
+/// Scroll the *focused* compare pane by `delta` rows in `dir`, clamped to its
+/// content. Returns `true` when the offset changed (so the caller redraws). Used
+/// by both the keyboard scroll path and the wheel-over-pane mouse path. In diff
+/// mode the two panes share one column, so whichever pane is focused scrolls the
+/// same diff body.
+fn scroll_subagent_compare(app: &mut TuiApp, dir: VerticalScrollDir, delta: usize) -> bool {
+    let Some(focus) = app.subagent_compare.map(|state| state.focus) else {
+        return false;
+    };
+    let Some((total, viewport)) = subagent_compare_geometry(app, focus) else {
+        return false;
+    };
+    let Some(state) = app.subagent_compare.as_mut() else {
+        return false;
+    };
+    let current = state.focused_scroll();
+    let next = match dir {
+        VerticalScrollDir::Up => current.saturating_sub(delta),
+        VerticalScrollDir::Down => current.saturating_add(delta),
+    };
+    let next = pinned_compare::clamp_pane_scroll(next, total, viewport);
+    if next == current {
+        return false;
+    }
+    state.set_focused_scroll(next);
+    app.needs_redraw = true;
+    true
+}
+
+/// The fully-expanded output lines for the subagent with stable `id`, at `width`.
+/// Built from the subagent's stored conversation (`record.transcript`) with the
+/// same expanded formatter the Ctrl+T overlay and the pinned compare use — a
+/// title line of attribution (`agent #N [status]`) then the body — so a compare
+/// pane shows the subagent's actual findings/output. Empty when the id has fallen
+/// out of the record list (the crate root heals that away before painting).
+fn subagent_compare_pane_lines(app: &TuiApp, id: SubagentId, width: u16) -> Vec<Line<'static>> {
+    let Some(index) = subagent_record_index(app, id) else {
+        return Vec::new();
+    };
+    let record = &app.subagent_pane.records[index];
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let status = subagent_status_of(record.lifecycle);
+    // Attribution header (the spec's "compare their findings with attribution"):
+    // the subagent's role + ordinal + lifecycle, so each pane is self-labelled
+    // even when the diff column drops the per-pane title.
+    let mut logical: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!("{} #{} [{}]", record.agent, index + 1, status.label()),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (entry_index, entry) in record.transcript.iter().enumerate() {
+        let body = format_transcript_entry_expanded(
+            entry,
+            false,
+            ToolDetailMode::Full,
+            message_outcome(&record.transcript, entry_index),
+            Some(width),
+            app.show_reasoning_usage,
+            shortcut.as_str(),
+        );
+        logical.extend(body);
+    }
+    wrap_transcript_overlay_rows(&logical, width)
+}
+
+/// The plain text of a compare pane (one `String` per row), used to feed the
+/// line-based clean-text diff. Strips styling down to concatenated content, then
+/// trims trailing whitespace so a cosmetic gutter difference does not register as
+/// a content change (mirrors `pinned_compare_pane_plain`).
+fn subagent_compare_pane_plain(app: &TuiApp, id: SubagentId, width: u16) -> Vec<String> {
+    subagent_compare_pane_lines(app, id, width)
+        .iter()
+        .map(|line| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// The rendered rows for the diff mode: a single column of `+`/`-`/` `-gutter
+/// lines from [`pinned_compare::clean_text_diff`] (left = old, right = new).
+/// Falls back to a one-line notice when either side is too large to diff (the
+/// spec's size-limit mitigation).
+fn subagent_compare_diff_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let Some(state) = app.subagent_compare else {
+        return Vec::new();
+    };
+    // The gutter eats one cell; diff the panes at the narrower body width so the
+    // wrapped rows line up with what each side would have shown.
+    let body_width = width.saturating_sub(2).max(1);
+    let old = subagent_compare_pane_plain(app, state.left_id, body_width);
+    let new = subagent_compare_pane_plain(app, state.right_id, body_width);
+    let Some(diff) = pinned_compare::clean_text_diff(&old, &new) else {
+        return vec![Line::from(Span::styled(
+            format!(
+                "diff skipped — output too large (> {} lines per side)",
+                pinned_compare::DIFF_LINE_LIMIT
+            ),
+            Style::default().fg(crate::render::theme::quiet()),
+        ))];
+    };
+    diff.into_iter()
+        .map(|line| {
+            let color = match line.tag {
+                pinned_compare::DiffTag::Same => crate::render::theme::quiet(),
+                pinned_compare::DiffTag::Added => crate::render::theme::green(),
+                pinned_compare::DiffTag::Removed => crate::render::theme::red(),
+            };
+            Line::from(Span::styled(
+                format!("{} {}", line.tag.marker(), line.text),
+                Style::default().fg(color),
+            ))
+        })
+        .collect()
+}
+
+/// `(total_rows, viewport_h)` for one compare pane. Prefers the LAST PAINTED text
+/// rect (cached each frame in `subagent_compare_rect_cache`) so the scroll clamp
+/// uses the geometry the user is looking at; falls back to rebuilding the rect
+/// off-frame from the live terminal size before the first paint. Returns `None`
+/// when no compare view is open or the area is too small to split (mirrors
+/// `pinned_compare_geometry`).
+fn subagent_compare_geometry(
+    app: &TuiApp,
+    pane: subagent_compare::ComparePane,
+) -> Option<(usize, usize)> {
+    let state = app.subagent_compare?;
+    // The cached rects are stored active-pane-first; resolve which slot this pane
+    // is in for this frame.
+    let text_area = match app.subagent_compare_rect_cache.get() {
+        Some((first, second)) => {
+            if pane == state.focus {
+                first
+            } else {
+                second
+            }
+        }
+        None => {
+            let (width, height) = app.off_frame_terminal_size();
+            let full_area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let inner = subagent_compare_inner(full_area);
+            let layout = pinned_compare::split_overlay_content(inner)?;
+            // Off-frame both panes share the same inner size, so either slot's
+            // inset rect is a fine proxy for the clamp.
+            let (first, _) = layout.panes();
+            pinned_compare::pane_inner(first)
+        }
+    };
+    if text_area.width == 0 || text_area.height == 0 {
+        return None;
+    }
+    let rows = if state.mode == pinned_compare::CompareMode::Diff {
+        subagent_compare_diff_lines(app, text_area.width)
+    } else {
+        subagent_compare_pane_lines(app, state.id_for(pane), text_area.width)
+    };
+    Some((rows.len(), usize::from(text_area.height)))
+}
+
+/// Route a mouse event while the Compare Subagent Outputs view (§12.8.3) is open.
+/// A wheel scrolls whichever pane the pointer is over (focusing it first — the
+/// mouse twin of `Tab` + scroll); a left-click focuses the pane under the pointer.
+/// The two panes' painted text rects are cached active-pane-first each frame; a
+/// click/wheel outside both is a no-op. Returns `Some(consumed)` when it acted on
+/// (or intentionally ignored) the event, or `None` when no rect cache exists yet
+/// (the caller still consumes the event, since the view is modal). Mirrors the
+/// §12.2.3 pinned-compare wheel/click routing.
+fn handle_subagent_compare_mouse(
+    app: &mut TuiApp,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<bool> {
+    let state = app.subagent_compare?;
+    let (first, second) = app.subagent_compare_rect_cache.get()?;
+    // `first` is the active pane, `second` the other (see the render).
+    let active = state.focus;
+    let other = active.toggled();
+    let hit = if pinned_compare::rect_contains(first, mouse.column, mouse.row) {
+        Some(active)
+    } else if pinned_compare::rect_contains(second, mouse.column, mouse.row) {
+        Some(other)
+    } else {
+        None
+    };
+    let pane = hit?;
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            focus_subagent_compare_pane(app, pane);
+            Some(scroll_subagent_compare(app, VerticalScrollDir::Up, 3))
+        }
+        MouseEventKind::ScrollDown => {
+            focus_subagent_compare_pane(app, pane);
+            Some(scroll_subagent_compare(app, VerticalScrollDir::Down, 3))
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            Some(focus_subagent_compare_pane(app, pane))
+        }
+        _ => Some(false),
+    }
 }
 
 // ---- What Changed Since Here? (§12.2.7) ----
@@ -15430,6 +15912,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::SubagentTimelineSelectJump(index) => {
             app.subagent_timeline_selected = index;
             subagent_timeline_jump_to_selected(app, false);
+        }
+        // A click on a Subagent Timeline Panel row's `[mark]` cell (§12.8.3):
+        // toggle that subagent's mark for the Compare Subagent Outputs view — the
+        // mouse twin of pressing `c` on the row. The index is the subagent's
+        // 0-based pane index, matching what the cell registered.
+        interaction::Action::SubagentCompareMark(index) => {
+            toggle_subagent_compare_mark(app, index);
         }
         // A click on an Entry Annotations row (§12.2.5): move the cursor onto it
         // and jump the main view to the entry that annotation anchors — the mouse
@@ -21731,6 +22220,16 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_subagent_timeline_surface(frame, area, app);
         return;
     }
+    // The Compare Subagent Outputs view (§12.8.3) paints as a fullscreen modal with
+    // two equal panes (the two marked subagents' outputs, side-by-side or stacked)
+    // over everything else while open, stamping each pane's text rect for the
+    // wheel/click hit-test. It heals to closed when a marked subagent's record has
+    // vanished, so the render path never paints an empty pane. Checked beside the
+    // subagent timeline panel (its sibling: the panel marks, this compares).
+    if app.subagent_compare.is_some() && subagent_compare_records_present(app) {
+        render_subagent_compare_surface(frame, area, app);
+        return;
+    }
     // The What Changed Since Here? overlay (§12.2.7) paints as a fullscreen grouped
     // delta list over everything else while open, registering its per-change row
     // click targets every frame. Checked beside the session-timeline overlay (its
@@ -25686,9 +26185,20 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             Style::default().fg(crate::render::theme::quiet()),
         ))
     } else {
+        let marked = app.subagent_compare_marks.len();
+        let compare_hint = if marked >= 2 {
+            format!(
+                " \u{00b7} c mark ({marked}) \u{00b7} {} compare",
+                key_hint(app, keymap::Action::ToggleSubagentCompare)
+            )
+        } else if marked == 1 {
+            " \u{00b7} c mark (1/2)".to_string()
+        } else {
+            " \u{00b7} c mark".to_string()
+        };
         Line::from(Span::styled(
             format!(
-                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} y promote \u{00b7} f filter \u{00b7} Esc close",
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} y promote{compare_hint} \u{00b7} f filter \u{00b7} Esc close",
                 app.subagent_timeline.summary(),
             ),
             Style::default()
@@ -25730,6 +26240,24 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
         } else {
             Style::default().fg(crate::render::theme::foreground())
         };
+        // Compare-mark cell (§12.8.3): `[*]` when this subagent is marked for the
+        // side-by-side compare view, `[ ]` when not — color *and* the `*` glyph so
+        // a monochrome terminal still reads the mark. The mark is keyed by the
+        // subagent's stable pane index, so a filtered/reordered list never marks
+        // the wrong one.
+        let pane_index = subagent_record_index(app, entry.id);
+        let is_marked = pane_index.is_some_and(|i| {
+            app.subagent_compare_marks
+                .contains(app.subagent_pane.records[i].id)
+        });
+        let mark_cell = if is_marked { "[*] " } else { "[ ] " };
+        let mark_style = if is_marked {
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::quiet())
+        };
         let line = Line::from(vec![
             Span::styled(
                 caret,
@@ -25739,6 +26267,7 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
                     crate::render::theme::quiet()
                 }),
             ),
+            Span::styled(mark_cell, mark_style),
             // Status tag carries run state in color *and* the status word, so a
             // monochrome terminal still reads it.
             Span::styled(
@@ -25808,7 +26337,223 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
                 );
             }
         }
+
+        // Register the `[mark]` cell AFTER the row so it takes precedence (the
+        // registry resolves the LAST-registered match): a click on the narrow mark
+        // cell marks for compare (§12.8.3), while a click anywhere else on the row
+        // selects + opens. Keyed by the subagent's pane index so the mark survives
+        // a filtered/reordered list. The mark cell (left edge) and the `[promote]`
+        // affordance (right edge) never overlap, so their registration order is
+        // independent.
+        if let Some(pane_idx) = pane_index {
+            let mark_rect = Rect {
+                x: inner.x.saturating_add(2),
+                y: row_rect.y,
+                width: 4.min(inner.width.saturating_sub(2)),
+                height: 1,
+            };
+            if mark_rect.width > 0 {
+                app.register_click(
+                    mark_rect,
+                    interaction::TargetKey::Chrome(interaction::ChromeKey::SubagentCompareMark(
+                        pane_idx,
+                    )),
+                    interaction::Action::SubagentCompareMark(pane_idx),
+                );
+            }
+        }
     }
+}
+
+/// The inner content rect of the Compare Subagent Outputs modal (§12.8.3) over a
+/// full-screen `area`: a centered rounded-border box (nearly the whole terminal)
+/// minus its border. Computed identically by the renderer and the off-frame
+/// geometry probe so the scroll clamp and the paint agree on the available size.
+/// Mirrors how `modal::surface` derives its inner rect, but exposed as a pure
+/// helper so `subagent_compare_geometry` can rebuild it without a frame.
+fn subagent_compare_inner(area: Rect) -> Rect {
+    // A large cap so the compare view uses nearly the whole terminal — two output
+    // panes need room. Falls back gracefully on a small terminal (centered clamps
+    // to the available size).
+    let outer = modal::centered(area, 200, 60);
+    Rect {
+        x: outer.x.saturating_add(1),
+        y: outer.y.saturating_add(1),
+        width: outer.width.saturating_sub(2),
+        height: outer.height.saturating_sub(2),
+    }
+}
+
+/// Paint the Compare Subagent Outputs view (§12.8.3) as a centered modal that
+/// shows the two marked subagents' outputs as equal side-by-side columns (wide
+/// terminal) or stacked panes (narrow terminal), each independently scrolled, with
+/// the active pane's border accented. In diff mode both panes show the same
+/// line-based clean-text diff column. Reuses the §12.2.3 split/diff machinery
+/// (`pinned_compare::split_overlay_content` / `pane_inner` / `clean_text_diff`).
+/// Stamps the painted pane text rects (active-first) into
+/// `subagent_compare_rect_cache` so the wheel/click hit-test routes to the right
+/// pane. Closes (heals) when a marked subagent has vanished is handled by the
+/// caller; here a too-small area paints an honest hint instead of a squeeze.
+fn render_subagent_compare_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(state) = app.subagent_compare else {
+        return;
+    };
+    let mode_note = format!(
+        "\u{2014} {} \u{00b7} Tab focus \u{00b7} x diff \u{00b7} Alt+7/Esc close ",
+        state.mode.label(),
+    );
+    let title = Line::from(vec![
+        Span::styled(
+            " Compare subagents ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            mode_note,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    // Paint the modal box and clear behind it, then split the SAME inner rect the
+    // off-frame geometry probe uses.
+    let _ = modal::surface(frame, area, 200, 60, title);
+    let inner = subagent_compare_inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        app.subagent_compare_rect_cache.set(None);
+        return;
+    }
+
+    let Some(layout) = pinned_compare::split_overlay_content(inner) else {
+        // Too small to show two panes: clear the cache and leave a hint so the
+        // view never paints a corrupted squeeze (mirrors the pinned compare).
+        app.subagent_compare_rect_cache.set(None);
+        let hint = Paragraph::new(Line::from(Span::styled(
+            "compare view needs a larger terminal",
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
+        frame.render_widget(hint, inner);
+        return;
+    };
+
+    // Separator rule (vertical when split, horizontal when stacked).
+    let separator = layout.separator();
+    if separator.width > 0 && separator.height > 0 {
+        let glyph = if layout.is_stacked() { "─" } else { "│" };
+        let rule = if layout.is_stacked() {
+            vec![Line::from(Span::styled(
+                glyph.repeat(usize::from(separator.width)),
+                Style::default().fg(crate::render::theme::quiet()),
+            ))]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    glyph,
+                    Style::default().fg(crate::render::theme::quiet()),
+                ));
+                usize::from(separator.height)
+            ]
+        };
+        frame.render_widget(Paragraph::new(rule), separator);
+    }
+
+    // `first` always holds the ACTIVE pane (the focus model gives it the prominent
+    // slot); `second` holds the other.
+    let (first_rect, second_rect) = layout.panes();
+    let active = state.focus;
+    let other = active.toggled();
+
+    let first_text = render_subagent_compare_pane(frame, first_rect, app, active, true, state.mode);
+    let second_text =
+        render_subagent_compare_pane(frame, second_rect, app, other, false, state.mode);
+
+    // Stamp the painted text rects (active first) so the wheel/click hit-test in
+    // `handle_subagent_compare_mouse` routes to the right pane. When either pane
+    // was too small to paint a body the cache is cleared (no routing target).
+    match (first_text, second_text) {
+        (Some(first), Some(second)) => {
+            app.subagent_compare_rect_cache.set(Some((first, second)));
+        }
+        _ => app.subagent_compare_rect_cache.set(None),
+    }
+}
+
+/// Paint one Compare Subagent Outputs pane into `pane_rect`: a bordered box titled
+/// with the pane's role + the subagent's attribution (agent + ordinal), the pane's
+/// body (content or, in diff mode, the shared clean-text diff) inside it,
+/// independently scrolled. The active pane's border is accented so the focus is
+/// visible. Returns the painted text rect, or `None` when the pane was too small
+/// to hold a body. Mirrors `render_pinned_compare_pane`.
+fn render_subagent_compare_pane(
+    frame: &mut Frame<'_>,
+    pane_rect: Rect,
+    app: &TuiApp,
+    pane: subagent_compare::ComparePane,
+    is_active: bool,
+    mode: subagent_compare::CompareMode,
+) -> Option<Rect> {
+    let state = app.subagent_compare?;
+    let diff = mode == subagent_compare::CompareMode::Diff;
+    let id = state.id_for(pane);
+    // Title: role + (in content mode) the subagent's attribution; in diff mode the
+    // single column is labelled "diff".
+    let role = pane.label();
+    let detail = if diff {
+        "diff".to_string()
+    } else {
+        subagent_compare_attribution(app, id).unwrap_or_else(|| "\u{2014}".to_string())
+    };
+    let title = format!(" {role}: {detail} ");
+    let border_color = if is_active {
+        crate::render::theme::accent()
+    } else {
+        crate::render::theme::quiet()
+    };
+    let mut title_style = Style::default().fg(border_color);
+    if is_active {
+        title_style = title_style.add_modifier(Modifier::BOLD);
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(title, title_style));
+    frame.render_widget(ratatui::widgets::Clear, pane_rect);
+    frame.render_widget(block, pane_rect);
+
+    let text_area = pinned_compare::pane_inner(pane_rect);
+    if text_area.width == 0 || text_area.height == 0 {
+        return None;
+    }
+    let rows = if diff {
+        subagent_compare_diff_lines(app, text_area.width)
+    } else {
+        subagent_compare_pane_lines(app, id, text_area.width)
+    };
+    let raw_scroll = state.scroll_for(pane);
+    let scroll =
+        pinned_compare::clamp_pane_scroll(raw_scroll, rows.len(), usize::from(text_area.height));
+    let visible = rows
+        .iter()
+        .skip(scroll)
+        .take(usize::from(text_area.height))
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), text_area);
+    Some(text_area)
+}
+
+/// A short attribution label for a subagent pane title (`agent #N [status]`), or
+/// `None` when the id has fallen out of the record list. The spec's "compare their
+/// findings with attribution" rendered into the pane border.
+fn subagent_compare_attribution(app: &TuiApp, id: SubagentId) -> Option<String> {
+    let index = subagent_record_index(app, id)?;
+    let record = &app.subagent_pane.records[index];
+    Some(format!(
+        "{} #{} [{}]",
+        record.agent,
+        index + 1,
+        subagent_status_of(record.lifecycle).label(),
+    ))
 }
 
 /// Paint the What Changed Since Here? overlay (§12.2.7) as a centered modal: a
@@ -39832,6 +40577,22 @@ pub(crate) struct TuiApp {
     /// (§12.8.1). Clamped to the visible count each render. Only meaningful while
     /// the panel is open.
     pub(crate) subagent_timeline_selected: usize,
+    /// Compare Subagent Outputs (§12.8.3): the bounded two-slot set of subagents
+    /// the user has marked (by stable id) for side-by-side comparison. Capped at
+    /// two so the compared pair is always two readable panes. Lives here (session
+    /// UI state); marking a third rolls the oldest off. Empty at rest.
+    pub(crate) subagent_compare_marks: subagent_compare::SubagentCompareMarks,
+    /// Compare Subagent Outputs (§12.8.3): the open compare view's state (the two
+    /// compared subagent ids, focus, content/diff mode, and the two independent
+    /// scroll offsets), or `None` when the view is closed (the resting state,
+    /// paints nothing extra). Opened from the timeline panel once two subagents
+    /// are marked; healed to `None` when a marked record disappears.
+    pub(crate) subagent_compare: Option<subagent_compare::SubagentCompareState>,
+    /// Last-painted text rects of the two Compare Subagent Outputs panes,
+    /// active-pane-first, cached each frame so a wheel/click hit-test can route to
+    /// the pane the pointer is over (mirrors `pinned_compare_rect_cache`). `None`
+    /// when the view is closed or too small to paint two bodies.
+    pub(crate) subagent_compare_rect_cache: std::cell::Cell<Option<(Rect, Rect)>>,
     /// Entry Annotations (§12.2.5): the durable set of private notes the user has
     /// attached to transcript entries, each keyed by a stable transcript entry id
     /// so it survives appends, resize, folds, and filters. Lives here (session UI
@@ -40618,6 +41379,9 @@ impl TuiApp {
             subagent_timeline: subagent_timeline::SubagentTimeline::new(),
             subagent_timeline_open: false,
             subagent_timeline_selected: 0,
+            subagent_compare_marks: subagent_compare::SubagentCompareMarks::new(),
+            subagent_compare: None,
+            subagent_compare_rect_cache: std::cell::Cell::new(None),
             annotations: annotations::AnnotationStore::new(),
             annotations_open: false,
             annotations_selected: 0,
@@ -41348,6 +42112,18 @@ impl TuiApp {
             self.subagent_pane.active = ConversationSource::Main;
             self.subagent_pane.selected = 0;
         }
+        // Drop Compare Subagent Outputs marks (§12.8.3) for any subagent that was
+        // just cleared, so a stale mark can never reopen the compare view over a
+        // vanished record. An open view over a cleared record is closed by the
+        // run-loop heal; this keeps the mark set itself consistent.
+        self.subagent_compare_marks
+            .ids()
+            .to_vec()
+            .into_iter()
+            .filter(|&id| !self.subagent_pane.records.iter().any(|r| r.id == id))
+            .for_each(|id| {
+                self.subagent_compare_marks.remove(id);
+            });
         // `clamp_subagent_selection` re-derives `selected` from `active` so
         // the highlight follows the shown conversation through the positional
         // shift left by dropping the finished rows above it.
@@ -42951,6 +43727,14 @@ impl TerminalGuard {
         // re-paints at most once a second while a subagent runs — never per frame.
         if app.subagent_timeline_open {
             refresh_subagent_timeline(app);
+        }
+
+        // Heal the Compare Subagent Outputs view (§12.8.3) when one of its two
+        // marked subagents has vanished from the record list (pruned / cleared):
+        // close it rather than leave it open over an empty pane. Costs nothing when
+        // the view is closed (this branch is skipped).
+        if app.subagent_compare.is_some() && !subagent_compare_records_present(app) {
+            close_subagent_compare(app);
         }
 
         // Keep the What Changed Since Here? delta (§12.2.7) current while its
