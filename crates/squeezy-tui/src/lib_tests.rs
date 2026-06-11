@@ -16709,6 +16709,61 @@ fn resize_keeps_the_same_entry_anchored_across_a_wrap_reflow() {
 }
 
 #[test]
+fn no_wrap_geometry_counts_unwrapped_rows_matching_the_renderer() {
+    // §11G.4: with soft-wrap OFF the renderer builds UNWRAPPED rows (one visual
+    // row per logical line) and pans horizontally. The off-frame scroll geometry
+    // must measure that SAME row model, not the far-larger wrapped count, or
+    // `max_scroll` is over-estimated and scroll-down stalls against a phantom
+    // distance.
+    let mut app = app_with_wrapping_turns(40);
+    app.set_test_frame_size(80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let include_startup_card = include_startup_card_for(&app, area);
+
+    // With wrap ON the geometry counts the wrapped rows.
+    let wrapped_total = active_transcript_geometry(&app).0;
+    let unwrapped_total = transcript_lines_for_render(&app, None, include_startup_card).len();
+    assert!(
+        wrapped_total > unwrapped_total,
+        "the seeded long prompts wrap to more rows than logical lines \
+         (wrapped {wrapped_total} vs unwrapped {unwrapped_total})",
+    );
+
+    // Turn wrap OFF: the geometry must now report the UNWRAPPED count.
+    toggle_soft_wrap(&mut app);
+    assert!(!app.wide_block.soft_wrap());
+    let (line_count, _viewport_h) = active_transcript_geometry(&app);
+    assert_eq!(
+        line_count, unwrapped_total,
+        "no-wrap geometry counts unwrapped logical rows, not phantom wrapped rows",
+    );
+}
+
+#[test]
+fn no_wrap_geometry_max_scroll_matches_painted_top_offset() {
+    // The geometry's max_scroll must equal the renderer's top-line offset window
+    // in no-wrap mode. The renderer paints `transcript_lines_for_render(.., None)`
+    // and windows it by `total_rows - viewport_h`; the off-frame geometry must
+    // agree so the scrollbar/Home/End all index the rows actually on screen.
+    let mut app = app_with_wrapping_turns(40);
+    app.set_test_frame_size(80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let include_startup_card = include_startup_card_for(&app, area);
+    toggle_soft_wrap(&mut app);
+    assert!(!app.wide_block.soft_wrap());
+
+    let (line_count, viewport_h) = active_transcript_geometry(&app);
+    let painted_unwrapped = transcript_lines_for_render(&app, None, include_startup_card).len();
+    let geometry_max_scroll = line_count.saturating_sub(viewport_h);
+    let painted_max_scroll = painted_unwrapped.saturating_sub(viewport_h);
+    assert_eq!(
+        geometry_max_scroll, painted_max_scroll,
+        "no-wrap max_scroll matches the painted unwrapped row window, not a \
+         phantom wrapped count",
+    );
+}
+
+#[test]
 fn resize_keeps_a_following_view_pinned_to_the_tail() {
     // A live (tail-following) view must stay pinned to the tail across a resize —
     // the anchor logic never freezes a live view onto a stale entry.

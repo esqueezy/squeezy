@@ -15380,8 +15380,12 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
     let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
     let text_width = area.width.saturating_sub(1).max(1);
+    // Match the renderer: soft-wrap off builds UNWRAPPED rows (one per logical
+    // line), so off-frame jump geometry must measure the same row model or its
+    // offsets/total point at phantom wrapped rows the user never sees.
+    let build_width = main_geometry_build_width(app, text_width);
     let (rows, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, Some(text_width), include_startup_card);
+        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
     let total_rows = rows.len();
     if entry_offsets.is_empty() || total_rows == 0 {
         return false;
@@ -15448,8 +15452,11 @@ fn transcript_nav_geometry_at(
     let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
     let text_width = area.width.saturating_sub(1).max(1);
+    // Match the renderer: soft-wrap off builds UNWRAPPED rows (one per logical
+    // line), so off-frame nav geometry must measure the same row model.
+    let build_width = main_geometry_build_width(app, text_width);
     let (rows, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, Some(text_width), include_startup_card);
+        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
     let total_rows = rows.len();
     if entry_offsets.is_empty() || total_rows == 0 {
         return None;
@@ -18483,6 +18490,20 @@ fn toggle_pinned_compare_mode(app: &mut TuiApp) -> bool {
 /// (the size the renderer last painted with) rather than a raw `terminal_size()`
 /// syscall, so the math agrees with the frame on screen and is deterministic in
 /// headless tests.
+/// The `build_width` the off-frame scroll/jump geometry must wrap at to match
+/// the painted row model. `render_transcript` builds soft-wrapped rows at the
+/// text width (the default) but builds UNWRAPPED logical rows (one per line)
+/// when soft-wrap is off (§11G.4), panning horizontally instead. The off-frame
+/// measurers must mirror that branch so `max_scroll`, jump offsets, and the
+/// stored `from_bottom` all line up with what is on screen.
+fn main_geometry_build_width(app: &TuiApp, text_width: u16) -> Option<u16> {
+    if app.wide_block.soft_wrap() {
+        Some(text_width)
+    } else {
+        None
+    }
+}
+
 fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
     let (width, height) = app.off_frame_terminal_size();
     let area = Rect {
@@ -18502,7 +18523,11 @@ fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
     // the full `area.width` would undercount wrapped rows, so the off-frame
     // `from_bottom` clamp would disagree with the painted line count.
     let (text_area, _) = transcript_main_text_and_scrollbar_areas(area);
-    let lines = transcript_lines_for_render(app, Some(text_area.width), include_startup_card);
+    // Match the renderer: soft-wrap off builds UNWRAPPED rows (one visual row per
+    // logical line), so the scroll geometry must measure the same row model or
+    // `max_scroll` over-counts and scroll-down stalls against a phantom distance.
+    let build_width = main_geometry_build_width(app, text_area.width);
+    let lines = transcript_lines_for_render(app, build_width, include_startup_card);
     (lines.len(), viewport_h as usize)
 }
 
