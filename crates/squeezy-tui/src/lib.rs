@@ -21506,7 +21506,17 @@ fn handle_export_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     };
 
     match (&request.destination, file_target) {
-        (_, Some(target)) => export_to_file(app, &payload, &target, request.format),
+        (_, Some(target)) => {
+            // Only the explicit-path form can collide (the timestamped Default /
+            // ConfiguredDir targets are unique), so the existence guard applies
+            // there; for the collision-free destinations `force` is implicit.
+            let force = request.force
+                || !matches!(
+                    request.destination,
+                    export_destination::ExportDestination::File(_)
+                );
+            export_to_file(app, &payload, &target, request.format, force)
+        }
         (ExportDestination::Clipboard, None) => {
             // Reuse the single semantic-copy funnel: provider chain, status +
             // toast, and one-time clipboard-history recording (§12.6.1).
@@ -21542,8 +21552,14 @@ fn handle_export_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
 /// Write a rendered `payload` to `target` atomically and surface the outcome on
 /// the status line, a toast, and a transcript system row. Shared by every
 /// file-backed export destination (default, explicit path, configured dir).
-fn export_to_file(app: &mut TuiApp, payload: &str, target: &Path, format: copy::CopyFormat) {
-    match write_export_atomically(target, payload) {
+fn export_to_file(
+    app: &mut TuiApp,
+    payload: &str,
+    target: &Path,
+    format: copy::CopyFormat,
+    force: bool,
+) {
+    match write_export_atomically(target, payload, force) {
         Ok(()) => {
             let bytes = payload.len();
             app.status = format!("wrote {} ({bytes} bytes)", target.display());
@@ -21558,7 +21574,16 @@ fn export_to_file(app: &mut TuiApp, payload: &str, target: &Path, format: copy::
             )));
         }
         Err(error) => {
-            let message = format!("export failed: {error}");
+            // An existing target is refused unless `force` was given; point the
+            // user at the overwrite token rather than a bare OS error.
+            let message = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "export failed: {} already exists (append `!` to overwrite)",
+                    target.display(),
+                )
+            } else {
+                format!("export failed: {error}")
+            };
             app.status = message.clone();
             app.toasts.push(message.clone(), toast::ToastVariant::Error);
             app.push_transcript_item(TranscriptItem::system(message));
@@ -21618,7 +21643,19 @@ fn export_tmp_path(target: &Path) -> PathBuf {
 /// Write `content` to `target` atomically (write to `<target>.tmp` then
 /// rename), creating the parent directory if missing. Mirrors the best-effort
 /// atomic-write pattern used for plan pointers.
-fn write_export_atomically(target: &Path, content: &str) -> std::io::Result<()> {
+///
+/// When `force` is `false` an already-existing `target` is refused with
+/// [`std::io::ErrorKind::AlreadyExists`] *before* any tmp file is written, so a
+/// `/export md notes.md` can never silently clobber a workspace source. The
+/// timestamped destinations (and `/bundle`) pass `force = true` because their
+/// paths are collision-free by construction.
+fn write_export_atomically(target: &Path, content: &str, force: bool) -> std::io::Result<()> {
+    if !force && target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists", target.display()),
+        ));
+    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -21676,7 +21713,9 @@ fn handle_bundle_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     );
 
     let target = bundle_export_path(app, &meta, request.format);
-    match write_export_atomically(&target, &bundle.artifact) {
+    // The bundle path is timestamped and collision-free, so overwrite-guarding it
+    // would only ever produce a false positive; write with `force = true`.
+    match write_export_atomically(&target, &bundle.artifact, true) {
         Ok(()) => {
             app.status = format!(
                 "wrote bundle {} ({} bytes)",

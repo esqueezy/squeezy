@@ -65,6 +65,12 @@ impl ExportDestination {
 pub(crate) struct ExportRequest {
     pub(crate) format: CopyFormat,
     pub(crate) destination: ExportDestination,
+    /// Overwrite an existing target. Only meaningful for the explicit
+    /// [`ExportDestination::File`] form (the timestamped destinations never
+    /// collide); set by a leading `force`/`-f` or a trailing `!` token on the
+    /// path tail. Defaults to `false` so a plain `/export md notes.md` refuses to
+    /// clobber an existing `notes.md`.
+    pub(crate) force: bool,
 }
 
 /// Shared usage hint for `/export`. Lists every destination keyword so the
@@ -102,36 +108,59 @@ pub(crate) fn parse_export_request(rest: &str) -> Result<ExportRequest, String> 
         .ok_or_else(|| format!("unknown export format {format_token:?}. {EXPORT_USAGE}"))?;
 
     let tail = parts.next().map(str::trim).unwrap_or_default();
-    let destination = parse_destination(tail)?;
+    let (destination, force) = parse_destination(tail)?;
     Ok(ExportRequest {
         format,
         destination,
+        force,
     })
 }
 
+/// Strip a force token from a *file* destination tail and report whether one was
+/// present. A leading `force `/`-f ` or a trailing ` !` opts into overwriting an
+/// existing file (`/export md notes.md !`, `/export md force notes.md`). The token
+/// is only honored on the file form; keyword/`dir:` tails are matched verbatim, so
+/// a path that is literally named `!` is still reachable as `/export md ./!`.
+fn split_force_token(tail: &str) -> (&str, bool) {
+    if let Some(rest) = tail
+        .strip_prefix("force ")
+        .or_else(|| tail.strip_prefix("-f "))
+    {
+        return (rest.trim_start(), true);
+    }
+    if let Some(rest) = tail.strip_suffix(" !").or_else(|| tail.strip_suffix(" -f")) {
+        return (rest.trim_end(), true);
+    }
+    (tail, false)
+}
+
 /// Resolve the destination tail (already format-stripped and trimmed) into an
-/// [`ExportDestination`]. Pulled out so the keyword/traversal rules can be
-/// exercised directly in unit tests.
-fn parse_destination(tail: &str) -> Result<ExportDestination, String> {
+/// [`ExportDestination`] plus its `force` (overwrite) flag. Pulled out so the
+/// keyword/traversal rules can be exercised directly in unit tests. The force flag
+/// is only ever `true` for the file form; the timestamped destinations are
+/// collision-free and need no overwrite opt-in.
+fn parse_destination(tail: &str) -> Result<(ExportDestination, bool), String> {
     if tail.is_empty() {
-        return Ok(ExportDestination::Default);
+        return Ok((ExportDestination::Default, false));
     }
     // Case-insensitive keyword match on the *whole* tail so `clipboard.md`
     // (a file) is never mistaken for the clipboard keyword.
     let lowered = tail.to_ascii_lowercase();
     match lowered.as_str() {
-        "clipboard" | "clip" => return Ok(ExportDestination::Clipboard),
-        "stdout" | "-" => return Ok(ExportDestination::Stdout),
+        "clipboard" | "clip" => return Ok((ExportDestination::Clipboard, false)),
+        "stdout" | "-" => return Ok((ExportDestination::Stdout, false)),
         _ => {}
     }
     if let Some(name) = tail.strip_prefix("dir:") {
         let name = name.trim();
         validate_configured_dir(name)?;
-        return Ok(ExportDestination::ConfiguredDir(name.to_string()));
+        return Ok((ExportDestination::ConfiguredDir(name.to_string()), false));
     }
     // Everything else is a file path, preserved verbatim (interior whitespace
-    // intact) for the existing workspace-relative atomic-write path.
-    Ok(ExportDestination::File(tail.to_string()))
+    // intact) for the existing workspace-relative atomic-write path — minus an
+    // optional `force`/`!` overwrite token.
+    let (path, force) = split_force_token(tail);
+    Ok((ExportDestination::File(path.to_string()), force))
 }
 
 /// Reject a configured-directory name that is empty, absolute, or escapes the

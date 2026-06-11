@@ -15531,7 +15531,9 @@ fn write_export_atomically_cleans_up_on_failure_and_avoids_tmp_collision() {
     // (a) Make `target` an existing DIRECTORY so the rename fails.
     let dir_target = root.join("transcript-1.md");
     fs::create_dir_all(&dir_target).expect("create dir target");
-    let result = write_export_atomically(&dir_target, "x");
+    // force=true so the call reaches the rename (the point under test) instead of
+    // being short-circuited by the existence guard.
+    let result = write_export_atomically(&dir_target, "x", true);
     assert!(result.is_err(), "rename onto an existing dir must fail");
     // No leftover *.squeezy-export-tmp litters the workspace.
     let leftover: Vec<_> = fs::read_dir(&root)
@@ -15559,13 +15561,89 @@ fn write_export_atomically_cleans_up_on_failure_and_avoids_tmp_collision() {
         export_tmp_path(&json),
         ".md and .json must not share a tmp path"
     );
-    // And both still write/round-trip.
-    write_export_atomically(&md, "markdown body").expect("md export");
-    write_export_atomically(&json, "json body").expect("json export");
+    // And both still write/round-trip (fresh targets, so force is irrelevant).
+    write_export_atomically(&md, "markdown body", false).expect("md export");
+    write_export_atomically(&json, "json body", false).expect("json export");
     assert_eq!(fs::read_to_string(&md).unwrap(), "markdown body");
     assert_eq!(fs::read_to_string(&json).unwrap(), "json body");
 
     let _ = fs::remove_dir_all(&root);
+}
+
+/// deep-review #61: a File-destination export must NOT silently clobber an
+/// existing file. With `force = false` an existing target is refused with
+/// `AlreadyExists` and the original bytes are left intact; `force = true` (the
+/// path used by the timestamped destinations and an explicit `!`) overwrites.
+#[test]
+fn write_export_refuses_to_overwrite_existing_file_without_force() {
+    let root = temp_workspace("export_no_clobber");
+    let target = root.join("notes.md");
+    fs::write(&target, "original workspace source").expect("seed existing file");
+
+    // force=false: refuse, and leave the original bytes untouched.
+    let err = write_export_atomically(&target, "REPLACEMENT", false)
+        .expect_err("an existing file must not be clobbered without force");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "original workspace source",
+        "the original file must be left intact",
+    );
+    // No tmp file was written either (the guard short-circuits before any write).
+    let leftover: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(".squeezy-export-tmp")
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "guard must not litter a tmp: {leftover:?}"
+    );
+
+    // force=true: overwrite succeeds.
+    write_export_atomically(&target, "REPLACEMENT", true).expect("force overwrites");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "REPLACEMENT");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The `force` opt-in is parsed off the File-destination tail (leading
+/// `force `/`-f ` or trailing ` !`) and never off a keyword/`dir:` form.
+#[test]
+fn export_parses_force_overwrite_token_for_file_only() {
+    use export_destination::{ExportDestination, parse_export_request};
+
+    // Plain path: force defaults off.
+    let plain = parse_export_request("md notes.md").expect("plain path parses");
+    assert!(!plain.force);
+    assert_eq!(
+        plain.destination,
+        ExportDestination::File("notes.md".to_string())
+    );
+
+    // Trailing `!` and leading `force`/`-f` opt into overwrite, leaving the path clean.
+    for tail in [
+        "md notes.md !",
+        "md force notes.md",
+        "md -f notes.md",
+        "md notes.md -f",
+    ] {
+        let req = parse_export_request(tail).unwrap_or_else(|e| panic!("{tail}: {e}"));
+        assert!(req.force, "{tail} sets force");
+        assert_eq!(
+            req.destination,
+            ExportDestination::File("notes.md".to_string()),
+            "{tail} keeps the path clean",
+        );
+    }
+
+    // A force token never applies to a keyword destination: `dir:` stays a dir.
+    let dir = parse_export_request("md dir:notes").expect("dir parses");
+    assert!(!dir.force);
 }
 
 /// A traversal attempt via `dir:` is rejected at the command boundary: no file
