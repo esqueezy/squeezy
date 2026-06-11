@@ -1,10 +1,13 @@
 # TUI Alt-Screen Renderer — Implementation Plan & Backlog
 
-> Status: **Approved, not yet implemented.** Owner: TUI. Branch of record: `feat/append-only-renderer`.
-> This document is the durable design, verification strategy, and feature backlog for moving the
-> squeezy main view from an inline native-scrollback renderer to one always-on alternate-screen
-> fullscreen renderer. The goal is not a quick workaround. The goal is a solid terminal
-> application model that can be made rich, clickable, searchable, copyable, and reliably testable.
+> Status: **Landed on `feat/append-only-renderer`.** Phases 0–10 (always-on alternate-screen
+> renderer, single fullscreen `render()` path, clean exit mirror, in-app scroll/search/copy) plus the
+> bulk of the feature backlog are implemented; the inline native-scrollback renderer has been deleted.
+> Owner: TUI. Branch of record: `feat/append-only-renderer`.
+> This document remains the durable design and verification rationale for that move; sections still
+> phrased in the future tense describe the original plan, not pending work. The goal was not a quick
+> workaround — it was a solid terminal application model that is rich, clickable, searchable,
+> copyable, and reliably testable.
 
 ---
 

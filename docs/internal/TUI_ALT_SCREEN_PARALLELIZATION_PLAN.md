@@ -1,5 +1,10 @@
 # TUI Alt-Screen Renderer — Parallelized Execution Plan (Workflow-Driven)
 
+> Status: **Executed.** The waves below have landed on `feat/append-only-renderer` (always-on
+> alt-screen renderer, single fullscreen `render()` path, inline renderer deleted in Phase 10). This
+> document is retained as the execution record; the wave/agent prompts are historical and describe
+> the plan as it was run, not pending work.
+>
 > Companion to `TUI_ALT_SCREEN_RENDERER_PLAN.md`. That doc is *what* and *why*. This doc is
 > *how to execute it with maximum parallelism*: the dependency DAG, the file-contention model,
 > the wave schedule, and the concrete `Workflow` orchestrations to run each wave.
