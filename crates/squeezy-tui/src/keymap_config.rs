@@ -236,13 +236,46 @@ impl KeybindingsFile {
 /// resolvable — CI sandboxes, some test harnesses — in which case the
 /// loader degrades to "no user overrides".
 ///
-/// The fast env path treats empty variables as unset and handles Windows
-/// `$USERPROFILE`; the fallback keeps the process-cached platform lookup
-/// from `squeezy_core::cached_home_dir()` for other platform home sources.
+/// `SQUEEZY_KEYBINDINGS` overrides the home-derived path entirely
+/// (deep-review #70): when set to a non-empty value it is used verbatim
+/// as the keybindings file, so the eval `TuiHarness` and any out-of-crate
+/// driver can pin a scratch file instead of routing key resolution
+/// through the operator's real `~/.squeezy/keybindings.toml`. When set to
+/// an empty (sentinel) value it bypasses the home file and resolves to
+/// `None` ("no user overrides"). This is honored in production builds so
+/// the eval driver — which links `squeezy-tui` WITHOUT `cfg(test)`, where
+/// the in-crate thread-local load override is compiled out — is covered.
+///
+/// The fast env path treats empty home variables as unset and handles
+/// Windows `$USERPROFILE`; the fallback keeps the process-cached platform
+/// lookup from `squeezy_core::cached_home_dir()` for other platform home
+/// sources.
 pub(crate) fn default_keybindings_path() -> Option<PathBuf> {
+    if let Some(path) = keybindings_path_override_from_env(|key| env::var_os(key)) {
+        return path;
+    }
     let home = default_home_dir_from_env(|key| env::var_os(key))
         .or_else(|| squeezy_core::cached_home_dir().filter(|home| !home.as_os_str().is_empty()))?;
     Some(home.join(".squeezy").join("keybindings.toml"))
+}
+
+/// Resolve the `SQUEEZY_KEYBINDINGS` override against `env_get`. The
+/// outer `Option` distinguishes "override is in effect" from "fall
+/// through to the home-derived path":
+///   - unset                  → `None`           (no override; use `$HOME`)
+///   - set to a non-empty path → `Some(Some(p))` (use `p` verbatim)
+///   - set to an empty value   → `Some(None)`    (sentinel: no user file)
+fn keybindings_path_override_from_env<F>(env_get: F) -> Option<Option<PathBuf>>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let raw = env_get("SQUEEZY_KEYBINDINGS")?;
+    if raw.is_empty() {
+        // Sentinel: bypass the home file with no user overrides at all.
+        Some(None)
+    } else {
+        Some(Some(PathBuf::from(raw)))
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +283,9 @@ fn default_keybindings_path_from_env<F>(env_get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<std::ffi::OsString>,
 {
+    if let Some(path) = keybindings_path_override_from_env(&env_get) {
+        return path;
+    }
     let home = default_home_dir_from_env(env_get)?;
     Some(home.join(".squeezy").join("keybindings.toml"))
 }

@@ -340,3 +340,90 @@ action = "transcript_overlay"
         }
     ));
 }
+
+#[test]
+fn squeezy_keybindings_env_override_pins_scratch_path_over_home() {
+    // deep-review #70: the eval `TuiHarness` and any out-of-crate driver
+    // build their keymap from `default_keybindings_path()`, which (before
+    // this fix) read the operator's real `~/.squeezy/keybindings.toml`
+    // unconditionally. `SQUEEZY_KEYBINDINGS` must override the home path so
+    // key routing resolves from a scratch file instead. Drive the env
+    // resolver directly (no process-global mutation) to prove the override
+    // wins and `$HOME` is never consulted when it is set.
+    let scratch = unique_temp_path("env_override");
+    fs::write(
+        &scratch,
+        r#"
+[[bindings]]
+key = "Ctrl+o"
+action = "transcript_overlay"
+"#,
+    )
+    .expect("write scratch keybindings");
+
+    let scratch_os = scratch.clone().into_os_string();
+    let resolved = default_keybindings_path_from_env(|key| match key {
+        "SQUEEZY_KEYBINDINGS" => Some(scratch_os.clone()),
+        // A real $HOME is present, yet must be ignored while the override
+        // is set — this is the operator's machine in the eval driver.
+        "HOME" => Some(OsString::from("/home/operator")),
+        _ => None,
+    });
+    assert_eq!(
+        resolved.as_deref(),
+        Some(scratch.as_path()),
+        "the env override must win over the home-derived path",
+    );
+    assert_ne!(
+        resolved,
+        Some(PathBuf::from("/home/operator/.squeezy/keybindings.toml")),
+        "resolution must NOT fall through to the operator's real ~/.squeezy",
+    );
+
+    // And the resolver built from the scratch file honors the rebind:
+    // transcript_overlay moves from its Ctrl+T default to Ctrl+O.
+    let merged = merge_user_overrides(BTreeMap::new(), resolved.as_deref())
+        .expect("scratch keybindings merge cleanly");
+    let resolver = KeymapResolver::from_overrides(&merged);
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        Some(Action::ToggleTranscriptOverlay),
+        "the scratch rebind is in effect",
+    );
+    assert_ne!(
+        resolver.lookup(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        Some(Action::ToggleTranscriptOverlay),
+        "the default Ctrl+T binding was displaced by the scratch file",
+    );
+}
+
+#[test]
+fn squeezy_keybindings_empty_env_sentinel_bypasses_home() {
+    // An empty `SQUEEZY_KEYBINDINGS` is the "no user overrides" sentinel:
+    // it bypasses the home file entirely (resolves to None) rather than
+    // looking under a real `$HOME`. This lets the harness fully neutralize
+    // operator keybindings without pointing at a placeholder file.
+    let resolved = default_keybindings_path_from_env(|key| match key {
+        "SQUEEZY_KEYBINDINGS" => Some(OsString::from("")),
+        "HOME" => Some(OsString::from("/home/operator")),
+        _ => None,
+    });
+    assert_eq!(
+        resolved, None,
+        "empty SQUEEZY_KEYBINDINGS bypasses the home file with no user overrides",
+    );
+}
+
+#[test]
+fn unset_squeezy_keybindings_env_falls_through_to_home() {
+    // Production fallback: with no `SQUEEZY_KEYBINDINGS`, resolution must
+    // still derive from `$HOME` so real users keep their hand-edited file.
+    let resolved = default_keybindings_path_from_env(|key| {
+        (key == "HOME").then(|| OsString::from("/home/operator"))
+    });
+    assert_eq!(
+        resolved,
+        Some(PathBuf::from("/home/operator/.squeezy/keybindings.toml")),
+        "unset override keeps the home-derived path",
+    );
+}
