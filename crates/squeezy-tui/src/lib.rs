@@ -2116,6 +2116,12 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.search = None;
             app.selection = None;
             app.selection_set = multi_selection::SelectionSet::new();
+            // The prompt queue (and its groups/conditions/undo/UI state and the
+            // last-turn outcome that gates conditional drains) belongs to the
+            // session we are leaving; without this reset session A's queued
+            // prompts would auto-dispatch against the resumed session B
+            // (deep-review #37).
+            app.reset_prompt_queue_for_session_switch();
             app.clear_turn_divider();
             for item in transcript {
                 hydrate_transcript_item(app, item);
@@ -45120,6 +45126,30 @@ impl TuiApp {
     fn clear_turn_divider(&mut self) {
         self.last_turn_duration = None;
         self.pending_turn_divider = None;
+    }
+
+    /// Drop every prompt-queue family field so a session quick-switch / resume
+    /// does not carry session A's queued prompts, groups, conditions, undo
+    /// history, drag/overlay/multiselect UI state, in-progress edit, auto-drain
+    /// flag, or last-turn outcome into session B (deep-review #37). Mirrors the
+    /// `/clear` handler's queue reset: without it, session A's pending prompts
+    /// and conditions would auto-dispatch against the resumed session B.
+    fn reset_prompt_queue_for_session_switch(&mut self) {
+        self.prompt_queue.clear();
+        self.prompt_queue_ids.clear();
+        self.prompt_queue_undo.clear();
+        self.prompt_queue_drag = None;
+        self.prompt_queue_overlay = None;
+        self.editing_queue_id = None;
+        self.prompt_queue_multiselect.clear();
+        // Queue-Groups (§12.3.4) batches are keyed by the now-gone item ids.
+        self.prompt_queue_groups = queue_groups::QueueGroups::new();
+        // Conditional Queue Items (§12.3.5) are keyed by the same item ids.
+        self.prompt_queue_conditions = queue_conditions::QueueConditions::new();
+        // The last-turn outcome gates conditional drains; session A's outcome
+        // must not satisfy a condition in session B.
+        self.last_turn_outcome = None;
+        self.auto_drain_queue = false;
     }
 
     /// Clear the hit-test registry at the start of each frame.

@@ -33118,6 +33118,54 @@ fn queue_strip_shows_group_summary_across_a_resize() {
     }
 }
 
+#[test]
+fn session_switch_clears_the_prompt_queue_family() {
+    // A session quick-switch / resume re-anchors transcript-scoped state for the
+    // new session; the prompt queue (and its groups, conditions, undo history,
+    // auto-drain flag, and last-turn outcome) is session A's pending work and
+    // must NOT survive into session B, where it would auto-dispatch against an
+    // unrelated conversation (deep-review #37).
+    let mut app = queue_app(&["from session A", "second draft"]);
+    let id0 = queue_id_at(&app, 0);
+    let id1 = queue_id_at(&app, 1);
+    app.prompt_queue_groups
+        .create_group(&[id0, id1])
+        .expect("group");
+    app.prompt_queue_conditions.cycle(id0);
+    app.prompt_queue_multiselect.toggle(id0);
+    app.auto_drain_queue = true;
+    app.editing_queue_id = Some(id1);
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: true,
+    });
+
+    // The state-reset block of `switch_to_session`'s Ok arm, exercised directly
+    // so the test stays synchronous and does not need a resumable Agent.
+    app.reset_prompt_queue_for_session_switch();
+
+    assert!(
+        app.prompt_queue.is_empty(),
+        "queued prompts from session A must not survive the switch"
+    );
+    assert!(app.prompt_queue_ids.is_empty());
+    assert!(app.prompt_queue_undo.is_empty());
+    assert!(app.prompt_queue_drag.is_none());
+    assert!(app.prompt_queue_overlay.is_none());
+    assert!(app.editing_queue_id.is_none());
+    assert!(app.prompt_queue_multiselect.is_empty());
+    assert!(app.prompt_queue_groups.is_empty());
+    assert!(app.prompt_queue_conditions.is_empty());
+    assert!(
+        !app.auto_drain_queue,
+        "auto-drain must be off so session B does not start pumping session A's queue"
+    );
+    assert!(
+        app.last_turn_outcome.is_none(),
+        "session A's turn outcome must not satisfy a conditional in session B"
+    );
+}
+
 #[tokio::test]
 async fn empty_queue_group_verbs_are_quiet_noops() {
     // Edge case: an open overlay over an empty queue. The group verbs must not
