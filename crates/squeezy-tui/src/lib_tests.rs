@@ -13844,6 +13844,77 @@ async fn ctrl_j_and_backslash_enter_insert_prompt_newlines() {
     assert_eq!(app.input, "first\nsecond\n");
 }
 
+/// deep-review #46: Ctrl+Enter is OpenFocusedInDetail by default but also the
+/// composer's newline-insert chord. While the composer holds a draft, Ctrl+Enter
+/// must insert a '\n' and must NOT open the transcript detail overlay.
+#[tokio::test]
+async fn ctrl_enter_with_nonempty_composer_inserts_newline_not_detail_overlay() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("an entry to focus"));
+
+    set_input(&mut app, "first".to_string());
+    assert!(
+        app.transcript_overlay.is_none(),
+        "precondition: no overlay open",
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-enter while editing");
+
+    assert_eq!(
+        app.input, "first\n",
+        "Ctrl+Enter inserted a newline while editing",
+    );
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Ctrl+Enter must NOT open the detail overlay while the composer is non-empty",
+    );
+}
+
+/// deep-review #46 (Ctrl+Up twin): Ctrl+Up is FocusPrevEntry by default but also
+/// the composer's multi-line cursor-up motion. While editing a multi-line draft,
+/// Ctrl+Up must move the input cursor up a line and must NOT move the transcript
+/// entry-focus cursor.
+#[tokio::test]
+async fn ctrl_up_with_multiline_composer_moves_cursor_not_entry_focus() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("first entry"));
+    app.push_transcript_item(TranscriptItem::assistant("second entry"));
+
+    set_input(&mut app, "alpha\nbravo".to_string());
+    app.input_cursor = "alpha\nbravo".len();
+    assert!(
+        app.selected_entry.is_none(),
+        "precondition: no entry focused",
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-up while editing");
+
+    // The composer cursor stepped up onto the first line.
+    assert_eq!(
+        app.input_cursor,
+        "alpha".len(),
+        "Ctrl+Up moved the input cursor up one line while editing",
+    );
+    assert!(
+        app.selected_entry.is_none(),
+        "Ctrl+Up must NOT move the transcript entry-focus cursor while editing",
+    );
+}
+
 #[tokio::test]
 async fn ctrl_y_copies_last_assistant_message() {
     let mut agent = test_agent(SessionMode::Build);

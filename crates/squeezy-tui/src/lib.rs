@@ -9366,11 +9366,23 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
+            // The default Ctrl+Up chord collides with the composer's multi-line
+            // cursor-up motion. While the composer holds text, defer to that editor
+            // motion (deep-review #46); with an empty composer the entry-focus
+            // cursor still moves.
+            if !app.input.is_empty() {
+                return false;
+            }
             select_previous_transcript_entry(app);
             true
         }
         keymap::Action::FocusNextEntry => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // The default Ctrl+Down chord collides with the composer's multi-line
+            // cursor-down motion; defer to it while editing (deep-review #46).
+            if !app.input.is_empty() {
                 return false;
             }
             select_next_transcript_entry(app);
@@ -9401,6 +9413,16 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
         }
         keymap::Action::OpenFocusedInDetail => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // The default Ctrl+Enter chord collides with the composer's newline
+            // insertion. While the composer holds text, defer to that editor
+            // motion — mirroring the TranscriptHome/End empty-composer convention —
+            // so Ctrl+Enter inserts a newline while editing rather than being
+            // swallowed by the detail-overlay verb (deep-review #46). With an empty
+            // composer the verb still fires (and reports a hint if no entry is
+            // focused).
+            if !app.input.is_empty() {
                 return false;
             }
             // Open the focused entry in the Ctrl+T detail overlay — the
