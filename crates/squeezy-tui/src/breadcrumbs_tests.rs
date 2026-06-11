@@ -178,6 +178,30 @@ fn full_width_counts_labels_plus_separators() {
 }
 
 #[test]
+fn full_width_measures_wide_glyphs_in_display_cells() {
+    // A CJK session label occupies TWO terminal cells but is a single char.
+    // full_width drives middle truncation, so it must count the cells the
+    // renderer actually paints, not chars().count() (which would undercount the
+    // wide glyph and let the trail overflow the row).
+    let model = BreadcrumbModel::build(&BreadcrumbContext {
+        session_label: Some("\u{6f22}".to_string()),
+        following_tail: true,
+        ..ctx()
+    });
+    // The root label is the single wide glyph (display width 2), not truncated.
+    assert_eq!(
+        model.get(0).map(|c| c.label.as_str()),
+        Some("\u{6f22}"),
+        "root crumb carries the wide glyph verbatim",
+    );
+    // "漢" (2 cells) + separator (3 cells) + "tail" (4 cells) = 9 cells.
+    // chars().count() would give 1 + 3 + 4 = 8 and overflow a width-8 row.
+    let sep_cells = unicode_width::UnicodeWidthStr::width(SEPARATOR);
+    assert_eq!(sep_cells, 3, "separator ' ▸ ' is 3 display cells");
+    assert_eq!(model.full_width(), 2 + sep_cells + 4);
+}
+
+#[test]
 fn clean_label_collapses_and_caps() {
     // Whitespace collapse + trim.
     assert_eq!(clean_label("  a   b  "), "a b");

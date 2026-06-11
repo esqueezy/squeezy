@@ -42425,7 +42425,7 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
 
     let push_sep = |spans: &mut Vec<Span<'static>>, col: &mut usize| {
         spans.push(Span::styled(breadcrumbs::SEPARATOR, sep_style));
-        *col += breadcrumbs::SEPARATOR.chars().count();
+        *col += UnicodeWidthStr::width(breadcrumbs::SEPARATOR);
     };
     let push_crumb = |spans: &mut Vec<Span<'static>>,
                       crumb_rects: &mut Vec<(usize, u16, u16)>,
@@ -42437,11 +42437,11 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
         } else {
             Style::default().fg(fg)
         };
-        let chars = label.chars().count();
+        let cells = UnicodeWidthStr::width(label);
         let start = (row.x as usize + *col).min(u16::MAX as usize) as u16;
-        crumb_rects.push((index, start, chars.min(u16::MAX as usize) as u16));
+        crumb_rects.push((index, start, cells.min(u16::MAX as usize) as u16));
         spans.push(Span::styled(label.to_string(), style));
-        *col += chars;
+        *col += cells;
     };
 
     if show_all {

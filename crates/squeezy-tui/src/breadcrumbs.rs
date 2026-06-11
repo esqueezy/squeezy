@@ -25,6 +25,8 @@
 //! shown (the `Alt+2` focus mode is on); a closed strip builds nothing and the
 //! model is never touched on an idle frame.
 
+use unicode_width::UnicodeWidthStr;
+
 /// What activating a crumb navigates to. Every variant maps to an existing jump
 /// path in `lib.rs` so a click and the keyboard reach the same handler:
 /// `Home`/`Tail` reuse the transcript home/jump-to-latest verbs, `Entry` reuses
@@ -239,14 +241,19 @@ impl BreadcrumbModel {
 
     /// The total display width of the trail at full size: every crumb label plus
     /// a separator between each pair. Used by the renderer to decide when middle
-    /// truncation is needed. Char counts (not byte lengths) so multi-byte labels
-    /// measure correctly.
+    /// truncation is needed. Measured in terminal display cells (not chars or
+    /// bytes) via [`UnicodeWidthStr`] so a label with wide (CJK / 2-cell) glyphs
+    /// measures the same number of columns the renderer actually paints.
     pub(crate) fn full_width(&self) -> usize {
         if self.crumbs.is_empty() {
             return 0;
         }
-        let labels: usize = self.crumbs.iter().map(|c| c.label.chars().count()).sum();
-        let seps = self.crumbs.len().saturating_sub(1) * SEPARATOR.chars().count();
+        let labels: usize = self
+            .crumbs
+            .iter()
+            .map(|c| UnicodeWidthStr::width(c.label.as_str()))
+            .sum();
+        let seps = self.crumbs.len().saturating_sub(1) * UnicodeWidthStr::width(SEPARATOR);
         labels + seps
     }
 }

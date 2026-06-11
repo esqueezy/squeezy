@@ -38896,6 +38896,62 @@ async fn breadcrumbs_mouse_click_focuses_and_jumps() {
 }
 
 #[tokio::test]
+async fn breadcrumbs_wide_glyph_crumb_rect_matches_painted_cells() {
+    // A crumb label containing a wide (CJK, 2-cell) glyph must register a click
+    // rect whose WIDTH is the display-cell span the renderer actually paints
+    // (2), not chars().count() (1). With the char-count width the rect under-
+    // covers the glyph and the next crumb's start column collides with it.
+    let mut app = app_with_breadcrumbs();
+    // The root crumb label is the trailing slice of the session id; a lone wide
+    // glyph keeps it a single 2-cell crumb (well under the label cap).
+    app.session_id = Some("\u{6f22}".to_string());
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+2 shows the strip");
+
+    // Render the full frame so the strip registers its crumb click rects.
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains('\u{6f22}'),
+        "the wide glyph crumb paints:\n{out}"
+    );
+
+    let root_rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::BreadcrumbCrumb(0),
+        ))
+        .expect("the wide-glyph root crumb registered a click rect");
+    // The registered width must be the painted display-cell span: 2 for one
+    // wide glyph. chars().count() would register 1 and clip the click target.
+    assert_eq!(
+        root_rect.width, 2,
+        "wide-glyph crumb rect spans its 2 painted cells, not 1 char",
+    );
+
+    // The painted strip places the glyph in the first registered cell and the
+    // following cell is its 2-cell continuation — i.e. the rect covers exactly
+    // the columns the renderer drew the glyph on.
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let strip_row = Rect::new(0, 0, 80, 1);
+    terminal
+        .draw(|frame| render_breadcrumbs_strip(frame, strip_row, &app))
+        .expect("draw strip");
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(root_rect.x, 0)].symbol(),
+        "\u{6f22}",
+        "the registered rect's first column holds the painted wide glyph",
+    );
+}
+
+#[tokio::test]
 async fn breadcrumbs_empty_session_shows_session_root() {
     // No transcript, no focus: the trail is still non-empty — just the session
     // root — and the strip paints without panicking.
