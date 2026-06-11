@@ -643,6 +643,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // (Alt+f default). The badge click and the keyboard verb both drive the
         // same `cycle_main_semantic_filter` handler.
         A::CycleSemanticFilter => KeyboardPath::Keymap(Action::CycleSemanticFilter),
+        // Attention Routing indicator (§12.8.6) — `JumpToAttention` (`Ctrl+Alt+Z`
+        // default). The status-line indicator click and the keyboard verb both
+        // drive the same `jump_to_attention` handler.
+        A::JumpToAttention => KeyboardPath::Keymap(Action::JumpToAttention),
         // Local Transcript Index overlay (§12.5.1) — the overlay's own key
         // handler owns ↑↓/kj (move the category cursor) and Enter/→/l (jump to the
         // next entry in the selected category) before the global keymap sees them,

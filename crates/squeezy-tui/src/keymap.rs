@@ -428,6 +428,15 @@ pub(crate) enum Action {
     /// no-op (status hint) when no subagent row is selected, so the chord never
     /// steals a key from the composer.
     PromoteSubagentResult,
+    /// Quick-jump to the subagent that most needs attention (`Ctrl+Alt+Z`
+    /// default; §12.8.6 Attention Routing). Routes the user to the
+    /// single highest-priority subagent that needs a look — a failure, a cap
+    /// rejection, a blocker, an awaited approval, or a pinned completion — landing
+    /// on it the same way the subagent timeline's Enter jump does (opens its
+    /// conversation, preserving the prior scroll). A no-op (status hint) when
+    /// nothing wants attention, so the chord never steals a key when the session is
+    /// calm. The mouse twin is a click on the status-line attention indicator.
+    JumpToAttention,
     /// Open the Compare Subagent Outputs view over the two marked subagents
     /// (`Alt+7` default; §12.8.3). Two subagents are marked from the Subagent
     /// Timeline Panel (the `c` key there, or a marked-row click); this verb opens
@@ -623,6 +632,7 @@ impl Action {
             Self::PreviewSubagent => "preview_subagent",
             Self::JumpToSubagent => "jump_to_subagent",
             Self::PromoteSubagentResult => "promote_subagent_result",
+            Self::JumpToAttention => "jump_to_attention",
             Self::ToggleSubagentCompare => "toggle_subagent_compare",
             Self::ToggleReviewBoard => "toggle_review_board",
             Self::ToggleToolActions => "toggle_tool_actions",
@@ -713,6 +723,7 @@ impl Action {
         Action::PreviewSubagent,
         Action::JumpToSubagent,
         Action::PromoteSubagentResult,
+        Action::JumpToAttention,
         Action::ToggleSubagentCompare,
         Action::ToggleReviewBoard,
         Action::ToggleToolActions,
@@ -919,6 +930,13 @@ impl Action {
             // Ctrl+Alt overlay/picker family. The always-available equivalent is the
             // subagent timeline panel's own `y` promote key.
             | Self::PromoteSubagentResult
+            // Attention Routing (§12.8.6): the quick-jump verb is `Ctrl+Alt+Z` (a
+            // Ctrl+Alt / Meta chord) — the same Meta encoding that is unreliable
+            // across Linux terminals, tmux, and SSH as the rest of the Ctrl+Alt
+            // overlay/picker family. The always-available equivalent is a click on
+            // the status-line attention indicator and the subagent timeline panel's
+            // own ↑↓ select + Enter open keys.
+            | Self::JumpToAttention
             // Compare Subagent Outputs (§12.8.3) opens with `Alt+7` — an Alt+digit
             // chord, the same Meta/Alt encoding that is unreliable across Linux
             // terminals, tmux, and SSH as the rest of the nav/overlay family. The
@@ -1306,6 +1324,17 @@ impl Action {
             // same handler for terminals that swallow the Meta chord.
             Self::PromoteSubagentResult => KeyBinding::new(
                 KeyCode::Char('q'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Attention Routing (§12.8.6). `Ctrl+Alt+Z` quick-jumps to the
+            // subagent that most needs attention — `Z` is the next free `Ctrl+Alt`
+            // letter (every other `Ctrl+Alt+letter` in the overlay/picker family —
+            // `L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/`T`/`K`/`J`/`B`/`E`/`W`/`G`/`D`/`I`/
+            // `U`/`Q` — is taken), and bare `Alt+z` is the lane-fold overlay, so the
+            // Ctrl+Alt modifier keeps the jump distinct from it while staying clear
+            // of every composer chord.
+            Self::JumpToAttention => KeyBinding::new(
+                KeyCode::Char('z'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
             // Compare Subagent Outputs (§12.8.3). `Alt+7` — the next free

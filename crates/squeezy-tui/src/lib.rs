@@ -79,6 +79,7 @@ mod accessibility;
 mod action_palette;
 mod annotations;
 mod approval;
+mod attention;
 // Real Terminal Benchmark Suite (§12.10.2). `cfg(test)`-gated so the benchmark
 // harness never compiles into a shipped TUI binary; every item is exercised by
 // its sibling `bench_render_tests.rs`, so the module carries no dead code.
@@ -3232,6 +3233,22 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((
             interaction::TargetKey::Chrome(interaction::ChromeKey::SemanticFilterBadge),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // Status-line Attention Routing indicator (§12.8.6): a left-click quick-jumps
+    // to the subagent that most needs attention — the mouse twin of the
+    // `JumpToAttention` (`Ctrl+Alt+Z`) keyboard verb. The indicator is painted on
+    // the footer status row in ABSOLUTE screen coordinates (it is part of the
+    // overview line, not the footer-relative `Chrome` space), so it is hit-tested
+    // in absolute coordinates here, mirroring the Semantic Filter badge arm above.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::AttentionIndicator),
             action,
         )) = app.click_target_at(mouse.column, mouse.row)
     {
@@ -8793,6 +8810,16 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             promote_selected_subagent_result(app);
             true
         }
+        keymap::Action::JumpToAttention => {
+            // Main-surface quick-jump; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            jump_to_attention(app);
+            true
+        }
         keymap::Action::ToggleSubagentCompare => {
             // Main-surface overlay; the config/setup screens own their own
             // routing, and the Ctrl+T overlay guard above already blocks this
@@ -10706,6 +10733,73 @@ fn review_board_jump_to_cursor(app: &mut TuiApp, advance: bool) {
             app.review_board_cursor = app.review_board.card_at(next).map(|card| card.id);
         }
     }
+    app.needs_redraw = true;
+}
+
+// ---- Attention Routing (§12.8.6) ----
+
+/// Quick-jump to the subagent that most needs attention (§12.8.6). Refreshes the
+/// Attention Routing model against the live records, takes the single
+/// highest-priority target (a failure first, then a cap rejection, a blocker, an
+/// awaited approval, a pinned completion), and lands on it the same way the
+/// subagent timeline's Enter jump does — selecting its pane row, making it the
+/// active conversation, pinning its scroll, and opening its transcript overlay.
+/// A no-op (status hint) when nothing wants attention or when the routed target's
+/// record has vanished, so the chord never disrupts a calm session.
+///
+/// The keyboard verb (`Ctrl+Alt+Z`) and a click on the status-line attention
+/// indicator both reach here.
+fn jump_to_attention(app: &mut TuiApp) {
+    refresh_attention_route(app);
+    let Some((id, kind, agent)) = app
+        .attention_route
+        .top()
+        .map(|item| (item.id, item.kind, item.agent.clone()))
+    else {
+        app.status = "attention: nothing needs a look right now".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let total = app.attention_route.len();
+    // Resolve the routed id to its pane row (row 0 is `main`; record N lives on
+    // row N + 1). A cap-rejected subagent never ran, so it has no transcript to
+    // open — surface it as a select-only status hint rather than a dead jump.
+    let Some(pos) = app
+        .subagent_pane
+        .records
+        .iter()
+        .position(|record| record.id == id)
+    else {
+        app.status = "attention: that subagent is no longer tracked".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let more = total.saturating_sub(1);
+    let more_note = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    if kind == attention::SubagentAttentionKind::Rejection {
+        // A rejection has no conversation; select its pane row but leave the
+        // surface where it is so the user can read the cap notice in place.
+        app.subagent_pane.selected = pos + 1;
+        app.status = format!(
+            "attention: {agent} [{}]{more_note} — capped before it ran",
+            kind.label(),
+        );
+        app.needs_redraw = true;
+        return;
+    }
+    app.subagent_pane.selected = pos + 1;
+    app.subagent_pane.active = ConversationSource::Subagent(id);
+    active_transcript_scroll_mut(app).pin_to_bottom();
+    open_subagent_transcript_overlay(app);
+    app.status = format!(
+        "attention: {agent} [{}]{more_note} — {} to expand, Esc to close",
+        kind.label(),
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay),
+    );
     app.needs_redraw = true;
 }
 
@@ -14676,6 +14770,30 @@ fn refresh_review_board(app: &mut TuiApp) {
     app.review_board.rebuild_if_stale(fingerprint, &sources);
 }
 
+/// Refresh the Attention Routing model (§12.8.6) against the live subagent-pane
+/// records, rebuilding **only** when the records' `(id, status, latest, pinned)`
+/// fingerprint has moved since the last refresh. Reuses the same timeline-source
+/// projection the Subagent Timeline Panel builds (so the two views never drift),
+/// tagging each with whether the user pinned it (the compare-mark set — the
+/// "selected/pinned completions" opt-in). Called from the render path before the
+/// status-line indicator paints and from the `JumpToAttention` quick-jump, so a
+/// calm session (everything running or quietly done) pays one `u64` comparison and
+/// surfaces nothing. The routing only *surfaces* events — it never drops a
+/// timeline/transcript row, so logs/evals keep every raw event.
+fn refresh_attention_route(app: &mut TuiApp) {
+    let sources = build_subagent_timeline_sources(app);
+    let attention_sources: Vec<attention::AttentionSource<'_>> = sources
+        .iter()
+        .map(|source| attention::AttentionSource {
+            source,
+            pinned: app.subagent_compare_marks.contains(source.id),
+        })
+        .collect();
+    let fingerprint = attention::AttentionRoute::fingerprint_of(attention_sources.iter());
+    app.attention_route
+        .rebuild_if_stale(fingerprint, &attention_sources);
+}
+
 /// Count the non-blank lines in a text blob — the body row count a lane header
 /// advertises ("tool output (12 lines)"). Bounded by counting only what is
 /// present; an empty/blank blob yields 0.
@@ -16056,6 +16174,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // keyboard verb drives, so mouse/keyboard parity holds by construction.
         interaction::Action::CycleSemanticFilter => {
             cycle_main_semantic_filter(app, false);
+        }
+        // A click on the status-line Attention Routing indicator (§12.8.6):
+        // quick-jump to the subagent that most needs attention — the mouse twin of
+        // the `JumpToAttention` (`Ctrl+Alt+Z`) keyboard verb.
+        interaction::Action::JumpToAttention => {
+            jump_to_attention(app);
         }
         // A click on a Local Transcript Index category row (§12.5.1): move the
         // cursor onto it and jump the main view to the next entry in it — the
@@ -38864,7 +38988,46 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if status_area.height > 0 {
         let paragraph = Paragraph::new(format_status_lines(app, status_area.width));
         frame.render_widget(paragraph, status_area);
+        // Attention Routing (§12.8.6): register a click target over the attention
+        // indicator span on the top overview row so a click quick-jumps to the
+        // subagent that most needs attention — the mouse twin of the
+        // `JumpToAttention` (`Ctrl+Alt+Z`) keyboard verb. Only registered when the
+        // indicator is actually painted (the session has attention items and the
+        // detail line is not occupying the overview row), so a calm session
+        // registers nothing.
+        register_attention_indicator_target(app, status_area);
     }
+}
+
+/// Register the Attention Routing indicator's click rect on the status block's
+/// bottom (hints) row (§12.8.6). [`format_status_lines`] prepends the indicator to
+/// that row at its left edge, so the click span is exactly `[x, x + indicator
+/// width)` on the last status row, clamped to the row width. A click there reaches
+/// the same `jump_to_attention` handler as the `JumpToAttention` keyboard verb. A
+/// no-op when nothing wants attention or when the status block has no second row to
+/// register on (a one-row footer).
+fn register_attention_indicator_target(app: &TuiApp, status_area: Rect) {
+    let indicator = app.attention_route.indicator();
+    if indicator.is_empty() || status_area.width == 0 || status_area.height < 2 {
+        return;
+    }
+    let row_right = (status_area.x + status_area.width) as usize;
+    let abs_start = status_area.x as usize;
+    let abs_end = (abs_start + indicator.chars().count()).min(row_right);
+    if abs_end <= abs_start {
+        return;
+    }
+    let rect = Rect {
+        x: status_area.x,
+        y: status_area.y + status_area.height - 1,
+        width: (abs_end - abs_start) as u16,
+        height: 1,
+    };
+    app.register_click(
+        rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::AttentionIndicator),
+        interaction::Action::JumpToAttention,
+    );
 }
 
 /// Paint the Clickable Breadcrumbs strip (§12.1.5) on a single `row` and register
@@ -39313,7 +39476,7 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         Some(detail_line) => compose_status_overview_with_detail(detail_line, app, width),
         None => format_status_overview_line(app, width),
     };
-    let bottom = if detail_was_present(app) {
+    let mut bottom = if detail_was_present(app) {
         Line::from(hints_span)
     } else if app.status_verbosity == StatusVerbosity::Verbose {
         Line::from(Span::styled(
@@ -39327,6 +39490,30 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     } else {
         Line::from(hints_span)
     };
+    // Attention Routing (§12.8.6): when one or more subagents need a look (a
+    // failure, a cap rejection, a blocker, an awaited approval, or a pinned
+    // completion), prepend the prioritized indicator to the hints row in an
+    // attention colour so a glance at the status line surfaces it without opening
+    // any overlay. The bottom (hints) row always renders, so the indicator is
+    // visible regardless of the configured detail-line layout. Painted nothing
+    // (and the span list is untouched) when the session is calm, so an idle
+    // session's status line is unchanged.
+    let indicator = app.attention_route.indicator();
+    if !indicator.is_empty() {
+        let mut spans = Vec::with_capacity(bottom.spans.len() + 2);
+        spans.push(Span::styled(
+            indicator,
+            Style::default()
+                .fg(crate::render::theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.append(&mut bottom.spans);
+        bottom = Line::from(spans);
+    }
     vec![top, bottom]
 }
 
@@ -40980,6 +41167,16 @@ pub(crate) struct TuiApp {
     /// comparison per refresh. Drives the panel's rail/list and selection; the
     /// active status filter lives inside it.
     pub(crate) subagent_timeline: subagent_timeline::SubagentTimeline,
+    /// Attention Routing (§12.8.6): the prioritized list of subagents that need
+    /// the user's attention — failures, cap rejections, blockers, awaited
+    /// approvals, and pinned completions — derived from the same live
+    /// `subagent_pane` records the timeline reads (plus the compare-mark set for
+    /// the pinned opt-in). Rebuilt incrementally — only when the records'
+    /// `(id, status, latest, pinned)` fingerprint moves — by
+    /// `refresh_attention_route`, so a calm session pays one `u64` comparison per
+    /// refresh and surfaces nothing. Drives the status-line attention indicator and
+    /// the `JumpToAttention` quick-jump.
+    pub(crate) attention_route: attention::AttentionRoute,
     /// Whether the Subagent Timeline Panel (§12.8.1) is open. `false` = closed
     /// (the resting state, paints nothing extra); `true` = the fullscreen
     /// rail/list owns key/mouse routing. Toggled by the `ToggleSubagentTimeline`
@@ -41807,6 +42004,7 @@ impl TuiApp {
             session_timeline_open: false,
             session_timeline_selected: 0,
             subagent_timeline: subagent_timeline::SubagentTimeline::new(),
+            attention_route: attention::AttentionRoute::new(),
             subagent_timeline_open: false,
             subagent_timeline_selected: 0,
             subagent_compare_marks: subagent_compare::SubagentCompareMarks::new(),
@@ -44172,6 +44370,17 @@ impl TerminalGuard {
         if app.review_board_open {
             refresh_review_board(app);
             review_board_reconcile_cursor(app);
+        }
+
+        // Keep the Attention Routing model (§12.8.6) current so the status-line
+        // attention indicator and the `Ctrl+Alt+Z` quick-jump always reflect the
+        // live subagents. Refreshed only while the session actually has subagent
+        // records — a session that never spawned one pays nothing (this branch is
+        // skipped entirely), and once it has some, the fingerprint only moves on a
+        // real subagent event (a lifecycle flip, a fresh activity line, a pin
+        // toggle), so an all-calm fanout costs one `u64` comparison per loop.
+        if !app.subagent_pane.records.is_empty() {
+            refresh_attention_route(app);
         }
 
         // Heal the Compare Subagent Outputs view (§12.8.3) when one of its two

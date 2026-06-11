@@ -36081,6 +36081,211 @@ async fn subagent_compare_heals_closed_when_a_marked_subagent_vanishes() {
     );
 }
 
+// ---- Attention Routing (§12.8.6) ----
+
+/// Drive the per-loop Attention Routing refresh the way the event loop does
+/// (tests call `render` directly and bypass the loop body), so the status-line
+/// indicator + quick-jump reflect the live records.
+fn refresh_attention_for_test(app: &mut TuiApp) {
+    refresh_attention_route(app);
+}
+
+#[tokio::test]
+async fn attention_indicator_paints_on_the_status_line_for_loud_subagents() {
+    let mut app = app_with_subagents();
+    refresh_attention_for_test(&mut app);
+
+    // The failed + cap-rejected records both surface; the running + completed ones
+    // stay quiet (timeline only).
+    assert_eq!(app.attention_route.len(), 2, "failed + capped surface");
+    let out = render_to_string(&app, 96, 24);
+    assert!(
+        out.contains("!2 attention"),
+        "indicator on status line:\n{out}"
+    );
+    assert!(out.contains("1 failed"), "failure breakdown:\n{out}");
+    assert!(out.contains("1 capped"), "rejection breakdown:\n{out}");
+}
+
+#[tokio::test]
+async fn attention_quick_jump_lands_on_the_highest_priority_subagent() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    refresh_attention_for_test(&mut app);
+
+    // The top target is the failure (id 3, "reviewer"): louder than the cap
+    // rejection. `Ctrl+Alt+Z` jumps to it, opening its conversation.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+Z quick-jumps to attention");
+
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(3),
+        "jumped to the failed subagent's conversation",
+    );
+    assert!(
+        app.status.contains("reviewer") && app.status.contains("failed"),
+        "status names the jumped subagent + its kind: {:?}",
+        app.status,
+    );
+}
+
+#[tokio::test]
+async fn attention_quick_jump_is_a_noop_hint_when_calm() {
+    // A completed-only session is calm: nothing wants attention.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(96, 24);
+    app.note_subagent_started(1, "explore".to_string(), "look".to_string());
+    app.note_subagent_completed(
+        1,
+        "explore".to_string(),
+        "all good".to_string(),
+        TurnMetrics::default(),
+    );
+    refresh_attention_for_test(&mut app);
+    assert!(
+        app.attention_route.is_empty(),
+        "calm session surfaces nothing"
+    );
+
+    // The indicator paints nothing on the status line.
+    let out = render_to_string(&app, 96, 24);
+    assert!(!out.contains("attention"), "no indicator when calm:\n{out}");
+
+    let mut agent = test_agent(SessionMode::Build);
+    let active_before = app.subagent_pane.active;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+Z is a harmless no-op when calm");
+    assert_eq!(
+        app.subagent_pane.active, active_before,
+        "calm quick-jump does not repoint the conversation",
+    );
+    assert!(
+        app.status.contains("nothing"),
+        "calm quick-jump leaves an honest hint: {:?}",
+        app.status,
+    );
+}
+
+#[tokio::test]
+async fn attention_indicator_click_quick_jumps() {
+    let mut app = app_with_subagents();
+    refresh_attention_for_test(&mut app);
+
+    // Render so `register_attention_indicator_target` registers the indicator's
+    // click rect on the status row, then resolve its on-screen position.
+    let _ = render_to_string(&app, 96, 24);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::AttentionIndicator,
+        ))
+        .expect("the indicator registers a click target while painted");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(3),
+        "clicking the indicator jumps to the highest-priority (failed) subagent",
+    );
+}
+
+#[tokio::test]
+async fn attention_routes_a_blocker_signal_from_a_running_subagents_activity() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(96, 24);
+    // A running subagent whose latest activity reports an awaited approval — a
+    // mid-run event the spec wants surfaced even though it is still running.
+    app.note_subagent_started(1, "delegate".to_string(), "edit the file".to_string());
+    app.note_subagent_activity(
+        1,
+        "delegate".to_string(),
+        "awaiting approval to write src/main.rs".to_string(),
+    );
+    refresh_attention_for_test(&mut app);
+
+    assert_eq!(
+        app.attention_route.len(),
+        1,
+        "the awaited approval surfaces"
+    );
+    assert_eq!(
+        app.attention_route.top().map(|i| i.kind),
+        Some(attention::SubagentAttentionKind::Approval),
+        "a running subagent awaiting approval routes to Approval",
+    );
+    let out = render_to_string(&app, 96, 24);
+    assert!(out.contains("1 approval"), "approval indicator:\n{out}");
+}
+
+#[tokio::test]
+async fn attention_quiet_progress_never_overwrites_a_failure() {
+    // The spec's core invariant: a failed subagent stays surfaced even as another
+    // subagent emits quiet running progress. The failure must remain the top
+    // (jump) target and the indicator must keep reporting it.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(96, 24);
+    app.note_subagent_started(1, "reviewer".to_string(), "review".to_string());
+    app.note_subagent_failed(
+        1,
+        "reviewer".to_string(),
+        "compile error".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_started(2, "delegate".to_string(), "run tests".to_string());
+    // A flurry of quiet progress on the *other* subagent.
+    for line in ["running cargo test", "compiling crate", "test 1 passed"] {
+        app.note_subagent_activity(2, "delegate".to_string(), line.to_string());
+        refresh_attention_for_test(&mut app);
+    }
+    assert_eq!(
+        app.attention_route.top().map(|i| i.id),
+        Some(1),
+        "the failure stays the surfaced attention target through quiet progress",
+    );
+    let out = render_to_string(&app, 96, 24);
+    assert!(out.contains("1 failed"), "failure stays visible:\n{out}");
+}
+
+#[tokio::test]
+async fn attention_indicator_renders_across_resizes_without_panic() {
+    let mut app = app_with_subagents();
+    refresh_attention_for_test(&mut app);
+    // The status line paints (and the indicator either fits or is truncated) at
+    // every size without panicking; the routed model is width-independent.
+    for (w, h) in [(120u16, 30u16), (96, 24), (40, 12)] {
+        let _ = render_to_string(&app, w, h);
+        assert_eq!(
+            app.attention_route.len(),
+            2,
+            "routed items are width-independent at {w}x{h}",
+        );
+    }
+}
+
 // ---- Universal Command Palette (§12.1.1) ----
 
 /// Open the Universal Command Palette via its `Ctrl+Alt+P` default chord. Returns a

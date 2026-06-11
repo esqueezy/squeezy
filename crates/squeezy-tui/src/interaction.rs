@@ -188,6 +188,11 @@ pub(crate) enum ChromeKey {
     /// stable subagent id (NOT a flattened index) so a click selects + jumps the
     /// main view to that worker's conversation even as lanes change between frames.
     ReviewBoardCard(u64),
+    /// The Attention Routing indicator painted on the status line (§12.8.6). A
+    /// single affordance with no identity of its own; a click quick-jumps to the
+    /// subagent that most needs attention — the mouse twin of the `JumpToAttention`
+    /// (`Ctrl+Alt+Z`) verb.
+    AttentionIndicator,
     /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
     /// 0-based index in the annotation list so a click selects + jumps the main
     /// view to the entry that exact annotation anchors.
@@ -398,6 +403,11 @@ pub(crate) enum Action {
     /// twin of the `Alt+f` keyboard verb / a click on the active-filter badge;
     /// both step the filter through its cycle and request a redraw.
     CycleSemanticFilter,
+    /// Quick-jump to the subagent that most needs attention (§12.8.6). Mouse twin
+    /// of the `JumpToAttention` (`Ctrl+Alt+Z`) keyboard verb / a click on the
+    /// status-line attention indicator; both land on the single highest-priority
+    /// attention target.
+    JumpToAttention,
     /// Select the given category row in the Local Transcript Index overlay
     /// (§12.5.1) and jump the main view to the next entry in it. Mouse twin of
     /// moving the cursor with ↑↓ and pressing Enter; a click both selects and
@@ -706,6 +716,7 @@ impl Action {
         Action::SubagentTimelinePromote(0),
         Action::SubagentCompareMark(0),
         Action::ReviewBoardSelectJump(0),
+        Action::JumpToAttention,
     ];
 }
 
