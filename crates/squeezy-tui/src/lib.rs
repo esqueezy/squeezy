@@ -39775,6 +39775,26 @@ fn strip_ansi_escape_sequences(input: &str) -> String {
             Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
                 let _ = chars.next();
             }
+            // OSC / DCS / SOS / PM / APC introducers begin a string whose body
+            // must be discarded up to its terminator — either a BEL (`\x07`) or
+            // an ST (`ESC \`). Without this the body (e.g. `0;evil` from
+            // `\x1b]0;evil\x07`) leaks through as visible junk.
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                while let Some(next) = chars.next() {
+                    if next == '\x07' {
+                        break;
+                    }
+                    if next == '\x1b' {
+                        // ST is `ESC \`; consume the trailing `\` (if present)
+                        // and stop. Any other `ESC X` here is malformed, but we
+                        // still stop so we don't swallow real following text.
+                        if chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
             Some(_) | None => {}
         }
     }

@@ -5840,6 +5840,17 @@ fn slash_suggestion_lines_keep_short_hints_inline_when_width_allows() {
     );
 }
 
+/// deep-review #122: OSC / string-terminated escape sequences (here OSC-8
+/// hyperlinks and the `ESC ] 0 ; title` window-title control) must have their
+/// whole body discarded, not just the introducer. Before the OSC arm was added
+/// the body (`8;;https://x`, `0;title`) leaked through as visible junk. Both
+/// terminator forms — BEL (`\x07`) and ST (`ESC \`) — must end the sequence.
+#[test]
+fn strip_ansi_escape_sequences_discards_osc_bodies() {
+    assert_eq!(strip_ansi_escape_sequences("a\x1b]8;;https://x\x07b"), "ab");
+    assert_eq!(strip_ansi_escape_sequences("a\x1b]0;title\x1b\\b"), "ab");
+}
+
 #[tokio::test]
 async fn slash_cost_reports_empty_session_without_model_turn() {
     let mut agent = test_agent(SessionMode::Build);
