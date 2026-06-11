@@ -15513,6 +15513,108 @@ fn wheel_accumulator_sums_small_bursts_into_line_scroll() {
     );
 }
 
+/// deep-review #13: with a multi-screen transcript that HAS a jump target above
+/// the viewport, a NON-empty composer must still keep readline word-motion.
+/// Alt+Left is JumpPrevAssistant by default but also the composer word-left key;
+/// while editing, it must move the cursor one word left and must NOT scroll the
+/// transcript (the jump must not fire and swallow the chord).
+#[tokio::test]
+async fn alt_left_with_nonempty_composer_moves_word_left_not_jump() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Multi-screen transcript with assistant entries to jump to.
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {index}")));
+    }
+    // Park on the live tail: many prior assistant entries now sit above the
+    // viewport, so JumpPrevAssistant (Alt+Left) has a real target above us and
+    // would fire if it ever saw the chord.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    let scroll_before = app.transcript_scroll;
+    assert!(
+        app.transcript_scroll.is_following(),
+        "precondition: parked on the tail",
+    );
+
+    // Now edit: non-empty composer, cursor mid-line.
+    set_input(&mut app, "alpha beta gamma".to_string());
+    app.input_cursor = app.input.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-left while editing");
+
+    assert_eq!(
+        app.input_cursor,
+        "alpha beta ".len(),
+        "Alt+Left moved the input cursor one word left while editing",
+    );
+    assert_eq!(
+        app.transcript_scroll, scroll_before,
+        "Alt+Left must NOT fire a transcript jump while the composer is non-empty",
+    );
+}
+
+/// deep-review #13 (Alt+Up twin): with a multi-screen transcript scrolled so a
+/// user turn sits above the viewport and a non-empty prompt history, Alt+Up must
+/// recall the previous prompt into the composer rather than firing
+/// JumpPrevUserTurn and scrolling the transcript.
+#[tokio::test]
+async fn alt_up_with_nonempty_composer_recalls_history_not_jump() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {index}")));
+    }
+    // Seed prompt history so recall has something to pull in.
+    push_input_history(&mut app, "earlier prompt".to_string());
+    // Park on the live tail: prior user turns sit above the viewport, so
+    // JumpPrevUserTurn (Alt+Up) has a real target above us and would fire.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    let scroll_before = app.transcript_scroll;
+    assert!(
+        app.transcript_scroll.is_following(),
+        "precondition: parked on the tail",
+    );
+
+    // Non-empty composer; Alt+Up must recall, not jump.
+    set_input(&mut app, "draft".to_string());
+    app.input_cursor = app.input.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-up while editing");
+
+    assert_eq!(
+        app.input, "earlier prompt",
+        "Alt+Up recalled the previous prompt while editing",
+    );
+    assert_eq!(
+        app.transcript_scroll, scroll_before,
+        "Alt+Up must NOT fire a transcript jump while the composer is non-empty",
+    );
+}
+
 #[tokio::test]
 async fn jump_next_user_turn_lands_on_a_later_user_message() {
     let mut agent = test_agent(SessionMode::Build);

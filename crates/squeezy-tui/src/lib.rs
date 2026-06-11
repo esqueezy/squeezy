@@ -15246,6 +15246,15 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
     if app.config_screen.is_some() || app.status_line_setup.is_some() {
         return false;
     }
+    // The Alt+arrow jump defaults collide with the composer's word-motion
+    // (Alt+Left/Right) and prompt-history recall (Alt+Up/Down). While the composer
+    // holds text, defer to those readline handlers — mirroring the
+    // TranscriptHome/End empty-composer convention — so editing a prompt is never
+    // hijacked by a transcript jump (deep-review #13 / #30). The jump verbs stay
+    // reachable with an empty composer (or via their non-Alt-arrow chords).
+    if !app.input.is_empty() {
+        return false;
+    }
     let (width, height) = app.off_frame_terminal_size();
     let area = Rect {
         x: 0,
