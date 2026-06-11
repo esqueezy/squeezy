@@ -10738,13 +10738,27 @@ fn persist_keybinding_change(app: &mut TuiApp) {
     // Build the delta-only override map from the editor's rows (the single source
     // the overlay edited), so the rebuilt resolver and the on-disk file agree.
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
+    // Tombstone slugs: rows the user reset to default whose binding the
+    // settings.toml base map specifies. Without a durable tombstone the reset is
+    // simply absent from `keybindings.toml`, and `merge_user_overrides` re-merges
+    // the base override on the next start, silently resurrecting the binding the
+    // user reset (deep-review #96). A reset of an action the base does NOT specify
+    // needs no marker — dropping the row already restores the default.
+    let mut tombstones: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for row in editor.rows() {
+        let slug = row.action.slug().to_string();
         if row.is_override {
-            overrides.insert(row.action.slug().to_string(), row.binding.display());
+            overrides.insert(slug, row.binding.display());
+        } else if app.keymap_base.contains_key(&slug) {
+            tombstones.insert(slug);
         }
     }
     // Rebuild the live resolver from the editor's overrides so the new binding is
-    // active for the very next keypress (and `/keymap` reads it back).
+    // active for the very next keypress (and `/keymap` reads it back). The editor
+    // rows already capture every active non-default binding as an override
+    // (including base-sourced ones), so a reset base binding is simply absent here
+    // and falls back to its default in the live session — the tombstone only has
+    // to make that survive a restart.
     app.keymap = keymap::KeymapResolver::from_overrides(&overrides);
     // Resolve the destination through the app so a pinned override (eval/test
     // harness) is honoured instead of always targeting the operator's real
@@ -10752,21 +10766,25 @@ fn persist_keybinding_change(app: &mut TuiApp) {
     let target = app.keybindings_save_path();
     // Write the file (best-effort). A missing home dir degrades to "in-memory
     // only" with a status note.
-    if let Err(err) = write_keybindings_file(target, &overrides) {
+    if let Err(err) = write_keybindings_file(target, &overrides, &tombstones) {
         app.status = format!("rebind applied (not saved: {err})");
     }
 }
 
-/// Write the delta-only override map to `target` (the resolved
-/// `~/.squeezy/keybindings.toml`, or a harness override) atomically (write to a
-/// sibling temp file, then rename). Serialises each entry as a `[[bindings]]`
-/// row in the same schema `keymap_config::KeybindingsFile` reads, so the
-/// editor's output round-trips through the loader on the next start. The parent
-/// directory is created if missing. `target == None` means no destination is
-/// resolvable (no home dir), surfaced as a `NotFound` error.
+/// Write the delta-only override map (plus any tombstones) to `target` (the
+/// resolved `~/.squeezy/keybindings.toml`, or a harness override) atomically
+/// (write to a sibling temp file, then rename). Serialises each entry as a
+/// `[[bindings]]` row in the same schema `keymap_config::KeybindingsFile` reads,
+/// so the editor's output round-trips through the loader on the next start. A
+/// tombstone is written as `action = "<slug>"` + `reset = true`, which the loader
+/// turns into a `merged.remove(slug)` so a reset base-sourced binding does not
+/// resurrect (deep-review #96). The parent directory is created if missing.
+/// `target == None` means no destination is resolvable (no home dir), surfaced as
+/// a `NotFound` error.
 fn write_keybindings_file(
     target: Option<PathBuf>,
     overrides: &BTreeMap<String, String>,
+    tombstones: &std::collections::BTreeSet<String>,
 ) -> std::io::Result<()> {
     let path = target.ok_or_else(|| {
         std::io::Error::new(
@@ -10784,6 +10802,11 @@ fn write_keybindings_file(
         body.push_str("\n[[bindings]]\n");
         body.push_str(&format!("action = {slug:?}\n"));
         body.push_str(&format!("key = {spec:?}\n"));
+    }
+    for slug in tombstones {
+        body.push_str("\n[[bindings]]\n");
+        body.push_str(&format!("action = {slug:?}\n"));
+        body.push_str("reset = true\n");
     }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, body)?;
@@ -44930,6 +44953,12 @@ pub(crate) struct TuiApp {
     /// here and `handle_key` consults it before dispatching to the
     /// legacy hardcoded handlers.
     pub(crate) keymap: keymap::KeymapResolver,
+    /// The `[tui.keymap]` base map from `settings.toml` the live resolver was
+    /// built on top of. Kept so the keybinding editor can write a durable
+    /// tombstone when the user resets a base-sourced binding: without it, the
+    /// reset row is simply omitted from `keybindings.toml` and the base override
+    /// resurrects on the next start (deep-review #96).
+    pub(crate) keymap_base: BTreeMap<String, String>,
     /// In-flight `/diff` snapshot work. `vcs.snapshot()` shells out to
     /// blocking git subprocesses and iterates every changed file, which
     /// can take seconds on a busy worktree. We offload it to
@@ -45394,6 +45423,7 @@ impl TuiApp {
         let status = "ready".to_string();
         let next_entry_id = transcript.len() as u64;
         let keymap = build_keymap_resolver(&config.tui.keymap);
+        let keymap_base = config.tui.keymap.clone();
         let open_config_section = startup.open_config_section;
         let language_summary = if startup.languages.trim().is_empty() {
             configured_language_summary(config)
@@ -45693,6 +45723,7 @@ impl TuiApp {
             status_line_setup: None,
             latest_plan_progress: None,
             keymap,
+            keymap_base,
             pending_diff: None,
             pending_diff_started_at: None,
             prompt_queue: VecDeque::new(),

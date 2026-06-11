@@ -6682,6 +6682,69 @@ fn keybinding_editor_persist_honors_path_override_and_spares_real_file() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn keybinding_editor_reset_of_a_base_sourced_binding_writes_a_durable_tombstone() {
+    // deep-review #96: resetting a binding that the settings.toml [tui.keymap]
+    // base provides must write a durable `reset = true` tombstone, so re-loading
+    // the file against the same base restores the default instead of resurrecting
+    // the base override. Without the tombstone the reset row is simply absent and
+    // `merge_user_overrides` re-merges the base entry on the next start.
+    let root = temp_workspace("keybind_tombstone");
+    let override_path = root.join("scratch-keybindings.toml");
+
+    let mut app = test_app(SessionMode::Build);
+    app.set_keybindings_path_override(Some(override_path.clone()));
+
+    // The base map (as if from settings.toml) moves ToggleConfigScreen off its
+    // F11 default onto Ctrl+Alt+Q; the live resolver is built on top of it so the
+    // editor row shows the action as an override.
+    let slug = keymap::Action::ToggleConfigScreen.slug().to_string();
+    let mut base = BTreeMap::new();
+    base.insert(slug.clone(), "Ctrl+Alt+Q".to_string());
+    app.keymap_base = base.clone();
+    app.keymap = keymap::KeymapResolver::from_overrides(&base);
+
+    toggle_keybinding_editor(&mut app);
+    let editor = app.keybinding_editor.as_mut().expect("editor open");
+    let index = editor
+        .rows()
+        .iter()
+        .position(|r| r.action == keymap::Action::ToggleConfigScreen)
+        .expect("the config-toggle row is present");
+    editor.select_index(index);
+    assert_eq!(
+        editor.selected_row().expect("a selected row").action,
+        keymap::Action::ToggleConfigScreen,
+        "the config-toggle row is selected"
+    );
+    assert!(
+        editor.selected_row().expect("a selected row").is_override,
+        "the base-sourced binding shows as an override before reset"
+    );
+
+    // Drive the same reset+persist path the `r`/Delete verb runs.
+    keybinding_editor_reset_selected(&mut app);
+
+    // The file carries a tombstone row for the slug, not a key binding.
+    let written =
+        fs::read_to_string(&override_path).expect("override keybindings file was written");
+    assert!(
+        written.contains(&format!("action = {slug:?}")) && written.contains("reset = true"),
+        "the reset must persist a tombstone, got:\n{written}"
+    );
+
+    // Re-loading the written file against the same base restores the default:
+    // the tombstone removes the base-sourced override.
+    let merged = keymap_config::merge_user_overrides(base, Some(&override_path))
+        .expect("written file re-merges cleanly");
+    assert!(
+        !merged.contains_key(&slug),
+        "the tombstone must drop the base override on reload: {merged:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn immediate_duplicate_large_paste_expands_existing_token() {
     let root = temp_workspace("tui_large_paste_immediate_dupe");

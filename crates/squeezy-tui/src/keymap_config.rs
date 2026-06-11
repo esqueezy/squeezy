@@ -54,17 +54,28 @@ use crate::keymap::{Action, KeyBinding as ResolvedKeyBinding, parse_keyspec};
 pub(crate) type KeymapAction = Action;
 
 /// One row from the `[[bindings]]` array of `~/.squeezy/keybindings.toml`.
+///
+/// A row is either an *override* (`key` set) or a *tombstone* (`reset = true`,
+/// `key` omitted). A tombstone is a durable "reset to default" marker: it removes
+/// the slug from the merged map so a base `[tui.keymap]` override the user reset
+/// in the editor does not silently resurrect on restart (deep-review #96).
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct KeyBinding {
     /// Keyspec string in the same grammar `[tui.keymap]` accepts
     /// (`"Ctrl+T"`, `"PageUp"`, `"Alt+k"`, …). Parsed by
-    /// [`parse_keyspec`] when the file is validated.
-    pub(crate) key: String,
+    /// [`parse_keyspec`] when the file is validated. Omitted for a
+    /// tombstone row (`reset = true`).
+    #[serde(default)]
+    pub(crate) key: Option<String>,
     /// Action slug. Deserialised through [`deserialize_action`] so
     /// unknown slugs fail at parse time instead of being silently
     /// dropped.
     #[serde(deserialize_with = "deserialize_action")]
     pub(crate) action: KeymapAction,
+    /// Tombstone marker: when `true` the row removes `action`'s slug from the
+    /// merged map (restoring the compiled-in default) instead of binding a key.
+    #[serde(default)]
+    pub(crate) reset: bool,
 }
 
 fn deserialize_action<'de, D>(deserializer: D) -> Result<KeymapAction, D::Error>
@@ -146,6 +157,10 @@ pub(crate) enum KeybindingsError {
         key: String,
         reserved: &'static str,
     },
+    /// A `[[bindings]]` row was neither a valid override (a `key` with no
+    /// `reset`) nor a valid tombstone (`reset = true` with no `key`): it set
+    /// both, or set neither. Carries the action so the message can name the row.
+    MalformedRow { action: KeymapAction },
 }
 
 impl fmt::Display for KeybindingsError {
@@ -171,6 +186,12 @@ impl fmt::Display for KeybindingsError {
             } => write!(
                 f,
                 "cannot rebind action {:?} to {key:?}: {reserved} is reserved",
+                action.slug()
+            ),
+            Self::MalformedRow { action } => write!(
+                f,
+                "binding row for action {:?} must set either `key` (an override) \
+                 or `reset = true` (a tombstone), not both or neither",
                 action.slug()
             ),
         }
@@ -210,23 +231,57 @@ impl KeybindingsFile {
     /// Returns the first validation failure rather than collecting:
     /// misconfiguring a personal keymap file should be loud and
     /// all-or-nothing, not silently partially-applied.
+    ///
+    /// Tombstone rows (`reset = true`) are validated but do not appear here;
+    /// callers that need them use [`Self::into_overrides_and_tombstones`].
+    ///
+    /// Test-only: production resolves through
+    /// [`Self::into_overrides_and_tombstones`] so tombstones are honoured.
+    #[cfg(test)]
     pub(crate) fn into_override_map(self) -> Result<BTreeMap<String, String>, KeybindingsError> {
-        let mut out = BTreeMap::new();
-        for KeyBinding { key, action } in self.bindings {
-            let parsed = parse_keyspec(&key).ok_or_else(|| KeybindingsError::InvalidKeyspec {
-                action,
-                key: key.clone(),
-            })?;
-            if let Some(reserved) = reserved_label(&parsed) {
-                return Err(KeybindingsError::ReservedKey {
-                    action,
-                    key,
-                    reserved,
-                });
+        Ok(self.into_overrides_and_tombstones()?.0)
+    }
+
+    /// Validate every row and split it into the override map (`key` rows) and
+    /// the set of tombstoned slugs (`reset = true` rows). A tombstone removes its
+    /// slug from the merged map at load time, so a base `[tui.keymap]` override
+    /// the user reset survives a restart instead of resurrecting (deep-review
+    /// #96). The same first-failure-wins, all-or-nothing validation applies.
+    pub(crate) fn into_overrides_and_tombstones(
+        self,
+    ) -> Result<(BTreeMap<String, String>, std::collections::BTreeSet<String>), KeybindingsError>
+    {
+        let mut overrides = BTreeMap::new();
+        let mut tombstones = std::collections::BTreeSet::new();
+        for KeyBinding { key, action, reset } in self.bindings {
+            match (key, reset) {
+                // Tombstone: `reset = true` and no `key`.
+                (None, true) => {
+                    tombstones.insert(action.slug().to_string());
+                }
+                // Override: a `key` and no `reset`.
+                (Some(key), false) => {
+                    let parsed =
+                        parse_keyspec(&key).ok_or_else(|| KeybindingsError::InvalidKeyspec {
+                            action,
+                            key: key.clone(),
+                        })?;
+                    if let Some(reserved) = reserved_label(&parsed) {
+                        return Err(KeybindingsError::ReservedKey {
+                            action,
+                            key,
+                            reserved,
+                        });
+                    }
+                    overrides.insert(action.slug().to_string(), key);
+                }
+                // Ambiguous: both set, or neither set.
+                (Some(_), true) | (None, false) => {
+                    return Err(KeybindingsError::MalformedRow { action });
+                }
             }
-            out.insert(action.slug().to_string(), key);
         }
-        Ok(out)
+        Ok((overrides, tombstones))
     }
 }
 
@@ -332,7 +387,15 @@ pub(crate) fn merge_user_overrides(
         return Ok(merged);
     }
     let file = KeybindingsFile::load(path)?;
-    for (slug, spec) in file.into_override_map()? {
+    let (overrides, tombstones) = file.into_overrides_and_tombstones()?;
+    // A tombstone removes the slug so a base `[tui.keymap]` override the user
+    // reset in the editor does not resurrect on restart. Applied before the
+    // overrides so a slug that is BOTH tombstoned and re-bound in the same file
+    // keeps its explicit re-binding (the override wins) rather than vanishing.
+    for slug in &tombstones {
+        merged.remove(slug);
+    }
+    for (slug, spec) in overrides {
         merged.insert(slug, spec);
     }
     Ok(merged)
