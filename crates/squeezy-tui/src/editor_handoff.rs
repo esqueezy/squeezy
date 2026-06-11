@@ -263,11 +263,25 @@ where
         return Err(error);
     }
 
-    let read_result = std::fs::read_to_string(&path);
-    // Delete the temp file regardless of how the read went — the buffer is now
-    // in memory (or the read failed and there is nothing to keep).
-    let _ = std::fs::remove_file(&path);
-    let edited = read_result?;
+    // Only delete the temp file when the read-back SUCCEEDS — the buffer is then
+    // safely in memory. A read failure (e.g. the editor saved non-UTF-8 bytes)
+    // must PRESERVE the user's edits on disk and surface the path, rather than
+    // silently destroying the session by deleting an unreadable buffer.
+    let edited = match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let _ = std::fs::remove_file(&path);
+            text
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "editor handoff read failed; your edits are preserved at {}: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
     Ok(classify_result(initial_text, &edited))
 }
 

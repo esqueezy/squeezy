@@ -231,6 +231,54 @@ fn run_handoff_slow_editor_completes_after_the_closure_returns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// deep-review #54: when read-back fails (the editor saved non-UTF-8 bytes),
+/// `run_handoff` must PRESERVE the user's edits on disk and surface the path —
+/// not delete the temp file and destroy the session. The old code removed the
+/// file before the `?` on the read result propagated.
+#[test]
+fn run_handoff_preserves_the_temp_file_when_read_back_fails() {
+    let dir = unique_dir("nonutf8");
+    let pid = 1234u32;
+    let seq = 11u64;
+    let expected_path = dir.join(temp_file_name(EditorTarget::Composer, pid, seq));
+    let command = EditorCommand {
+        program: "fake".to_string(),
+        args: Vec::new(),
+    };
+    let result = run_handoff(
+        &command,
+        EditorTarget::Composer,
+        "before",
+        &dir,
+        pid,
+        seq,
+        |_command, path| {
+            // The "editor" saves bytes that are not valid UTF-8.
+            std::fs::write(path, [0xff, 0xfe, 0x00])
+        },
+    );
+
+    // (a) The handoff errors rather than silently dropping the edit.
+    let error = result.expect_err("a non-UTF-8 save surfaces as an error");
+    // (c) The error message carries the path so the user can recover.
+    assert!(
+        error
+            .to_string()
+            .contains(&expected_path.display().to_string()),
+        "the error must surface the preserved path, got: {error}"
+    );
+    // (b) The temp file STILL EXISTS and holds the saved bytes.
+    let bytes = std::fs::read(&expected_path).expect("the edits are preserved on disk");
+    assert_eq!(
+        bytes,
+        [0xff, 0xfe, 0x00],
+        "the preserved file holds the editor's saved bytes"
+    );
+
+    let _ = std::fs::remove_file(&expected_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Security (deep-review #23/#53, CWE-59 symlink + CWE-377 mode): `run_handoff`
 /// must create its temp file exclusively. If a symlink is pre-planted at the
 /// predictable temp path pointing at a sentinel outside `dir`, the old
