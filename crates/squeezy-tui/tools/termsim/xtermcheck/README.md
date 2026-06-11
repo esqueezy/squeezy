@@ -1,11 +1,17 @@
-# xtermcheck — the gated VS Code (xterm.js) oracle leg
+# xtermcheck — the standalone VS Code (xterm.js) oracle
 
-`xtermcheck` is the **out-of-process VS Code oracle leg** of the `squeezy-tui`
-term-matrix (`crates/squeezy-tui/src/termsim/`). The in-process Rust legs replay
-a captured ANSI stream through `vt100` and `alacritty_terminal`; this leg replays
-the *same* stream through [`@xterm/headless`](https://www.npmjs.com/package/@xterm/headless),
-the exact terminal engine VS Code's integrated terminal (and anything else built
-on xterm.js) uses.
+`xtermcheck` is an **out-of-process VS Code oracle** for the `squeezy-tui`
+append-only renderer. It replays a captured ANSI stream through
+[`@xterm/headless`](https://www.npmjs.com/package/@xterm/headless), the exact
+terminal engine VS Code's integrated terminal (and anything else built on
+xterm.js) uses, and asserts the renderer's turn divider does not stack.
+
+> **History:** this used to be one leg of an in-process Rust term-matrix under
+> `crates/squeezy-tui/src/termsim/` (vt100 + alacritty_terminal legs feeding the
+> same stream). That matrix and its `paint_main` producer were removed during the
+> alt-screen migration (Phase 10). `xtermcheck` now stands on its own: it consumes
+> the self-describing `CaptureLog` JSON documented below, so it needs no Rust
+> producer, and it carries its own Node regression tests under `test/`.
 
 It exists to catch the one regression those well-behaved Rust emulators cannot
 see: under xterm.js's cursor/reflow behavior, the append-only renderer can leave
@@ -15,11 +21,25 @@ more means stale dividers stacked. `xtermcheck` exits non-zero when that happens
 
 ## Why it is gated
 
-xterm.js is a Node/npm dependency, so this leg is **opt-in**: the matrix runs it
-only when `node` is present (and `@xterm/headless` is installed). On machines
-without Node — and in the default `cargo test` path — the Rust legs run alone and
-this oracle is skipped. Treat a missing `node` as "oracle not run", not as a
-pass; CI that wants the VS Code guarantee must provision Node and install deps.
+xterm.js is a Node/npm dependency, so this oracle is **opt-in**: it runs only
+when `node` is present (and `@xterm/headless` is installed). The default
+`cargo test` path does not invoke it. Treat a missing `node` as "oracle not run",
+not as a pass; CI that wants the VS Code guarantee must provision Node and install
+deps.
+
+## Tests
+
+The oracle carries its own Node regression tests (no Rust producer required):
+
+```sh
+cd crates/squeezy-tui/tools/termsim/xtermcheck
+npm install        # pulls @xterm/headless
+npm test           # runs node --test against test/
+```
+
+The headline test feeds a two-frame `CaptureLog` (`test/fixtures/`) whose first
+frame is wide and second frame is narrow, so that correct per-frame replay
+surfaces a divider stack across the width change.
 
 ## Setup
 
@@ -52,8 +72,9 @@ xtermcheck: OK — no divider stacking
 
 ## CaptureLog JSON contract
 
-The input mirrors `CaptureLog` / `FrameMark` in
-`crates/squeezy-tui/src/termsim/types.rs`:
+The input is a self-describing `CaptureLog`: a byte stream plus per-frame marks
+(formerly the `CaptureLog` / `FrameMark` Rust types; the producer is gone, but
+the JSON shape is stable and self-contained):
 
 ```json
 {
@@ -80,35 +101,20 @@ per-frame resize the harness drove. After the last frame it reads the live
 viewport (`buffer.active`, anchored at `baseY`) and counts rows matching
 `/☽[^\n]*?[─╌┈]/u`.
 
-## Exporting a CaptureLog from the Rust harness
+## Producing a CaptureLog
 
-The Rust side already produces a `CaptureLog` (`bytes: Vec<u8>` + `frames:
-Vec<FrameMark>`) in `crates/squeezy-tui/src/termsim/`. To feed it here, serialize
-it to the JSON shape above. A minimal exporter (no new public types needed):
+There is no longer a Rust `CaptureLog` producer (the old `src/termsim/` harness
+was removed). A capture is just the JSON above, so any process that can capture
+squeezy's emitted byte stream plus the `(w, h)` in effect at each paint can write
+one. The committed `test/fixtures/*.json` are hand-built examples; produce more
+the same way (collect the bytes, record a `byte_offset` + `w`/`h` per frame,
+base64- or hex-encode the bytes).
 
-```rust
-// In a #[cfg(test)] helper or a small bin, given a `CaptureLog` `log`:
-use base64::Engine as _;
-
-let json = serde_json::json!({
-    "bytes_base64": base64::engine::general_purpose::STANDARD.encode(&log.bytes),
-    "frames": log.frames.iter().map(|f| serde_json::json!({
-        "byte_offset": f.byte_offset,
-        "w": f.w,
-        "h": f.h,
-    })).collect::<Vec<_>>(),
-});
-std::fs::write("capturelog.json", serde_json::to_vec_pretty(&json)?)?;
-```
-
-(If you prefer zero base64 dependency, emit `bytes_hex` instead:
-`log.bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()`.)
-
-Then the matrix's gated step is simply:
+To run the oracle against a capture in CI or a script:
 
 ```sh
 command -v node >/dev/null 2>&1 \
   && node crates/squeezy-tui/tools/termsim/xtermcheck/replay.js capturelog.json
 ```
 
-a non-zero exit fails the VS Code oracle leg.
+A non-zero exit fails the VS Code oracle.

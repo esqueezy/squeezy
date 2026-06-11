@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 
-// xtermcheck — the gated VS Code (xterm.js) oracle leg of the termsim matrix.
+// xtermcheck — the standalone, gated VS Code (xterm.js) oracle.
 //
-// It loads an exported CaptureLog (the same append-only ANSI stream the Rust
-// `paint_main` path emits, serialized to JSON), replays it through
+// It loads a CaptureLog (the append-only ANSI stream squeezy's renderer emits,
+// serialized to the self-describing JSON shape below), replays it through
 // @xterm/headless — the exact terminal engine VS Code's integrated terminal
 // uses — and asserts that the moon-crescent (`☽`) divider does NOT stack.
+//
+// (Historically this was one leg of an in-process Rust term-matrix whose
+// `paint_main` producer lived under crates/squeezy-tui/src/termsim/; that
+// matrix was removed in the alt-screen migration, so this oracle now stands
+// alone and consumes the JSON contract directly.)
 //
 // "Stacking" is the migration regression this oracle exists to catch: under
 // xterm.js's cursor/reflow behavior the append-only renderer could leave more
@@ -14,16 +19,16 @@
 // one (or zero, before the first turn closes) is correct; two or more means the
 // renderer left stale dividers painted, so we exit non-zero.
 //
-// CaptureLog JSON shape (mirrors crates/squeezy-tui/src/termsim/types.rs):
+// CaptureLog JSON shape (self-describing; no Rust producer required):
 //   {
 //     "bytes_base64": "...",          // OR "bytes_hex": "..."
 //     "frames": [ { "byte_offset": N, "w": COLS, "h": ROWS }, ... ]
 //   }
 // Frame i's bytes are bytes[frames[i-1].byte_offset .. frames[i].byte_offset]
 // (frame 0 starts at offset 0), so the log is self-slicing per frame. Each
-// frame carries the FixedSize (w, h) in effect when it was painted, so we
+// frame carries the (w, h) in effect when it was painted, so we
 // term.resize(w, h) before writing that frame's slice — reproducing the
-// per-frame resize the real harness drives.
+// per-frame resize that drove the original capture.
 
 const fs = require('fs');
 const path = require('path');
@@ -98,8 +103,8 @@ function readViewportLines(term) {
   for (let y = 0; y < rows; y++) {
     const line = buffer.getLine(base + y);
     // translateToString(trimRight=true) drops trailing blank cells so rows
-    // compare cleanly across reflows, matching the Rust legs (alacritty trims
-    // trailing spaces; vt100's rows() trims too).
+    // compare cleanly across reflows (trailing spaces are not significant for
+    // divider detection).
     lines.push(line ? line.translateToString(true) : '');
   }
   return lines;
