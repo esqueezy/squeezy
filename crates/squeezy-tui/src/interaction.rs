@@ -296,6 +296,11 @@ pub(crate) enum ChromeKey {
     /// index in [`crate::glyph_mode::GlyphMode::ALL`] (0=Unicode, 1=Compact,
     /// 2=ASCII) so a click selects exactly that mode (the mouse twin of ↑↓).
     GlyphModeRow(usize),
+    /// A field row in the Smart Split Panes overlay (§12.4.2), keyed by its 0-based
+    /// index in [`crate::smart_split::SplitField::ALL`] (0=pane kind, 1=orientation,
+    /// 2=split ratio) so a click focuses + adjusts exactly that row (the mouse twin
+    /// of ↑↓ + ←→/Space).
+    SmartSplitField(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -631,6 +636,12 @@ pub(crate) enum Action {
     /// a subagent row reaches the same `jump_to_subagent_index` handler the verb
     /// does. A capped subagent (no transcript) resolves to a select-only no-op.
     SubagentJump(usize),
+    /// Focus + adjust the given field row (by 0-based index in
+    /// [`crate::smart_split::SplitField::ALL`]) in the Smart Split Panes overlay
+    /// (§12.4.2). Mouse twin of moving the field focus with ↑↓ and adjusting it with
+    /// ←→/Space; a click on a field row both focuses it and steps its value forward
+    /// in one go (cycle the pane kind / orientation, or widen the split).
+    SmartSplitAdjustField(usize),
 }
 
 impl Action {
@@ -717,6 +728,7 @@ impl Action {
         Action::SubagentCompareMark(0),
         Action::ReviewBoardSelectJump(0),
         Action::JumpToAttention,
+        Action::SmartSplitAdjustField(0),
     ];
 }
 

@@ -158,6 +158,7 @@ mod session_timeline;
 mod settings_watcher;
 mod signal_teardown;
 mod size_source;
+mod smart_split;
 mod snippet_store;
 mod startup_model_picker;
 mod status;
@@ -1890,6 +1891,9 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         // The Minimal Glyph Mode overlay (§12.7.6) is modal: block the switch like
         // every other overlay above.
         || app.glyph_mode_editor.is_some()
+        // The Smart Split Panes inspector (§12.4.2) is modal: block the switch like
+        // every other overlay above.
+        || app.smart_split.is_some()
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
@@ -2815,6 +2819,36 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             )) = app.click_target_at(mouse.column, mouse.row)
         {
             glyph_mode_select_row(app, index);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Smart Split Panes inspector (§12.4.2) owns the pointer while open: a
+    // left-click on a field row focuses + adjusts that control (the mouse twin of
+    // ↑↓ + →/Space). Every other click is swallowed so a stray press can't fall
+    // through to the surface beneath. Hit-tested in ABSOLUTE screen coordinates
+    // against the targets `render_smart_split_surface` registered this frame.
+    if app.smart_split.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind {
+            // A click on a field row focuses + adjusts that control.
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SmartSplitField(_)),
+                interaction::Action::SmartSplitAdjustField(index),
+            )) = app.click_target_at(mouse.column, mouse.row)
+            {
+                smart_split_adjust_field(app, index);
+            } else if let Some((main, pane)) = app.smart_split_rect_cache.get() {
+                // A click on the previewed PANE region of the diagram widens the
+                // split; a click on the MAIN region narrows it — direct manipulation
+                // of the split ratio, the mouse twin of the Split field's ←→. Routed
+                // by `rect_contains` against the diagram's real on-screen rects.
+                if smart_split::rect_contains(pane, mouse.column, mouse.row) {
+                    smart_split_drag_ratio(app, true);
+                } else if smart_split::rect_contains(main, mouse.column, mouse.row) {
+                    smart_split_drag_ratio(app, false);
+                }
+            }
         }
         // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
@@ -5748,6 +5782,166 @@ fn glyph_mode_commit(app: &mut TuiApp, _agent: &mut Agent) {
     app.needs_redraw = true;
 }
 
+/// Open / close the Smart Split Panes inspector overlay (§12.4.2). On open it
+/// seeds the overlay with the *natural* pane kind for what the user is currently
+/// focused on — Compare while the pinned-compare view is up, Scratch while the
+/// scratchpad pane is open, Detail otherwise — so the previewed layout matches the
+/// surface the user is reasoning about. The same chord closes it.
+fn toggle_smart_split(app: &mut TuiApp) {
+    if app.smart_split.is_some() {
+        app.smart_split = None;
+        app.smart_split_rect_cache.set(None);
+        app.status = "split inspector closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let kind = if app.pinned_compare.is_some() {
+        smart_split::PaneKind::Compare
+    } else if app.scratchpad_open {
+        smart_split::PaneKind::Scratch
+    } else {
+        smart_split::PaneKind::Detail
+    };
+    app.smart_split = Some(smart_split::SmartSplitState::new(kind));
+    app.smart_split_rect_cache.set(None);
+    app.status = smart_split_status(app);
+    app.needs_redraw = true;
+}
+
+/// The status line shown while the Smart Split Panes overlay is open: the chosen
+/// placement for the current terminal size + the in-overlay verb legend.
+fn smart_split_status(app: &TuiApp) -> String {
+    let Some(state) = app.smart_split else {
+        return "split inspector closed".to_string();
+    };
+    let placement = state.solve(smart_split_preview_content(app));
+    format!(
+        "split: {} \u{00b7} {} \u{2014} \u{2191}\u{2193} field \u{00b7} \u{2190}\u{2192}/Space adjust \u{00b7} r reset \u{00b7} Esc close",
+        state.kind().label(),
+        placement.label(),
+    )
+}
+
+/// The content rect the overlay's preview solver runs against: the live frame
+/// size (stamped each render) minus the overlay's own border inset, falling back
+/// to a terminal-size query when no frame has been stamped yet (e.g. a direct
+/// status call in a test). This is the area the *real* transcript+pane split would
+/// be solved against, so the preview is honest about what the current terminal can
+/// do.
+fn smart_split_preview_content(app: &TuiApp) -> Rect {
+    let (w, h) = app.off_frame_terminal_size();
+    Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    }
+}
+
+/// Handle a key while the Smart Split Panes overlay (§12.4.2) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or the
+/// global keymap while the overlay owns focus). The overlay is modal: its own
+/// toggle chord and Esc close; ↑/↓ (and k/j) move the field focus; ←/→/Space adjust
+/// the focused field (cycle the pane kind / orientation, or widen/narrow the
+/// split); `r`/Delete reset the orientation + ratio to their defaults.
+fn handle_smart_split_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.smart_split.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord closes it (the same key opens and closes).
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleSmartSplit) {
+        toggle_smart_split(app);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            toggle_smart_split(app);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = app.smart_split.as_mut() {
+                state.focus_prev();
+            }
+            app.status = smart_split_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = app.smart_split.as_mut() {
+                state.focus_next();
+            }
+            app.status = smart_split_status(app);
+            app.needs_redraw = true;
+        }
+        // → and Space step the focused field forward; ← steps it backward.
+        KeyCode::Right | KeyCode::Char(' ') => {
+            if let Some(state) = app.smart_split.as_mut() {
+                state.adjust_forward();
+            }
+            app.smart_split_rect_cache.set(None);
+            app.status = smart_split_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Left => {
+            if let Some(state) = app.smart_split.as_mut() {
+                state.adjust_backward();
+            }
+            app.smart_split_rect_cache.set(None);
+            app.status = smart_split_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Char('r') | KeyCode::Backspace | KeyCode::Delete => {
+            if let Some(state) = app.smart_split.as_mut() {
+                state.reset();
+            }
+            app.smart_split_rect_cache.set(None);
+            app.status = smart_split_status(app);
+            app.needs_redraw = true;
+        }
+        _ => {}
+    }
+    // The overlay is modal: swallow every key so nothing leaks to the composer
+    // beneath, even keys it does not act on.
+    true
+}
+
+/// Focus + adjust a Smart Split field by its [`smart_split::SplitField::ALL`] index
+/// (the mouse twin of ↑↓ onto a row then →/Space, fed by a click on a field row).
+/// Focusing a not-yet-focused row just moves the cursor; a click on the already
+/// focused row steps its value forward, so a click both focuses and adjusts in one
+/// go like the other overlay field editors. Refreshes the status line and requests
+/// a redraw.
+fn smart_split_adjust_field(app: &mut TuiApp, index: usize) {
+    if let Some(state) = app.smart_split.as_mut() {
+        let was_focused = state.cursor() == index;
+        if was_focused {
+            state.adjust_forward();
+        } else {
+            state.focus_row(index);
+        }
+    }
+    app.smart_split_rect_cache.set(None);
+    app.status = smart_split_status(app);
+    app.needs_redraw = true;
+}
+
+/// Resize the previewed split by clicking the diagram (§12.4.2): a click on the
+/// pane region widens the pane (`widen == true`), a click on the main region
+/// narrows it. Moves the field focus onto the Split row first (so the readout
+/// follows the adjustment, the mouse twin of focusing it with ↑↓), then nudges the
+/// ratio. Refreshes the status line and requests a redraw.
+fn smart_split_drag_ratio(app: &mut TuiApp, widen: bool) {
+    if let Some(state) = app.smart_split.as_mut() {
+        state.focus_row(smart_split::SplitField::Ratio.index());
+        if widen {
+            state.ratio_widen();
+        } else {
+            state.ratio_narrow();
+        }
+    }
+    app.smart_split_rect_cache.set(None);
+    app.status = smart_split_status(app);
+    app.needs_redraw = true;
+}
+
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
 /// `true` when the key was consumed (so it never leaks to the composer or the
 /// global keymap). Two modes:
@@ -6743,6 +6937,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Smart Split Panes inspector (§12.4.2) is modal while open: it owns the
+    // keyboard (↑↓/kj move the field focus, ←→/Space adjust the focused field,
+    // r/Delete reset, Esc/Ctrl+Alt+V close) BEFORE any selection-clear, search,
+    // chord, or keymap dispatch, so a stray key never leaks into the composer
+    // underneath. Sits beside the other front-of-loop overlays for the same reason.
+    if app.smart_split.is_some() && handle_smart_split_key(app, key) {
+        return Ok(false);
+    }
+
     // The Entry Annotations overlay (§12.2.5) is modal while open: it owns the
     // keyboard (↑↓/kj/n/p move the annotation cursor, Enter jump, e edit, d/Delete
     // delete, Esc/Alt+\ close — or, in edit mode, free text compose) BEFORE any
@@ -7332,6 +7535,9 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
         || app.terminal_profile_editor.is_some()
         || app.gesture_settings_editor.is_some()
         || app.glyph_mode_editor.is_some()
+        // The Smart Split Panes inspector (§12.4.2) is likewise modal with no text
+        // field, so it swallows paste too.
+        || app.smart_split.is_some()
     {
         return Ok(());
     }
@@ -8945,6 +9151,15 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_glyph_mode_editor(app);
+            true
+        }
+        keymap::Action::ToggleSmartSplit => {
+            // §12.4.2: open / close the Smart Split Panes inspector.
+            // Main-surface overlay; the config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_smart_split(app);
             true
         }
     }
@@ -12466,6 +12681,9 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.terminal_profile_editor.is_some()
         || app.gesture_settings_editor.is_some()
         || app.glyph_mode_editor.is_some()
+        // The Smart Split Panes inspector (§12.4.2) owns the surface too, so the
+        // hint would paint behind it — suppress.
+        || app.smart_split.is_some()
 }
 
 /// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
@@ -16455,6 +16673,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // (filtered) subagent list, matching the row's select target.
         interaction::Action::SubagentTimelinePromote(index) => {
             promote_subagent_timeline_row(app, index);
+        }
+        // §12.4.2: a click on a Smart Split Panes field row focuses + adjusts it —
+        // the same handler the keyboard ↑↓ + →/Space path drives, so keyboard/mouse
+        // parity holds by construction. The index is into
+        // `smart_split::SplitField::ALL`, matching the row's click target.
+        interaction::Action::SmartSplitAdjustField(index) => {
+            smart_split_adjust_field(app, index);
         }
     }
 }
@@ -22703,6 +22928,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_glyph_mode_surface(frame, area, app, editor);
         return;
     }
+    // The Smart Split Panes inspector (§12.4.2) paints as a fullscreen modal over
+    // the main surface while open, registering its per-field-row click targets and
+    // stamping the previewed pane rects every frame. Checked beside the glyph-mode
+    // overlay so its targets register and it owns the surface while open.
+    if let Some(state) = &app.smart_split {
+        render_smart_split_surface(frame, area, app, *state);
+        return;
+    }
     if let Some(state) = &app.config_screen {
         config_screen::render(frame, area, state);
         return;
@@ -25619,6 +25852,283 @@ fn render_glyph_mode_surface(
                 x: inner.x,
                 y: footer_y,
                 width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// Paint the Smart Split Panes inspector (§12.4.2) as a centered modal: a header
+/// with the in-overlay verb legend, one selectable field row per control (pane
+/// kind / orientation / split ratio), and a live preview of the placement the
+/// §12.4.2 solver would choose for the current terminal — including the "single
+/// column" graceful-fallback state on a too-narrow terminal. Registers each field
+/// row's click target and stamps the previewed `(main, pane)` rects into the
+/// frame-local registry so the wheel/click hit-test can route a pointer to the
+/// previewed pane.
+fn render_smart_split_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    state: smart_split::SmartSplitState,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Smart split ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} adaptive pane layout ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 72, 16, title);
+    if inner.width == 0 || inner.height == 0 {
+        app.smart_split_rect_cache.set(None);
+        return;
+    }
+
+    // The placement the solver picks for the live terminal — what the preview
+    // diagram and the footer describe.
+    let content = smart_split_preview_content(app);
+    let placement = state.solve(content);
+
+    // Header: the in-overlay verb legend.
+    let header = Line::from(Span::styled(
+        "\u{2191}\u{2193} field \u{00b7} \u{2190}\u{2192}/Space adjust \u{00b7} r reset \u{00b7} Esc close",
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    // The three control rows: pane kind, orientation, split ratio. Each is a
+    // clickable field; the focused row gets a caret + emphasis, and ←→/Space (or a
+    // click on the focused row) adjusts its value.
+    let cursor = state.cursor();
+    let bottom = inner.y.saturating_add(inner.height);
+    let body_top = inner.y.saturating_add(2);
+    for (index, field) in smart_split::SplitField::ALL.iter().enumerate() {
+        let y = body_top.saturating_add(index as u16);
+        if y >= bottom {
+            break;
+        }
+        let is_focused = index == cursor;
+        let row_rect = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        let caret = if is_focused { "\u{203a} " } else { "  " };
+        let value = match field {
+            smart_split::SplitField::Kind => state.kind().label().to_string(),
+            smart_split::SplitField::Orientation => state.orientation().label().to_string(),
+            smart_split::SplitField::Ratio => {
+                let steps = state.ratio().steps();
+                match steps.cmp(&0) {
+                    std::cmp::Ordering::Equal => "balanced".to_string(),
+                    std::cmp::Ordering::Greater => format!("pane +{steps}"),
+                    std::cmp::Ordering::Less => format!("pane {steps}"),
+                }
+            }
+        };
+        let value_style = if is_focused {
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_focused {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:<13}", field.label()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(format!("{value:<14}"), value_style),
+            Span::styled(
+                match field {
+                    smart_split::SplitField::Kind => state.kind().description(),
+                    smart_split::SplitField::Orientation => "Auto picks from terminal aspect ratio",
+                    smart_split::SplitField::Ratio => "\u{2190}\u{2192} resize the pane",
+                },
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::SmartSplitField(index)),
+            interaction::Action::SmartSplitAdjustField(index),
+        );
+    }
+
+    // Preview line: the placement the solver chose for the live terminal, in plain
+    // words, so the user sees the decision (and the graceful single-column fallback
+    // when too narrow) before any real split is drawn.
+    let preview_y = body_top.saturating_add(smart_split::SplitField::ALL.len() as u16 + 1);
+    if preview_y < bottom {
+        let summary = match placement {
+            smart_split::PanePlacement::Side { main, pane, .. } => format!(
+                "side-by-side: transcript {}w \u{00b7} {} pane {}w",
+                main.width,
+                state.kind().label(),
+                pane.width,
+            ),
+            smart_split::PanePlacement::Stacked { main, pane, .. } => format!(
+                "stacked: transcript {}h \u{00b7} {} pane {}h",
+                main.height,
+                state.kind().label(),
+                pane.height,
+            ),
+            smart_split::PanePlacement::SingleColumn { .. } => format!(
+                "single column ({}x{} too small to split) \u{2014} pane \u{2192} overlay",
+                content.width, content.height,
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "layout: ",
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+                Span::styled(
+                    summary,
+                    Style::default()
+                        .fg(if placement.is_split() {
+                            crate::render::theme::secondary()
+                        } else {
+                            crate::render::theme::quiet()
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            Rect {
+                x: inner.x,
+                y: preview_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    // A small on-screen DIAGRAM of the placement, in the footer band of the modal.
+    // Running the SAME solver against this little box (rather than the live frame)
+    // gives a faithful, to-scale picture of where the pane lands — side, stacked, or
+    // a single column on a box too small to split. The diagram's real screen rects
+    // are stamped into the frame-local registry so the wheel/click hit-test
+    // (`rect_contains`) routes a pointer to the previewed pane.
+    let diagram_top = preview_y.saturating_add(2);
+    let diagram_h = bottom.saturating_sub(diagram_top);
+    if diagram_top < bottom && diagram_h >= 3 && inner.width >= 4 {
+        let box_rect = Rect {
+            x: inner.x,
+            y: diagram_top,
+            width: inner.width,
+            height: diagram_h.min(5),
+        };
+        // Solve the *same* layout against the diagram box (default thresholds lowered
+        // here so even a small diagram can show a split shape; the live decision
+        // above already reported the true frame placement).
+        let diagram_solver = smart_split::LayoutSolver {
+            min_side_width: 12,
+            min_stack_height: 4,
+        };
+        let shape =
+            diagram_solver.solve(box_rect, state.kind(), state.orientation(), state.ratio());
+        // Draw the main (transcript) region.
+        draw_split_region(
+            frame,
+            shape.main(),
+            "transcript",
+            crate::render::theme::secondary(),
+        );
+        // Draw the separator rule, if the diagram split at all.
+        if let Some(sep) = shape.separator() {
+            let sep_glyph = if sep.width == 1 {
+                "\u{2502}"
+            } else {
+                "\u{2500}"
+            };
+            for row in sep.y..sep.y.saturating_add(sep.height) {
+                for col in sep.x..sep.x.saturating_add(sep.width) {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            sep_glyph,
+                            Style::default().fg(crate::render::theme::quiet()),
+                        ))),
+                        Rect {
+                            x: col,
+                            y: row,
+                            width: 1,
+                            height: 1,
+                        },
+                    );
+                }
+            }
+        }
+        // Draw the pane region (when the diagram split), labelled with the pane kind.
+        if let Some(pane) = shape.pane() {
+            draw_split_region(
+                frame,
+                pane,
+                state.kind().label(),
+                crate::render::theme::accent(),
+            );
+        }
+        // Stamp the diagram's real on-screen rects so the mouse handler can route a
+        // pointer to the previewed pane. The inner (border-stripped) rects are what a
+        // click should land on, so use `pane_inner` for both.
+        app.smart_split_rect_cache.set(shape.pane().map(|pane| {
+            (
+                smart_split::pane_inner(shape.main()),
+                smart_split::pane_inner(pane),
+            )
+        }));
+    } else {
+        // No room for the diagram: clear the cache so a stale rect never routes a
+        // pointer to a pane that is not painted this frame.
+        app.smart_split_rect_cache.set(None);
+    }
+}
+
+/// Draw one region of the Smart Split preview diagram: a rounded border block with
+/// a centered label, used for both the transcript and the pane sub-rects. A no-op
+/// for a region too small to hold a border (so a tiny diagram degrades cleanly).
+fn draw_split_region(frame: &mut Frame<'_>, rect: Rect, label: &str, color: ratatui::style::Color) {
+    if rect.width < 2 || rect.height < 2 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color));
+    let body = block.inner(rect);
+    frame.render_widget(block, rect);
+    // Center the (truncated) label in the bordered body.
+    let inner = smart_split::pane_inner(rect);
+    if inner.width > 0 && inner.height > 0 {
+        let truncated: String = label.chars().take(inner.width as usize).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncated,
+                Style::default().fg(color),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            Rect {
+                x: body.x,
+                y: body.y + body.height / 2,
+                width: body.width,
                 height: 1,
             },
         );
@@ -40978,6 +41488,19 @@ pub(crate) struct TuiApp {
     /// value restored from the user-scope config at startup) lowers it for limited
     /// terminals. An idle session pays one enum-tag read.
     pub(crate) glyph_mode: glyph_mode::GlyphMode,
+    /// Smart Split Panes (§12.4.2): the interactive split-layout inspector overlay,
+    /// or `None` when closed (the resting state, which paints nothing extra and
+    /// schedules no redraw). `Some` = the fullscreen overlay owns key/mouse routing
+    /// for picking the secondary pane kind, the orientation, and the split ratio,
+    /// previewing where the §12.4.2 layout solver would place the pane against the
+    /// live terminal. Opened by the `ToggleSmartSplit` keymap action.
+    pub(crate) smart_split: Option<smart_split::SmartSplitState>,
+    /// Frame-local pane rect registry for the Smart Split Panes overlay (§12.4.2):
+    /// the `(main, pane)` rects the solver carved this frame, or `None` when the
+    /// layout degraded to a single column (no pane). Stamped each frame the overlay
+    /// paints so the wheel/click hit-test can route a pointer to the previewed pane
+    /// without re-solving. Cleared on close.
+    pub(crate) smart_split_rect_cache: std::cell::Cell<Option<(Rect, Rect)>>,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -41970,6 +42493,8 @@ impl TuiApp {
             gesture_settings_override: None,
             glyph_mode_editor: None,
             glyph_mode: glyph_mode::GlyphMode::DEFAULT,
+            smart_split: None,
+            smart_split_rect_cache: std::cell::Cell::new(None),
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

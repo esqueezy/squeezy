@@ -554,6 +554,15 @@ pub(crate) enum Action {
     /// to the user-scope config. Costs nothing until opened; an idle session never
     /// paints it.
     OpenGlyphMode,
+    /// Smart Split Panes (§12.4.2): open / close the split-layout inspector
+    /// (`Ctrl+Alt+V` default). A small overlay that runs the §12.4.2 layout solver
+    /// over the live terminal and shows where it would place a secondary pane
+    /// (detail / scratch / compare) beside or below the transcript — choosing the
+    /// orientation from the terminal aspect, degrading to a single column when too
+    /// narrow. The cursor (↑↓) picks the pane kind / orientation / split ratio row,
+    /// ←→/Space adjust the focused row, `r`/Delete reset, Esc/the toggle close. The
+    /// overlay does not exist until opened, so an idle session pays nothing.
+    ToggleSmartSplit,
 }
 
 impl Action {
@@ -646,6 +655,7 @@ impl Action {
             Self::OpenTerminalProfile => "open_terminal_profile",
             Self::OpenGestureSettings => "open_gesture_settings",
             Self::OpenGlyphMode => "open_glyph_mode",
+            Self::ToggleSmartSplit => "toggle_smart_split",
         }
     }
 
@@ -737,6 +747,7 @@ impl Action {
         Action::OpenTerminalProfile,
         Action::OpenGestureSettings,
         Action::OpenGlyphMode,
+        Action::ToggleSmartSplit,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -1001,6 +1012,12 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+G`/`Ctrl+Alt+W` profile
             // chords and the rest of the Ctrl+Alt overlay/picker family above.
             | Self::OpenGlyphMode
+            // Smart Split Panes (§12.4.2) opens with `Ctrl+Alt+V` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family above. The always-available equivalent is the overlay's own
+            // ↑↓/←→ keys once opened.
+            | Self::ToggleSmartSplit
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1461,6 +1478,17 @@ impl Action {
             // of every composer chord.
             Self::OpenGlyphMode => KeyBinding::new(
                 KeyCode::Char('u'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Smart Split Panes (§12.4.2). `Ctrl+Alt+V` (mnemonic: split View) is a
+            // free `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/
+            // `N`/`T`/`B`/`E`/`W`/`Y`/`G`/`D`/`I`/`U`/`Q`/`O`/`Z` are taken by the
+            // macro/debug/overlay/picker/editor/profile/subagent chords above, and
+            // bare `Alt+v` is the copy-viewport verb, so the Ctrl+Alt modifier keeps
+            // the split inspector distinct from it while staying clear of every
+            // composer chord.
+            Self::ToggleSmartSplit => KeyBinding::new(
+                KeyCode::Char('v'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

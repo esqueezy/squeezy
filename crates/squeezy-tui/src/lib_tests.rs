@@ -17020,6 +17020,335 @@ fn last_message_content(app: &TuiApp) -> Option<&str> {
     }
 }
 
+// ===========================================================================
+// Smart Split Panes (§12.4.2)
+// ===========================================================================
+
+/// The `Ctrl+Alt+V` chord that opens / closes the Smart Split Panes inspector.
+fn smart_split_chord() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('v'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+#[tokio::test]
+async fn smart_split_keymap_chord_opens_and_closes_through_dispatch() {
+    // Keyboard path: the Ctrl+Alt+V keymap action drives the open/close through the
+    // real dispatch, the same routing a rebound key would take.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(app.smart_split.is_none());
+
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    assert!(consumed, "the chord is consumed by the keymap dispatch");
+    assert!(
+        app.smart_split.is_some(),
+        "Ctrl+Alt+V opens the split inspector"
+    );
+
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    assert!(consumed, "the chord is consumed again");
+    assert!(
+        app.smart_split.is_none(),
+        "the same chord closes the inspector"
+    );
+}
+
+#[tokio::test]
+async fn smart_split_overlay_renders_through_real_render_and_registers_field_targets() {
+    // Integration: open the overlay and render it through the real fullscreen
+    // `render()` on a wide TestBackend. The chosen layout text and every field row
+    // paint, and each field row registers its click target.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    assert!(app.smart_split.is_some());
+
+    let output = render_to_string(&app, 120, 30);
+    assert!(output.contains("Smart split"), "title paints: {output}");
+    assert!(output.contains("Pane"), "the pane-kind field row paints");
+    assert!(
+        output.contains("Orientation"),
+        "the orientation field row paints"
+    );
+    assert!(
+        output.contains("side-by-side"),
+        "a wide terminal previews a side split: {output}"
+    );
+
+    // Every field row registered a click target this frame.
+    for index in 0..smart_split::SplitField::ALL.len() {
+        let mut found = false;
+        'scan: for row in 0..30u16 {
+            for col in 0..120u16 {
+                if let Some((_, interaction::Action::SmartSplitAdjustField(i))) =
+                    app.click_target_at(col, row)
+                    && i == index
+                {
+                    found = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(found, "field row {index} registers a click target");
+    }
+}
+
+#[tokio::test]
+async fn smart_split_keyboard_cycles_pane_kind_and_orientation() {
+    // Keyboard path: ↓ moves the field focus, →/Space adjust the focused field.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    // Render once so the preview solver has a stamped frame size.
+    let _ = render_to_string(&app, 120, 30);
+
+    // Cursor starts on the Pane row; → cycles the pane kind forward.
+    let start_kind = app.smart_split.expect("open").kind();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        app.smart_split.expect("open").kind(),
+        start_kind,
+        "→ on the Pane row cycles the pane kind"
+    );
+
+    // ↓ to the Orientation row, then Space cycles the orientation off Auto.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.smart_split.expect("open").focused_field(),
+        smart_split::SplitField::Orientation
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        app.smart_split.expect("open").orientation(),
+        smart_split::Orientation::Auto,
+        "Space on the Orientation row cycles it off Auto"
+    );
+}
+
+#[tokio::test]
+async fn smart_split_reset_restores_defaults() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    let _ = render_to_string(&app, 120, 30);
+
+    // Shape the orientation off Auto, then reset.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        app.smart_split.expect("open").orientation(),
+        smart_split::Orientation::Auto
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.smart_split.expect("open").orientation(),
+        smart_split::Orientation::Auto,
+        "r resets the orientation to Auto"
+    );
+}
+
+#[tokio::test]
+async fn smart_split_mouse_click_on_field_row_adjusts_it() {
+    // Mouse path: a click on the (already-focused) Pane field row cycles the pane
+    // kind, the mouse twin of →/Space. Reuses the registered click target.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    let _ = render_to_string(&app, 120, 30);
+
+    // Locate the Pane (index 0) field row's registered click cell.
+    let mut cell = None;
+    'scan: for row in 0..30u16 {
+        for col in 0..120u16 {
+            if let Some((_, interaction::Action::SmartSplitAdjustField(0))) =
+                app.click_target_at(col, row)
+            {
+                cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = cell.expect("the Pane field row registers a click target");
+
+    let start_kind = app.smart_split.expect("open").kind();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_ne!(
+        app.smart_split.expect("open").kind(),
+        start_kind,
+        "clicking the focused Pane row cycles the pane kind"
+    );
+}
+
+#[tokio::test]
+async fn smart_split_mouse_click_on_preview_pane_widens_split() {
+    // Mouse path: clicking the previewed PANE region of the diagram widens the
+    // split ratio (direct manipulation), routed by `rect_contains` against the
+    // diagram's real on-screen rects cached this frame.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    let _ = render_to_string(&app, 120, 30);
+
+    let (_, pane) = app
+        .smart_split_rect_cache
+        .get()
+        .expect("a wide terminal previews a split with a pane rect");
+    assert!(pane.width > 0 && pane.height > 0);
+
+    let start_ratio = app.smart_split.expect("open").ratio().steps();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: pane.x,
+            row: pane.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.smart_split.expect("open").ratio().steps() > start_ratio,
+        "clicking the previewed pane widens the split"
+    );
+    assert_eq!(
+        app.smart_split.expect("open").focused_field(),
+        smart_split::SplitField::Ratio,
+        "the split-ratio field follows the mouse drag"
+    );
+}
+
+#[tokio::test]
+async fn smart_split_narrow_terminal_previews_single_column_fallback() {
+    // Edge case: on a terminal too small to split (narrow AND short), the inspector
+    // still opens and honestly reports the single-column graceful fallback, and the
+    // pane-rect cache stays empty (no pane painted to route a pointer to). 40x6 is
+    // below both MIN_SIDE_WIDTH (64) and MIN_STACK_HEIGHT (7).
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+
+    // Render at the tiny size so the preview solver measures against it, then nudge
+    // a key so the status line re-solves against the stamped frame.
+    let _ = render_to_string(&app, 40, 6);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.status.contains("single column"),
+        "a tiny terminal reports the single-column fallback in the status: {}",
+        app.status
+    );
+    // Re-render at the tiny size and confirm no pane rect is cached (single column
+    // has no pane).
+    let _ = render_to_string(&app, 40, 6);
+    assert!(
+        app.smart_split_rect_cache.get().is_none(),
+        "no pane rect is cached when the layout degrades to a single column"
+    );
+}
+
+#[tokio::test]
+async fn smart_split_resize_reflows_the_previewed_placement() {
+    // Resize: the same overlay previews a side split when wide and re-solves to a
+    // stack when the terminal becomes narrow-but-tall, recomputed from the model
+    // each frame (never frozen at open time).
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+
+    let wide = render_to_string(&app, 120, 30);
+    assert!(wide.contains("side-by-side"), "wide previews a side split");
+
+    let tall = render_to_string(&app, 40, 30);
+    assert!(
+        tall.contains("stacked"),
+        "narrow-but-tall previews a stacked split: {tall}"
+    );
+}
+
+#[tokio::test]
+async fn smart_split_overlay_swallows_keys_and_does_not_leak_to_composer() {
+    // The overlay is modal: a printable key typed while it is open is swallowed,
+    // never appended to the composer beneath.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_keymap_action(&mut app, &mut agent, smart_split_chord());
+    let _ = render_to_string(&app, 120, 30);
+    assert!(app.input.is_empty());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.input.is_empty(),
+        "a key typed while the overlay is open does not leak into the composer"
+    );
+    assert!(app.smart_split.is_some(), "the overlay stays open");
+
+    // Esc closes it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.smart_split.is_none(), "Esc closes the overlay");
+}
+
 async fn wait_for_turn_completion(app: &mut TuiApp) {
     for _ in 0..100 {
         drain_agent_events(app).await;

@@ -845,6 +845,13 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // default) and the timeline panel's own `y` key both reach the same
         // `promote_subagent_timeline_row` handler the click drives.
         A::SubagentTimelinePromote(_) => KeyboardPath::Keymap(Action::PromoteSubagentResult),
+        // Smart Split field adjust (§12.4.2) — the overlay's own ↑↓/←→/Space keys
+        // reach the same `smart_split_adjust_field`/`focus`/`adjust` handlers the
+        // field-row click drives, so keyboard/mouse parity holds. (The overlay also
+        // opens from the rebindable `ToggleSmartSplit` chord.)
+        A::SmartSplitAdjustField(_) => {
+            KeyboardPath::Always("smart split \u{2191}\u{2193}/\u{2190}\u{2192} keys")
+        }
     })
 }
 
