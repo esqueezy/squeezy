@@ -22730,6 +22730,13 @@ async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
                 };
                 // Carry the id sidecar with the removed slot so the two stay aligned.
                 app.prompt_queue_ids.remove(index);
+                // The pump can run while the reorder overlay is open (it omits
+                // `prompt_queue_overlay` from `prompt_queue_drain_blocked`), so the
+                // queue just shrank under the cursor. `selected` is the one piece of
+                // overlay state that is NOT id-stabilised, so clamp it before the
+                // next iteration or it could exceed `len - 1` and make Enter/'e'/'r'
+                // resolve `ids.get(selected)` to `None` (a dead key).
+                clamp_queue_focus(app);
                 let remaining = app.prompt_queue.len();
                 app.status = if remaining == 0 {
                     "running queued prompt".to_string()
@@ -22758,6 +22765,9 @@ async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
                         push_queue_undo(app, QueueMutation::Deleted { index, id, text });
                     }
                 }
+                // Same as the Run arm: the queue shrank under an open overlay, so
+                // stabilise the positional cursor before re-planning.
+                clamp_queue_focus(app);
                 app.status = format!("skipped queued prompt ({} left)", app.prompt_queue.len());
                 app.needs_redraw = true;
                 // Loop: re-plan against the now-shorter queue.

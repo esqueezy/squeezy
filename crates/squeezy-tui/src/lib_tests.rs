@@ -31717,6 +31717,89 @@ async fn condition_skip_drop_is_recoverable_via_queue_undo() {
 }
 
 #[tokio::test]
+async fn drain_under_open_overlay_clamps_the_focus_cursor() {
+    // The drain pump runs while the reorder overlay is open (it omits the overlay
+    // from `prompt_queue_drain_blocked`), shrinking the queue under the cursor.
+    // `selected` is NOT id-stabilised, so the pump must clamp it after every
+    // removal or `ids.get(selected)` goes out of range and Enter/'e'/'r' go dead.
+    // Front prompt = IfPrevSucceeded (skip-bound after a FAILED turn so it Drops);
+    // the rest are Manual so the pump parks (no real turn spawns).
+    let mut app = queue_app(&["drop-me", "park-a", "park-b"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // Condition the FRONT prompt: 1 cycle Always -> IfPrevSucceeded.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("cycle front to if-succeeded");
+    // Make rows 1 and 2 Manual so the pump stops after dropping the front.
+    for idx in [1usize, 2] {
+        if let Some(state) = app.prompt_queue_overlay.as_mut() {
+            state.selected = idx;
+        }
+        for _ in 0..5 {
+            handle_key(
+                &mut app,
+                &mut agent,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            )
+            .await
+            .expect("cycle to manual");
+        }
+    }
+    // Focus the LAST row (selected = len - 1 = 2) and KEEP the overlay open.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 2;
+    }
+    // A FAILED outcome makes the front IfPrevSucceeded prompt skip-bound.
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: false,
+        had_edits: false,
+    });
+    // The pump drops the front prompt (queue 3 -> 2) and parks at the manual row,
+    // all while the overlay is open with selected == 2 (now out of range).
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert_eq!(
+        queue_texts(&app),
+        vec!["park-a".to_string(), "park-b".to_string()],
+        "the skip-bound front prompt drained out",
+    );
+    assert!(app.turn_rx.is_none(), "no turn spawned");
+    let selected = app
+        .prompt_queue_overlay
+        .as_ref()
+        .expect("overlay still open")
+        .selected;
+    assert!(
+        selected < app.prompt_queue.len(),
+        "the focus cursor was clamped into range ({selected} < {})",
+        app.prompt_queue.len()
+    );
+    assert!(
+        app.prompt_queue_ids.get(selected).is_some(),
+        "a clamped cursor resolves to a live id so Enter/'e'/'r' are not dead keys",
+    );
+    // A subsequent Enter resolves the focused row and begins an edit (the dead-key
+    // symptom is gone): the composer picks up the focused prompt text.
+    assert!(
+        handle_prompt_queue_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ),
+        "Enter is consumed by the overlay",
+    );
+    assert!(
+        app.editing_queue_id.is_some(),
+        "Enter on a clamped cursor begins editing the focused prompt",
+    );
+}
+
+#[tokio::test]
 async fn record_turn_outcome_captures_success_and_edits() {
     // The turn-finish capture stores the success flag + the edits flag for the
     // condition gate.
