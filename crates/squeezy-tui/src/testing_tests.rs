@@ -180,3 +180,73 @@ async fn pump_until_idle_yields_on_pending_approval_then_respond_clears() {
     assert!(!harness.respond_approval());
     assert!(!harness.respond_deny());
 }
+
+/// Regression for deep-review #117. `pump_until_idle` used to drain the queue
+/// with a bare `pop_front` + `start_user_turn`, bypassing the production
+/// `drain_prompt_queue_if_idle` gating. A `Manual`-conditioned front prompt must
+/// be LEFT parked (never auto-run) — the bare pop would have run it.
+#[tokio::test]
+async fn pump_until_idle_leaves_a_manual_conditioned_prompt_parked() {
+    let mut harness = build_harness();
+    {
+        let app = harness.app_mut();
+        app.prompt_queue.push_back("manual-only".to_string());
+        crate::enqueue_queue_id(app);
+        let id = *app.prompt_queue_ids.front().expect("id stamped");
+        app.prompt_queue_conditions
+            .set(id, crate::queue_conditions::QueueCondition::Manual);
+        // Arm the pump exactly as a turn-finish would.
+        app.auto_drain_queue = true;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), harness.pump_until_idle())
+        .await
+        .expect("pump must return promptly, not spin on the parked prompt")
+        .expect("pump_until_idle returns Ok with a parked prompt");
+
+    // The Manual prompt is still queued (parked), and no model turn was started.
+    assert!(
+        !harness.is_turn_active(),
+        "a Manual-conditioned prompt must not be auto-run by the harness pump",
+    );
+    let app = harness.app_mut();
+    assert_eq!(
+        app.prompt_queue.iter().cloned().collect::<Vec<_>>(),
+        vec!["manual-only".to_string()],
+        "the parked prompt stays in the queue",
+    );
+}
+
+/// Companion to the above: a queued slash command must be DISPATCHED as a command
+/// (via `submit_queued_input`), not started as a raw model turn. The bare-pop
+/// harness path sent the slash text straight to `start_user_turn`.
+#[tokio::test]
+async fn pump_until_idle_dispatches_a_queued_slash_command() {
+    let mut harness = build_harness();
+    {
+        let app = harness.app_mut();
+        app.push_transcript_item(crate::TranscriptItem::user("old context"));
+        app.prompt_queue.push_back("/clear".to_string());
+        crate::enqueue_queue_id(app);
+        app.auto_drain_queue = true;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), harness.pump_until_idle())
+        .await
+        .expect("pump must return promptly")
+        .expect("pump_until_idle returns Ok after dispatching the slash command");
+
+    assert!(
+        !harness.is_turn_active(),
+        "a queued /clear is a command, not a model turn",
+    );
+    let app = harness.app_mut();
+    assert!(
+        app.prompt_queue.is_empty(),
+        "the queued slash entry was consumed by the drain",
+    );
+    assert!(
+        app.terminal_clear_pending,
+        "/clear was dispatched as a command (it requested a hard terminal clear)",
+    );
+}

@@ -22739,7 +22739,7 @@ fn queue_input_behind_running_turn(app: &mut TuiApp, input: String) {
 /// materialises the per-item facts (paused flag + condition) in queue order and
 /// hands them over. Assumes `sync_queue_ids` + `retain_live` ran so the sidecar
 /// and maps are aligned with the live queue.
-fn queue_drain_action(app: &TuiApp) -> queue_conditions::DrainAction {
+pub(crate) fn queue_drain_action(app: &TuiApp) -> queue_conditions::DrainAction {
     let items: Vec<queue_conditions::DrainItem> = app
         .prompt_queue_ids
         .iter()
@@ -22751,7 +22751,7 @@ fn queue_drain_action(app: &TuiApp) -> queue_conditions::DrainAction {
     queue_conditions::plan_drain(&items, app.last_turn_outcome)
 }
 
-async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
+pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
     while app.turn_rx.is_none() && !prompt_queue_drain_blocked(app) {
         // Keep the id sidecar aligned before consulting the group/condition models
         // so a front-drain since the last tick can't stale the pause / condition

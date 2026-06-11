@@ -24,8 +24,9 @@ use tokio::sync::oneshot;
 
 use crate::{
     Clipboard, PendingMcpElicitation, TranscriptEntryKind, TuiApp, apply_theme_overrides,
-    drain_agent_events, drain_job_events, drain_pending_diff, format_mcp_elicitation_status_line,
-    handle_key, handle_slash_command, keymap::parse_keyspec, render, start_user_turn,
+    drain_agent_events, drain_job_events, drain_pending_diff, drain_prompt_queue_if_idle,
+    format_mcp_elicitation_status_line, handle_key, handle_slash_command, keymap::parse_keyspec,
+    render, start_user_turn,
 };
 
 /// Opaque driver wrapping a TuiApp + Agent + headless terminal.
@@ -128,9 +129,13 @@ impl TuiHarness {
 
     /// Drive the same drain order `run_inner` uses (`drain_job_events`
     /// → `drain_agent_events` → optional `auto_drain_queue` →
-    /// `drain_pending_diff`) until no turn is active and the prompt
-    /// queue is empty. Bounded so a stuck channel surfaces as an error
-    /// rather than hanging the calling scenario.
+    /// `drain_pending_diff`) until no turn is active and the prompt queue is
+    /// empty or fully parked. The `auto_drain_queue` step routes through the
+    /// PRODUCTION `drain_prompt_queue_if_idle`, so the harness inherits the real
+    /// condition/paused-group gating and slash-command routing rather than a bare
+    /// `pop_front` (a parked `Manual`/paused/conditional prompt is left in place,
+    /// and a queued slash command is dispatched, not run as a raw turn). Bounded so
+    /// a stuck channel surfaces as an error rather than hanging the scenario.
     ///
     /// "Idle" includes any open operator-input modal: a parked
     /// `pending_approval`, `pending_mcp_elicitation`, or
@@ -151,18 +156,23 @@ impl TuiHarness {
             drain_agent_events(&mut self.app).await;
             let queued = if self.app.auto_drain_queue {
                 self.app.auto_drain_queue = false;
-                if self.app.turn_rx.is_none()
-                    && let Some(next) = self.app.prompt_queue.pop_front()
-                {
-                    let agent = self
-                        .agent
-                        .as_mut()
-                        .expect("agent dropped before harness; this is a bug in TuiHarness");
-                    start_user_turn(&mut self.app, agent, next);
-                    true
-                } else {
-                    false
-                }
+                let had_turn = self.app.turn_rx.is_some();
+                // Route through the PRODUCTION drain pump rather than a bare
+                // `pop_front` + `start_user_turn`, so the harness inherits the same
+                // gating `run_inner` uses: `prompt_queue_drain_blocked`, the
+                // `sync_queue_ids` + `retain_live` realignment, the
+                // condition/paused-group `queue_drain_action` planning (Run / Drop /
+                // Stop), the lockstep id-sidecar removal, and `submit_queued_input`
+                // slash-routing (a queued `/export …` is dispatched as a command,
+                // not started as a raw model turn).
+                let agent = self
+                    .agent
+                    .as_mut()
+                    .expect("agent dropped before harness; this is a bug in TuiHarness");
+                drain_prompt_queue_if_idle(&mut self.app, agent).await;
+                // The pump started a turn iff `turn_rx` is now attached and was not
+                // before; that tells the idle check below to keep pumping it out.
+                !had_turn && self.app.turn_rx.is_some()
             } else {
                 false
             };
@@ -178,11 +188,18 @@ impl TuiHarness {
             // the scenario back before `drain_pending_diff` had a
             // chance to land the result. squeezy-nyg8.2.
             let waiting_on_pending_diff = self.app.pending_diff.is_some();
-            if !queued
-                && self.app.turn_rx.is_none()
-                && self.app.prompt_queue.is_empty()
-                && !waiting_on_pending_diff
-            {
+            // The queue is "drained" for idle purposes when it is empty OR every
+            // remaining item is parked (a paused group / a `Manual` or
+            // not-yet-evaluable condition) so the production pump returns `Stop`.
+            // Routing the drain through `drain_prompt_queue_if_idle` (above) means a
+            // parked prompt is intentionally LEFT in place, so an "is_empty" idle
+            // gate would spin to the deadline — treat a parked queue as idle too.
+            let queue_drained = self.app.prompt_queue.is_empty()
+                || matches!(
+                    crate::queue_drain_action(&self.app),
+                    crate::queue_conditions::DrainAction::Stop
+                );
+            if !queued && self.app.turn_rx.is_none() && queue_drained && !waiting_on_pending_diff {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
