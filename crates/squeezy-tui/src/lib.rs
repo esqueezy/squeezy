@@ -10497,20 +10497,29 @@ fn persist_keybinding_change(app: &mut TuiApp) {
     // Rebuild the live resolver from the editor's overrides so the new binding is
     // active for the very next keypress (and `/keymap` reads it back).
     app.keymap = keymap::KeymapResolver::from_overrides(&overrides);
+    // Resolve the destination through the app so a pinned override (eval/test
+    // harness) is honoured instead of always targeting the operator's real
+    // `~/.squeezy/keybindings.toml`.
+    let target = app.keybindings_save_path();
     // Write the file (best-effort). A missing home dir degrades to "in-memory
     // only" with a status note.
-    if let Err(err) = write_keybindings_file(&overrides) {
+    if let Err(err) = write_keybindings_file(target, &overrides) {
         app.status = format!("rebind applied (not saved: {err})");
     }
 }
 
-/// Write the delta-only override map to `~/.squeezy/keybindings.toml` atomically
-/// (write to a sibling temp file, then rename). Serialises each entry as a
-/// `[[bindings]]` row in the same schema `keymap_config::KeybindingsFile` reads,
-/// so the editor's output round-trips through the loader on the next start. The
-/// parent directory is created if missing.
-fn write_keybindings_file(overrides: &BTreeMap<String, String>) -> std::io::Result<()> {
-    let path = keymap_config::default_keybindings_path().ok_or_else(|| {
+/// Write the delta-only override map to `target` (the resolved
+/// `~/.squeezy/keybindings.toml`, or a harness override) atomically (write to a
+/// sibling temp file, then rename). Serialises each entry as a `[[bindings]]`
+/// row in the same schema `keymap_config::KeybindingsFile` reads, so the
+/// editor's output round-trips through the loader on the next start. The parent
+/// directory is created if missing. `target == None` means no destination is
+/// resolvable (no home dir), surfaced as a `NotFound` error.
+fn write_keybindings_file(
+    target: Option<PathBuf>,
+    overrides: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let path = target.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no home directory for ~/.squeezy/keybindings.toml",
@@ -44342,6 +44351,13 @@ pub(crate) struct TuiApp {
     /// harness so scenario runs cannot clobber the operator's real
     /// `~/.squeezy/settings.toml`.
     pub(crate) settings_path_override: Option<PathBuf>,
+    /// Override for the keybindings file the in-session Keybinding Editor
+    /// (Ctrl+Alt+B) persists into. `None` ⇒ production path:
+    /// `keymap_config::default_keybindings_path()` (`$HOME/.squeezy/
+    /// keybindings.toml`). `Some(path)` ⇒ rebinds/resets are pinned to
+    /// `path`, used by the eval/test harness so driving a rebind or reset
+    /// cannot clobber the operator's real `~/.squeezy/keybindings.toml`.
+    pub(crate) keybindings_path_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44905,6 +44921,7 @@ impl TuiApp {
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,
             settings_path_override: None,
+            keybindings_path_override: None,
         };
         if let Some(section) = open_config_section {
             // Prefer a freshly-merged settings config (matches what's saved on
@@ -44979,6 +44996,31 @@ impl TuiApp {
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn set_settings_path_override(&mut self, path: Option<PathBuf>) {
         self.settings_path_override = path;
+    }
+
+    /// Resolve the keybindings file the Keybinding Editor should write to.
+    /// Returns the [`keybindings_path_override`](Self::keybindings_path_override)
+    /// when one has been pinned (eval/test harness path), else the production
+    /// [`keymap_config::default_keybindings_path`] (`$HOME/.squeezy/
+    /// keybindings.toml`). `None` here means no destination is resolvable
+    /// (no home dir) and the rebind degrades to in-memory only.
+    pub(crate) fn keybindings_save_path(&self) -> Option<PathBuf> {
+        self.keybindings_path_override
+            .clone()
+            .or_else(keymap_config::default_keybindings_path)
+    }
+
+    /// Pin the keybindings save path. Used by the in-crate keybinding-editor
+    /// tests (and available to the eval/test harness) so a fixture-driven rebind
+    /// or reset cannot escape the per-run scratch directory and clobber the
+    /// operator's real `~/.squeezy/keybindings.toml`. Has no effect on
+    /// production sessions, which never call this. The `allow(dead_code)` keeps
+    /// the `testing`-feature build (where only the harness could call it) warning
+    /// -free until a harness caller is wired up.
+    #[cfg(any(test, feature = "testing"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_keybindings_path_override(&mut self, path: Option<PathBuf>) {
+        self.keybindings_path_override = path;
     }
 
     /// Open `content` as a typed slash-command overlay and return a

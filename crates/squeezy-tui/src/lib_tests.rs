@@ -6507,6 +6507,60 @@ async fn keybinding_editor_swallows_paste_instead_of_leaking_to_composer() {
     );
 }
 
+#[test]
+fn keybinding_editor_persist_honors_path_override_and_spares_real_file() {
+    // §12.7.1 + deep-review #71: a fixture-driven rebind must write the pinned
+    // override path, NOT the operator's real ~/.squeezy/keybindings.toml. We
+    // pin a scratch path, drive a commit through the editor + persist writer,
+    // and assert the override file was written while the real default path is
+    // left exactly as it was (existence + content unchanged).
+    let root = temp_workspace("keybind_override");
+    let override_path = root.join("scratch-keybindings.toml");
+
+    // Snapshot the real default destination so we can prove we never touch it.
+    let real_path = keymap_config::default_keybindings_path();
+    let real_before = real_path.as_ref().and_then(|p| fs::read(p).ok());
+
+    let mut app = test_app(SessionMode::Build);
+    app.set_keybindings_path_override(Some(override_path.clone()));
+
+    // Open the editor and rebind the first row to a fresh chord via the same
+    // editor state machine the live Enter path drives.
+    toggle_keybinding_editor(&mut app);
+    let editor = app.keybinding_editor.as_mut().expect("editor open");
+    editor.select_first();
+    let action = editor.selected_row().expect("a rebindable row").action;
+    assert!(editor.begin_capture(), "capture begins");
+    // Ctrl+Alt+F8 is an unusual chord unlikely to collide with a default.
+    let chord = keymap::KeyBinding::new(KeyCode::F(8), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let outcome = editor.capture(chord).expect("capture produces an outcome");
+    assert!(
+        outcome.is_committable(),
+        "the fresh chord is committable, got {outcome:?}"
+    );
+    let committed = editor.commit().expect("commit yields the new binding");
+    assert_eq!(committed.0, action, "committed row is the selected action");
+
+    persist_keybinding_change(&mut app);
+
+    // The override path was written and round-trips the rebind.
+    let written =
+        fs::read_to_string(&override_path).expect("override keybindings file was written");
+    assert!(
+        written.contains(&format!("action = {:?}", action.slug())),
+        "override file carries the rebound action, got:\n{written}"
+    );
+
+    // The operator's real keybindings file is untouched.
+    let real_after = real_path.as_ref().and_then(|p| fs::read(p).ok());
+    assert_eq!(
+        real_before, real_after,
+        "the real ~/.squeezy/keybindings.toml must not be created or modified"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn immediate_duplicate_large_paste_expands_existing_token() {
     let root = temp_workspace("tui_large_paste_immediate_dupe");
