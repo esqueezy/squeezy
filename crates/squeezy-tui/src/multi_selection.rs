@@ -35,7 +35,10 @@
 //! a range that abuts an existing one collapses to one — exactly the
 //! "normalize overlapping selections while preserving block boundaries" the spec
 //! requires. Multi-row (`Row`-mode) members are ordered but not merged across
-//! rows, so block boundaries survive.
+//! rows, so block boundaries survive. Two multi-row members can therefore still
+//! overlap on the rows they share; [`combined_clean_text`] de-duplicates at the
+//! `(row, cleaned-col)` cell level so a shared row's text is emitted exactly once
+//! in a combined copy even though both members keep their own boundary.
 //!
 //! Selection is MAIN-view only (mirroring [`crate::selection`]), and the whole
 //! module is dead in a plain non-Unix build path until the dispatch wires it up,
@@ -143,10 +146,13 @@ impl SelectionSet {
 }
 
 /// Flatten the committed set PLUS the live `active` range (when present and
-/// non-empty) into one reading-ordered, de-duplicated list of ranges to act on.
-/// The live range is folded through the same touch/overlap merge as a committed
-/// member, so a combined copy never double-counts a cell the live range shares
-/// with a committed one.
+/// non-empty) into one reading-ordered list of ranges to act on. The live range
+/// is folded through the same touch/overlap merge as a committed member, so a
+/// single-row live range that overlaps a single-row member collapses into it.
+/// Overlapping MULTI-row members are ordered but not merged (their block
+/// boundaries are preserved), so the returned list can still contain ranges that
+/// share rows — [`combined_clean_text`] is what de-duplicates those shared cells
+/// when the combined text is taken, so no cell is copied twice.
 pub(crate) fn combined_ranges(set: &SelectionSet, active: Option<&Selection>) -> Vec<Selection> {
     let mut all = SelectionSet::new();
     for m in &set.members {
@@ -170,20 +176,75 @@ pub(crate) fn combined_ranges(set: &SelectionSet, active: Option<&Selection>) ->
 
 /// Join the clean text of every range in `ranges` over the painted `rows`,
 /// separating disjoint ranges with a blank line so the combined payload reads as
-/// distinct blocks (the spec's combined copy/export). Reuses
-/// [`selection::selection_clean_text`] per range so each block is byte-for-byte
-/// what a single-range copy of it would yield. Empty per-range slices are
-/// dropped so a stray range contributes nothing.
+/// distinct blocks (the spec's combined copy/export).
+///
+/// Ranges are emitted in the order given (callers pass them in reading order),
+/// and any `(row, cleaned-col)` cell already emitted by an earlier range is
+/// SUBTRACTED from a later one before its text is taken, so two overlapping
+/// multi-row members never duplicate the rows they share (deep-review #48). A
+/// range whose every cell was already claimed contributes nothing and its block
+/// is dropped, exactly as an empty slice was before. For non-overlapping ranges
+/// nothing is subtracted, so each block is byte-for-byte what a single-range
+/// copy of it would yield.
 pub(crate) fn combined_clean_text(
     rows: &[ratatui::text::Line<'static>],
     ranges: &[Selection],
 ) -> String {
-    let blocks: Vec<String> = ranges
-        .iter()
-        .map(|sel| selection::selection_clean_text(rows, sel))
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Per visual row, the cleaned-char spans already emitted by earlier ranges.
+    let mut claimed: std::collections::BTreeMap<usize, Vec<std::ops::Range<usize>>> =
+        std::collections::BTreeMap::new();
+    let mut blocks: Vec<String> = Vec::new();
+    for sel in ranges {
+        let mut row_slices: Vec<String> = Vec::new();
+        for row in sel.row_span() {
+            let Some((cleaned, span)) = selection::cleaned_row_span(rows, sel, row) else {
+                continue;
+            };
+            let row_claimed = claimed.entry(row).or_default();
+            // Emit only the part of this row's span not already taken by an
+            // earlier range, then record the whole span as claimed so a later
+            // overlapping range subtracts it in turn.
+            for sub in subtract_claimed(span.clone(), row_claimed) {
+                let slice: String = cleaned.chars().skip(sub.start).take(sub.len()).collect();
+                row_slices.push(slice);
+            }
+            row_claimed.push(span);
+        }
+        let block = row_slices.join("\n").trim_end().to_string();
+        if !block.is_empty() {
+            blocks.push(block);
+        }
+    }
     blocks.join("\n\n")
+}
+
+/// Subtract every already-`claimed` cleaned-char range from `span`, returning the
+/// uncovered sub-ranges in ascending order. Empty when `span` is wholly claimed.
+fn subtract_claimed(
+    span: std::ops::Range<usize>,
+    claimed: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut pieces = vec![span];
+    for taken in claimed {
+        if taken.start >= taken.end {
+            continue;
+        }
+        let mut next = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            // The part of `piece` strictly before `taken`.
+            let left = piece.start..piece.end.min(taken.start);
+            if left.start < left.end {
+                next.push(left);
+            }
+            // The part of `piece` strictly after `taken`.
+            let right = piece.start.max(taken.end)..piece.end;
+            if right.start < right.end {
+                next.push(right);
+            }
+        }
+        pieces = next;
+    }
+    pieces
 }
 
 /// True when `pos` falls inside `sel`'s normalized span (row+column aware on the

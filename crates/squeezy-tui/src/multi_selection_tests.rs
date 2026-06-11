@@ -38,6 +38,19 @@ fn whole_row(row: usize, len: usize) -> Selection {
     sel
 }
 
+/// A multi-row whole-row (`Row`-mode) selection spanning rows `[top, bottom]`
+/// edge to edge, on the main surface.
+fn multi_row(top: usize, bottom: usize) -> Selection {
+    let mut sel = Selection::at(
+        SelectionSurface::Main,
+        Pos::new(top, 0),
+        SelectionMode::Row,
+        80,
+    );
+    sel.cursor = Pos::new(bottom, 0);
+    sel
+}
+
 // ---- add / order ----------------------------------------------------------
 
 #[test]
@@ -235,4 +248,50 @@ fn combined_clean_text_drops_empty_range_slices() {
 fn combined_clean_text_of_no_ranges_is_empty() {
     let rows = vec![line("alpha")];
     assert!(combined_clean_text(&rows, &[]).is_empty());
+}
+
+#[test]
+fn combined_clean_text_dedupes_rows_shared_by_overlapping_multi_row_ranges() {
+    // Regression for deep-review #48: a committed multi-row Row-mode selection
+    // over rows 3-7 and a live range over rows 5-9 overlap on rows 5-7. Multi-row
+    // members order but never merge, so both survive `combined_ranges`; without
+    // cell-level de-duplication `combined_clean_text` would emit rows 5-7 twice.
+    let rows = vec![
+        line("r0"),
+        line("r1"),
+        line("r2"),
+        line("row3"),
+        line("row4"),
+        line("row5"),
+        line("row6"),
+        line("row7"),
+        line("row8"),
+        line("row9"),
+    ];
+    let mut set = SelectionSet::new();
+    assert!(set.add(multi_row(3, 7)));
+    let live = multi_row(5, 9);
+
+    let ranges = combined_ranges(&set, Some(&live));
+    assert_eq!(
+        ranges.len(),
+        2,
+        "overlapping multi-row members order but do not merge"
+    );
+
+    let text = combined_clean_text(&rows, &ranges);
+    // Every shared row appears exactly once.
+    for shared in ["row5", "row6", "row7"] {
+        assert_eq!(
+            text.matches(shared).count(),
+            1,
+            "a row shared by two overlapping multi-row ranges must appear once, not twice: {text:?}"
+        );
+    }
+    // The first block carries rows 3-7; the second carries ONLY the rows the
+    // first did not (8-9), joined as a distinct block.
+    assert_eq!(
+        text, "row3\nrow4\nrow5\nrow6\nrow7\n\nrow8\nrow9",
+        "shared rows stay with the first block; the later range keeps only its unclaimed tail"
+    );
 }

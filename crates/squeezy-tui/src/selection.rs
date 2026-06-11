@@ -383,36 +383,50 @@ fn split_spans_at_char(
 pub(crate) fn selection_clean_text(rows: &[Line<'static>], sel: &Selection) -> String {
     let mut out: Vec<String> = Vec::new();
     for row in sel.row_span() {
-        let Some(line) = rows.get(row) else {
+        let Some((cleaned, span)) = cleaned_row_span(rows, sel, row) else {
             continue;
         };
-        let plain = plain_text_of_line(line);
-        let full_len = plain.chars().count();
-        let Some(span) = sel.col_span_for_row(row, full_len) else {
-            continue;
-        };
-
-        // Clean the WHOLE line (strip_gutter measures the rail against the full
-        // line), then re-intersect the selected column span with the surviving
-        // content: the gutter occupies `gutter_chars` leading chars.
-        let cleaned = strip_gutter(&plain);
-        let cleaned_len = cleaned.chars().count();
-        let gutter_chars = full_len.saturating_sub(cleaned_len);
-
-        // Shift the selection into the cleaned text's char space, clamping the
-        // start up past the stripped gutter so a selection that begins inside
-        // the chrome still starts at the first content char.
-        // (`x.max(g).saturating_sub(g)` == `x.saturating_sub(g)` for all `x`, so
-        // the saturating subtraction alone does the clamp.)
-        let lo = span.start.saturating_sub(gutter_chars);
-        let hi = span.end.saturating_sub(gutter_chars);
-        let lo = lo.min(cleaned_len);
-        let hi = hi.min(cleaned_len).max(lo);
-
-        let slice: String = cleaned.chars().skip(lo).take(hi - lo).collect();
+        let slice: String = cleaned.chars().skip(span.start).take(span.len()).collect();
         out.push(slice);
     }
     out.join("\n").trim_end().to_string()
+}
+
+/// The cleaned (gutter-stripped) plain text of visual `row` together with the
+/// half-open char span `[lo, hi)` of it that `sel` selects, both measured in the
+/// CLEANED text's char space. `None` when `row` is outside `sel`'s span or off
+/// the painted rows. This is the per-row unit `selection_clean_text` slices, and
+/// it is the same `(row, cleaned-col)` cell space a combined multi-selection
+/// copy de-duplicates over so shared rows are emitted exactly once.
+pub(crate) fn cleaned_row_span(
+    rows: &[Line<'static>],
+    sel: &Selection,
+    row: usize,
+) -> Option<(String, Range<usize>)> {
+    let line = rows.get(row)?;
+    let plain = plain_text_of_line(line);
+    let full_len = plain.chars().count();
+    let span = sel.col_span_for_row(row, full_len)?;
+
+    // Clean the WHOLE line (strip_gutter measures the rail against the full
+    // line), then re-intersect the selected column span with the surviving
+    // content: the gutter occupies `gutter_chars` leading chars.
+    let cleaned = strip_gutter(&plain).to_string();
+    let cleaned_len = cleaned.chars().count();
+    let gutter_chars = full_len.saturating_sub(cleaned_len);
+
+    // Shift the selection into the cleaned text's char space, clamping the
+    // start up past the stripped gutter so a selection that begins inside
+    // the chrome still starts at the first content char.
+    // (`x.max(g).saturating_sub(g)` == `x.saturating_sub(g)` for all `x`, so
+    // the saturating subtraction alone does the clamp.)
+    let lo = span.start.saturating_sub(gutter_chars).min(cleaned_len);
+    let hi = span
+        .end
+        .saturating_sub(gutter_chars)
+        .min(cleaned_len)
+        .max(lo);
+    Some((cleaned, lo..hi))
 }
 
 #[cfg(test)]
