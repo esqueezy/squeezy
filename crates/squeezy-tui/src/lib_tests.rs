@@ -34178,16 +34178,17 @@ fn consecutive_temp_file_stagings_write_distinct_files() {
 /// `squeezy_paste_<pid>_<nonce>.txt` leaves it produces never collide with
 /// another test staging under the shared pid (staging now creates files
 /// exclusively via `create_new`, so a stale collision would fail the write).
+///
+/// Purely atomic (no wall clock) with a large per-call stride and a high base
+/// offset: each call reserves a distinct block of 1000 nonces so a test's own
+/// internal `+1` increments stay inside its block, and the high base keeps every
+/// value clear of the `nonce == 0` start used by other staging tests.
 fn unique_staging_nonce() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static BUMP: AtomicU64 = AtomicU64::new(0);
-    let base = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    // Mix in a per-call bump so two tests entering within the same nanosecond
-    // still diverge.
-    base.wrapping_add(BUMP.fetch_add(1, Ordering::Relaxed) * 1000)
+    static NEXT_BLOCK: AtomicU64 = AtomicU64::new(0);
+    const BASE: u64 = 1_000_000;
+    const STRIDE: u64 = 1000;
+    BASE + NEXT_BLOCK.fetch_add(1, Ordering::Relaxed) * STRIDE
 }
 
 /// Pull the on-disk path out of the Nth inserted "Staged paste → <path>"
@@ -34236,12 +34237,11 @@ fn staged_paste_temp_file_is_mode_0600() {
 #[test]
 fn staged_paste_refuses_to_clobber_a_preplanted_path() {
     let mut app = test_app(SessionMode::Build);
-    // Pin a UNIQUE nonce so the predictable leaf this test plants cannot collide
-    // with another test staging its own first paste under the shared pid.
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    // Pin a process-UNIQUE nonce (shared bump counter) so the predictable leaf
+    // this test plants cannot collide with another staging test under the shared
+    // pid — otherwise this test's pre-planted file could trip another test's
+    // create_new, or vice versa, under heavy parallel load.
+    let nonce = unique_staging_nonce();
     app.next_temp_file_nonce = nonce;
     let planted = std::env::temp_dir().join(format!(
         "squeezy_paste_{}_{}.txt",
