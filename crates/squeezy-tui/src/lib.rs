@@ -2049,6 +2049,13 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
     match agent.resume_current(session_id) {
         Ok(transcript) => {
             app.transcript.clear();
+            // Re-arm follow-tail so the resumed conversation tracks its live tail
+            // from the bottom rather than inheriting the prior session's
+            // scrolled-up anchor (resume sends no user message, so nothing else
+            // re-pins) and cancel any in-flight ease against the gone geometry
+            // (deep-review #66).
+            app.transcript_scroll = scroll::ScrollState::pinned();
+            cancel_main_scroll_anim(app);
             app.selected_entry = None;
             app.next_entry_id = 0;
             // Entry ids restart from 0 on a transcript rebuild, so old marks
@@ -20089,6 +20096,12 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 // `/clear` is refused mid-turn, so the streaming/cancel
                 // fields are already idle; clearing them is defensive.
                 app.transcript.clear();
+                // Re-arm follow-tail so the fresh conversation tracks its live
+                // tail rather than inheriting the prior scrolled-up anchor (the
+                // system clear-notice push does not re-pin), and cancel any
+                // in-flight ease against the now-gone geometry (deep-review #66).
+                app.transcript_scroll = scroll::ScrollState::pinned();
+                cancel_main_scroll_anim(app);
                 app.selected_entry = None;
                 app.next_entry_id = 0;
                 // Entry ids restart from 0 after a clear, so old marks would

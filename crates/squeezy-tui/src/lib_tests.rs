@@ -32831,6 +32831,32 @@ async fn clear_resets_row_indexed_search_and_selection() {
     );
 }
 
+#[tokio::test]
+async fn clear_re_pins_the_transcript_scroll_to_the_tail() {
+    // `/clear` replaces the transcript but pushes only a system notice (no user
+    // message), so nothing else re-pins the scroll. The reset must re-arm
+    // follow-tail so the fresh conversation tracks its live tail rather than
+    // inheriting the prior scrolled-up anchor (deep-review #66).
+    let mut app = app_with_user_turns(60);
+    let mut agent = test_agent(SessionMode::Build);
+    // Scroll up off the tail so the view is unpinned with a positive from_bottom.
+    scroll_transcript_up(&mut app, 20);
+    assert!(!app.transcript_scroll.is_following());
+    assert!(app.transcript_scroll.from_bottom() > 0);
+
+    apply_dispatch_command(&mut app, &mut agent, DispatchCommand::Clear).await;
+
+    assert!(
+        app.transcript_scroll.is_following(),
+        "the cleared conversation re-arms follow-tail",
+    );
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        0,
+        "the cleared conversation is pinned to the tail",
+    );
+}
+
 // ---- Minimap turn rail (§11.2 / 11G.3) ------------------------------
 
 /// Seed a transcript with mixed user turns, tool calls, and a failure so the
