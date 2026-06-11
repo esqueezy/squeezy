@@ -854,6 +854,46 @@ fn open_workspace_profile_default_does_not_collide_with_other_actions() {
 }
 
 #[test]
+fn restore_terminal_action_round_trips_and_defaults_to_ctrl_alt_comma() {
+    // §12.9.2 Terminal Restore Command: slug round-trips, is registered in `ALL`
+    // (so `/keymap` and the command palette list it and an override can target
+    // it), and defaults to the free Ctrl+Alt punctuation chord `Ctrl+Alt+,` — the
+    // companion of the §12.4.5 Zen `Ctrl+Alt+.`.
+    assert_eq!(
+        Action::from_slug("restore_terminal"),
+        Some(Action::RestoreTerminal),
+    );
+    assert!(Action::ALL.contains(&Action::RestoreTerminal));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::RestoreTerminal),
+        KeyBinding::new(
+            KeyCode::Char(','),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    );
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char(','),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        Some(Action::RestoreTerminal),
+    );
+    // `Ctrl+Alt+,` is distinct from the bare `Alt+,` previous-tool-call nav verb.
+    assert_eq!(
+        resolver.lookup(KeyCode::Char(','), KeyModifiers::ALT),
+        Some(Action::JumpPrevToolCall),
+        "the bare Alt+, nav verb is unaffected by the Ctrl+Alt+, recovery chord",
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent; the
+    // `/terminal-reset` slash command is the always-typeable equivalent.
+    assert_eq!(
+        Action::RestoreTerminal.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

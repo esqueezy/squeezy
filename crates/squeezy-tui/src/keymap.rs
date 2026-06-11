@@ -604,6 +604,17 @@ pub(crate) enum Action {
     /// minimal zen status line. Pure layout policy: one `bool` per painted frame,
     /// no idle redraw.
     ToggleZenMode,
+    /// Terminal Restore Command (§12.9.2): forcibly return a wedged terminal to a
+    /// sane state (`Ctrl+Alt+,` default). Leaves the alternate screen, disables raw
+    /// mode and every input mode (mouse, bracketed paste, focus, alternate scroll),
+    /// resets keyboard-enhancement flags + title, shows the hardware cursor, then
+    /// re-enters the fullscreen surface and forces a full repaint — recovery from a
+    /// corrupted screen WITHOUT exiting the session or purging scrollback. Reuses
+    /// the single-sourced emergency-teardown / enter-setup byte machinery; the
+    /// `/terminal-reset` slash command is the discoverable twin. There is no mouse
+    /// affordance: a wedged terminal may not report clicks, so recovery stays on the
+    /// always-reachable keyboard/command surface.
+    RestoreTerminal,
 }
 
 impl Action {
@@ -701,6 +712,7 @@ impl Action {
             Self::ToggleSmartSplit => "toggle_smart_split",
             Self::TogglePresentation => "toggle_presentation",
             Self::ToggleZenMode => "toggle_zen_mode",
+            Self::RestoreTerminal => "restore_terminal",
         }
     }
 
@@ -797,6 +809,7 @@ impl Action {
         Action::ToggleSmartSplit,
         Action::TogglePresentation,
         Action::ToggleZenMode,
+        Action::RestoreTerminal,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -1091,6 +1104,13 @@ impl Action {
             // The always-available equivalent is a click on the minimal zen status
             // line that the mode itself paints.
             | Self::ToggleZenMode
+            // Terminal Restore Command (§12.9.2) is `Ctrl+Alt+,` — a Ctrl+Alt
+            // (Meta) punctuation chord, the same classically-unreliable encoding
+            // across Linux terminals, tmux, and SSH as the Zen `Ctrl+Alt+.` policy
+            // chord above. The always-available equivalent is the `/terminal-reset`
+            // slash command, which the user can type even if the chord is swallowed
+            // by a wedged terminal.
+            | Self::RestoreTerminal
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1601,6 +1621,18 @@ impl Action {
             // always-available equivalent is a click on the minimal zen status line.
             Self::ToggleZenMode => KeyBinding::new(
                 KeyCode::Char('.'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Terminal Restore Command (§12.9.2). `Ctrl+Alt+,` is a free `Ctrl+Alt`
+            // punctuation chord — every `Ctrl+Alt` LETTER is taken by the overlay /
+            // picker / editor / policy family, the §12.4.5 Zen toggle claimed the
+            // companion `Ctrl+Alt+.`, and bare `Alt+,` is the previous-tool-call nav
+            // verb, so the Ctrl+Alt modifier keeps the recovery verb distinct from
+            // it while staying clear of every composer chord. The `/terminal-reset`
+            // slash command is the always-typeable twin for a terminal that swallows
+            // the chord.
+            Self::RestoreTerminal => KeyBinding::new(
+                KeyCode::Char(','),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

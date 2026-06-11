@@ -175,6 +175,7 @@ mod subagent_preview;
 mod subagent_promote;
 mod subagent_timeline;
 mod terminal_profile;
+mod terminal_restore;
 mod terminal_writer;
 mod theme_editor;
 mod toast;
@@ -1038,6 +1039,15 @@ async fn run_inner_with_terminal(
         // queues a request off Unix.
         #[cfg(unix)]
         terminal.run_pending_editor_handoff(&mut app);
+
+        // Terminal Restore Command (§12.9.2): if `Ctrl+Alt+,` or `/terminal-reset`
+        // queued a forcible restore, run it here at the top of the loop (the guard
+        // owns the terminal, so it can leave / re-enter the alt-screen safely)
+        // before the next draw. A no-op single `take()` check when nothing is
+        // queued, so it costs one discriminant comparison at idle. Cross-platform:
+        // the restore reuses the crossterm emit machinery that works on POSIX and
+        // Windows console / ConPTY alike, so this is NOT `cfg`-gated.
+        terminal.run_pending_terminal_restore(&mut app);
 
         // Drain producers first so the next draw reflects everything that
         // has landed since the previous iteration. A flurry of events
@@ -6168,6 +6178,27 @@ fn reveal_presentation(app: &mut TuiApp) {
     app.needs_redraw = true;
 }
 
+/// Terminal Restore Command (§12.9.2): queue a forcible terminal restore for the
+/// next loop turn. Both the `Ctrl+Alt+,` keymap verb and the `/terminal-reset`
+/// slash command funnel through here so the request is raised exactly once and the
+/// confirmation status is single-sourced. The run loop drains
+/// `pending_terminal_restore` and performs the byte work + raw-mode cycle on the
+/// guard; setting `needs_redraw` guarantees the loop wakes to do so even at idle.
+fn request_terminal_restore(app: &mut TuiApp) {
+    app.pending_terminal_restore = terminal_restore::TerminalRestoreRequest::Pending;
+    // The guard sets the final confirmation (which differs for a real recovery vs
+    // an already-normal screen); show an in-flight note so the verb feels
+    // responsive on the frame before the loop drains the request. The status line
+    // is not the transient-notice surface in the main view, so also raise a toast,
+    // which paints over the surface and gives the verb a visible acknowledgement.
+    app.status = terminal_restore::RESTORE_REQUESTED_TOAST.to_string();
+    app.toasts.push(
+        terminal_restore::RESTORE_REQUESTED_TOAST,
+        toast::ToastVariant::Info,
+    );
+    app.needs_redraw = true;
+}
+
 /// Persist the Presentation Mode (§12.4.6) enabled-state to the user-scope config
 /// at `[tui].presentation`. The on-state writes its slug; the off-state clears
 /// the key so a restored session starts with the mode off. The one-shot reveal
@@ -9614,6 +9645,16 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_zen_mode(app);
+            true
+        }
+        keymap::Action::RestoreTerminal => {
+            // §12.9.2: forcibly restore a wedged terminal. The dispatch only
+            // flags the request (side-effect light); the run loop owns the
+            // terminal guard and performs the restore-then-re-enter byte work.
+            // Reachable from every surface — a corrupted screen is exactly when
+            // the config/setup screens are unusable too, so unlike the overlay
+            // verbs this is NOT gated behind them.
+            request_terminal_restore(app);
             true
         }
     }
@@ -18255,6 +18296,25 @@ async fn handle_slash_command_on_surface(
             slash_arg_shape_from_rest(input),
         );
         reveal_presentation(app);
+        return true;
+    }
+
+    // `/terminal-reset` (§12.9.2) is the Terminal Restore Command's discoverable
+    // slash twin: it forcibly returns a wedged terminal to a sane state (leave
+    // alt-screen, reset modes, show cursor, disable raw mode) and re-enters the
+    // fullscreen surface. A TUI-local recovery verb handled here before the
+    // agent-owned dispatch parser, which does not know it — and the always-typeable
+    // path when the `Ctrl+Alt+,` chord is swallowed by the corrupted terminal.
+    if raw_head == "/terminal-reset" {
+        record_slash_command_telemetry(
+            agent,
+            "/terminal-reset",
+            surface,
+            SlashOutcome::Accepted,
+            SlashAliasKind::Canonical,
+            slash_arg_shape_from_rest(input),
+        );
+        request_terminal_restore(app);
         return true;
     }
 
@@ -43005,6 +43065,13 @@ pub(crate) struct TuiApp {
     /// there — hence the non-Unix `dead_code` allow for the Windows clippy gate.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) pending_editor_handoff: Option<editor_handoff::EditorHandoffRequest>,
+    /// Terminal Restore Command (§12.9.2): set by the `Ctrl+Alt+,` keymap verb and
+    /// the `/terminal-reset` slash command, drained by the run loop. Like
+    /// `pending_editor_handoff`, the dispatch only flags the request (side-effect
+    /// light); the loop owns the terminal guard and so performs the forcible
+    /// restore-then-re-enter recovery. Always drained the same turn, so it is
+    /// `Pending` for at most one loop iteration.
+    pub(crate) pending_terminal_restore: terminal_restore::TerminalRestoreRequest,
     /// Persistent main-view focus cursor for entry/tool/code copies, as a
     /// `RowId` into the freshly built transcript row list. `None` defaults to
     /// the live tail (the last entry-owned row), so "copy current entry"
@@ -43710,6 +43777,7 @@ impl TuiApp {
             theme_editor_preview_pending: None,
             editor_handoff: None,
             pending_editor_handoff: None,
+            pending_terminal_restore: terminal_restore::TerminalRestoreRequest::None,
             copy_focus: None,
             copy_format: copy::CopyFormat::default_format(),
             main_text_width: std::cell::Cell::new(0),
@@ -45485,9 +45553,10 @@ fn emit_finish_fullscreen<W: Write>(
 /// re-anchor contract is unit-testable on every platform without the Unix-only
 /// blocking re-raise.
 ///
-/// Compiled on Unix (the only suspend/resume target) and in any test build (so
-/// the contract test runs on Windows CI too); elsewhere it would be dead code.
-#[cfg(any(unix, test))]
+/// Compiled unconditionally: besides the Unix suspend/resume + editor-handoff
+/// callers, the cross-platform Terminal Restore Command (§12.9.2,
+/// [`TerminalGuard::run_pending_terminal_restore`]) calls it on every platform to
+/// force the post-re-enter repaint, so it must not be `cfg`-gated off Windows.
 fn mark_full_redraw_after_resume(app: &mut TuiApp) {
     app.needs_redraw = true;
     app.pending_resize = true;
@@ -45898,6 +45967,82 @@ impl TerminalGuard {
             }
             Err(error) => report_editor_handoff_error(app, &error),
         }
+    }
+
+    /// Terminal Restore Command (§12.9.2): drain a pending forcible terminal
+    /// restore and recover a wedged terminal in place. Unlike the crash paths,
+    /// this runs from a LIVE session — the user pressed `Ctrl+Alt+,` (or typed
+    /// `/terminal-reset`) because the screen looks corrupted but the app is still
+    /// running — so it restore-then-RE-ENTERs rather than tearing down for good.
+    ///
+    /// Order mirrors [`Self::suspend_and_resume`] minus the job-control stop, and
+    /// reuses the exact single-sourced byte machinery so the recovery emits the
+    /// same proven sequence as every other restore path:
+    ///   1. RESTORE: replay [`emit_terminal_emergency_teardown`] (leave the
+    ///      alternate screen, disable mouse / bracketed paste / focus / alternate
+    ///      scroll, reset keyboard-enhancement flags + title, show the hardware
+    ///      cursor), then disable raw mode LAST — exactly the wedged-terminal
+    ///      symptoms §12.9.2 enumerates. Deliberately NEVER purges scrollback.
+    ///   2. RE-ENTER: re-enable raw mode, replay [`emit_terminal_enter_setup`]
+    ///      (alt-screen, clear, home, bracketed paste, focus, mouse capture, hidden
+    ///      cursor), re-publish the crash-path alt-screen flag, clear ratatui's
+    ///      diff baseline, and mark the app so the next frame fully repaints from
+    ///      model state.
+    ///
+    /// Cross-platform: the emit functions and the raw-mode toggles are crossterm
+    /// calls that work on both POSIX terminals and Windows console / ConPTY (where
+    /// the ANSI resets are honoured by Windows Terminal), so — unlike the Unix-only
+    /// suspend / editor-handoff paths — this is NOT `cfg`-gated. Best-effort
+    /// throughout (`let _ =`): a flaky terminal must not abort the recovery
+    /// mid-restore. A no-op (status-only) when the alternate screen has already been
+    /// left, so there is nothing to re-enter.
+    fn run_pending_terminal_restore(&mut self, app: &mut TuiApp) {
+        if !app.pending_terminal_restore.take() {
+            return;
+        }
+        // Nothing to restore if the alternate screen has already been left (a
+        // clean exit raced the request). Consume the flag and report honestly.
+        if !self.alt_screen_active {
+            app.status = terminal_restore::restore_status(false).to_string();
+            app.needs_redraw = true;
+            return;
+        }
+
+        // 1. RESTORE the terminal to a sane state. Reuse the emergency-teardown
+        //    bytes (leave alt-screen + restore every mode, NO transcript mirror),
+        //    then show the cursor and disable raw mode last.
+        {
+            let backend = self.term().backend_mut();
+            let _ = emit_terminal_emergency_teardown(backend, /* alt_screen_active = */ true);
+            let _ = backend.flush();
+        }
+        let _ = self.term().show_cursor();
+        let _ = disable_raw_mode();
+        self.alt_screen_active = false;
+        signal_teardown::set_alt_screen_active(false);
+
+        // 2. RE-ENTER the alternate screen and force a full repaint from model
+        //    state — the user lands back in a clean fullscreen surface.
+        let _ = enable_raw_mode();
+        {
+            let mouse_capture = self.mouse_capture;
+            let backend = self.term().backend_mut();
+            let _ = emit_terminal_enter_setup(backend, mouse_capture);
+            let _ = backend.flush();
+        }
+        self.alt_screen_active = true;
+        signal_teardown::set_alt_screen_active(true);
+        let _ = self.term().clear();
+        mark_full_redraw_after_resume(app);
+
+        app.status = terminal_restore::restore_status(true).to_string();
+        // On-surface confirmation: the freshly re-entered screen is blank, so a
+        // toast (painted over the repainted frame) tells the user the recovery
+        // worked. Terse so it survives the toast width clamp.
+        app.toasts.push(
+            terminal_restore::RESTORE_DONE_TOAST,
+            toast::ToastVariant::Info,
+        );
     }
 
     /// Paint a single centered status line, flushed before the first real

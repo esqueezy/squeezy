@@ -10865,6 +10865,258 @@ fn resume_marks_app_for_full_redraw() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Terminal Restore Command (§12.9.2).
+//
+// The recovery verb that forcibly returns a wedged terminal to a sane state
+// (leave alt-screen, reset modes, show cursor, disable raw mode) and re-enters
+// the fullscreen surface. Both the `Ctrl+Alt+,` keybinding and the
+// `/terminal-reset` slash command flag the request on the model; the run loop
+// drains it on the guard. These drive the real dispatch + the real guard against
+// a `TerminalWriter::Capture` sink — no real TTY.
+// ---------------------------------------------------------------------------
+
+/// `Ctrl+Alt+,` — the default Terminal Restore Command verb.
+fn ctrl_alt_comma() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char(','),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+#[tokio::test]
+async fn keyboard_ctrl_alt_comma_queues_a_terminal_restore() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(
+        !app.pending_terminal_restore.is_pending(),
+        "no restore is queued at rest",
+    );
+
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, ctrl_alt_comma());
+    assert!(consumed, "Ctrl+Alt+, is consumed by the keymap dispatch");
+    assert!(
+        app.pending_terminal_restore.is_pending(),
+        "the keyboard verb queues the restore for the run loop to drain",
+    );
+    // The verb is responsive: an in-flight status shows on the frame before the
+    // loop runs the recovery, and a redraw is requested so the loop wakes.
+    assert!(
+        app.status.contains("restoring terminal"),
+        "an in-flight status is shown: {}",
+        app.status,
+    );
+    assert!(
+        app.needs_redraw,
+        "a redraw wakes the loop to drain the request"
+    );
+}
+
+#[tokio::test]
+async fn slash_terminal_reset_queues_a_terminal_restore() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
+    assert!(!app.pending_terminal_restore.is_pending());
+
+    // The discoverable slash twin funnels through the same request helper.
+    assert!(
+        handle_slash_command(&mut app, &mut agent, "/terminal-reset").await,
+        "/terminal-reset is handled as a TUI-local recovery command",
+    );
+    assert!(
+        app.pending_terminal_restore.is_pending(),
+        "the slash command queues the same restore as the keybinding",
+    );
+    assert!(app.status.contains("restoring terminal"), "{}", app.status);
+}
+
+#[tokio::test]
+async fn slash_terminal_reset_does_not_collide_with_terminal_diagnostic() {
+    // §12.9.2: `/terminal-reset` is a distinct TUI-local recovery verb handled
+    // before the agent dispatch parser (like `/reveal`), so it must not be mistaken
+    // for the `/terminal` diagnostic command — its head is matched exactly.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
+
+    // `/terminal-reset` queues a restore (the recovery verb).
+    assert!(handle_slash_command(&mut app, &mut agent, "/terminal-reset").await);
+    assert!(
+        app.pending_terminal_restore.is_pending(),
+        "/terminal-reset is the recovery verb, not the diagnostic",
+    );
+
+    // A bare `/terminal` (the diagnostic) does NOT queue a restore — the two
+    // commands are kept distinct.
+    app.pending_terminal_restore = terminal_restore::TerminalRestoreRequest::None;
+    let _ = handle_slash_command(&mut app, &mut agent, "/terminal").await;
+    assert!(
+        !app.pending_terminal_restore.is_pending(),
+        "/terminal is the diagnostic, never the recovery verb",
+    );
+}
+
+/// Driver-level recovery: drive a queued restore through the real
+/// `run_pending_terminal_restore` against the `for_capture_test` `Capture` seam,
+/// then assert on the captured byte stream that the recovery RESTORES the terminal
+/// (leave alt-screen + mode resets) and then RE-ENTERS it (re-enter alt-screen +
+/// clear), in that order — the end-to-end form of the §12.9.2 contract — without
+/// ever purging the user's scrollback.
+#[test]
+fn terminal_restore_emits_teardown_then_reenter_bytes() {
+    let mut app = test_app(SessionMode::Build);
+    app.pending_terminal_restore = terminal_restore::TerminalRestoreRequest::Pending;
+
+    let (mut guard, sink) = TerminalGuard::for_capture_test(100, 40);
+    guard.run_pending_terminal_restore(&mut app);
+
+    // The request is drained exactly once.
+    assert!(
+        !app.pending_terminal_restore.is_pending(),
+        "the restore request is consumed by the run-loop drain",
+    );
+
+    let ansi = sink_to_string(&sink);
+
+    // RESTORE: the alternate screen is left and input modes are reset — the wedged
+    // symptoms §12.9.2 enumerates (mouse, bracketed paste).
+    let leave_pos = ansi
+        .find(LEAVE_ALT_SCREEN)
+        .expect("restore must leave the alternate screen");
+    assert!(
+        ansi.contains(DISABLE_MOUSE_MODES),
+        "restore must disable mouse modes",
+    );
+    assert!(
+        ansi.contains("\x1b[?2004l"),
+        "restore must disable bracketed paste",
+    );
+    // The hardware cursor is shown again (a hidden cursor is a classic wedged
+    // symptom the recovery repairs).
+    assert!(
+        ansi.contains("\x1b[?25h"),
+        "restore must show the hardware cursor",
+    );
+
+    // RE-ENTER: the alternate screen is re-entered AFTER the leave, so the user
+    // lands back in the fullscreen surface rather than at a bare shell.
+    let reenter_pos = ansi
+        .rfind("\x1b[?1049h")
+        .expect("restore must re-enter the alternate screen");
+    assert!(
+        leave_pos < reenter_pos,
+        "the terminal is restored (leave at {leave_pos}) BEFORE it is re-entered \
+         (at {reenter_pos})",
+    );
+    // Mouse capture comes back up with the re-enter.
+    assert!(
+        ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "re-enter must re-arm mouse click capture",
+    );
+
+    // A recovery must NEVER purge the user's pre-launch scrollback.
+    assert!(
+        !ansi.contains("\x1b[3J"),
+        "terminal restore must never purge scrollback (\\x1b[3J)",
+    );
+
+    // The guard is back in the alt-screen with a forced full repaint queued, and
+    // the success status is shown.
+    assert!(
+        app.needs_redraw,
+        "restore forces a repaint from model state"
+    );
+    assert!(
+        app.pending_resize,
+        "restore re-anchors scroll geometry after re-enter"
+    );
+    assert_eq!(app.status, terminal_restore::RESTORE_STATUS);
+}
+
+/// Edge case: a restore requested when the alternate screen has already been left
+/// (a clean exit raced the request) consumes the flag, emits NO bytes, and reports
+/// the honest no-op instead of claiming a redraw that did not happen.
+#[test]
+fn terminal_restore_on_already_normal_screen_is_a_reported_noop() {
+    let mut app = test_app(SessionMode::Build);
+    app.pending_terminal_restore = terminal_restore::TerminalRestoreRequest::Pending;
+
+    let (mut guard, sink) = TerminalGuard::for_capture_test(100, 40);
+    // Simulate the alternate screen already being left (e.g. a clean-exit race).
+    guard.finish_fullscreen(&app).expect("leave the alt screen");
+    let len_before = sink.lock().expect("sink lock").len();
+
+    guard.run_pending_terminal_restore(&mut app);
+
+    assert!(
+        !app.pending_terminal_restore.is_pending(),
+        "the request is still consumed on the no-op path",
+    );
+    let len_after = sink.lock().expect("sink lock").len();
+    assert_eq!(
+        len_before, len_after,
+        "an already-normal screen emits no further restore bytes",
+    );
+    assert_eq!(app.status, terminal_restore::RESTORE_NOOP_STATUS);
+}
+
+/// An idle guard with no queued restore drains nothing: a single `take()` check,
+/// no bytes, no status churn. Pins idle-redraw-stays-zero for the loop call.
+#[test]
+fn terminal_restore_with_no_request_is_inert() {
+    let mut app = test_app(SessionMode::Build);
+    app.status = "ready".to_string();
+    app.needs_redraw = false;
+    assert!(!app.pending_terminal_restore.is_pending());
+
+    let (mut guard, sink) = TerminalGuard::for_capture_test(100, 40);
+    guard.run_pending_terminal_restore(&mut app);
+
+    assert!(
+        sink.lock().expect("sink lock").is_empty(),
+        "no queued restore must emit no bytes",
+    );
+    assert_eq!(
+        app.status, "ready",
+        "an inert drain leaves the status alone"
+    );
+    assert!(
+        !app.needs_redraw,
+        "an inert drain requests no redraw (idle stays zero)"
+    );
+}
+
+/// The verb paints through the real `render()` across a resize: the in-flight
+/// recovery toast survives the fullscreen layout at a narrow and a wide size, so
+/// the recovery affordance is visible after the screen is re-entered at whatever
+/// size the user's terminal now is.
+#[test]
+fn terminal_restore_toast_renders_across_resize() {
+    let mut app = test_app(SessionMode::Build);
+    request_terminal_restore(&mut app);
+
+    // Narrow and wide — the recovery toast paints at both, surviving the resize.
+    for (w, h) in [(80_u16, 24_u16), (200, 50)] {
+        let output = render_to_string(&app, w, h);
+        assert!(
+            output.contains("restoring terminal"),
+            "the recovery toast must render at {w}x{h}: {output}",
+        );
+    }
+}
+
+/// Edge case: the real `render()` must not panic at a degenerate tiny size while a
+/// restore is in flight — the recovery affordance degrades gracefully (the toast
+/// overlay paints nothing below 8 cells wide) rather than crashing the very
+/// terminal it is trying to repair.
+#[test]
+fn terminal_restore_toast_renders_without_panic_at_tiny_size() {
+    let mut app = test_app(SessionMode::Build);
+    request_terminal_restore(&mut app);
+    // 1x1 and 20x3 must paint without panicking (the toast is clipped/suppressed).
+    let _ = render_to_string(&app, 1, 1);
+    let _ = render_to_string(&app, 20, 3);
+}
+
 /// Phase 9 cancel-vs-teardown: a mid-turn Ctrl+C cancels the running turn and
 /// returns to the composer with the TUI INTACT — `handle_key` returns `Ok(false)`
 /// (the loop keeps running, so neither `finish_fullscreen` nor the emergency
