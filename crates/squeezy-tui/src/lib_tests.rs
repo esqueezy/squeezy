@@ -10445,6 +10445,15 @@ async fn signal_handlers_install_before_the_resume_picker() {
 /// matching pop on teardown underflows the main screen's stack and corrupts its
 /// keyboard mode. Assert the byte offset of `EnterAlternateScreen` precedes the
 /// `PushKeyboardEnhancementFlags` CSI in the emitted enter-setup stream.
+///
+/// Gated to non-Windows: crossterm's `PushKeyboardEnhancementFlags` reports
+/// `is_ansi_code_supported() == false` on Windows, so `execute!` routes it to
+/// `execute_winapi` (which returns `Unsupported`, swallowed by the best-effort
+/// `let _ = execute!` in `emit_terminal_enter_setup`) and the push CSI is NEVER
+/// written to the ANSI stream. The kitty protocol isn't a legacy Windows-console
+/// thing, so there is no push to order against there; this ordering invariant
+/// only exists on the platforms that actually emit the push.
+#[cfg(not(windows))]
 #[test]
 fn fullscreen_enter_pushes_keyboard_flags_after_alt_screen() {
     let mut bytes = Vec::new();
