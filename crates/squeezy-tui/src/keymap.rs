@@ -1806,6 +1806,11 @@ pub(crate) struct KeymapResolver {
     /// Bindings the user supplied that did not parse as a keyspec,
     /// surfaced via `/keymap`.
     pub(crate) invalid_bindings: Vec<(String, String, String)>,
+    /// Bindings the user supplied that landed on a reserved recovery key
+    /// (`Ctrl+C` / `Esc` / `Ctrl+D`) and were therefore skipped (the action keeps
+    /// its compiled-in default). Each entry is `(slug, spec, reserved_label)`,
+    /// surfaced via `/keymap` so the user learns why the override was ignored.
+    pub(crate) reserved_bindings: Vec<(String, String, String)>,
 }
 
 impl KeymapResolver {
@@ -1820,6 +1825,7 @@ impl KeymapResolver {
         }
         let mut unknown_actions = Vec::new();
         let mut invalid_bindings = Vec::new();
+        let mut reserved_bindings = Vec::new();
         // Actions the user explicitly rebound. These win the reverse-lookup
         // collision over default-bound actions: an explicit `Alt+k = page_up`
         // override must take effect even if some *default*-bound action also
@@ -1833,6 +1839,17 @@ impl KeymapResolver {
             };
             match parse_keyspec(spec) {
                 Some(binding) => {
+                    // Reject a reserved recovery binding (`Ctrl+C` / `Esc` /
+                    // `Ctrl+D`) the same way the `keybindings.toml` file path and
+                    // the in-TUI editor already do. Without this the `[tui.keymap]`
+                    // settings surface could bind an action onto turn-interrupt /
+                    // exit and strand the user with no way out (deep-review #24).
+                    // Skip the override (the action keeps its default) and record
+                    // it as a diagnostic for `/keymap`.
+                    if let Some(label) = crate::keymap_config::reserved_label(&binding) {
+                        reserved_bindings.push((slug.clone(), spec.clone(), label.to_string()));
+                        continue;
+                    }
                     bindings.insert(action, binding);
                     overridden.insert(action);
                 }
@@ -1862,6 +1879,7 @@ impl KeymapResolver {
             bindings,
             unknown_actions,
             invalid_bindings,
+            reserved_bindings,
         }
     }
 
@@ -2122,6 +2140,13 @@ pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
         lines.push("Invalid key specs (default kept):".to_string());
         for (slug, spec, _) in &resolver.invalid_bindings {
             lines.push(format!("  {slug} = {spec:?}"));
+        }
+    }
+    if !resolver.reserved_bindings.is_empty() {
+        lines.push(String::new());
+        lines.push("Reserved recovery keys (override skipped, default kept):".to_string());
+        for (slug, spec, label) in &resolver.reserved_bindings {
+            lines.push(format!("  {slug} = {spec:?} ({label} is reserved)"));
         }
     }
     lines.join("\n")

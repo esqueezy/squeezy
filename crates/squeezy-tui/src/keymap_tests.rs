@@ -126,6 +126,53 @@ fn invalid_entries_surface_in_diagnostics() {
 }
 
 #[test]
+fn settings_keymap_override_cannot_bind_reserved_recovery_keys() {
+    // deep-review #24: the `[tui.keymap]` settings surface must reject reserved
+    // recovery bindings (Ctrl+C / Esc / Ctrl+D) the same way the keybindings.toml
+    // file path and the in-TUI editor already do — otherwise an override could
+    // swallow turn-interrupt / exit and strand the user with no way out.
+
+    // Ctrl+C override is skipped: it never resolves to the copy action, and the
+    // copy action keeps its compiled-in default (Ctrl+Y).
+    let mut overrides = BTreeMap::new();
+    overrides.insert("copy_last_assistant".to_string(), "Ctrl+C".to_string());
+    let resolver = KeymapResolver::from_overrides(&overrides);
+    assert_ne!(
+        resolver.lookup(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        Some(Action::CopyLastAssistant),
+        "Ctrl+C must never be bound to an action by a settings override",
+    );
+    assert_eq!(
+        resolver.binding(Action::CopyLastAssistant),
+        Action::CopyLastAssistant.default_binding(),
+        "the rejected override leaves the default binding live",
+    );
+    assert!(
+        resolver
+            .reserved_bindings
+            .iter()
+            .any(|(slug, _, label)| slug == "copy_last_assistant" && *label == "Ctrl+C"),
+        "the rejected reserved override surfaces as a diagnostic",
+    );
+
+    // Bare Esc is likewise never consumed by an override.
+    let mut esc_overrides = BTreeMap::new();
+    esc_overrides.insert("copy_last_assistant".to_string(), "Esc".to_string());
+    let esc_resolver = KeymapResolver::from_overrides(&esc_overrides);
+    assert!(
+        esc_resolver
+            .lookup(KeyCode::Esc, KeyModifiers::NONE)
+            .is_none(),
+        "bare Esc must never be claimed by a settings override",
+    );
+    assert_eq!(
+        esc_resolver.binding(Action::CopyLastAssistant),
+        Action::CopyLastAssistant.default_binding(),
+        "the rejected Esc override leaves the default binding live",
+    );
+}
+
+#[test]
 fn queue_undo_action_round_trips_and_defaults_to_u() {
     // Slug round-trips and is registered in `ALL` (so `/keymap` lists it and
     // an override can target it).
