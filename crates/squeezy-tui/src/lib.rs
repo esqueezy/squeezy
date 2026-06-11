@@ -21800,6 +21800,17 @@ fn toggle_transcript_entry_fold(app: &mut TuiApp, index: usize) -> bool {
     }
     entry.collapsed = !entry.collapsed;
     entry.bump_revision();
+    // Folding/unfolding changes the painted row count, so every row-indexed
+    // anchor below the entry now points at shifted content. Invalidate the
+    // selection and re-anchor search to the new row model — the same treatment
+    // the resize arm gives a reflow — so a stale highlight band or k-of-N count
+    // can't survive the fold (deep-review #73). Covers the mouse caret-click,
+    // double-click expand, keyboard Ctrl+O, and palette fold paths uniformly.
+    app.selection = None;
+    app.selection_set.clear();
+    if app.search.is_some() {
+        refresh_search(app);
+    }
     true
 }
 

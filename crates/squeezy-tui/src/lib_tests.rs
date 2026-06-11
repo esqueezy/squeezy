@@ -40453,6 +40453,55 @@ fn app_with_hover_preview(focus: usize) -> TuiApp {
     app
 }
 
+#[test]
+fn mouse_fold_toggle_invalidates_row_anchored_selection() {
+    // A caret-click fold changes the painted row count, so any selection_set
+    // range below the entry now points at shifted rows. The fold-toggle dispatch
+    // (the mouse caret-click arm) must invalidate the row-anchored state rather
+    // than leaving it pointing at moved content (deep-review #73).
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    // An expanded multi-row first entry, then content below it.
+    app.push_tool_result(sample_tool_result(
+        "shell",
+        "line one\nline two\nline three\nline four",
+    ));
+    app.push_transcript_item(TranscriptItem::assistant("below the foldable block"));
+    let _ = render_to_string(&app, 100, 30);
+    let captured_width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .expect("a painted frame stamps the text-area cache");
+
+    // A committed range over a row below the first entry.
+    let mut set = multi_selection::SelectionSet::new();
+    let mut committed = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos { row: 5, col: 0 },
+        selection::SelectionMode::Cell,
+        captured_width,
+    );
+    committed.cursor = selection::Pos { row: 5, col: 4 };
+    assert!(set.add(committed));
+    app.selection_set = set;
+    assert!(!app.selection_set.is_empty());
+
+    // Fold the first entry via the same dispatch arm the mouse caret-click drives.
+    let collapsed_before = app.transcript[0].collapsed;
+    let entry_id = transcript_surface::EntryId(app.transcript[0].id);
+    dispatch_click_action(&mut app, interaction::Action::ToggleEntryCollapsed(entry_id));
+    assert_ne!(
+        app.transcript[0].collapsed, collapsed_before,
+        "the fold toggle actually flipped the entry's collapsed state",
+    );
+
+    assert!(
+        app.selection_set.is_empty(),
+        "the row-anchored selection_set is invalidated when the fold shifts rows",
+    );
+}
+
 /// Find a screen cell whose registered hit target is the caret of the entry with
 /// stable `entry_id` (the `ToggleEntryCollapsed` zone), after a render populated
 /// the registry. The caret is the non-text affordance the §12.1.4 double-click
