@@ -384,6 +384,8 @@ pub(crate) struct DiffLine {
 /// can fall back to plain content rather than pay an unbounded `O(n*m)` cost (the
 /// spec's "add size limits and lazy diffing" mitigation).
 pub(crate) fn clean_text_diff(old: &[String], new: &[String]) -> Option<Vec<DiffLine>> {
+    #[cfg(test)]
+    note_clean_text_diff_run();
     if old.len() > DIFF_LINE_LIMIT || new.len() > DIFF_LINE_LIMIT {
         return None;
     }
@@ -441,6 +443,33 @@ pub(crate) fn clean_text_diff(old: &[String], new: &[String]) -> Option<Vec<Diff
         j += 1;
     }
     Some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of how many times [`clean_text_diff`] actually ran its
+    /// alignment, so a test can prove the pinned-compare diff cache skips the
+    /// heavy LCS DP on a content/width-unchanged repaint. Thread-local (not a
+    /// process-wide atomic) so parallel `cargo test` threads never race.
+    static CLEAN_TEXT_DIFF_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: record one entry into [`clean_text_diff`]'s body.
+#[cfg(test)]
+fn note_clean_text_diff_run() {
+    CLEAN_TEXT_DIFF_RUNS.with(|c| c.set(c.get() + 1));
+}
+
+/// Test-only: reset this thread's [`clean_text_diff`] run counter to zero.
+#[cfg(test)]
+pub(crate) fn reset_clean_text_diff_runs() {
+    CLEAN_TEXT_DIFF_RUNS.with(|c| c.set(0));
+}
+
+/// Test-only: this thread's [`clean_text_diff`] run count since the last reset.
+#[cfg(test)]
+pub(crate) fn clean_text_diff_runs() -> u64 {
+    CLEAN_TEXT_DIFF_RUNS.with(|c| c.get())
 }
 
 #[cfg(test)]

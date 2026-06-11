@@ -18669,7 +18669,45 @@ fn pinned_compare_diff_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let body_width = width.saturating_sub(2).max(1);
     let old = pinned_compare_pane_plain(app, pinned_compare::ComparePane::Pinned, body_width);
     let new = pinned_compare_pane_plain(app, pinned_compare::ComparePane::Compare, body_width);
-    let Some(diff) = pinned_compare::clean_text_diff(&old, &new) else {
+    // Cache the heavy LCS diff + styled-row build keyed on the width and a content
+    // hash of both plain panes. The plain-text build above is a cheap cache-hitting
+    // wrap; the DP table (`clean_text_diff`) is the ~2.9 MB cost we skip on a hit,
+    // so an open diff overlay re-runs the alignment only when a side's content or
+    // the width actually changes — not every painted frame / scroll tick.
+    let key = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        width.hash(&mut hasher);
+        old.len().hash(&mut hasher);
+        for row in &old {
+            row.hash(&mut hasher);
+        }
+        // Separate the two sides so `[a, b]` vs `[]`,`[a, b]` cannot collide.
+        usize::MAX.hash(&mut hasher);
+        new.len().hash(&mut hasher);
+        for row in &new {
+            row.hash(&mut hasher);
+        }
+        hasher.finish()
+    };
+    {
+        let cache = app.pinned_compare_diff_cache.borrow();
+        if cache.key == Some(key) {
+            return cache.rows.clone();
+        }
+    }
+    let rows = pinned_compare_diff_rows(&old, &new);
+    let mut cache = app.pinned_compare_diff_cache.borrow_mut();
+    cache.key = Some(key);
+    cache.rows = rows.clone();
+    rows
+}
+
+/// Build the styled diff rows from two plain panes — the LCS alignment plus the
+/// `+`/`-`/` ` gutter coloring. Extracted from [`pinned_compare_diff_lines`] so the
+/// cache front door wraps only the heavy part; returns the too-large fallback
+/// notice when either side exceeds the diff size limit.
+fn pinned_compare_diff_rows(old: &[String], new: &[String]) -> Vec<Line<'static>> {
+    let Some(diff) = pinned_compare::clean_text_diff(old, new) else {
         return vec![Line::from(Span::styled(
             format!(
                 "diff skipped — output too large (> {} lines per side)",
@@ -33797,6 +33835,21 @@ pub(crate) struct TranscriptOverlayRenderCache {
     rows: Vec<Line<'static>>,
 }
 
+/// Memoizes the pinned-compare diff body (§ pinned-compare) so the full LCS DP
+/// table (`clean_text_diff`, up to ~720k cells / ~2.9 MB for two 600-line sides)
+/// is built ONCE per content/width change rather than recomputed on every painted
+/// frame and every scroll tick (`pinned_compare_diff_lines` is called per pane per
+/// frame plus per scroll via `pinned_compare_geometry`). The key folds the width
+/// and a content hash of BOTH plain panes, so any edit/append to either side, a
+/// resize, or a pane swap invalidates the cache; the cheap plain-text build (a
+/// cache-hitting wrap) still runs each call, but the heavy DP does not. The stored
+/// rows are cloned out on a hit, matching the owned-`Vec` return contract.
+#[derive(Debug, Default)]
+pub(crate) struct PinnedCompareDiffCache {
+    key: Option<u64>,
+    rows: Vec<Line<'static>>,
+}
+
 /// Render the full-screen transcript overlay. Replaces the normal
 /// transcript + prompt layout while `app.transcript_overlay` is `Some`.
 fn render_transcript_overlay_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -44107,6 +44160,11 @@ pub(crate) struct TuiApp {
     /// to that pane. Set at the end of the overlay render when the compare view
     /// paints; `None` otherwise.
     pub(crate) pinned_compare_rect_cache: std::cell::Cell<Option<(Rect, Rect)>>,
+    /// Memoized pinned-compare diff body so the heavy LCS DP (`clean_text_diff`)
+    /// is not recomputed on every painted frame / scroll tick while the diff
+    /// overlay is open. Keyed on the width + a content hash of both plain panes,
+    /// so any content edit or resize invalidates it. See `pinned_compare_diff_lines`.
+    pub(crate) pinned_compare_diff_cache: std::cell::RefCell<PinnedCompareDiffCache>,
     /// Per-frame snapshot of the MAIN transcript scrollbar gutter so a mouse
     /// click/drag can map to a `from_bottom` without re-deriving the layout.
     /// Set at the end of `render_transcript`; `None` when content fits.
@@ -45627,6 +45685,7 @@ impl TuiApp {
             diff_detail_pane_rect_cache: std::cell::Cell::new(None),
             pinned_compare: None,
             pinned_compare_rect_cache: std::cell::Cell::new(None),
+            pinned_compare_diff_cache: std::cell::RefCell::new(PinnedCompareDiffCache::default()),
             main_scrollbar_cache: std::cell::Cell::new(None),
             main_text_area_cache: std::cell::Cell::new(None),
             last_frame_size: std::cell::Cell::new(None),

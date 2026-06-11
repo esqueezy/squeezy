@@ -2989,6 +2989,63 @@ async fn pinned_compare_x_toggles_a_clean_text_diff() {
     );
 }
 
+// Regression (deep-review #105): the pinned-compare diff body memoizes the heavy
+// LCS DP (`clean_text_diff`) keyed on width + a content hash of both plain panes,
+// so an open diff overlay does NOT recompute the ~2.9 MB alignment on every painted
+// frame / scroll tick. The DP must run once for a given (content, width), be reused
+// on an identical repaint, and re-run only when the width changes.
+#[tokio::test]
+async fn pinned_compare_diff_caches_the_lcs_across_identical_repaints() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("x switches to diff mode");
+    assert_eq!(
+        app.pinned_compare.expect("open").mode,
+        pinned_compare::CompareMode::Diff
+    );
+
+    // First diff build runs the LCS alignment once.
+    pinned_compare::reset_clean_text_diff_runs();
+    let first = pinned_compare_diff_lines(&app, 80);
+    assert_eq!(
+        pinned_compare::clean_text_diff_runs(),
+        1,
+        "the first diff at a fresh (content, width) builds the LCS once"
+    );
+    assert!(!first.is_empty(), "the diff produced rows");
+
+    // A second identical call (same content, same width) is a cache hit: the heavy
+    // DP must NOT run again, and the rows are byte-identical.
+    let second = pinned_compare_diff_lines(&app, 80);
+    assert_eq!(
+        pinned_compare::clean_text_diff_runs(),
+        1,
+        "an identical repaint reuses the cached diff instead of re-running the LCS"
+    );
+    assert_eq!(
+        first, second,
+        "the cached rows match the freshly built rows"
+    );
+
+    // Changing the width invalidates the cache (the panes re-wrap at the new
+    // column), so the alignment must run again.
+    let _ = pinned_compare_diff_lines(&app, 60);
+    assert_eq!(
+        pinned_compare::clean_text_diff_runs(),
+        2,
+        "a width change re-runs the diff against the re-wrapped panes"
+    );
+}
+
 #[tokio::test]
 async fn pinned_compare_closes_when_overlay_closes() {
     let mut app = app_with_focused_tool_entry();
