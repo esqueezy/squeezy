@@ -11275,6 +11275,12 @@ fn emergency_teardown_leaves_alt_screen_and_restores_modes_without_mirror() {
 /// stream. The push (`CSI > … u`) and the non-stack set/reset (`CSI = … u`) are
 /// NOT stack pops and are excluded. Used to prove a teardown pops exactly once
 /// per push, never underflowing the per-screen stack. (deep-review #94)
+///
+/// Non-Windows only: its sole caller
+/// (`teardown_pops_keyboard_enhancement_stack_exactly_once`) is gated off Windows
+/// because the kitty pop CSI is never emitted there, so without this gate the
+/// helper would be dead code and trip `-D warnings` on the Windows build.
+#[cfg(not(windows))]
 fn count_keyboard_stack_pops(ansi: &str) -> usize {
     let bytes = ansi.as_bytes();
     let mut count = 0usize;
@@ -11305,6 +11311,18 @@ fn count_keyboard_stack_pops(ansi: &str) -> usize {
 /// AND `RESET_KEYBOARD_ENHANCEMENT_FLAGS` when that constant was the raw `\x1b[<u`
 /// default-1 pop — popping TWICE and underflowing the stack. The reset is now the
 /// non-stack set form (`CSI = 0 ; 1 u`), so exactly one stack pop remains.
+///
+/// Gated to non-Windows: the one-pop assertion counts the kitty stack-pop CSI
+/// (`CSI < … u`) that crossterm's `PopKeyboardEnhancementFlags` emits. On Windows
+/// `is_ansi_code_supported() == false`, so `execute!` routes that pop to
+/// `execute_winapi` (a no-op for the kitty protocol, swallowed by the best-effort
+/// `let _ = execute!` in the teardown emitters) and NO stack-pop CSI reaches the
+/// ANSI stream — the count is 0, not 1. The same is true of the matching push in
+/// `emit_terminal_enter_setup` (see `fullscreen_enter_pushes_keyboard_flags_after_alt_screen`,
+/// also non-Windows): with no push there is no pop to count. The teardown is still
+/// correct on Windows (no kitty stack exists to underflow); the one-push⇒one-pop
+/// stream invariant only exists on the platforms that actually emit the push/pop.
+#[cfg(not(windows))]
 #[test]
 fn teardown_pops_keyboard_enhancement_stack_exactly_once() {
     // Emergency teardown (panic hook / SIGTERM / SIGHUP / Drop / suspend) path.
