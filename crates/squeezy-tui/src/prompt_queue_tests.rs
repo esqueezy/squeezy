@@ -134,7 +134,7 @@ fn indicator_line_present_when_queue_non_empty() {
 fn render_lines_includes_header_and_empty_marker() {
     let state = PromptQueueState::new();
     let queue: VecDeque<String> = VecDeque::new();
-    let lines = render_lines(&state, &queue, None, None, None, None);
+    let lines = render_lines(&state, &queue, None, None, None, None, None);
     assert!(lines.len() >= 2);
 }
 
@@ -144,7 +144,7 @@ fn render_lines_paints_multiselect_checkbox() {
     let queue = queue_of(&["alpha", "beta", "gamma"]);
     // Tag the middle item only.
     let tagged = [false, true, false];
-    let lines = render_lines(&state, &queue, Some(&tagged), None, None, None);
+    let lines = render_lines(&state, &queue, Some(&tagged), None, None, None, None);
     let text: String = lines
         .iter()
         .flat_map(|l| l.spans.iter())
@@ -161,10 +161,57 @@ fn render_lines_paints_multiselect_checkbox() {
 }
 
 #[test]
+fn render_lines_paints_right_aligned_delete_glyph_at_the_hit_zone_column() {
+    // With a known content width, each item row paints a visible `[x]` delete
+    // affordance in its trailing DELETE_AFFORDANCE_WIDTH cells — flush right at
+    // `width - DELETE_AFFORDANCE_WIDTH`, the exact column the `QueueDelete` hit
+    // rect (registered at `x = handle_w = width - delete_w`) occupies. Before the
+    // fix rows were left-aligned `NN. preview` with empty trailing cells.
+    let state = PromptQueueState::new();
+    let queue = queue_of(&["alpha", "beta"]);
+    let width: u16 = 40;
+    let lines = render_lines(&state, &queue, None, None, None, None, Some(width));
+    // Skip the header (line 0); inspect the first item row.
+    let row: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    let row_w = unicode_width::UnicodeWidthStr::width(row.as_str());
+    assert_eq!(
+        row_w, width as usize,
+        "the row fills the full content width so the glyph lands flush right: {row:?}"
+    );
+    assert!(
+        row.ends_with("[x]"),
+        "the row's trailing cells paint the delete glyph: {row:?}"
+    );
+    // The glyph occupies exactly the trailing DELETE_AFFORDANCE_WIDTH cells, i.e.
+    // it begins at the same x the QueueDelete hit rect does.
+    let glyph_start = row_w - DELETE_AFFORDANCE_WIDTH as usize;
+    assert_eq!(
+        &row[row.char_indices().nth(glyph_start).map(|(i, _)| i).unwrap()..],
+        "[x]",
+        "delete glyph starts at width - DELETE_AFFORDANCE_WIDTH"
+    );
+}
+
+#[test]
+fn render_lines_truncates_long_preview_so_it_never_overwrites_the_delete_glyph() {
+    // A preview longer than the row must be truncated to leave room for the
+    // trailing `[x]`, so the glyph stays at the hit-zone column.
+    let state = PromptQueueState::new();
+    let long = "x".repeat(200);
+    let queue = queue_of(&[long.as_str()]);
+    let width: u16 = 30;
+    let lines = render_lines(&state, &queue, None, None, None, None, Some(width));
+    let row: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    let row_w = unicode_width::UnicodeWidthStr::width(row.as_str());
+    assert_eq!(row_w, width as usize, "row clamped to width: {row:?}");
+    assert!(row.ends_with("[x]"), "glyph survives truncation: {row:?}");
+}
+
+#[test]
 fn render_lines_header_is_base_hint_with_no_group() {
     let state = PromptQueueState::new();
     let queue = queue_of(&["alpha"]);
-    let lines = render_lines(&state, &queue, Some(&[false]), None, None, None);
+    let lines = render_lines(&state, &queue, Some(&[false]), None, None, None, None);
     let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(header.contains("reorder"), "base header hint: {header}");
     assert!(!header.contains("delete group"));

@@ -40944,7 +40944,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         // never change the line count, so the height calc can skip computing them
         // (`None`).
         .map(|state| {
-            prompt_queue::render_lines(state, &app.prompt_queue, None, None, None, None).len()
+            prompt_queue::render_lines(state, &app.prompt_queue, None, None, None, None, None).len()
         })
         .unwrap_or(0);
     let overlay_lines = if queue_overlay_lines > 0 {
@@ -41387,6 +41387,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 Some(&queue_groups),
                 Some(&queue_conditions),
                 app.last_turn_outcome,
+                Some(area.width),
             )
         })
         .unwrap_or_default();
@@ -41472,8 +41473,10 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
-/// Width of the trailing delete affordance (`[x]`) on each item row.
-const QUEUE_DELETE_AFFORDANCE_WIDTH: u16 = 3;
+/// Width of the trailing delete affordance (`[x]`) on each item row. Aliased to
+/// the painter's [`prompt_queue::DELETE_AFFORDANCE_WIDTH`] so the registered hit
+/// rect and the painted glyph share one source of truth and can never drift.
+const QUEUE_DELETE_AFFORDANCE_WIDTH: u16 = prompt_queue::DELETE_AFFORDANCE_WIDTH;
 
 /// Register the per-item mouse affordances for the open reorder overlay: a
 /// trailing delete zone (`QueueDelete`) and the rest of the row as a

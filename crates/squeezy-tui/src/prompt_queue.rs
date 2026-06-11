@@ -14,9 +14,20 @@ use std::collections::VecDeque;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::render::button::{ButtonState, button_spans};
 use crate::render::palette;
+
+/// Width (in cells) of the trailing delete affordance painted on each open
+/// item row and registered as the `QueueDelete` hit zone. Shared between the
+/// painter ([`render_lines`]) and the hit-target registrar in `lib.rs` so the
+/// glyph and the click rect can never drift apart.
+pub(crate) const DELETE_AFFORDANCE_WIDTH: u16 = 3;
+
+/// The glyph painted in the trailing [`DELETE_AFFORDANCE_WIDTH`] cells of each
+/// item row. Exactly three cells wide so it fills the registered delete zone.
+const DELETE_GLYPH: &str = "[x]";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PromptQueueState {
@@ -169,6 +180,14 @@ fn preview(text: &str) -> String {
 /// latest `outcome` so a skip-bound / blocked row reads at a glance. A shorter /
 /// absent slice paints every row unconditional. Like the group marker it is an
 /// inline prefix, so it never changes the row count the height calc relies on.
+///
+/// `content_width` is the render area width: when `Some`, each item row is padded
+/// out and a `[x]` delete glyph is painted right-aligned in its trailing
+/// [`DELETE_AFFORDANCE_WIDTH`] cells, landing at exactly the column the `QueueDelete`
+/// hit rect occupies (`content_width - DELETE_AFFORDANCE_WIDTH`) so the painted
+/// affordance and the click zone coincide. The preview body is truncated to fit
+/// left of the glyph so it never overwrites it. `None` (tests that only inspect
+/// the prefix markers) paints rows without the trailing glyph.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_lines(
     state: &PromptQueueState,
@@ -177,6 +196,7 @@ pub(crate) fn render_lines(
     groups: Option<&[Option<&crate::queue_groups::QueueGroup>]>,
     conditions: Option<&[crate::queue_conditions::QueueCondition]>,
     outcome: Option<crate::queue_conditions::TurnOutcome>,
+    content_width: Option<u16>,
 ) -> Vec<Line<'static>> {
     let group_active = tagged.is_some_and(|t| t.iter().any(|&b| b));
     let any_group = groups.is_some_and(|g| g.iter().any(|m| m.is_some()));
@@ -234,7 +254,7 @@ pub(crate) fn render_lines(
         } else {
             format!("{:>2}. {}", index + 1, preview(item))
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 marker,
                 Style::default().fg(if is_selected {
@@ -247,10 +267,62 @@ pub(crate) fn render_lines(
             crate::queue_groups::group_marker_span(group),
             crate::queue_conditions::condition_marker_span(condition, outcome),
             Span::raw(" "),
-            Span::styled(body, style),
-        ]));
+        ];
+        // Reserve the trailing cells for a visible `[x]` delete affordance that
+        // lines up with the registered `QueueDelete` hit rect. Truncate the body
+        // so it never overwrites the glyph, pad the gap so the glyph lands flush
+        // right at `content_width - DELETE_AFFORDANCE_WIDTH`.
+        if let Some(width) = content_width.filter(|w| *w > DELETE_AFFORDANCE_WIDTH) {
+            let prefix_w: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let body_budget = (width as usize)
+                .saturating_sub(DELETE_AFFORDANCE_WIDTH as usize)
+                .saturating_sub(prefix_w);
+            let body = truncate_to_width(&body, body_budget);
+            let body_w = UnicodeWidthStr::width(body.as_str());
+            let pad = body_budget.saturating_sub(body_w);
+            spans.push(Span::styled(body, style));
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            spans.push(Span::styled(
+                DELETE_GLYPH,
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        } else {
+            spans.push(Span::styled(body, style));
+        }
+        lines.push(Line::from(spans));
     }
     lines
+}
+
+/// Truncate `text` so its display width is at most `budget` cells, appending a
+/// `…` (1 cell) when it had to cut so the user sees the row continues. Width-aware
+/// (a CJK preview never overruns the delete glyph) and never splits a codepoint.
+fn truncate_to_width(text: &str, budget: usize) -> String {
+    if UnicodeWidthStr::width(text) <= budget {
+        return text.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    // Leave one cell for the ellipsis.
+    let target = budget.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthStr::width(ch.to_string().as_str());
+        if used + w > target {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
