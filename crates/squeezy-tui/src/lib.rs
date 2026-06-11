@@ -15859,6 +15859,11 @@ fn build_fold_candidates(entries: &[TranscriptEntry]) -> Vec<duplicate_fold::Fol
         .filter_map(|(i, entry)| {
             let text = fold_output_text(entry)?;
             Some(duplicate_fold::FoldableOutput {
+                // `i` is the entry's position in the *full* transcript, not in
+                // this tool-only candidate slice, so the fold model can require
+                // genuine transcript adjacency and never fold two outputs that
+                // are separated by intervening conversation.
+                seq: i,
                 id: entry.id,
                 revision: entry.revision,
                 output: duplicate_fold::output_fingerprint(&text),

@@ -6,7 +6,11 @@
 use super::*;
 
 fn cand(id: u64, output: u64) -> FoldableOutput {
+    // Existing tests use slice-contiguous ids 1,2,3,…, so deriving `seq` from
+    // `id` makes them transcript-adjacent by construction. Tests that need a gap
+    // (intervening conversation) build the candidate explicitly with `seq`.
     FoldableOutput {
+        seq: id as usize,
         id,
         revision: 0,
         output,
@@ -16,6 +20,7 @@ fn cand(id: u64, output: u64) -> FoldableOutput {
 
 fn err(id: u64, output: u64) -> FoldableOutput {
     FoldableOutput {
+        seq: id as usize,
         id,
         revision: 0,
         output,
@@ -97,6 +102,49 @@ fn two_separate_runs_make_two_spans() {
     assert_eq!(folds.spans()[0].lead_id, 1);
     assert_eq!(folds.spans()[1].lead_id, 4);
     assert_eq!(folds.hidden_count(), 2);
+}
+
+#[test]
+fn intervening_conversation_breaks_a_run() {
+    // Two identical, non-error tool outputs that are *not* transcript-adjacent:
+    // a conversation turn sits between them (seq 0 then seq 5), so the
+    // tool-only candidate slice makes them slice-adjacent while the transcript
+    // does not. They must NOT fold — a fold would hide the second output far
+    // from its lead. A trailing distinct output rounds out the slice.
+    let mut folds = DuplicateFolds::new();
+    let cands = vec![
+        FoldableOutput {
+            seq: 0,
+            id: 1,
+            revision: 0,
+            output: 100,
+            is_error: false,
+        },
+        FoldableOutput {
+            seq: 5,
+            id: 2,
+            revision: 0,
+            output: 100,
+            is_error: false,
+        },
+        FoldableOutput {
+            seq: 6,
+            id: 3,
+            revision: 0,
+            output: 200,
+            is_error: false,
+        },
+    ];
+    let fp = DuplicateFolds::fingerprint_of(cands.iter());
+    folds.rebuild_if_stale(fp, &cands);
+    // The seq gap (0 -> 5) breaks the run: no span, nothing hidden, neither
+    // member projects as hidden.
+    assert_eq!(folds.span_count(), 0);
+    assert_eq!(folds.hidden_count(), 0);
+    assert!(!folds.is_folded(1));
+    assert!(!folds.is_folded(2));
+    assert!(!folds.is_hidden_in_projection(1));
+    assert!(!folds.is_hidden_in_projection(2));
 }
 
 #[test]

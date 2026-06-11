@@ -102,13 +102,17 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
-/// One fold-candidate transcript entry, as the caller feeds it in. `id` is the
-/// stable `TranscriptEntry::id`; `revision` is its content revision (folded into
-/// the staleness fingerprint so a mutation recomputes); `output` is the
-/// normalized output fingerprint from [`output_fingerprint`]; `is_error` flags a
-/// failure that must never be folded.
+/// One fold-candidate transcript entry, as the caller feeds it in. `seq` is the
+/// entry's **position in the full transcript** (not in the candidate slice), so
+/// run detection can tell genuinely consecutive tool outputs apart from ones
+/// separated by intervening conversation; `id` is the stable
+/// `TranscriptEntry::id`; `revision` is its content revision (folded into the
+/// staleness fingerprint so a mutation recomputes); `output` is the normalized
+/// output fingerprint from [`output_fingerprint`]; `is_error` flags a failure
+/// that must never be folded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FoldableOutput {
+    pub(crate) seq: usize,
     pub(crate) id: u64,
     pub(crate) revision: u64,
     pub(crate) output: u64,
@@ -169,16 +173,18 @@ impl DuplicateFolds {
     }
 
     /// Fold a staleness fingerprint over a sequence of candidates. Order- and
-    /// content-sensitive: id, revision, output fingerprint, and the error flag
-    /// all participate, so an append, a revision bump, a reorder, an output
-    /// change, or a drop all move the value. Pure and standalone so the caller
-    /// can compute it cheaply each refresh and compare before deciding to
-    /// recompute.
+    /// content-sensitive: transcript position, id, revision, output fingerprint,
+    /// and the error flag all participate, so an append, a revision bump, a
+    /// reorder, an output change, a drop, or intervening conversation that shifts
+    /// a tool output's transcript position (and can break a run) all move the
+    /// value. Pure and standalone so the caller can compute it cheaply each
+    /// refresh and compare before deciding to recompute.
     pub(crate) fn fingerprint_of<'a>(
         candidates: impl IntoIterator<Item = &'a FoldableOutput>,
     ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for c in candidates {
+            c.seq.hash(&mut hasher);
             c.id.hash(&mut hasher);
             c.revision.hash(&mut hasher);
             c.output.hash(&mut hasher);
@@ -218,11 +224,17 @@ impl DuplicateFolds {
                 continue;
             }
             // Extend a run of consecutive non-error candidates sharing this
-            // output fingerprint.
+            // output fingerprint. Contiguity is *transcript-relative*: each step
+            // must sit immediately after the previous one in the full transcript
+            // (`seq` is +1), so any intervening user/assistant/log entry breaks
+            // the run even though such entries are absent from this tool-only
+            // candidate slice. Without this, two identical outputs separated by a
+            // conversation turn would fold as if adjacent.
             let mut j = i + 1;
             while j < candidates.len()
                 && !candidates[j].is_error
                 && candidates[j].output == head.output
+                && candidates[j].seq == candidates[j - 1].seq + 1
             {
                 j += 1;
             }
