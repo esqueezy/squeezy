@@ -18506,6 +18506,46 @@ fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
     (lines.len(), viewport_h as usize)
 }
 
+/// Keep an *unpinned* main-transcript view anchored to the content the user is
+/// reading when new content is appended (Append-Aware Anchor).
+///
+/// The scroll model stores `from_bottom` (distance up from the tail), so a fresh
+/// append grows `max_scroll` and the same `from_bottom` resolves to a larger
+/// top-line offset — the viewport yanks forward by the appended rows. This
+/// re-runs just before paint: it reads the *prior* frame's wrapped-row count from
+/// `main_text_area_cache`, recomputes the *current* count at the same painted
+/// width, and bumps `from_bottom` by the row delta so `offset == max_scroll -
+/// from_bottom` stays put. A following view is left pinned (it intends to track
+/// the tail). Gated on matching viewport+width so a reflow/resize (handled by
+/// `reanchor_active_scroll_on_resize`) never double-compensates.
+fn compensate_main_scroll_for_append(app: &mut TuiApp) {
+    // Only the MAIN transcript has the append-anchor model; a subagent view is
+    // log-only and always tail-tracking.
+    if !matches!(app.subagent_pane.active, ConversationSource::Main) {
+        return;
+    }
+    let Some(cache) = app.main_text_area_cache.get() else {
+        return;
+    };
+    if active_transcript_scroll(app).is_following() {
+        return;
+    }
+    let (new_total, viewport_h) = active_transcript_geometry(app);
+    // A viewport-height change is a reflow, not an append — leave it to the
+    // resize re-anchor. The painted text width is the cache's `text_area.width`;
+    // `active_transcript_geometry` wraps at that same width via
+    // `off_frame_terminal_size`, so a width change shows up as a viewport change
+    // or a non-growth row delta and is filtered out here.
+    if usize::from(cache.viewport_h) != viewport_h {
+        return;
+    }
+    let delta = new_total.saturating_sub(cache.total_rows);
+    if delta == 0 {
+        return;
+    }
+    active_transcript_scroll_mut(app).compensate_for_growth(delta, new_total, viewport_h);
+}
+
 /// Re-anchor the active transcript scroll + focus to the current (post-resize)
 /// geometry (Focus-Preserving Resize, §12.4.3).
 ///
@@ -47537,6 +47577,11 @@ impl TerminalGuard {
         if app.changes_since_open {
             refresh_change_summary(app);
         }
+
+        // Keep an unpinned main view anchored to the content the user is reading
+        // when new transcript content has been appended since the last paint, so
+        // a streamed answer below the fold doesn't yank the viewport forward.
+        compensate_main_scroll_for_append(app);
 
         let paint = self.paint_one_frame(app);
 

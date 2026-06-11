@@ -274,6 +274,39 @@ fn home_then_end_round_trips_top_to_tail() {
     assert_eq!(s.offset(100, 24), 76, "tail renders the last viewport");
 }
 
+// ---- compensate_for_growth (append-aware anchor) -----------------------
+
+#[test]
+fn compensate_for_growth_keeps_unpinned_top_row_steady() {
+    // Unpinned 5 from the tail over 100 rows in a 20-row viewport: the top row
+    // shown is offset 75. Appending 10 rows must NOT yank the viewport forward —
+    // the row the user is reading (offset 75) stays put.
+    let line_count = 100usize;
+    let viewport_h = 20usize;
+    let mut s = ScrollState::scrolled_up(5);
+    assert_eq!(s.offset(line_count, viewport_h), 75);
+    // Content grows by 10 rows; new geometry is the post-growth count.
+    s.compensate_for_growth(10, line_count + 10, viewport_h);
+    assert_eq!(
+        s.offset(line_count + 10, viewport_h),
+        75,
+        "the top row the user was reading does not move on append"
+    );
+    // The compensation is exactly the appended delta, leaving the view unpinned.
+    assert_eq!(s.from_bottom(), 15);
+    assert!(!s.is_following());
+}
+
+#[test]
+fn compensate_for_growth_noop_while_following_tail() {
+    // A following view intends to track the live tail, so growth must leave it
+    // pinned (from_bottom 0) rather than scrolling it off the bottom.
+    let mut s = ScrollState::pinned();
+    s.compensate_for_growth(10, 110, 20);
+    assert_eq!(s.from_bottom(), 0);
+    assert!(s.is_following());
+}
+
 // ---- set_from_bottom (scrollbar click / jump-nav target) ---------------
 
 #[test]

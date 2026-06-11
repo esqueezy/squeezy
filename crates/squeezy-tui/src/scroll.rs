@@ -186,6 +186,37 @@ impl ScrollState {
         self.follow_tail = next == 0;
     }
 
+    /// Keep the viewport top anchored to the content the user is reading when
+    /// the content grows underneath an *unpinned* view.
+    ///
+    /// On append the wrapped-row count (and therefore `max_scroll`) grows, so a
+    /// fixed `from_bottom` would resolve to a larger top-line `offset` and yank
+    /// the viewport forward by the appended rows. Bumping `from_bottom` by the
+    /// same `delta` rows holds `offset == max_scroll - from_bottom` steady, so
+    /// the row the user was reading stays put. No-op while following the tail
+    /// (the existing pin keeps tracking the live bottom). The result is clamped
+    /// to the new `max_scroll`.
+    ///
+    /// `line_count` / `viewport_h` are the *post-growth* geometry.
+    pub(crate) fn compensate_for_growth(
+        &mut self,
+        delta: usize,
+        line_count: usize,
+        viewport_h: usize,
+    ) {
+        if self.follow_tail || delta == 0 {
+            return;
+        }
+        let max_scroll = Self::max_scroll(line_count, viewport_h);
+        self.from_bottom = self.from_bottom.saturating_add(delta).min(max_scroll);
+        // Anchoring to grown content never re-pins by itself; only an explicit
+        // scroll-down/pin re-pins. If the clamp collapsed us to 0 (content still
+        // fits) restore the follow intent, mirroring `scroll_by`/`set_from_bottom`.
+        if self.from_bottom == 0 {
+            self.follow_tail = true;
+        }
+    }
+
     /// Pin the view to the bottom: `from_bottom = 0`, `follow_tail = true`.
     pub(crate) fn pin_to_bottom(&mut self) {
         self.from_bottom = 0;
