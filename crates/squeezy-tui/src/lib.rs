@@ -17573,7 +17573,37 @@ fn entry_index_for_id(app: &TuiApp, id: transcript_surface::EntryId) -> Option<u
 /// its `EntryId` back to a live index, then calls the SAME handler the keyboard
 /// path calls — so keyboard/mouse parity holds by construction. Adding a new
 /// button means adding a variant to [`interaction::Action`] and one arm here.
+/// True when `action` is a DESTRUCTIVE clear/reset click verb whose owning overlay
+/// is currently closed — meaning a click resolved this target against a STALE
+/// frame-local registry (the overlay closed earlier in the same input batch, before
+/// the next repaint rebuilt the click targets) and must be refused (deep-review
+/// #33). Each clear verb is owned by exactly one picker/editor overlay; when that
+/// overlay is open the verb is legitimate, when it is closed the target is stale.
+/// Pure read over `app`.
+fn destructive_click_verb_owner_closed(app: &TuiApp, action: interaction::Action) -> bool {
+    match action {
+        interaction::Action::SnippetClear => !app.snippets_open,
+        interaction::Action::ClipboardClear => !app.clipboard_history_open,
+        interaction::Action::TemplateClear => !app.templates_open,
+        interaction::Action::KeybindingReset => app.keybinding_editor.is_none(),
+        _ => false,
+    }
+}
+
 fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
+    // Stale-registry guard (deep-review #33): the hit-test registry is frame-local
+    // and rebuilt only at draw time, so a click that arrives in the SAME input
+    // batch right after an Esc closed a picker (no intervening repaint) can still
+    // resolve against last frame's `Chrome(SnippetClear)` / `ClipboardClear` /
+    // `TemplateClear` / `KeybindingReset` target via the unguarded catch-all chrome
+    // arm in `handle_mouse`. Re-validate the DESTRUCTIVE clear/reset verbs against
+    // their owning overlay's current open-state and refuse them when that overlay is
+    // closed — a click can never wipe a stash whose picker is no longer on screen.
+    // Non-destructive verbs are intentionally not gated here (a stale select/scroll
+    // is harmless and the per-overlay arms already short-circuit the modal cases).
+    if destructive_click_verb_owner_closed(app, action) {
+        return;
+    }
     match action {
         interaction::Action::ToggleQueueOverlay => toggle_prompt_queue_overlay(app),
         interaction::Action::ToggleEntryCollapsed(id) => {

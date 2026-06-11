@@ -26905,6 +26905,109 @@ async fn snippets_picker_mouse_click_selects_and_double_click_inserts() {
 }
 
 #[tokio::test]
+async fn stale_snippet_clear_target_is_refused_after_the_picker_closes() {
+    // deep-review #33: the hit-test registry is frame-local and rebuilt only at
+    // draw time. If a click arrives in the SAME input batch right after an Esc
+    // closed the snippets picker — with NO intervening repaint — it still resolves
+    // against last frame's `Chrome(SnippetClear)` target. The unguarded catch-all
+    // chrome arm would then dispatch `SnippetClear` and wipe the stash even though
+    // the picker that owns the button is gone. The destructive-verb open-state
+    // re-validation must refuse it.
+    let mut app = test_app(SessionMode::Build);
+    let src = |row: usize, text: &str| snippet_store::SnippetSource {
+        surface: snippet_store::SnippetSurface::Main,
+        row_start: row,
+        row_end: row,
+        chars: text.chars().count(),
+        bytes: text.len(),
+    };
+    app.snippets.save("keep me one", src(0, "keep me one"));
+    app.snippets.save("keep me two", src(1, "keep me two"));
+    app.snippets_open = true;
+
+    // Render the OPEN picker so it registers `Chrome(SnippetClear)` this frame.
+    let _ = render_to_string(&app, 100, 24);
+    let clear_cell = queue_cell_for(
+        &app,
+        100,
+        24,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::SnippetClear),
+        interaction::Action::SnippetClear,
+    )
+    .expect("the open picker registers a Clear-all click target");
+
+    // The picker closes (an Esc earlier in the same batch) WITHOUT a repaint, so
+    // the stale `SnippetClear` target is still resolvable in the registry.
+    app.snippets_open = false;
+    assert!(
+        queue_cell_for(
+            &app,
+            100,
+            24,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::SnippetClear),
+            interaction::Action::SnippetClear,
+        )
+        .is_some(),
+        "the registry still holds the stale Clear target (no repaint yet)"
+    );
+
+    let before = app.snippets.len();
+    // The deferred click lands on the now-stale Clear button cell.
+    handle_mouse(
+        &mut app,
+        left_down(clear_cell.0, clear_cell.1, KeyModifiers::NONE),
+    );
+
+    assert_eq!(
+        app.snippets.len(),
+        before,
+        "a stale SnippetClear click must NOT wipe the stash once the picker is closed"
+    );
+    assert!(
+        !app.snippets.is_empty(),
+        "the snippets survive the stale destructive click"
+    );
+}
+
+#[tokio::test]
+async fn snippet_clear_button_click_still_works_while_the_picker_is_open() {
+    // Control for deep-review #33: while the owning picker IS open, the Clear-all
+    // button must still wipe the stash — the open-state guard refuses the verb only
+    // when the overlay is closed, never when it is legitimately on screen.
+    let mut app = test_app(SessionMode::Build);
+    let src = |row: usize, text: &str| snippet_store::SnippetSource {
+        surface: snippet_store::SnippetSurface::Main,
+        row_start: row,
+        row_end: row,
+        chars: text.chars().count(),
+        bytes: text.len(),
+    };
+    app.snippets.save("body one", src(0, "body one"));
+    app.snippets.save("body two", src(1, "body two"));
+    app.snippets_open = true;
+
+    let _ = render_to_string(&app, 100, 24);
+    let clear_cell = queue_cell_for(
+        &app,
+        100,
+        24,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::SnippetClear),
+        interaction::Action::SnippetClear,
+    )
+    .expect("the open picker registers a Clear-all click target");
+
+    handle_mouse(
+        &mut app,
+        left_down(clear_cell.0, clear_cell.1, KeyModifiers::NONE),
+    );
+    assert!(
+        app.snippets.is_empty(),
+        "clicking Clear-all while the picker is open wipes the stash"
+    );
+    assert_eq!(app.status, "snippets cleared");
+}
+
+#[tokio::test]
 async fn snippets_picker_survives_narrow_resize() {
     let mut app = test_app(SessionMode::Build);
     let src = |row: usize, text: &str| snippet_store::SnippetSource {
