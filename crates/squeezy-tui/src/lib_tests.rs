@@ -33824,6 +33824,52 @@ fn main_render_cached_matches_uncached_byte_for_byte() {
 }
 
 #[test]
+fn transcript_entry_offsets_does_not_clone_cached_rows() {
+    // Regression for deep-review #39: the offsets-only callers (card hit-testing,
+    // annotation/rename-label placement, hover affordances, the minimap rail)
+    // must read the cheap `Vec<usize>` offset map WITHOUT deep-cloning the whole
+    // wrapped `Vec<Line>` out of the shared `Arc`. The rows-consuming front door
+    // (`transcript_lines_and_entry_offsets`) bumps a test-only rows-clone counter;
+    // the offsets-only accessor (`transcript_entry_offsets`) must leave it
+    // untouched. Several of these offsets-only paths fire per painted frame, so
+    // the saved clones add up.
+    let _theme = lock_main_render_theme();
+    let app = main_render_app();
+    let width = 60u16;
+
+    // Warm the cache so every subsequent call is a hit (no recompute), isolating
+    // the clone behaviour from the build.
+    let warm = transcript_lines_and_entry_offsets(&app, Some(width), false);
+
+    // The offsets-only accessor must return the SAME offsets as the rows path...
+    let offsets = transcript_entry_offsets(&app, Some(width), false);
+    assert_eq!(
+        offsets, warm.1,
+        "offsets-only accessor must return the same per-entry offset map"
+    );
+
+    // ...without cloning the rows: snapshot the counter, hammer the offsets-only
+    // path, and assert ZERO additional rows clones.
+    let before = main_render_cache::main_rows_clone_count();
+    for _ in 0..8 {
+        let _ = transcript_entry_offsets(&app, Some(width), false);
+    }
+    assert_eq!(
+        main_render_cache::main_rows_clone_count(),
+        before,
+        "transcript_entry_offsets must not deep-clone the cached rows Vec<Line>"
+    );
+
+    // Sanity: the rows-consuming front door DOES clone (so the counter is a real
+    // signal, not stuck at zero).
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert!(
+        main_render_cache::main_rows_clone_count() > before,
+        "the rows-consuming accessor must bump the clone counter"
+    );
+}
+
+#[test]
 fn main_render_rich_fixture_exercises_segmentation_edges() {
     // Pin that the rich fixture actually drives the suppressed-segment branches
     // the byte-for-byte sweep is meant to cover, so a future fixture edit that

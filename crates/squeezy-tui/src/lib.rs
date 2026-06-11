@@ -32599,8 +32599,7 @@ fn register_transcript_card_targets(
     // Build the entry offsets at the SAME width the frame painted with
     // (`build_width`: `Some(width)` while wrapping, `None` no-wrap), so the
     // offset units match `total_rows` and the screen `y` lands on the real row.
-    let (_lines, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -32681,8 +32680,7 @@ fn render_entry_annotation_markers(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
-    let (_lines, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -32782,8 +32780,7 @@ fn render_entry_rename_labels(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
-    let (_lines, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -32908,8 +32905,7 @@ fn render_hover_affordance(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
-    let (_lines, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -33313,8 +33309,7 @@ fn render_minimap_rail(
     // `project_row`'s `offset.min(span)` then clamps every marker onto the bottom
     // rail row (deep-review #10). Reusing `build_width` also hits the warm
     // text-width row-model cache instead of forcing a per-frame width-1 re-wrap.
-    let (_lines, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
     let rail_entries = minimap_rail_entries(app, &entry_offsets);
     let layout = minimap::build_layout(
         &rail_entries,
@@ -35576,8 +35571,43 @@ fn transcript_lines_and_entry_offsets(
     width: Option<u16>,
     include_startup_card: bool,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let cached = cached_main_rows(app, width, include_startup_card);
+    #[cfg(test)]
+    main_render_cache::note_main_rows_clone();
+    (cached.0.clone(), cached.1.clone())
+}
+
+/// Offsets-only front door for the cached main render.
+///
+/// Many callers (card hit-testing, annotation/rename-label placement, hover
+/// affordances, the minimap rail) need ONLY the per-entry offset map and discard
+/// the wrapped rows. Routing them through [`transcript_lines_and_entry_offsets`]
+/// would deep-clone the entire `Vec<Line>` out of the shared `Arc` on every call
+/// just to throw it away. This accessor returns the cheap `Vec<usize>` offsets
+/// while leaving the rows in the `Arc`, so a painted frame that exercises several
+/// of these paths no longer pays a full wrapped-transcript clone per call.
+fn transcript_entry_offsets(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> Vec<usize> {
+    cached_main_rows(app, width, include_startup_card).1.clone()
+}
+
+/// Shared cache front door returning the `Arc<(rows, offsets)>` without cloning
+/// either inner `Vec`. The rows-consuming and offsets-only accessors clone only
+/// the part they actually need out of the returned `Arc`.
+fn cached_main_rows(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> main_render_cache::MainRows {
     let Some(width) = width else {
-        return transcript_lines_and_entry_offsets_uncached(app, None, include_startup_card);
+        return std::sync::Arc::new(transcript_lines_and_entry_offsets_uncached(
+            app,
+            None,
+            include_startup_card,
+        ));
     };
     let width = width.max(1);
     // Settle-fold entries render a per-frame eased height that is not part of
@@ -35586,13 +35616,16 @@ fn transcript_lines_and_entry_offsets(
         .iter()
         .any(|entry| entry.settle.is_some())
     {
-        return transcript_lines_and_entry_offsets_uncached(app, Some(width), include_startup_card);
+        return std::sync::Arc::new(transcript_lines_and_entry_offsets_uncached(
+            app,
+            Some(width),
+            include_startup_card,
+        ));
     }
     let key = main_render_key(app, width, include_startup_card);
-    let cached = main_render_cache::get_or_compute_main(key, || {
+    main_render_cache::get_or_compute_main(key, || {
         transcript_lines_and_entry_offsets_uncached(app, Some(width), include_startup_card)
-    });
-    (cached.0.clone(), cached.1.clone())
+    })
 }
 
 /// Build the assembled main-render cache key: every input that can change the

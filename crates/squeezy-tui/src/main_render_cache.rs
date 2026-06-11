@@ -148,6 +148,13 @@ pub(crate) struct MainRenderKey {
 /// handle through the render path. Bumped on every `get_or_compute` call.
 static MAIN_HITS: AtomicU64 = AtomicU64::new(0);
 static MAIN_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Test-only counter of how many times the cached rows `Vec<Line>` is deep-cloned
+/// out of the shared `Arc`. The rows-consuming accessor
+/// (`transcript_lines_and_entry_offsets`) bumps it; the offsets-only accessor
+/// (`transcript_entry_offsets`) must NOT, which is what the regression test for
+/// deep-review #39 asserts.
+#[cfg(test)]
+static MAIN_ROWS_CLONES: AtomicU64 = AtomicU64::new(0);
 /// Hit/miss counters for the per-entry wrapped-row cache.
 static ENTRY_WRAP_HITS: AtomicU64 = AtomicU64::new(0);
 static ENTRY_WRAP_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -307,6 +314,20 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 pub(crate) fn main_render_len() -> usize {
     main_render_cache().lock().map(|c| c.len()).unwrap_or(0)
+}
+
+/// Test-only: record one deep-clone of the cached rows `Vec<Line>`. Called by
+/// the rows-consuming front door so a test can prove the offsets-only accessor
+/// avoids that clone.
+#[cfg(test)]
+pub(crate) fn note_main_rows_clone() {
+    MAIN_ROWS_CLONES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Test-only: snapshot of the rows-clone counter (see [`note_main_rows_clone`]).
+#[cfg(test)]
+pub(crate) fn main_rows_clone_count() -> u64 {
+    MAIN_ROWS_CLONES.load(Ordering::Relaxed)
 }
 
 /// Test-only: is `key` currently resident in the assembled-render LRU? Used by
