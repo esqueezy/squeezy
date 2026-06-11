@@ -10912,6 +10912,152 @@ async fn keyboard_ctrl_alt_comma_queues_a_terminal_restore() {
     );
 }
 
+fn ctrl_alt_slash() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('/'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+#[tokio::test]
+async fn keyboard_ctrl_alt_slash_toggles_layout_fallback_diagnostics() {
+    // §12.9.3 keyboard path: the diagnostics toggle flips the hidden flag, forces
+    // the render-metrics HUD visible (the line rides inside it), and requests a
+    // redraw so the change shows immediately.
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(
+        !app.show_layout_fallback,
+        "the diagnostics line is off at rest",
+    );
+
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, ctrl_alt_slash());
+    assert!(consumed, "Ctrl+Alt+/ is consumed by the keymap dispatch");
+    assert!(
+        app.show_layout_fallback,
+        "the keyboard verb flips the diagnostics line on",
+    );
+    assert!(
+        app.show_render_metrics,
+        "turning the line on forces the render-metrics HUD it rides inside visible",
+    );
+    assert!(app.needs_redraw, "a redraw shows the change immediately");
+
+    // A second press toggles it back off; the HUD flag is sticky (the user may
+    // have wanted it), matching the latency / dogfood toggles.
+    assert!(dispatch_keymap_action(
+        &mut app,
+        &mut agent,
+        ctrl_alt_slash()
+    ));
+    assert!(
+        !app.show_layout_fallback,
+        "a second press toggles the diagnostics line back off",
+    );
+}
+
+#[test]
+fn render_records_a_last_known_good_layout_for_a_normal_frame() {
+    // §12.9.3 render path: a normal (non-degenerate) frame painted through the
+    // real `render()` records its geometry as the last-known-good snapshot, keyed
+    // by the rendered size, and never trips the fallback.
+    let app = test_app(SessionMode::Build);
+    assert_eq!(
+        app.layout_fallback.good(),
+        None,
+        "nothing recorded pre-paint"
+    );
+
+    let _ = render_to_string(&app, 100, 30);
+
+    let good = app
+        .layout_fallback
+        .good()
+        .expect("a normal frame records a last-known-good snapshot");
+    assert_eq!(
+        (good.width, good.height),
+        (100, 30),
+        "the snapshot is keyed by the rendered size",
+    );
+    assert!(
+        good.input_height > 0,
+        "the recorded good frame reserves a composer row",
+    );
+    assert!(
+        !good.is_degenerate(),
+        "the recorded snapshot is a valid (non-degenerate) layout",
+    );
+    assert_eq!(
+        app.layout_fallback.fallback_count(),
+        0,
+        "a normal frame never falls back",
+    );
+}
+
+#[test]
+fn layout_fallback_diagnostics_line_paints_in_the_real_render_hud() {
+    // §12.9.3 render path: with the diagnostics line toggled on, the real
+    // `render()` paints the fallback status inside the render-metrics HUD, keyed
+    // by the rendered size.
+    let mut app = test_app(SessionMode::Build);
+    app.toggle_layout_fallback_diagnostics();
+    assert!(app.show_layout_fallback && app.show_render_metrics);
+
+    let output = render_to_string(&app, 120, 30);
+    assert!(
+        output.contains("layout-fallback:"),
+        "the diagnostics line paints inside the HUD:\n{output}",
+    );
+    assert!(
+        output.contains("good=120x30"),
+        "the painted line reports the good-snapshot size:\n{output}",
+    );
+    assert!(
+        output.contains("falls=0"),
+        "a healthy session reports zero fallbacks:\n{output}",
+    );
+}
+
+#[test]
+fn render_records_good_per_size_across_a_resize() {
+    // §12.9.3 size seam: re-rendering at a new size records a fresh good snapshot
+    // keyed by the new size, so a resize never strands the prior geometry.
+    let app = test_app(SessionMode::Build);
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(
+        app.layout_fallback.good().map(|g| (g.width, g.height)),
+        Some((80, 24)),
+    );
+
+    // Resize: a wider/taller frame becomes the new last-known-good.
+    let _ = render_to_string(&app, 140, 40);
+    assert_eq!(
+        app.layout_fallback.good().map(|g| (g.width, g.height)),
+        Some((140, 40)),
+        "the good snapshot tracks the latest rendered size",
+    );
+    assert_eq!(
+        app.layout_fallback.fallback_count(),
+        0,
+        "two normal frames at different sizes never fall back",
+    );
+}
+
+#[test]
+fn render_on_a_tiny_terminal_does_not_fall_back() {
+    // §12.9.3 edge case: a sub-usable terminal cannot host the split, so no frame
+    // is judged degenerate (there is nothing better to restore) and the renderer
+    // paints what it has without tripping the fallback.
+    let app = test_app(SessionMode::Build);
+    // A 3-row terminal is below the usable height threshold.
+    let _ = render_to_string(&app, 40, 3);
+    assert_eq!(
+        app.layout_fallback.fallback_count(),
+        0,
+        "a tiny terminal never trips the fallback",
+    );
+}
+
 #[tokio::test]
 async fn slash_terminal_reset_queues_a_terminal_restore() {
     let mut app = test_app(SessionMode::Build);

@@ -122,6 +122,7 @@ mod keymap;
 mod keymap_config;
 mod lane_fold;
 mod latency;
+mod layout_fallback;
 mod logical_scroll;
 mod macros;
 mod main_render_cache;
@@ -8749,6 +8750,7 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
         && action != keymap::Action::OpenSearch
         && action != keymap::Action::ToggleLatencyOverlay
         && action != keymap::Action::ToggleDogfoodMetrics
+        && action != keymap::Action::ToggleLayoutFallbackDiag
         // The Pinned Compare View (§12.2.3) lives INSIDE the Ctrl+T overlay (it
         // compares against what the overlay shows), so — like the overlay toggle
         // itself — it must pass this guard while the overlay is open.
@@ -9655,6 +9657,13 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             // the config/setup screens are unusable too, so unlike the overlay
             // verbs this is NOT gated behind them.
             request_terminal_restore(app);
+            true
+        }
+        keymap::Action::ToggleLayoutFallbackDiag => {
+            // Hidden debug surface (§12.9.3): the Last-Known-Good Layout Fallback
+            // diagnostics line in the render-metrics HUD, reachable from every
+            // surface including the Ctrl+T overlay (allowed past the guard above).
+            app.toggle_layout_fallback_diagnostics();
             true
         }
     }
@@ -23206,6 +23215,7 @@ fn approval_block_capped(
 /// transcript viewport height (`transcript_height`) is the single source of
 /// truth shared by `render()` and the off-frame `active_transcript_geometry`,
 /// so the scroll math clamps against exactly the height the renderer draws.
+#[derive(Clone, Copy)]
 struct MainTranscriptLayout {
     task_height: Option<u16>,
     approval_height: u16,
@@ -23328,6 +23338,48 @@ fn main_transcript_layout(
 /// hands `render_transcript`. The off-frame scroll-geometry path uses this.
 fn main_transcript_height(app: &TuiApp, area: Rect, include_startup_card: bool) -> u16 {
     main_transcript_layout(app, area, include_startup_card).transcript_height
+}
+
+impl MainTranscriptLayout {
+    /// Snapshot this resolved layout into a `Copy` [`layout_fallback::LayoutGeometry`]
+    /// keyed by the `area` it was computed for, so the Last-Known-Good Layout
+    /// Fallback (§12.9.3) can record a good frame or restore a prior one. A
+    /// straight field copy — the geometry mirrors this struct one-for-one.
+    fn to_geometry(self, area: Rect) -> layout_fallback::LayoutGeometry {
+        layout_fallback::LayoutGeometry {
+            width: area.width,
+            height: area.height,
+            task_height: self.task_height,
+            approval_height: self.approval_height,
+            plan_indicator_height: self.plan_indicator_height,
+            subagent_height: self.subagent_height,
+            attachment_height: self.attachment_height,
+            transcript_prompt_gap_height: self.transcript_prompt_gap_height,
+            transcript_height: self.transcript_height,
+            show_completed_turn_divider: self.show_completed_turn_divider,
+            input_height: self.input_height,
+        }
+    }
+
+    /// Rebuild the layout heights from a [`layout_fallback::LayoutGeometry`]
+    /// snapshot the fallback restored. The inverse of [`to_geometry`]; the
+    /// snapshot's `(width, height)` are dropped because the render path already
+    /// holds the live `area`.
+    ///
+    /// [`to_geometry`]: MainTranscriptLayout::to_geometry
+    fn from_geometry(geometry: layout_fallback::LayoutGeometry) -> Self {
+        MainTranscriptLayout {
+            task_height: geometry.task_height,
+            approval_height: geometry.approval_height,
+            plan_indicator_height: geometry.plan_indicator_height,
+            subagent_height: geometry.subagent_height,
+            attachment_height: geometry.attachment_height,
+            transcript_prompt_gap_height: geometry.transcript_prompt_gap_height,
+            transcript_height: geometry.transcript_height,
+            show_completed_turn_divider: geometry.show_completed_turn_divider,
+            input_height: geometry.input_height,
+        }
+    }
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -23667,7 +23719,19 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // even on a slightly shorter window. `Default` keeps the renderer's prior
     // hard-coded `>= 16` threshold, so the default-density build is unchanged.
     let include_startup_card = include_startup_card_for(app, main_area);
-    let layout = main_transcript_layout(app, main_area, include_startup_card);
+    // Last-Known-Good Layout Fallback (§12.9.3): resolve the freshly-computed
+    // geometry through the last-good store. A valid frame is recorded as the new
+    // good snapshot and painted as-is; a degenerate frame (no composer row, or a
+    // reserve that overflows the area) is replaced by the prior good geometry
+    // *at the same size* rather than committed as a broken paint. With no
+    // matching good snapshot the fresh geometry is painted best-effort. The store
+    // is keyed by `main_area`'s size — the same seam the renderer stamps via
+    // `stamp_frame_size` — so a resize never restores stale rows. Zero idle cost:
+    // a valid frame is one `Cell` write, an idle session never repaints.
+    let resolution = app.layout_fallback.resolve(
+        main_transcript_layout(app, main_area, include_startup_card).to_geometry(main_area),
+    );
+    let layout = MainTranscriptLayout::from_geometry(resolution.geometry());
     let MainTranscriptLayout {
         task_height,
         approval_height,
@@ -30124,6 +30188,15 @@ fn render_metrics_hud(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if app.show_dogfood_metrics {
         lines.push(String::new());
         lines.extend(app.dogfood_metrics.snapshot_lines());
+    }
+    // Last-Known-Good Layout Fallback (§12.9.3): when the diagnostics line is
+    // toggled on, append the one-line fallback status (good-snapshot size +
+    // running fallback count) below the other panels. Always non-empty (it
+    // reports `good=none` before the first paint), so it shows as soon as the
+    // overlay is on.
+    if app.show_layout_fallback {
+        lines.push(String::new());
+        lines.push(app.layout_fallback.diagnostics_line());
     }
     if lines.is_empty() || area.height < 3 || area.width < 12 {
         return;
@@ -42449,6 +42522,19 @@ pub(crate) struct TuiApp {
     /// entirely off timing the loop already computes, so an idle session never
     /// trips it and pays only an `Option` reset per iteration.
     pub(crate) render_health: render_health::RenderHealth,
+    /// Last-Known-Good Layout Fallback (§12.9.3). Stores the geometry of the most
+    /// recent *valid* main-view frame (keyed by its size) so the render path can
+    /// repaint it instead of committing a degenerate frame — one with no composer
+    /// row or a reserve that overflows the area. Driven entirely off the one
+    /// geometry the renderer already computes each paint, so an idle session that
+    /// never repaints pays nothing.
+    pub(crate) layout_fallback: layout_fallback::LastGoodLayout,
+    /// When set, the hidden render-metrics overlay also paints the Last-Known-Good
+    /// Layout Fallback (§12.9.3) diagnostics line (whether a good snapshot is held,
+    /// its size, and the running fallback count). Off by default; flipped at
+    /// runtime by the `toggle_layout_fallback_diag` keymap action. A normal session
+    /// never shows it.
+    pub(crate) show_layout_fallback: bool,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
     /// Elapsed time on the currently-running tool, sourced from the
@@ -43661,6 +43747,11 @@ impl TuiApp {
             dogfood_metrics: build_dogfood_metrics(|key| std::env::var(key).ok()),
             show_dogfood_metrics: resolve_dogfood_metrics(|key| std::env::var_os(key)),
             render_health: render_health::RenderHealth::default(),
+            // Last-Known-Good Layout Fallback (§12.9.3): starts empty (no good
+            // frame yet) and records its first snapshot on the first valid paint.
+            // The diagnostics line is off unless toggled at runtime.
+            layout_fallback: layout_fallback::LastGoodLayout::default(),
+            show_layout_fallback: false,
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             active_tool_elapsed_ms: None,
@@ -44073,6 +44164,22 @@ impl TuiApp {
         self.show_dogfood_metrics = !self.show_dogfood_metrics;
         if self.show_dogfood_metrics {
             // The dogfood panel only paints inside the render-metrics HUD, so
+            // turning it on implies turning the HUD on.
+            self.show_render_metrics = true;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Flip the hidden Last-Known-Good Layout Fallback (§12.9.3) diagnostics line
+    /// on/off and request a repaint so the change shows immediately. Like the
+    /// latency and dogfood panels it rides inside the render-metrics HUD (which it
+    /// forces visible when toggled on), so a single top-right box holds the frame
+    /// budget and the fallback status (good-snapshot size + running fallback
+    /// count).
+    pub(crate) fn toggle_layout_fallback_diagnostics(&mut self) {
+        self.show_layout_fallback = !self.show_layout_fallback;
+        if self.show_layout_fallback {
+            // The fallback line only paints inside the render-metrics HUD, so
             // turning it on implies turning the HUD on.
             self.show_render_metrics = true;
         }

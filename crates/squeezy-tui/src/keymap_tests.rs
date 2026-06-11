@@ -894,6 +894,52 @@ fn restore_terminal_action_round_trips_and_defaults_to_ctrl_alt_comma() {
 }
 
 #[test]
+fn layout_fallback_diag_action_round_trips_and_defaults_to_ctrl_alt_slash() {
+    // §12.9.3 Last-Known-Good Layout Fallback diagnostics toggle: slug
+    // round-trips, is registered in `ALL` (so `/keymap` lists it and an override
+    // can target it), and defaults to the free Ctrl+Alt punctuation chord
+    // `Ctrl+Alt+/` — the companion of the §12.4.5 Zen `Ctrl+Alt+.` and the §12.9.2
+    // Terminal-Restore `Ctrl+Alt+,`.
+    assert_eq!(
+        Action::from_slug("toggle_layout_fallback_diag"),
+        Some(Action::ToggleLayoutFallbackDiag),
+    );
+    assert!(Action::ALL.contains(&Action::ToggleLayoutFallbackDiag));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::ToggleLayoutFallbackDiag),
+        KeyBinding::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    );
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        Some(Action::ToggleLayoutFallbackDiag),
+    );
+    // The Ctrl+Alt chord is distinct from the bare `/` open-search verb and the
+    // `Alt+/` annotate verb, so the diagnostics toggle collides with neither.
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('/'), KeyModifiers::NONE),
+        Some(Action::OpenSearch),
+        "bare / still opens search",
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('/'), KeyModifiers::ALT),
+        Some(Action::AnnotateEntry),
+        "Alt+/ still annotates",
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent.
+    assert_eq!(
+        Action::ToggleLayoutFallbackDiag.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

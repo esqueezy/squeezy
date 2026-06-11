@@ -615,6 +615,15 @@ pub(crate) enum Action {
     /// affordance: a wedged terminal may not report clicks, so recovery stays on the
     /// always-reachable keyboard/command surface.
     RestoreTerminal,
+    /// Toggle the Last-Known-Good Layout Fallback (§12.9.3) diagnostics line
+    /// (`Ctrl+Alt+/` default). A hidden debug surface that rides inside the
+    /// render-metrics HUD: it reports whether a good layout snapshot is held, its
+    /// size, and how many times this session a degenerate frame was repainted from
+    /// the last-known-good geometry instead of committed broken. The fallback
+    /// itself is always active in the render path (no toggle); this only reveals
+    /// its status. There is no mouse affordance — like the latency / dogfood debug
+    /// overlays it lives on the keyboard/command surface only.
+    ToggleLayoutFallbackDiag,
 }
 
 impl Action {
@@ -713,6 +722,7 @@ impl Action {
             Self::TogglePresentation => "toggle_presentation",
             Self::ToggleZenMode => "toggle_zen_mode",
             Self::RestoreTerminal => "restore_terminal",
+            Self::ToggleLayoutFallbackDiag => "toggle_layout_fallback_diag",
         }
     }
 
@@ -810,6 +820,7 @@ impl Action {
         Action::TogglePresentation,
         Action::ToggleZenMode,
         Action::RestoreTerminal,
+        Action::ToggleLayoutFallbackDiag,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -1111,6 +1122,13 @@ impl Action {
             // slash command, which the user can type even if the chord is swallowed
             // by a wedged terminal.
             | Self::RestoreTerminal
+            // Last-Known-Good Layout Fallback diagnostics toggle (§12.9.3) is
+            // `Ctrl+Alt+/` — a Ctrl+Alt (Meta) punctuation chord, the same
+            // classically-unreliable encoding across Linux terminals, tmux, and SSH
+            // as the rest of the Ctrl+Alt debug/policy family above. There is no
+            // mouse twin (a hidden debug surface), so it is honestly flagged
+            // terminal-dependent.
+            | Self::ToggleLayoutFallbackDiag
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1633,6 +1651,17 @@ impl Action {
             // the chord.
             Self::RestoreTerminal => KeyBinding::new(
                 KeyCode::Char(','),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Last-Known-Good Layout Fallback diagnostics toggle (§12.9.3).
+            // `Ctrl+Alt+/` is a free `Ctrl+Alt` punctuation chord — every
+            // `Ctrl+Alt` LETTER is taken by the overlay / picker / editor / policy
+            // family, the Zen and Terminal-Restore verbs claimed `Ctrl+Alt+.` and
+            // `Ctrl+Alt+,`, and bare `/` (OpenSearch) and `Alt+/` (AnnotateEntry)
+            // are distinct from the Ctrl+Alt chord — so this stays clear of every
+            // other binding while sitting alongside the other hidden debug toggles.
+            Self::ToggleLayoutFallbackDiag => KeyBinding::new(
+                KeyCode::Char('/'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }
