@@ -4,6 +4,30 @@ use squeezy_core::{AppConfig, TUI_THEME_COLOR_TOKENS, TuiThemeSettings};
 
 use super::*;
 
+/// RAII guard that snapshots the process-global `ACTIVE_THEME` on construction and
+/// restores it on drop. Mirrors the env-var guards used elsewhere in the suite so a
+/// test that calls [`set_active_theme`] can never leak the swap into a concurrent
+/// in-process test (e.g. `approval_tests.rs` reading `blue()`/`accent()`).
+struct ActiveThemeGuard {
+    prior: Theme,
+}
+
+impl ActiveThemeGuard {
+    fn capture() -> Self {
+        Self {
+            prior: current_theme(),
+        }
+    }
+}
+
+impl Drop for ActiveThemeGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = active_theme().write() {
+            *active = self.prior.clone();
+        }
+    }
+}
+
 #[test]
 fn default_theme_resolves_every_token() {
     let cfg = AppConfig::default();
@@ -88,14 +112,23 @@ fn setting_active_theme_swaps_snapshot_and_bumps_generation() {
     let before_name = current_theme_name();
     let before = theme_generation();
 
-    set_active_theme(&cfg);
+    // Swap inside a scope guarded by the RAII restore so the bright theme can never
+    // outlive this test and contaminate a concurrent in-process reader.
+    {
+        let _guard = ActiveThemeGuard::capture();
+        set_active_theme(&cfg);
 
-    assert_eq!(current_theme_name(), "bright");
-    if before_name != "bright" {
-        assert!(theme_generation() > before);
+        assert_eq!(current_theme_name(), "bright");
+        if before_name != "bright" {
+            assert!(theme_generation() > before);
+        }
+        assert_eq!(
+            current_theme().resolve(token::PALETTE_ACCENT),
+            Some([255, 214, 85])
+        );
     }
-    assert_eq!(
-        current_theme().resolve(token::PALETTE_ACCENT),
-        Some([255, 214, 85])
-    );
+
+    // The guard restored the prior theme on drop — no global mutation leaks out
+    // (deep-review #64).
+    assert_eq!(current_theme_name(), before_name);
 }
