@@ -16122,12 +16122,8 @@ fn re_triggering_a_jump_mid_ease_samples_start_from_the_displayed_position() {
         anim.started_at = checkpoint_earlier(now, half);
     }
     let (line_count, viewport_h) = active_transcript_geometry(&app);
-    let displayed_mid = displayed_main_from_bottom(
-        &app,
-        app.transcript_scroll,
-        line_count,
-        viewport_h,
-    );
+    let displayed_mid =
+        displayed_main_from_bottom(&app, app.transcript_scroll, line_count, viewport_h);
     assert!(
         displayed_mid > first.start && displayed_mid < first.target,
         "the ease is genuinely partway (displayed {displayed_mid} between \
@@ -16895,6 +16891,83 @@ fn tail_stays_visible_past_the_u16_row_ceiling() {
     assert!(
         painted.contains(SENTINEL),
         "the live tail past the u16 ceiling is painted, not clipped at row 65535",
+    );
+}
+
+/// User turns whose content straddles the rail+gutter boundary: at a 100-col
+/// frame they wrap to MORE rows at the painted width (98, rail+gutter) than at
+/// the gutter-only width (99), so an off-frame geometry that forgets the rail
+/// under-counts the wrapped rows.
+fn app_with_rail_straddling_turns(count: usize) -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    for _ in 0..count {
+        app.push_transcript_item(TranscriptItem::user("z".repeat(94)));
+    }
+    app
+}
+
+#[test]
+fn geometry_matches_painted_rows_with_the_minimap_rail_on() {
+    // §12.4.3 invariant (deep-review #129): with the minimap rail on,
+    // `render_transcript` carves TWO columns (rail + scrollbar gutter) before
+    // wrapping, so the off-frame geometry must subtract the rail too — otherwise
+    // it over-measures the width by one column and under-counts wrapped rows, and
+    // `from_bottom`/`max_scroll` diverge from the painted frame.
+    let mut app = app_with_rail_straddling_turns(3);
+    app.show_minimap = true;
+
+    let area = Rect::new(0, 0, 100, 30);
+    let include_startup_card = include_startup_card_for(&app, area);
+    // The width the renderer paints at with the rail on (cols - 2) vs the
+    // gutter-only width (cols - 1): the straddling content wraps to MORE rows at
+    // the narrower painted width.
+    let painted_rows = transcript_lines_for_render(&app, Some(98), include_startup_card).len();
+    let gutter_only_rows = transcript_lines_for_render(&app, Some(99), include_startup_card).len();
+    assert!(
+        painted_rows > gutter_only_rows,
+        "the content straddles the rail boundary (painted {painted_rows} > \
+         gutter-only {gutter_only_rows})",
+    );
+
+    let geometry_rows = active_transcript_geometry(&app).0;
+    assert_eq!(
+        geometry_rows, painted_rows,
+        "geometry counts rows at the painted (rail+gutter) width, matching the \
+         renderer, not at the wider gutter-only width",
+    );
+}
+
+#[test]
+fn from_bottom_stays_within_max_scroll_after_a_minimap_wrap_change() {
+    // The cross-mode integration the test gap left open (deep-review #129): toggle
+    // the minimap on (which re-wraps the painted text one column narrower) and the
+    // stored anchor must still resolve within the (now larger) max_scroll the
+    // painted frame uses — i.e. the off-frame clamp measures the SAME geometry.
+    let mut app = app_with_rail_straddling_turns(40);
+    // Scroll up to a mid-content anchor with the minimap OFF.
+    let (line_count_off, viewport_h) = active_transcript_geometry(&app);
+    let max_scroll_off = line_count_off.saturating_sub(viewport_h);
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(max_scroll_off);
+
+    // Turn the rail on (text wraps one column narrower -> more rows) and clamp the
+    // stored anchor to the new geometry, exactly as the resize/reflow path does.
+    app.show_minimap = true;
+    let (line_count_on, viewport_h_on) = active_transcript_geometry(&app);
+    app.transcript_scroll.clamp(line_count_on, viewport_h_on);
+
+    let max_scroll_on = line_count_on.saturating_sub(viewport_h_on);
+    assert!(
+        line_count_on > line_count_off,
+        "the rail narrows the text, so the painted rows grow \
+         ({line_count_on} > {line_count_off})",
+    );
+    assert!(
+        app.transcript_scroll
+            .offset_from_bottom(line_count_on, viewport_h_on)
+            <= max_scroll_on,
+        "the stored from_bottom never exceeds the painted max_scroll after the \
+         minimap wrap change",
     );
 }
 
@@ -40719,7 +40792,10 @@ fn mouse_fold_toggle_invalidates_row_anchored_selection() {
     // Fold the first entry via the same dispatch arm the mouse caret-click drives.
     let collapsed_before = app.transcript[0].collapsed;
     let entry_id = transcript_surface::EntryId(app.transcript[0].id);
-    dispatch_click_action(&mut app, interaction::Action::ToggleEntryCollapsed(entry_id));
+    dispatch_click_action(
+        &mut app,
+        interaction::Action::ToggleEntryCollapsed(entry_id),
+    );
     assert_ne!(
         app.transcript[0].collapsed, collapsed_before,
         "the fold toggle actually flipped the entry's collapsed state",
@@ -45017,5 +45093,3 @@ fn dock_restore_ignores_a_malformed_config() {
         .expect("write bare-panel settings");
     assert_eq!(read_persisted_dock(&app), None);
 }
-
-

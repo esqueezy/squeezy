@@ -15408,7 +15408,9 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
     // the renderer paints.
     let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
-    let text_width = area.width.saturating_sub(1).max(1);
+    // Carve the minimap rail (when shown) AND the scrollbar gutter, exactly as
+    // `render_transcript` does, so the painted-row units match (deep-review #129).
+    let text_width = main_painted_text_width(app, area).max(1);
     // Match the renderer: soft-wrap off builds UNWRAPPED rows (one per logical
     // line), so off-frame jump geometry must measure the same row model or its
     // offsets/total point at phantom wrapped rows the user never sees.
@@ -15480,7 +15482,9 @@ fn transcript_nav_geometry_at(
     // the renderer paints.
     let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card) as usize;
-    let text_width = area.width.saturating_sub(1).max(1);
+    // Carve the minimap rail (when shown) AND the scrollbar gutter, exactly as
+    // `render_transcript` does, so the painted-row units match (deep-review #129).
+    let text_width = main_painted_text_width(app, area).max(1);
     // Match the renderer: soft-wrap off builds UNWRAPPED rows (one per logical
     // line), so off-frame nav geometry must measure the same row model.
     let build_width = main_geometry_build_width(app, text_width);
@@ -18509,16 +18513,6 @@ fn toggle_pinned_compare_mode(app: &mut TuiApp) -> bool {
     true
 }
 
-/// Current `(line_count, viewport_h)` for the *active* transcript, using the
-/// last-painted-frame width and the transcript area height. Mirrors the geometry
-/// `render_transcript` feeds to `ScrollState::offset` so `scroll_by`/
-/// `scroll_to_top`/`clamp` clamp against the same numbers the renderer uses.
-///
-/// Recomputed off-frame the same way `transcript_overlay_max_scroll` rebuilds
-/// the overlay `Rect`, both sizing from [`TuiApp::off_frame_terminal_size`]
-/// (the size the renderer last painted with) rather than a raw `terminal_size()`
-/// syscall, so the math agrees with the frame on screen and is deterministic in
-/// headless tests.
 /// The `build_width` the off-frame scroll/jump geometry must wrap at to match
 /// the painted row model. `render_transcript` builds soft-wrapped rows at the
 /// text width (the default) but builds UNWRAPPED logical rows (one per line)
@@ -18533,6 +18527,16 @@ fn main_geometry_build_width(app: &TuiApp, text_width: u16) -> Option<u16> {
     }
 }
 
+/// Current `(line_count, viewport_h)` for the *active* transcript, using the
+/// last-painted-frame width and the transcript area height. Mirrors the geometry
+/// `render_transcript` feeds to `ScrollState::offset` so `scroll_by`/
+/// `scroll_to_top`/`clamp` clamp against the same numbers the renderer uses.
+///
+/// Recomputed off-frame the same way `transcript_overlay_max_scroll` rebuilds
+/// the overlay `Rect`, both sizing from [`TuiApp::off_frame_terminal_size`]
+/// (the size the renderer last painted with) rather than a raw `terminal_size()`
+/// syscall, so the math agrees with the frame on screen and is deterministic in
+/// headless tests.
 fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
     let (width, height) = app.off_frame_terminal_size();
     let area = Rect {
@@ -18548,16 +18552,29 @@ fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
     let include_startup_card = include_startup_card_for(app, area);
     let viewport_h = main_transcript_height(app, area, include_startup_card);
     // Wrap at the text width the renderer actually uses: `render_transcript`
-    // reserves a 1-cell scrollbar gutter and wraps at `width - 1`. Measuring at
-    // the full `area.width` would undercount wrapped rows, so the off-frame
-    // `from_bottom` clamp would disagree with the painted line count.
-    let (text_area, _) = transcript_main_text_and_scrollbar_areas(area);
+    // carves the 1-cell minimap rail (when shown) AND the 1-cell scrollbar gutter
+    // off the right edge before wrapping (so text is `width - 1`, or `- 2` with
+    // the minimap). Measuring at the wider width would undercount wrapped rows, so
+    // the off-frame `from_bottom` clamp would disagree with the painted line count
+    // (deep-review #129).
+    let text_width = main_painted_text_width(app, area);
     // Match the renderer: soft-wrap off builds UNWRAPPED rows (one visual row per
     // logical line), so the scroll geometry must measure the same row model or
     // `max_scroll` over-counts and scroll-down stalls against a phantom distance.
-    let build_width = main_geometry_build_width(app, text_area.width);
+    let build_width = main_geometry_build_width(app, text_width);
     let lines = transcript_lines_for_render(app, build_width, include_startup_card);
     (lines.len(), viewport_h as usize)
+}
+
+/// The painted main-text width for `area`, matching `render_transcript`: carve
+/// the minimap rail (when shown) then the scrollbar gutter off the right edge.
+/// The off-frame scroll/jump measurers must wrap at this exact column so their
+/// row counts and entry offsets line up with what is painted.
+fn main_painted_text_width(app: &TuiApp, area: Rect) -> u16 {
+    let show_minimap = app.show_minimap && !app.zen.chrome_suppressed();
+    let (body_area, _rail) = transcript_main_body_and_rail_areas(area, show_minimap);
+    let (text_area, _scrollbar) = transcript_main_text_and_scrollbar_areas(body_area);
+    text_area.width
 }
 
 /// Keep an *unpinned* main-transcript view anchored to the content the user is
@@ -18605,16 +18622,15 @@ fn compensate_main_scroll_for_append(app: &mut TuiApp) {
 /// edge before wrapping, so a text selection's column indices live in this
 /// narrower coordinate space, not the full frame width.
 fn main_painted_text_width_for(app: &TuiApp, width: u16, height: u16) -> u16 {
-    let area = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    let show_minimap = app.show_minimap && !app.zen.chrome_suppressed();
-    let (body_area, _rail) = transcript_main_body_and_rail_areas(area, show_minimap);
-    let (text_area, _scrollbar) = transcript_main_text_and_scrollbar_areas(body_area);
-    text_area.width
+    main_painted_text_width(
+        app,
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+    )
 }
 
 /// Invalidate text selections whose captured wrap width no longer matches the
@@ -18775,12 +18791,8 @@ fn commit_main_from_bottom_animated(app: &mut TuiApp, target_from_bottom: usize)
     // that ease's destination, so easing from it would snap the paint back to the
     // old target before easing forward. `displayed_main_from_bottom` returns the
     // live mid-ease position when an anim is active (deep-review #125).
-    let start = displayed_main_from_bottom(
-        app,
-        active_transcript_scroll(app),
-        line_count,
-        viewport_h,
-    );
+    let start =
+        displayed_main_from_bottom(app, active_transcript_scroll(app), line_count, viewport_h);
     active_transcript_scroll_mut(app).set_from_bottom(target_from_bottom, line_count, viewport_h);
     arm_main_scroll_anim_from(app, start);
 }
@@ -18793,12 +18805,8 @@ fn jump_main_to_top_animated(app: &mut TuiApp) {
     // Sample the start from the DISPLAYED (mid-ease) position so re-triggering a
     // jump while a prior ease is in flight eases from where the paint actually is,
     // not from the prior ease's logical destination (deep-review #125).
-    let start = displayed_main_from_bottom(
-        app,
-        active_transcript_scroll(app),
-        line_count,
-        viewport_h,
-    );
+    let start =
+        displayed_main_from_bottom(app, active_transcript_scroll(app), line_count, viewport_h);
     active_transcript_scroll_mut(app).scroll_to_top(line_count, viewport_h);
     arm_main_scroll_anim_from(app, start);
 }
@@ -47308,13 +47316,7 @@ impl TerminalGuard {
         // rows (with OSC 8 hyperlinks when capable) and the resume hint, all
         // becoming native scrollback. Emit at the mirror buffer's own (painted)
         // width so the per-row column scan matches the buffer it built.
-        emit_finish_fullscreen_mirror(
-            backend,
-            &mirror,
-            mirror_width,
-            exit_hint.as_deref(),
-            links,
-        )?;
+        emit_finish_fullscreen_mirror(backend, &mirror, mirror_width, exit_hint.as_deref(), links)?;
         // The alternate screen has been left; record it so `Drop` won't leave it
         // again. Set BEFORE the trailing fallible calls so an error here still
         // prevents a double-leave. Mirror the same fact into the crash-path flag
