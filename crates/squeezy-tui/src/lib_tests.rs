@@ -1911,6 +1911,46 @@ async fn left_click_on_indicator_rect_toggles_queue_overlay() {
     );
 }
 
+/// deep-review #100: the always-on fullscreen renderer registers footer chrome
+/// click rects in ABSOLUTE screen coordinates, so a footer Chrome click must
+/// dispatch at the exact painted row with no origin offset. This pins the
+/// behavior after the dead `footer_origin` field (always 0, only ever a no-op
+/// subtraction) and its two coordinate translations were removed: a Chrome
+/// target registered at a non-zero absolute row dispatches when clicked there.
+#[tokio::test]
+async fn footer_chrome_click_dispatches_at_absolute_row_without_origin_offset() {
+    let mut app = test_app(SessionMode::Build);
+    // Register the queue-strip Chrome target deep in the screen (row 17), the
+    // kind of footer-relative offset the removed `footer_origin` would have
+    // wrongly subtracted had it ever been non-zero.
+    app.register_click(
+        Rect {
+            x: 0,
+            y: 17,
+            width: 80,
+            height: 1,
+        },
+        interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+        interaction::Action::ToggleQueueOverlay,
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 3,
+            row: 17,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.prompt_queue_overlay.is_some(),
+        "a footer Chrome click at the absolute painted row must dispatch its \
+         action (no footer-origin offset)",
+    );
+}
+
 #[tokio::test]
 async fn queue_strip_click_target_tracks_the_painted_row_under_footer_scroll() {
     // The footer Paragraph scrolls when its lines exceed the area height. The

@@ -3426,21 +3426,16 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
 
     // Footer chrome (the prompt-queue strip, jump-to-latest) is dispatched via
     // the per-frame click registry so a new footer button needs no edit here.
-    // In the inline renderer the footer's click rects are registered
-    // footer-relative (origin 0), so the absolute mouse row is translated by the
-    // footer's screen origin; clicks above the footer land in committed
-    // scrollback and have no chrome target.
+    // The always-on fullscreen renderer registers every click rect in absolute
+    // screen coordinates, so the chrome hit-test runs against the raw mouse row.
     //
-    // Entry / RowSpan targets are NOT dispatched here: `render_transcript`
-    // registers them in absolute screen coordinates, so the footer-relative
-    // translation does not apply to them, and they carry gesture semantics
-    // (focus-then-select fall-through, double/triple-click → selection) that the
-    // dedicated card block below owns. Restricting this block to `Chrome` keys
-    // keeps the two coordinate spaces from colliding when `footer_origin` is 0.
+    // Entry / RowSpan targets are NOT dispatched here: they carry gesture
+    // semantics (focus-then-select fall-through, double/triple-click →
+    // selection) that the dedicated card block below owns. Restricting this
+    // block to `Chrome` keys keeps the footer chrome and the card gestures from
+    // claiming the same press.
     if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
-        && mouse.row >= app.footer_origin
-        && let Some((key, action)) =
-            app.click_target_at(mouse.column, mouse.row - app.footer_origin)
+        && let Some((key, action)) = app.click_target_at(mouse.column, mouse.row)
         && matches!(key, interaction::TargetKey::Chrome(_))
     {
         dispatch_click_action(app, action);
@@ -22798,15 +22793,11 @@ fn handle_queue_overlay_mouse(
 ) -> Option<bool> {
     use crossterm::event::MouseButton;
     let now = std::time::Instant::now();
-    // The queue-item targets are registered against the footer-relative `area`
-    // (footer_origin is 0 in the always-on fullscreen renderer, non-zero only in
-    // the inline-repro path). Translate the pointer the same way the footer
-    // chrome arm does (`mouse.row - app.footer_origin`, guarded) so the hit-test
-    // shares one coordinate convention with the painted rows. Above the footer
-    // there are no queue items, so a row < footer_origin resolves to no hit.
+    // The always-on fullscreen renderer registers the queue-item targets in
+    // absolute screen coordinates, so the hit-test runs against the raw mouse
+    // row — the same coordinate convention the painted rows use.
     let hit_test = |app: &TuiApp, mouse: &crossterm::event::MouseEvent| {
-        let row = mouse.row.checked_sub(app.footer_origin)?;
-        app.click_target_at(mouse.column, row)
+        app.click_target_at(mouse.column, mouse.row)
     };
     use crossterm::event::KeyModifiers;
     // A modified press (Ctrl or Shift) toggles multi-select instead of
@@ -44218,11 +44209,6 @@ pub(crate) struct TuiApp {
     /// The fullscreen renderer redraws every cell from model state on the next
     /// frame; ratatui autoresizes the alternate screen cleanly.
     pub(crate) pending_resize: bool,
-    /// Origin row for footer-relative click-rect mapping. The fullscreen
-    /// renderer registers absolute click rects and never offsets the hit-test,
-    /// so this stays 0 for the whole session; the guarded click arms subtract it
-    /// (a no-op at 0). Retained so the hit-test math reads uniformly.
-    pub(crate) footer_origin: u16,
     /// Set by `/clear` after the app transcript has been reset. The next
     /// terminal draw purges the visible screen and scrollback before any
     /// fresh-session transcript rows are flushed.
@@ -45604,7 +45590,6 @@ impl TuiApp {
             pending_turn_divider: None,
             turn_divider_generation: 0,
             pending_resize: false,
-            footer_origin: 0,
             terminal_clear_pending: false,
             terminal_title_state: TerminalTitleState::Cleared,
             last_terminal_title: None,
