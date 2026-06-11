@@ -23,6 +23,13 @@ use crate::metrics::ByteCounter;
 /// frames in order; rotation/truncation is the operator's job.
 pub(crate) const WRITE_LOG_ENV: &str = "SQUEEZY_TUI_WRITE_LOG";
 
+/// Test-only callback fired by [`WriterKind::CaptureProbe`] after each write, so
+/// a test can observe shared state at the exact byte boundary it is emitted (see
+/// [`TerminalWriter::capture_probe`], deep-review #93). Aliased to keep the
+/// clippy `type_complexity` lint satisfied at each use site.
+#[cfg(test)]
+pub(crate) type ProbeCallback = Box<dyn FnMut(&[u8]) + Send>;
+
 /// The byte-sink behind a [`TerminalWriter`]: the real stdout, an optional
 /// file tap mirror, or an in-memory capture buffer. Split out from the wrapper
 /// so the per-frame byte counter ([`TerminalWriter::counter`]) lives on the
@@ -48,6 +55,17 @@ pub(crate) enum WriterKind {
     /// `Plain`/`Tee` variants.
     #[allow(dead_code)]
     Capture { sink: Arc<Mutex<Vec<u8>>> },
+    /// Test-only capture variant that also fires a callback on every write,
+    /// AFTER the bytes are appended to `sink`. Lets a test observe shared state
+    /// (e.g. the crash-path alt-screen flag) at the exact moment a particular
+    /// byte sequence is emitted — used to pin that `finish_fullscreen` clears the
+    /// alt-screen flag BEFORE it writes the transcript mirror rows
+    /// (deep-review #93). The callback receives the bytes just written.
+    #[cfg(test)]
+    CaptureProbe {
+        sink: Arc<Mutex<Vec<u8>>>,
+        on_write: ProbeCallback,
+    },
 }
 
 /// Sink used as the crossterm backend writer for the TUI. Owns the
@@ -103,6 +121,17 @@ impl TerminalWriter {
         }
     }
 
+    /// Test-only: build a capture writer that also invokes `on_write` after each
+    /// write, so a test can observe shared state at the moment specific bytes are
+    /// emitted (see [`WriterKind::CaptureProbe`]). (deep-review #93)
+    #[cfg(test)]
+    pub(crate) fn capture_probe(sink: Arc<Mutex<Vec<u8>>>, on_write: ProbeCallback) -> Self {
+        Self {
+            kind: WriterKind::CaptureProbe { sink, on_write },
+            counter: None,
+        }
+    }
+
     /// Install the shared per-frame [`ByteCounter`] so every subsequent write
     /// increments it. Called once by the `TerminalGuard` after construction;
     /// the guard keeps the other end of the `Arc` to sample bytes-per-frame.
@@ -135,6 +164,16 @@ impl Write for TerminalWriter {
                 }
                 buf.len()
             }
+            #[cfg(test)]
+            WriterKind::CaptureProbe { sink, on_write } => {
+                if let Ok(mut buffer) = sink.lock() {
+                    buffer.extend_from_slice(buf);
+                }
+                // Fire the probe AFTER appending, so a test observing shared
+                // state sees it as of the moment these bytes were emitted.
+                on_write(buf);
+                buf.len()
+            }
         };
         // Count exactly the bytes the sink accepted (so a short stdout write is
         // reflected). Relaxed: this is a per-frame statistic, never a
@@ -156,6 +195,8 @@ impl Write for TerminalWriter {
             // The sink is written eagerly, so there is nothing to
             // flush; bytes are already visible to the holder of `sink`.
             WriterKind::Capture { .. } => Ok(()),
+            #[cfg(test)]
+            WriterKind::CaptureProbe { .. } => Ok(()),
         }
     }
 }

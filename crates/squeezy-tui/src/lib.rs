@@ -47328,6 +47328,39 @@ impl TerminalGuard {
         (guard, sink)
     }
 
+    /// Test-only sibling of [`Self::for_capture_test`] whose capture writer also
+    /// fires `on_write` after every emitted chunk, letting a test observe shared
+    /// state (e.g. the crash-path alt-screen flag) at the exact byte boundary it
+    /// is emitted. Used to pin that [`Self::finish_fullscreen`] clears the
+    /// alt-screen flag BEFORE the first transcript-mirror row is written, not
+    /// after the whole mirror (deep-review #93).
+    #[cfg(test)]
+    fn for_probe_test(
+        w: u16,
+        h: u16,
+        on_write: terminal_writer::ProbeCallback,
+    ) -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sink: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let byte_counter: metrics::ByteCounter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut writer = TerminalWriter::capture_probe(sink.clone(), on_write);
+        writer.set_byte_counter(Arc::clone(&byte_counter));
+        let backend = CrosstermBackend::new(writer);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, w.max(1), h.max(1)));
+        let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
+            .expect("probe capture terminal builds with a fixed viewport");
+        signal_teardown::set_alt_screen_active(true);
+        let guard = Self {
+            terminal: Some(terminal),
+            alt_screen_active: true,
+            mouse_capture: true,
+            exit_hint: None,
+            synchronized_output: false,
+            size_source: Box::new(crate::size_source::FixedSize(w, h)),
+            byte_counter,
+        };
+        (guard, sink)
+    }
+
     /// Test-only: force the resolved DEC 2026 synchronized-output flag on (the
     /// `for_capture_test` constructor defaults it off). Lets a capture test
     /// drive a frame with synchronized output enabled and assert the begin/end
@@ -47396,6 +47429,17 @@ impl TerminalGuard {
             emit_finish_fullscreen_restore(backend)?;
             backend.flush()?;
         }
+        // The alternate screen has now been LEFT (and flushed). Clear both flags
+        // immediately — BEFORE building/emitting the heavy transcript mirror —
+        // rather than after the whole mirror is written. This shrinks the window
+        // in which a panic hook / SIGTERM firing mid-shutdown would see the shared
+        // flag still `true` and re-leave an alternate screen we already left: from
+        // the entire mirror emission down to the handful of restore bytes above.
+        // Clearing the guard-local flag too keeps `Drop` from re-leaving. Set
+        // BEFORE the fallible mirror/flush below so an error there still prevents a
+        // double-leave. (deep-review #93)
+        self.alt_screen_active = false;
+        signal_teardown::set_alt_screen_active(false);
         // Collapsed-by-default mirror over the WHOLE transcript, opened by the
         // startup/session card, built through the same fullscreen line pipeline
         // `render()` draws — so the mirrored rows match what the user saw. Built
@@ -47423,13 +47467,9 @@ impl TerminalGuard {
         // becoming native scrollback. Emit at the mirror buffer's own (painted)
         // width so the per-row column scan matches the buffer it built.
         emit_finish_fullscreen_mirror(backend, &mirror, mirror_width, exit_hint.as_deref(), links)?;
-        // The alternate screen has been left; record it so `Drop` won't leave it
-        // again. Set BEFORE the trailing fallible calls so an error here still
-        // prevents a double-leave. Mirror the same fact into the crash-path flag
-        // so a panic hook / signal handler that fires after this clean exit does
-        // not re-leave an alternate screen we already left.
-        self.alt_screen_active = false;
-        signal_teardown::set_alt_screen_active(false);
+        // NOTE: the alt-screen flags were already cleared right after the restore
+        // above (deep-review #93), shrinking the crash re-leave race to the
+        // restore bytes rather than the whole mirror emission below.
         // NOTE: the previous panic hook is restored in `Drop` (which always runs
         // after this clean exit), so it is NOT restored here — that keeps the
         // restore symmetric across clean / inline / error-path exits instead of

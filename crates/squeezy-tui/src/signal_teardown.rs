@@ -336,6 +336,15 @@ pub(crate) fn panic_hook_installed_for_test() -> bool {
     HOOKS_INSTALLED.load(Ordering::SeqCst)
 }
 
+/// Test-only: read the shared crash-path alt-screen flag WITHOUT clearing it.
+/// Lets a test observe whether the flag has already been cleared at a given
+/// point (e.g. by the time `finish_fullscreen` writes the first mirror row, the
+/// flag must already be `false` — deep-review #93).
+#[cfg(test)]
+pub(crate) fn is_alt_screen_active() -> bool {
+    ALT_SCREEN_ACTIVE.load(Ordering::SeqCst)
+}
+
 /// Test-only serialization lock for any test that asserts on the SHARED
 /// crash-path [`ALT_SCREEN_ACTIVE`] flag interacting with `TerminalGuard::Drop`
 /// (which now read-and-clears that flag, deep-review #27). The flag is

@@ -11916,6 +11916,58 @@ fn finish_fullscreen_leaves_alt_screen_before_mirror_rows() {
     );
 }
 
+/// (deep-review #93) `finish_fullscreen` must clear the SHARED crash-path
+/// alt-screen flag immediately after leaving the alternate screen — BEFORE it
+/// builds and writes the heavy transcript mirror — not after the whole mirror is
+/// emitted. Otherwise a panic hook / SIGTERM firing mid-shutdown sees the flag
+/// still `true` and re-leaves a screen already left. We drive the REAL
+/// `finish_fullscreen` through a probe writer that records the shared flag at the
+/// first CR-bearing mirror-row write; it must already be `false` by then.
+#[test]
+fn finish_fullscreen_clears_alt_screen_flag_before_mirror_rows() {
+    let _flag_guard = crate::signal_teardown::ALT_SCREEN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("durable mirror row"));
+
+    // Record the shared flag's value the FIRST time a CR-bearing chunk is
+    // written. The terminal-restore bytes (leave alt + mode restores) contain no
+    // CR; the mirror rows are written starting with `b"\r"`. So the first CR
+    // write is the first mirror row — the exact boundary the fix targets.
+    let flag_at_first_mirror_row: Arc<StdMutex<Option<bool>>> = Arc::new(StdMutex::new(None));
+    let recorder = Arc::clone(&flag_at_first_mirror_row);
+    let on_write: crate::terminal_writer::ProbeCallback = Box::new(move |buf: &[u8]| {
+        if buf.contains(&b'\r') {
+            let mut slot = recorder.lock().expect("probe slot lock");
+            if slot.is_none() {
+                *slot = Some(crate::signal_teardown::is_alt_screen_active());
+            }
+        }
+    });
+
+    let (mut guard, sink) = TerminalGuard::for_probe_test(80, 24, on_write);
+    guard.finish_fullscreen(&app).expect("clean exit");
+
+    // Sanity: the mirror really did emit a CR-bearing row (so the probe fired).
+    let ansi = sink_to_string(&sink);
+    assert!(
+        ansi.contains("durable mirror row"),
+        "the clean exit mirrored the transcript row: {ansi:?}",
+    );
+    let observed = flag_at_first_mirror_row
+        .lock()
+        .expect("probe slot lock")
+        .expect("probe must have fired on the first CR-bearing mirror row");
+    assert!(
+        !observed,
+        "the shared crash-path alt-screen flag must already be cleared by the time \
+         the first mirror row is written (it was still set, leaving the re-leave \
+         race open across the whole mirror emission)",
+    );
+}
+
 #[test]
 fn finish_fullscreen_normal_exit_does_not_purge_scrollback() {
     let mut app = test_app(SessionMode::Build);
