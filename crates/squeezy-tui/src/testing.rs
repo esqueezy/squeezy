@@ -44,8 +44,9 @@ pub struct TuiHarness {
 
 impl TuiHarness {
     /// Build a harness around `config + provider`. Mirrors the
-    /// preamble of `run_inner` (`apply_theme_overrides` then construct
-    /// TuiApp + Agent) so palette and state line up with production.
+    /// preamble of `run_inner` (`apply_theme_overrides`, construct
+    /// TuiApp + Agent, then restore the per-workspace UI profile) so
+    /// palette and state line up with production.
     ///
     /// `settings_path_override` pins the user-scope settings file that
     /// in-session slash commands (`/theme`, `/statusline`, …) persist
@@ -53,6 +54,19 @@ impl TuiHarness {
     /// can't clobber the operator's real `~/.squeezy/settings.toml`;
     /// `None` keeps the production fallback
     /// (`squeezy_core::default_settings_path`).
+    ///
+    /// ## Per-workspace UI profile (§12.7.4) parity
+    ///
+    /// `run_inner` calls `restore_workspace_profile` after constructing
+    /// `app + agent` and before the first paint, so a session opens with
+    /// the density / transcript-detail / minimap / theme the user last
+    /// saved for this workspace. The harness mirrors that — but ONLY when
+    /// the profile store is explicitly pinned via
+    /// [`workspace_profile::PROFILE_DIR_ENV`] (`SQUEEZY_UI_PROFILE_DIR`).
+    /// Without that pin the restore is skipped so eval runs stay
+    /// deterministic and never read the operator's real
+    /// `~/.squeezy/projects` tree: pointing the env at a scratch (or
+    /// empty) dir is the opt-in, leaving it unset is the opt-out.
     pub fn new(
         config: AppConfig,
         mode: SessionMode,
@@ -68,10 +82,18 @@ impl TuiHarness {
         // defined as `self.provider.name()`, so reading it directly off
         // the trait keeps eval and production in lock-step.
         let provider_name = provider.name();
-        let agent = Agent::new(config.clone(), provider);
+        let mut agent = Agent::new(config.clone(), provider);
         let mut app =
             TuiApp::new_with_clipboard(provider_name, &config, mode, None, Box::new(NoopClipboard));
         app.set_settings_path_override(settings_path_override);
+        // Per-Workspace UI Profile (§12.7.4): mirror `run_inner`'s pre-paint
+        // restore so the harness opens with the saved density / detail / minimap
+        // / theme — but only when the store is explicitly pinned to a scratch dir
+        // (see the doc above), so eval stays deterministic and never reads the
+        // operator's real `~/.squeezy/projects`.
+        if std::env::var_os(crate::workspace_profile::PROFILE_DIR_ENV).is_some() {
+            crate::restore_workspace_profile(&mut app, &mut agent);
+        }
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)
             .map_err(|e| SqueezyError::Terminal(format!("test backend init: {e}")))?;
