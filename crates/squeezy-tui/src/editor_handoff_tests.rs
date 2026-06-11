@@ -231,6 +231,102 @@ fn run_handoff_slow_editor_completes_after_the_closure_returns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Security (deep-review #23/#53, CWE-59 symlink + CWE-377 mode): `run_handoff`
+/// must create its temp file exclusively. If a symlink is pre-planted at the
+/// predictable temp path pointing at a sentinel outside `dir`, the old
+/// `fs::write` would follow it and overwrite the sentinel; `create_new(true)`
+/// refuses the pre-existing path with an error and never touches the sentinel.
+#[cfg(unix)]
+#[test]
+fn run_handoff_refuses_to_follow_a_preplanted_symlink() {
+    let dir = unique_dir("symlink");
+    let pid = 1234u32;
+    let seq = 99u64;
+    let target_path = dir.join(temp_file_name(EditorTarget::Composer, pid, seq));
+
+    // A sentinel file OUTSIDE dir that must remain intact.
+    let sentinel = unique_dir("symlink_sentinel").join("sentinel.txt");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"SENTINEL").unwrap();
+
+    // Plant a symlink at the predictable temp path pointing at the sentinel.
+    std::os::unix::fs::symlink(&sentinel, &target_path).expect("plant symlink");
+
+    let command = EditorCommand {
+        program: "fake".to_string(),
+        args: Vec::new(),
+    };
+    let editor_ran = std::cell::Cell::new(false);
+    let result = run_handoff(
+        &command,
+        EditorTarget::Composer,
+        "payload that must NOT reach the sentinel",
+        &dir,
+        pid,
+        seq,
+        |_command, _path| {
+            editor_ran.set(true);
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "create_new must refuse the pre-planted path"
+    );
+    assert!(
+        !editor_ran.get(),
+        "the editor must never spawn on a refused write"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel still readable"),
+        b"SENTINEL",
+        "the symlink target must not be followed/overwritten"
+    );
+
+    let _ = std::fs::remove_file(&target_path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(sentinel.parent().unwrap());
+}
+
+/// Security (deep-review #23/#53, CWE-377): the temp file `run_handoff` creates
+/// must be private (0o600), not the umask-derived 0o644 the old `fs::write`
+/// produced, so the composer buffer is not readable by other local users.
+#[cfg(unix)]
+#[test]
+fn run_handoff_creates_a_0600_temp_file() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    let dir = unique_dir("mode");
+    let command = EditorCommand {
+        program: "fake".to_string(),
+        args: Vec::new(),
+    };
+    // Capture the file's mode WHILE it still exists (run_handoff deletes it on
+    // return), from inside the editor closure.
+    let observed: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let observed_in = Arc::clone(&observed);
+    let outcome = run_handoff(
+        &command,
+        EditorTarget::Composer,
+        "buffer",
+        &dir,
+        1234,
+        7,
+        move |_command, path| {
+            let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+            *observed_in.lock().unwrap() = Some(mode);
+            Ok(())
+        },
+    )
+    .expect("handoff runs");
+    assert_eq!(outcome, HandoffOutcome::Unchanged);
+    let mode = observed.lock().unwrap().expect("mode observed");
+    assert_eq!(mode, 0o600, "temp file must be 0o600, got {mode:o}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── EditorHandoffReview ───────────────────────────────────────────────────
 
 #[test]

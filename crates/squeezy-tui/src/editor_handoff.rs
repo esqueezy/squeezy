@@ -206,6 +206,28 @@ pub(crate) fn classify_result(original: &str, edited: &str) -> HandoffOutcome {
     }
 }
 
+/// Create `path` exclusively and write `bytes` to it.
+///
+/// Uses `create_new(true)` (O_CREAT|O_EXCL) so a pre-existing file or symlink
+/// already sitting at the predictable temp path causes the write to fail with
+/// `AlreadyExists` instead of being followed/truncated — closing the symlink
+/// (CWE-59) and clobber holes the old `fs::write` left open. On Unix the file is
+/// forced to mode 0o600 so a composer/paste buffer is not world-readable
+/// (CWE-377).
+fn write_new_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
+
 /// Run a full editor handoff against a real (or fake) editor.
 ///
 /// Writes `initial_text` to `<dir>/<temp_file_name>`, invokes `run_editor` with
@@ -231,7 +253,7 @@ where
     R: FnOnce(&EditorCommand, &Path) -> io::Result<()>,
 {
     let path: PathBuf = dir.join(temp_file_name(target, pid, nonce));
-    std::fs::write(&path, initial_text.as_bytes())?;
+    write_new_private(&path, initial_text.as_bytes())?;
 
     // Run the editor; on failure still clean up the temp file before bubbling
     // the error so a failed spawn never leaves a stray file behind.
