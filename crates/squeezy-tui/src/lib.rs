@@ -41295,8 +41295,13 @@ fn prompt_visual_line_count(input: &str, width: u16) -> usize {
     input
         .split('\n')
         .map(|line| {
-            let chars = line.chars().count().max(1);
-            chars.div_ceil(content_width)
+            // Measure each logical line by Unicode *display* width, not char
+            // count: the composer paints via `Paragraph::wrap(Wrap{trim:false})`,
+            // which re-flows by grapheme display width. A char-count estimate
+            // under-reserved rows for wide/CJK input, so the panel was too short
+            // and the scroll could push the caret row out of view.
+            let display = UnicodeWidthStr::width(line).max(1);
+            display.div_ceil(content_width)
         })
         .sum()
 }

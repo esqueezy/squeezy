@@ -14237,6 +14237,40 @@ fn prompt_height_grows_for_multiline_input() {
     assert_eq!(input_panel_height(&app, 100), PROMPT_MAX_HEIGHT);
 }
 
+/// Deep-review #123: the composer height model counted chars, but the composer
+/// paints via `Paragraph::wrap(Wrap{trim:false})`, which re-flows by grapheme
+/// display width. A line of CJK glyphs whose display width exceeds the content
+/// width under-reserved rows (reported 1, painted 2), so the panel was too short
+/// and the scroll could push the caret out of view. The estimate must be at
+/// least the true wrapped height ratatui paints.
+#[test]
+fn prompt_visual_line_count_reserves_rows_for_wide_input() {
+    let width = 40u16;
+    // `prompt_visual_line_count` measures against `width - 1` content columns.
+    let content_width = width.saturating_sub(1);
+    // Exactly `content_width` full-width glyphs = 2 * content_width display cols,
+    // which must wrap to two rows. Char count sees `content_width` "columns" and
+    // (pre-fix) keeps it on one row.
+    let cjk = "好".repeat(content_width as usize);
+
+    let estimate = prompt_visual_line_count(&cjk, width);
+
+    // Ground truth: ratatui's own wrapped row count for the same text/width.
+    let painted = Paragraph::new(vec![Line::from(cjk.clone())])
+        .wrap(Wrap { trim: false })
+        .line_count(content_width);
+
+    assert!(
+        painted >= 2,
+        "fixture must wrap to multiple painted rows (painted={painted})",
+    );
+    assert!(
+        estimate >= painted,
+        "composer height estimate {estimate} must reserve at least the true \
+         wrapped height {painted} for wide/CJK input",
+    );
+}
+
 #[test]
 fn task_panel_keeps_non_running_state_compact() {
     let mut app = test_app(SessionMode::Build);
