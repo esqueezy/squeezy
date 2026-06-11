@@ -2515,6 +2515,12 @@ async fn handle_input_event(
             // highlight correctness, which re-derives width from the freshly
             // wrapped surface rows.
             refresh_search(app);
+            // Text selections store the wrap width their (row,col) indices were
+            // taken at; a reflow to a new width re-wraps the surface rows so
+            // those indices now point at different cells. Invalidate drifted
+            // selections the same way search is re-anchored above (deep-review
+            // #42). No-op on a height-only resize.
+            reanchor_or_clear_selection_on_resize(app, width, height);
             Ok(false)
         }
         // Crossterm only emits these after `EnableFocusChange` succeeded
@@ -18569,6 +18575,59 @@ fn compensate_main_scroll_for_append(app: &mut TuiApp) {
         return;
     }
     active_transcript_scroll_mut(app).compensate_for_growth(delta, new_total, viewport_h);
+}
+
+/// The painted main-text width for a frame of `(width, height)`: the renderer
+/// carves the minimap rail (when shown) and the scrollbar gutter off the right
+/// edge before wrapping, so a text selection's column indices live in this
+/// narrower coordinate space, not the full frame width.
+fn main_painted_text_width_for(app: &TuiApp, width: u16, height: u16) -> u16 {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let show_minimap = app.show_minimap && !app.zen.chrome_suppressed();
+    let (body_area, _rail) = transcript_main_body_and_rail_areas(area, show_minimap);
+    let (text_area, _scrollbar) = transcript_main_text_and_scrollbar_areas(body_area);
+    text_area.width
+}
+
+/// Invalidate text selections whose captured wrap width no longer matches the
+/// painted width after a resize (deep-review #42).
+///
+/// A `Selection` records the `text_area.width` its (row, col) positions were
+/// taken at; a reflow to a new width re-wraps the surface rows, so those indices
+/// now point at different cells (wrong copied text / a stray highlight band).
+/// `refresh_search` re-anchors search the same way; selections carry no
+/// re-wrap-able anchor (and `selection_set` ranges carry no width at all), so the
+/// safe minimal fix is to clear them when the width drifts. No-op when the width
+/// is unchanged (a pure height resize) so a vertical-only resize keeps the
+/// selection.
+fn reanchor_or_clear_selection_on_resize(app: &mut TuiApp, width: u16, height: u16) {
+    if app.selection.is_none() && app.selection_set.is_empty() {
+        return;
+    }
+    let painted_width = main_painted_text_width_for(app, width, height);
+    // The active selection stamps the width it was captured at; a `selection_set`
+    // member carries none, so any width change invalidates it. Drive the decision
+    // off the active selection's stored width when present, else off the cache.
+    let captured_width = app
+        .selection
+        .as_ref()
+        .map(|sel| sel.width)
+        .or_else(|| app.main_text_area_cache.get().map(|c| c.text_area.width));
+    let drifted = match captured_width {
+        Some(w) => w != painted_width,
+        // No stored width to compare against: be conservative and clear so a
+        // stale set never survives an unknown reflow.
+        None => true,
+    };
+    if drifted {
+        app.selection = None;
+        app.selection_set.clear();
+    }
 }
 
 /// Re-anchor the active transcript scroll + focus to the current (post-resize)

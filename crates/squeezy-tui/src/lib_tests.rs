@@ -16763,6 +16763,88 @@ fn no_wrap_geometry_max_scroll_matches_painted_top_offset() {
     );
 }
 
+#[tokio::test]
+async fn resize_to_a_new_width_invalidates_a_drifted_selection() {
+    // A text selection stores the wrap width its (row,col) indices were captured
+    // at; a resize to a NEW width re-wraps the surface rows so those indices now
+    // point at different cells. The resize handler must invalidate the drifted
+    // selection (and the width-less selection_set) the same way it re-anchors
+    // search (deep-review #42).
+    let mut app = app_with_wrapping_turns(20);
+    let mut agent = test_agent(SessionMode::Build);
+    // Paint at 80 so the text-area cache holds the painted width the selection is
+    // captured against.
+    let _ = render_to_string(&app, 80, 24);
+    let captured_width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .expect("a painted frame stamps the text-area cache");
+
+    app.selection = Some(selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos { row: 3, col: 5 },
+        selection::SelectionMode::Cell,
+        captured_width,
+    ));
+    let mut set = multi_selection::SelectionSet::new();
+    let mut committed = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos { row: 1, col: 0 },
+        selection::SelectionMode::Cell,
+        captured_width,
+    );
+    // A non-collapsed range so `add` keeps it (a bare click is dropped).
+    committed.cursor = selection::Pos { row: 1, col: 8 };
+    assert!(set.add(committed), "a real range commits into the set");
+    app.selection_set = set;
+    assert!(!app.selection_set.is_empty());
+
+    // Resize to a much narrower width: every entry reflows, so the indices drift.
+    dispatch_input_events(&mut app, &mut agent, vec![Event::Resize(40, 24)])
+        .await
+        .expect("dispatch resize");
+
+    assert!(
+        app.selection.is_none(),
+        "the active selection is invalidated when the wrap width changes",
+    );
+    assert!(
+        app.selection_set.is_empty(),
+        "the width-less selection_set is cleared on any width change",
+    );
+}
+
+#[tokio::test]
+async fn height_only_resize_keeps_the_selection() {
+    // A pure vertical resize does not change the wrap width, so the selection's
+    // column indices still line up — it must NOT be invalidated.
+    let mut app = app_with_wrapping_turns(20);
+    let mut agent = test_agent(SessionMode::Build);
+    let _ = render_to_string(&app, 80, 24);
+    let captured_width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .expect("a painted frame stamps the text-area cache");
+    app.selection = Some(selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos { row: 3, col: 5 },
+        selection::SelectionMode::Cell,
+        captured_width,
+    ));
+
+    // Same width (80), different height: a height-only resize.
+    dispatch_input_events(&mut app, &mut agent, vec![Event::Resize(80, 40)])
+        .await
+        .expect("dispatch resize");
+
+    assert!(
+        app.selection.is_some(),
+        "a height-only resize keeps the same-width selection",
+    );
+}
+
 #[test]
 fn resize_keeps_a_following_view_pinned_to_the_tail() {
     // A live (tail-following) view must stay pinned to the tail across a resize —
