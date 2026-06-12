@@ -31348,6 +31348,80 @@ async fn copy_of_a_drag_selection_sends_clean_text_through_the_recording_sink() 
 }
 
 #[tokio::test]
+async fn ctrl_c_copies_the_active_selection_then_clears_it() {
+    // Ctrl+C is the universal Copy when a selection is active (Claude Code's
+    // fullscreen model): mouse capture stays on, the app owns the drag-select,
+    // and Ctrl+C sends the selection to the clipboard and clears the highlight.
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("the prompt"));
+    app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 30, y));
+    assert!(app.selection.is_some(), "the drag armed a selection");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+c copies");
+
+    assert_eq!(
+        writes.lock().unwrap().clone().as_slice(),
+        ["copy this exact phrase"],
+        "Ctrl+C with a selection copies the selected clean text",
+    );
+    assert!(
+        app.selection.is_none(),
+        "Ctrl+C clears the selection highlight after copying",
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_with_no_selection_keeps_interrupt_and_copies_nothing() {
+    // With NO selection, Ctrl+C must keep its interrupt / exit-confirm behavior
+    // and never touch the clipboard.
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("answer"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+    assert!(app.selection.is_none(), "no selection armed");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+c");
+
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "Ctrl+C with no selection copies nothing",
+    );
+}
+
+#[tokio::test]
 async fn copy_with_no_selection_does_not_send_empty_selection_text() {
     // Guards the routing: a copy chord with no active selection falls back to
     // the semantic unit (the last assistant message), never an empty send.

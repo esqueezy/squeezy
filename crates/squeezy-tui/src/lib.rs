@@ -8105,6 +8105,18 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        // A visual selection turns Ctrl+C into Copy — the standard everywhere,
+        // and how Claude Code's fullscreen mode works: mouse capture is left ON
+        // (so click affordances + scroll keep working), the app owns the drag
+        // selection, and Ctrl+C copies it to the system clipboard (pbcopy on a
+        // local session, deep-review #11). Copies, clears the highlight, and
+        // consumes the key. With NO selection, Ctrl+C keeps its interrupt /
+        // exit-confirm behavior below.
+        if copy_active_selection(app) {
+            app.selection = None;
+            app.needs_redraw = true;
+            return Ok(false);
+        }
         if request_turn_interrupt(app) {
             app.exit_confirm_armed = false;
             return Ok(false);
