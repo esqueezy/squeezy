@@ -1,0 +1,295 @@
+//! Logical scroll model and scrollbar geometry for the transcript view.
+//!
+//! This module provides a `usize`-backed scroll model (plan Phase 4, "MOVE 5").
+//! [`ScrollState`] now drives the MAIN transcript view: the renderer resolves
+//! the top-line offset through [`ScrollState::offset`], scroll commands mutate
+//! it through [`ScrollState::scroll_by`] / [`ScrollState::pin_to_bottom`] /
+//! [`ScrollState::scroll_to_top`], and follow-tail intent lives in the state
+//! itself rather than a bare `from_bottom` sentinel.
+//!
+//! The semantics deliberately mirror the legacy helpers in `lib.rs` so the
+//! swap is behavior-preserving:
+//!
+//! * [`ScrollState::offset`] replicates `transcript_scroll_offset` — the
+//!   "distance scrolled up from the tail" (`from_bottom`) is converted into an
+//!   absolute top-line offset, clamped to the available scroll range.
+//! * [`scrollbar_geometry`] replicates `transcript_overlay_scrollbar_geometry`
+//!   — thumb length is proportional to the viewport/content ratio and the thumb
+//!   is positioned along its travel by the current scroll offset.
+//!
+//! Everything is computed in `usize` to remove the historical `u16` ceiling on
+//! row counts. Conversion to `u16` (for ratatui geometry) is funneled through
+//! the single [`to_u16_clamped`] helper.
+//!
+//! Wiring status (parallelization-plan Phase 4 / MOVE 5): [`to_u16_clamped`],
+//! [`ScrollState`], and [`scrollbar_geometry`] / [`ScrollbarGeometry`] are all
+//! used in production now that the main transcript view draws a scrollbar in its
+//! right gutter (`render_transcript`).
+
+/// Saturating conversion from `usize` to `u16`.
+///
+/// Values at or above [`u16::MAX`] clamp to [`u16::MAX`]. This is the *only*
+/// place the new `usize` model narrows back to the `u16` world that ratatui
+/// geometry uses, so the truncation policy lives in exactly one spot.
+#[inline]
+#[must_use]
+pub(crate) fn to_u16_clamped(value: usize) -> u16 {
+    value.min(u16::MAX as usize) as u16
+}
+
+/// Logical scroll position for an append-only transcript.
+///
+/// The position is stored as `from_bottom`: the number of lines the viewport's
+/// *top* has been scrolled up away from the position that would show the very
+/// last line of content. `from_bottom == 0` therefore means "showing the tail".
+///
+/// `follow_tail` records intent: while following, the view should stay pinned to
+/// the bottom as new content arrives (mirroring how the renderer keeps
+/// `from_bottom` at 0). Scrolling up unpins; pinning to bottom re-pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScrollState {
+    /// Lines scrolled up from the tail. `0` == pinned to the last line.
+    from_bottom: usize,
+    /// Whether the view should track the tail as content grows.
+    follow_tail: bool,
+}
+
+impl Default for ScrollState {
+    /// A fresh view follows the tail at `from_bottom == 0`.
+    fn default() -> Self {
+        Self {
+            from_bottom: 0,
+            follow_tail: true,
+        }
+    }
+}
+
+impl ScrollState {
+    /// Construct a state pinned to the bottom (following the tail).
+    #[must_use]
+    pub(crate) fn pinned() -> Self {
+        Self::default()
+    }
+
+    /// The raw `from_bottom` distance (unclamped, as stored).
+    // This is a field getter named after the `from_bottom` field, not a
+    // `from_*` converter; the conventional "no `self`" rule does not apply.
+    // Production reads it when capturing the Session Auto-Save Checkpoint anchor
+    // (`capture_session_checkpoint`); the render path uses the geometry-clamped
+    // `offset_from_bottom` instead.
+    #[allow(clippy::wrong_self_convention)]
+    #[must_use]
+    pub(crate) fn from_bottom(&self) -> usize {
+        self.from_bottom
+    }
+
+    /// Whether the view is currently following the tail. Read when capturing the
+    /// Session Auto-Save Checkpoint anchor (`capture_session_checkpoint`); the
+    /// render path compares the whole `ScrollState` via its derived `PartialEq`.
+    #[must_use]
+    pub(crate) fn is_following(&self) -> bool {
+        self.follow_tail
+    }
+
+    /// Set the stored `from_bottom` directly, clamped to `[0, max_scroll]`, and
+    /// re-pin to the tail when the result is `0`.
+    ///
+    /// Used by the scrollbar drag/click and the jump-navigation commands, which
+    /// already compute an absolute `from_bottom` against the current geometry.
+    pub(crate) fn set_from_bottom(
+        &mut self,
+        from_bottom: usize,
+        line_count: usize,
+        viewport_h: usize,
+    ) {
+        let max_scroll = Self::max_scroll(line_count, viewport_h);
+        let next = from_bottom.min(max_scroll);
+        self.from_bottom = next;
+        self.follow_tail = next == 0;
+    }
+
+    /// The maximum `from_bottom` that still shows content, i.e. the number of
+    /// lines that can scroll off the top before the first line is at the top.
+    ///
+    /// Equivalent to `transcript_scroll_offset`'s `max_scroll`
+    /// (`line_count - viewport`), saturating at 0 when content fits. Delegates to
+    /// the shared [`crate::logical_scroll::max_top_offset`] so the main view and
+    /// the Ctrl+T overlay agree on a single definition of "max scroll".
+    #[must_use]
+    fn max_scroll(line_count: usize, viewport_h: usize) -> usize {
+        crate::logical_scroll::max_top_offset(line_count, viewport_h)
+    }
+
+    /// Absolute top-line offset for rendering, clamped to the valid range.
+    ///
+    /// Mirrors `transcript_scroll_offset(line_count, area_height, from_bottom)`:
+    /// `max_scroll = line_count - viewport`, returning
+    /// `max_scroll - from_bottom` (saturating). When `from_bottom == 0` this is
+    /// `max_scroll` — the tail. When `from_bottom >= max_scroll` this is `0` —
+    /// the top.
+    #[must_use]
+    pub(crate) fn offset(&self, line_count: usize, viewport_h: usize) -> usize {
+        let max_scroll = Self::max_scroll(line_count, viewport_h);
+        max_scroll.saturating_sub(self.from_bottom)
+    }
+
+    /// The stored `from_bottom` clamped to the current `[0, max_scroll]` range.
+    ///
+    /// `offset` saturates the stored value rather than persisting a clamped one,
+    /// so this is the geometry-aware "how far up am I, really" the scrollbar and
+    /// the scrolled-vs-live indicator read.
+    #[must_use]
+    pub(crate) fn offset_from_bottom(&self, line_count: usize, viewport_h: usize) -> usize {
+        let max_scroll = Self::max_scroll(line_count, viewport_h);
+        self.from_bottom.min(max_scroll)
+    }
+
+    /// Clamp the stored `from_bottom` so it never exceeds the current
+    /// `max_scroll`. Returns `true` if the value changed.
+    ///
+    /// Call this after the content length or viewport changes. If the state is
+    /// following the tail, it is re-pinned to `0` regardless.
+    ///
+    /// Wired into the main view's resize handler so a reflow keeps the logical
+    /// anchor (scrolled-up) or re-pins to the tail (following).
+    pub(crate) fn clamp(&mut self, line_count: usize, viewport_h: usize) -> bool {
+        let before = self.from_bottom;
+        if self.follow_tail {
+            self.from_bottom = 0;
+        } else {
+            let max_scroll = Self::max_scroll(line_count, viewport_h);
+            self.from_bottom = self.from_bottom.min(max_scroll);
+        }
+        self.from_bottom != before
+    }
+
+    /// Scroll by `delta_lines`: positive scrolls **up** (away from the tail,
+    /// increasing `from_bottom`), negative scrolls **down** (toward the tail).
+    ///
+    /// The result is clamped to `[0, max_scroll]`. Reaching `0` re-pins to the
+    /// tail (`follow_tail = true`); any upward movement unpins.
+    pub(crate) fn scroll_by(&mut self, delta_lines: isize, line_count: usize, viewport_h: usize) {
+        let max_scroll = Self::max_scroll(line_count, viewport_h);
+        let next = if delta_lines >= 0 {
+            self.from_bottom
+                .saturating_add(delta_lines as usize)
+                .min(max_scroll)
+        } else {
+            // delta_lines is negative; magnitude moves us toward the tail.
+            // Clamp the (possibly stale/over-max) stored value to `max_scroll`
+            // first so a single scroll-down can reach the tail instead of
+            // chipping the page size off a phantom distance.
+            let down = delta_lines.unsigned_abs();
+            self.from_bottom.min(max_scroll).saturating_sub(down)
+        };
+        self.from_bottom = next;
+        self.follow_tail = next == 0;
+    }
+
+    /// Keep the viewport top anchored to the content the user is reading when
+    /// the content grows underneath an *unpinned* view.
+    ///
+    /// On append the wrapped-row count (and therefore `max_scroll`) grows, so a
+    /// fixed `from_bottom` would resolve to a larger top-line `offset` and yank
+    /// the viewport forward by the appended rows. Bumping `from_bottom` by the
+    /// same `delta` rows holds `offset == max_scroll - from_bottom` steady, so
+    /// the row the user was reading stays put. No-op while following the tail
+    /// (the existing pin keeps tracking the live bottom). The result is clamped
+    /// to the new `max_scroll`.
+    ///
+    /// `line_count` / `viewport_h` are the *post-growth* geometry.
+    pub(crate) fn compensate_for_growth(
+        &mut self,
+        delta: usize,
+        line_count: usize,
+        viewport_h: usize,
+    ) {
+        if self.follow_tail || delta == 0 {
+            return;
+        }
+        let max_scroll = Self::max_scroll(line_count, viewport_h);
+        self.from_bottom = self.from_bottom.saturating_add(delta).min(max_scroll);
+        // Anchoring to grown content never re-pins by itself; only an explicit
+        // scroll-down/pin re-pins. If the clamp collapsed us to 0 (content still
+        // fits) restore the follow intent, mirroring `scroll_by`/`set_from_bottom`.
+        if self.from_bottom == 0 {
+            self.follow_tail = true;
+        }
+    }
+
+    /// Pin the view to the bottom: `from_bottom = 0`, `follow_tail = true`.
+    pub(crate) fn pin_to_bottom(&mut self) {
+        self.from_bottom = 0;
+        self.follow_tail = true;
+    }
+
+    /// Jump to the top: clamp `from_bottom` to `max_scroll` and unpin.
+    ///
+    /// Stores the *real* top offset instead of the legacy `usize::MAX`
+    /// sentinel, so the value stays meaningful for a later `clamp`/`offset`.
+    pub(crate) fn scroll_to_top(&mut self, line_count: usize, viewport_h: usize) {
+        self.from_bottom = Self::max_scroll(line_count, viewport_h);
+        self.follow_tail = false;
+    }
+
+    /// Test-only constructor for a view scrolled up by `from_bottom` lines and
+    /// unpinned. Lets tests assert on a specific stored position without the
+    /// geometry-aware `scroll_by` clamp.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn scrolled_up(from_bottom: usize) -> Self {
+        Self {
+            from_bottom,
+            follow_tail: from_bottom == 0,
+        }
+    }
+}
+
+/// Pure scrollbar geometry for a vertical track of `viewport_h` rows showing
+/// `total_rows` rows of content scrolled up by `from_bottom` lines.
+///
+/// Returns `None` when no scrollbar should be drawn: a zero-height track, or
+/// content that fits entirely within the viewport (`total_rows <= viewport_h`).
+///
+/// Mirrors `transcript_overlay_scrollbar_geometry`. Note that function takes a
+/// resolved *top-line* `scroll` offset, whereas this takes `from_bottom`; the
+/// two coordinate systems produce the same thumb position because
+/// `scroll = max_scroll - from_bottom` and the thumb travels from top (scroll 0)
+/// to bottom (scroll == max_scroll). Here `from_bottom == 0` (the tail) places
+/// the thumb at the bottom of its travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScrollbarGeometry {
+    /// Offset of the thumb's top edge from the top of the track, in rows.
+    pub(crate) thumb_offset: usize,
+    /// Length of the thumb, in rows (always `>= 1` when present).
+    pub(crate) thumb_len: usize,
+}
+
+/// Compute [`ScrollbarGeometry`] for the given content/viewport/scroll.
+///
+/// See [`ScrollbarGeometry`] for the `None` cases. The thumb length is the
+/// proportional `track * track / content`, clamped to `[1, track]`, and the
+/// thumb top is `scroll * travel / max_scroll` where `scroll` is the resolved
+/// top-line offset (`max_scroll - from_bottom`).
+#[must_use]
+pub(crate) fn scrollbar_geometry(
+    total_rows: usize,
+    viewport_h: usize,
+    from_bottom: usize,
+) -> Option<ScrollbarGeometry> {
+    // Convert the "distance from tail" into the renderer's top-line scroll, the
+    // same coordinate the overlay consumes, then delegate to the single shared
+    // thumb primitive (§11G.11). `max_top_offset` matches the legacy
+    // `total_rows - viewport` clamp.
+    let max_scroll = crate::logical_scroll::max_top_offset(total_rows, viewport_h);
+    let scroll = max_scroll.saturating_sub(from_bottom.min(max_scroll));
+    let geometry = crate::logical_scroll::thumb_geometry(total_rows, viewport_h, scroll)?;
+    Some(ScrollbarGeometry {
+        thumb_offset: geometry.thumb_offset,
+        thumb_len: geometry.thumb_len,
+    })
+}
+
+#[cfg(test)]
+#[path = "scroll_tests.rs"]
+mod tests;

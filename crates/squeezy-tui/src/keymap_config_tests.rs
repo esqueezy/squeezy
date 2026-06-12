@@ -319,6 +319,82 @@ action = "page_up"
 }
 
 #[test]
+fn merge_user_overrides_tombstone_removes_a_base_sourced_binding() {
+    // deep-review #96: a `reset = true` tombstone row for a slug that the
+    // settings.toml base map provides must REMOVE the slug from the merged map,
+    // so a base override the user reset in the editor restores the compiled-in
+    // default instead of silently resurrecting on restart.
+    let path = unique_temp_path("tombstone");
+    fs::write(
+        &path,
+        r#"
+[[bindings]]
+action = "toggle_config_screen"
+reset = true
+"#,
+    )
+    .expect("write temp file");
+    let mut base = BTreeMap::new();
+    base.insert("toggle_config_screen".to_string(), "Ctrl+Alt+Q".to_string());
+    base.insert("page_down".to_string(), "Alt+j".to_string());
+    let merged = merge_user_overrides(base, Some(&path)).expect("merges from disk");
+    assert!(
+        !merged.contains_key("toggle_config_screen"),
+        "the tombstoned base binding must be removed (default restored): {merged:?}"
+    );
+    // An untouched base binding survives.
+    assert_eq!(merged.get("page_down").map(String::as_str), Some("Alt+j"));
+}
+
+#[test]
+fn merge_user_overrides_rebind_wins_over_a_same_slug_tombstone() {
+    // A file that both tombstones and re-binds the same slug keeps the explicit
+    // re-binding (the override is applied after the tombstone removal), so the
+    // slug is not accidentally dropped.
+    let path = unique_temp_path("tombstone_and_rebind");
+    fs::write(
+        &path,
+        r#"
+[[bindings]]
+action = "toggle_config_screen"
+reset = true
+
+[[bindings]]
+action = "toggle_config_screen"
+key = "F9"
+"#,
+    )
+    .expect("write temp file");
+    let mut base = BTreeMap::new();
+    base.insert("toggle_config_screen".to_string(), "Ctrl+Alt+Q".to_string());
+    let merged = merge_user_overrides(base, Some(&path)).expect("merges from disk");
+    assert_eq!(
+        merged.get("toggle_config_screen").map(String::as_str),
+        Some("F9")
+    );
+}
+
+#[test]
+fn into_overrides_and_tombstones_rejects_a_row_with_both_key_and_reset() {
+    // A row that sets both `key` and `reset` (or neither) is ambiguous and must
+    // be a loud, all-or-nothing validation failure rather than silently picking
+    // one interpretation.
+    let file = KeybindingsFile::from_toml_str(
+        r#"
+[[bindings]]
+action = "toggle_config_screen"
+key = "F9"
+reset = true
+"#,
+    )
+    .expect("parses as TOML");
+    let err = file
+        .into_overrides_and_tombstones()
+        .expect_err("ambiguous row must fail validation");
+    assert!(matches!(err, KeybindingsError::MalformedRow { .. }));
+}
+
+#[test]
 fn merge_user_overrides_propagates_reserved_error() {
     let path = unique_temp_path("reserved_disk");
     fs::write(
@@ -339,4 +415,91 @@ action = "transcript_overlay"
             ..
         }
     ));
+}
+
+#[test]
+fn squeezy_keybindings_env_override_pins_scratch_path_over_home() {
+    // deep-review #70: the eval `TuiHarness` and any out-of-crate driver
+    // build their keymap from `default_keybindings_path()`, which (before
+    // this fix) read the operator's real `~/.squeezy/keybindings.toml`
+    // unconditionally. `SQUEEZY_KEYBINDINGS` must override the home path so
+    // key routing resolves from a scratch file instead. Drive the env
+    // resolver directly (no process-global mutation) to prove the override
+    // wins and `$HOME` is never consulted when it is set.
+    let scratch = unique_temp_path("env_override");
+    fs::write(
+        &scratch,
+        r#"
+[[bindings]]
+key = "Ctrl+o"
+action = "transcript_overlay"
+"#,
+    )
+    .expect("write scratch keybindings");
+
+    let scratch_os = scratch.clone().into_os_string();
+    let resolved = default_keybindings_path_from_env(|key| match key {
+        "SQUEEZY_KEYBINDINGS" => Some(scratch_os.clone()),
+        // A real $HOME is present, yet must be ignored while the override
+        // is set — this is the operator's machine in the eval driver.
+        "HOME" => Some(OsString::from("/home/operator")),
+        _ => None,
+    });
+    assert_eq!(
+        resolved.as_deref(),
+        Some(scratch.as_path()),
+        "the env override must win over the home-derived path",
+    );
+    assert_ne!(
+        resolved,
+        Some(PathBuf::from("/home/operator/.squeezy/keybindings.toml")),
+        "resolution must NOT fall through to the operator's real ~/.squeezy",
+    );
+
+    // And the resolver built from the scratch file honors the rebind:
+    // transcript_overlay moves from its Ctrl+T default to Ctrl+O.
+    let merged = merge_user_overrides(BTreeMap::new(), resolved.as_deref())
+        .expect("scratch keybindings merge cleanly");
+    let resolver = KeymapResolver::from_overrides(&merged);
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        Some(Action::ToggleTranscriptOverlay),
+        "the scratch rebind is in effect",
+    );
+    assert_ne!(
+        resolver.lookup(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        Some(Action::ToggleTranscriptOverlay),
+        "the default Ctrl+T binding was displaced by the scratch file",
+    );
+}
+
+#[test]
+fn squeezy_keybindings_empty_env_sentinel_bypasses_home() {
+    // An empty `SQUEEZY_KEYBINDINGS` is the "no user overrides" sentinel:
+    // it bypasses the home file entirely (resolves to None) rather than
+    // looking under a real `$HOME`. This lets the harness fully neutralize
+    // operator keybindings without pointing at a placeholder file.
+    let resolved = default_keybindings_path_from_env(|key| match key {
+        "SQUEEZY_KEYBINDINGS" => Some(OsString::from("")),
+        "HOME" => Some(OsString::from("/home/operator")),
+        _ => None,
+    });
+    assert_eq!(
+        resolved, None,
+        "empty SQUEEZY_KEYBINDINGS bypasses the home file with no user overrides",
+    );
+}
+
+#[test]
+fn unset_squeezy_keybindings_env_falls_through_to_home() {
+    // Production fallback: with no `SQUEEZY_KEYBINDINGS`, resolution must
+    // still derive from `$HOME` so real users keep their hand-edited file.
+    let resolved = default_keybindings_path_from_env(|key| {
+        (key == "HOME").then(|| OsString::from("/home/operator"))
+    });
+    assert_eq!(
+        resolved,
+        Some(PathBuf::from("/home/operator/.squeezy/keybindings.toml")),
+        "unset override keeps the home-derived path",
+    );
 }

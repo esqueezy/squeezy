@@ -3254,6 +3254,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "ignore",
+ "libc",
  "lru",
  "pulldown-cmark",
  "ratatui",
@@ -3296,6 +3297,8 @@ dependencies = [
  "tree-sitter-toml-updated",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

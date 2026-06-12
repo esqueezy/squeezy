@@ -37,11 +37,59 @@ pub(crate) enum Action {
     ToggleConfigScreen,
     /// Open / close the transcript overlay (`Ctrl+T` default).
     ToggleTranscriptOverlay,
+    /// Open incremental transcript search (`/` default). Searches the active
+    /// surface (main view, or the Ctrl+T overlay when it is open).
+    OpenSearch,
     /// Expand or collapse the live task panel (`Ctrl+P` default).
     ToggleTaskPanel,
     /// Copy the last assistant response to the system clipboard
     /// (`Ctrl+Y` default).
     CopyLastAssistant,
+    /// Copy the current/focused transcript entry to the clipboard
+    /// (`Alt+c` default).
+    CopyFocusedEntry,
+    /// Copy the current/nearest tool output to the clipboard
+    /// (`Alt+o` default).
+    CopyCurrentToolOutput,
+    /// Copy the fenced code block under the cursor to the clipboard
+    /// (`Alt+k` default).
+    CopyCodeBlock,
+    /// Code-Aware Copy/Export (§12.5.5): copy EVERY fenced code block of the
+    /// focused entry (or, when it holds none, the whole transcript) to the
+    /// clipboard — languages preserved, UI rails stripped (`Alt+j` default).
+    CopyAllCode,
+    /// Copy the rows visible in the main viewport to the clipboard
+    /// (`Alt+v` default).
+    CopyViewport,
+    /// Copy the entire transcript to the clipboard (`Alt+a` default).
+    CopyFullTranscript,
+    /// Copy the active visual selection to the clipboard (`Alt+y`
+    /// default). Convenience only — every copy chord already prefers an
+    /// active selection when one is present; this is the explicit verb.
+    CopySelection,
+    /// Quote the active visual selection into the composer as a Markdown
+    /// blockquote (`>` default; §11.1 quote-to-compose). Only fires while a
+    /// main-view selection is active; otherwise the `>` keystroke falls
+    /// through to normal composer input.
+    QuoteSelectionToCompose,
+    /// Multi-Cursor-Like Transcript Selection (§12.1.6): commit the live visual
+    /// selection into the disjoint selection set so the next gesture starts a
+    /// fresh non-contiguous range (`Alt+d` default). With no live selection it
+    /// is a no-op and falls through.
+    AddSelectionToSet,
+    /// Multi-Cursor-Like Transcript Selection (§12.1.6): copy EVERY committed
+    /// disjoint range plus the live one as one combined payload (`Ctrl+Alt+Y`
+    /// default), distinct blocks separated by a blank line.
+    CopyMultiSelection,
+    /// Prompt Snippets From Selection (§12.3.2): save the active main-view visual
+    /// selection as a reusable named prompt snippet (`Alt+3` default). With no
+    /// live selection it is a no-op and falls through so the key keeps its normal
+    /// meaning.
+    SaveSnippetFromSelection,
+    /// Prompt Snippets From Selection (§12.3.2): toggle the saved-snippets picker
+    /// overlay (`Ctrl+Alt+S` default), from which a snippet inserts into the
+    /// composer or is staged onto the prompt queue.
+    ToggleSnippets,
     /// Restore the most recently cancelled prompt back into the
     /// composer (`Ctrl+R` default).
     RestoreCancelledPrompt,
@@ -55,6 +103,555 @@ pub(crate) enum Action {
     /// Jump to the bottom of the transcript when the composer is
     /// empty (`End` default; falls through to line-end otherwise).
     TranscriptEnd,
+    /// Jump the transcript to the previous user turn (`Alt+Up` default).
+    JumpPrevUserTurn,
+    /// Jump the transcript to the next user turn (`Alt+Down` default).
+    JumpNextUserTurn,
+    /// Jump the transcript to the previous assistant answer (`Alt+Left`
+    /// default).
+    JumpPrevAssistant,
+    /// Jump the transcript to the next assistant answer (`Alt+Right`
+    /// default).
+    JumpNextAssistant,
+    /// Jump the transcript to the previous tool call (`Alt+,` default).
+    JumpPrevToolCall,
+    /// Jump the transcript to the next tool call (`Alt+.` default).
+    JumpNextToolCall,
+    /// Jump the transcript to the previous error (`Alt+[` default).
+    JumpPrevError,
+    /// Jump the transcript to the next error (`Alt+]` default).
+    JumpNextError,
+    /// Move the focused-entry cursor to the previous transcript entry
+    /// (`Ctrl+Up` default). Used by the per-entry fold controls.
+    FocusPrevEntry,
+    /// Move the focused-entry cursor to the next transcript entry
+    /// (`Ctrl+Down` default).
+    FocusNextEntry,
+    /// Toggle the collapsed state of the focused transcript entry in the
+    /// main inline view (`Ctrl+O` default). Paired with the mouse caret click,
+    /// which dispatches the same fold toggle.
+    ToggleFocusedFold,
+    /// Open the focused transcript entry in the Ctrl+T detail overlay
+    /// (`Ctrl+Enter` default). Paired with the mouse "open in detail"
+    /// affordance; both drive `open_focused_entry_in_detail`.
+    OpenFocusedInDetail,
+    /// Undo the most recent prompt-queue mutation — delete or reorder
+    /// (`u` default). The keyboard twin of the mouse undo affordance. Only
+    /// fires while the queue reorder overlay is open; outside it the key
+    /// falls through so `u` keeps its normal composer meaning. The other
+    /// queue verbs (focus move, item reorder, delete) are consumed inside the
+    /// overlay's own modal key handler via `PromptQueueState::dispatch`
+    /// (Up/Down, Shift+Up/Down, Delete). While that overlay is open
+    /// `dispatch_keymap_action_inner` early-returns for every action except this
+    /// `QueueUndo` and the hidden debug overlays, so the global keymap can no
+    /// longer fire over the open overlay — `QueueUndo` is the one genuinely new
+    /// verb allowed through, so it earns a rebindable action.
+    QueueUndo,
+    /// Toggle the hidden per-interaction UX latency-budget overlay
+    /// (`Ctrl+Alt+L` default; §12.10.1). A deliberately obscure debug chord —
+    /// it forces the render-metrics HUD visible and adds a p95/p99-vs-budget
+    /// panel for keypress echo, scroll, page jumps, queue drag, paste preview,
+    /// copy ack, search jump, and resize redraw. Off in a normal session.
+    ToggleLatencyOverlay,
+    /// Toggle the hidden dogfood-telemetry `/metrics` snapshot overlay
+    /// (`Ctrl+Alt+M` default; §12.10.3). Like the latency overlay, a
+    /// deliberately obscure debug chord: it forces the render-metrics HUD
+    /// visible and adds a session-long counter snapshot (frames/bytes/cache/
+    /// input/storms/copy/terminal-profile/a11y/teardown). Off by default.
+    ToggleDogfoodMetrics,
+    /// Set a jump mark at the entry currently at the top of the viewport
+    /// (`Alt+m` default; §11.2 / 11G.2). Marks are stored by stable entry id,
+    /// so they survive a transcript reflow. Paired with `JumpToMark`.
+    SetJumpMark,
+    /// Jump back to the most recently set jump mark, popping it off the mark
+    /// stack (`Alt+'` default; §11.2 / 11G.2). With no marks set, falls back to
+    /// showing the recent jump history in the status line.
+    JumpToMark,
+    /// Toggle the minimap turn rail (`Alt+r` default; §11.2 / 11G.3). A compact
+    /// vertical rail in the main view showing user turns, tool calls, errors,
+    /// and the current viewport band; clickable to jump when mouse capture is
+    /// on. Off by default so an idle session paints nothing extra.
+    ToggleMinimap,
+    /// Toggle the main view between soft-wrap (every line reflows to the column)
+    /// and no-wrap horizontal-scroll (`Alt+w` default; §11.2 / 11G.4). No-wrap
+    /// lets wide code/diff blocks and long command output pan left/right instead
+    /// of wrapping or being hidden. Paired with `ScrollBlockLeft`/`Right`.
+    ToggleSoftWrap,
+    /// Pan the no-wrap main view left one step (`Alt+h` default; §11G.4). The
+    /// keyboard twin of Shift+wheel-up. A no-op while soft-wrap is on.
+    ScrollBlockLeft,
+    /// Pan the no-wrap main view right one step (`Alt+l` default; §11G.4). The
+    /// keyboard twin of Shift+wheel-down. A no-op while soft-wrap is on.
+    ScrollBlockRight,
+    /// Cycle the Adaptive Density override (`Ctrl+Alt+X` default; §12.4.1).
+    /// Rotates the density knob `auto → compact → default → expanded → auto`:
+    /// `auto` (the default) derives a compact/default/expanded layout from the
+    /// painted terminal size; the three pinned modes force that layout regardless
+    /// of size (the explicit user override). Density only scales the
+    /// transcript-to-prompt gap, the startup-card threshold, and the status detail
+    /// level — it preserves scroll, selection, focus, the queue, and the composer.
+    /// The pick is persisted to `[tui].density` so it survives a restart. The
+    /// mouse twin is a click on the status-line density indicator.
+    CycleDensity,
+    /// Cycle the Dockable Panels dock (`Ctrl+Alt+F` default; §12.4.4). One verb
+    /// walks every auxiliary panel (scratchpad / subagent timeline / detail) on
+    /// every edge and back to undocked — `undocked → scratchpad left/right/bottom
+    /// → subagents … → detail bottom → undocked`. Reuses the §12.4.2 split-pane
+    /// solver to carve the panel off the main view (degrading to a single
+    /// transcript column when the terminal is too small). The pick is persisted to
+    /// `[tui].dock` so it survives a restart. The mouse twin is a click on the
+    /// docked panel's header.
+    CycleDockPanel,
+    /// Cycle the OSC 8 hyperlink mode for rendered URLs/file paths (`Alt+8`
+    /// default; §11.5 / 11G.5). Rotates auto (the startup terminal probe) → on
+    /// (exit-mirror links) → off (force plain text), so a user whose terminal was
+    /// mis-detected either way can correct it without restarting. The escapes ride
+    /// only on the persisted exit-mirror rows today — no live frame emits OSC 8 —
+    /// so the `on` label says `exit-mirror links`, not a live click-to-open claim.
+    ToggleHyperlinks,
+    /// Open / close the in-app clipboard-history picker (`Alt+p` default;
+    /// §12.6.1). A bounded ring of Squeezy's own recent copies — never the OS
+    /// clipboard — that the user can re-copy, pin, delete, or clear from a
+    /// fullscreen overlay. Records every copy through the same provider chain and
+    /// records nothing at idle, so an unopened picker costs zero.
+    ToggleClipboardHistory,
+    /// Build a shareable session bundle with the defaults (`Alt+b` default;
+    /// §12.6.6) — the keyboard twin of `/bundle`. Renders the transcript through
+    /// the export pipeline, assembles a self-contained Markdown artifact
+    /// (transcript + manifest + checksum + diagnostics, redacted), writes it
+    /// atomically under session storage, and echoes a preview into the transcript
+    /// for review before sharing. A one-shot action — it paints nothing at idle.
+    BuildSessionBundle,
+    /// Open the composer text in the user's `$VISUAL`/`$EDITOR` (`Alt+e` default;
+    /// §12.6.5 External Editor Handoff). Suspends the alt-screen, hands a temp
+    /// file to the editor, and re-imports the saved buffer through an
+    /// accept/reopen/discard confirmation. A safe no-op (status hint) when no
+    /// editor is configured, and degrades to the same hint off Unix where the
+    /// spawn/terminal-restore plumbing is not wired. Records nothing at idle.
+    OpenComposerInEditor,
+    /// Cycle the main-view Semantic Filter (§12.5.2) forward through its
+    /// categories — all → user turns → assistant → tool calls → errors → (per
+    /// tool, when more than one) → all (`Alt+f` default). Narrows the inline
+    /// transcript to one semantic category in place, the complement of the Ctrl+T
+    /// overlay's local `f` filter. Paired with a click on the active-filter badge,
+    /// which dispatches the same forward cycle. A main-surface action; off (`All`)
+    /// by default so an idle session paints nothing extra.
+    CycleSemanticFilter,
+    /// Open / close the Local Transcript Index overlay (`Alt+i` default;
+    /// §12.5.1). A fullscreen summary of the in-memory transcript index — entry
+    /// counts by category (user turns, tool calls, errors, reasoning, subagents,
+    /// …) with keyboard/mouse navigation that jumps the main view to the next
+    /// entry in the selected category. The index rebuilds incrementally only on a
+    /// transcript revision bump, so an idle session pays nothing.
+    ToggleTranscriptIndex,
+    /// Open / close the Related-Entry Links overlay (`Alt+g` default; §12.5.3).
+    /// Surfaces the links between the focused (or latest) transcript entry and
+    /// the entries it relates to — its prompt/reply, the tool calls it triggered,
+    /// the error it caused, the follow-up that fixed it, same-tool calls, and
+    /// subagent breadcrumbs — with keyboard/mouse navigation that jumps the main
+    /// view to the selected related entry. The relation graph rebuilds
+    /// incrementally only on a transcript revision bump, so an idle session pays
+    /// nothing.
+    ToggleRelatedLinks,
+    /// Open / close the Duplicate-Output Folds overlay (`Alt+u` default;
+    /// §12.5.4). A fullscreen list of detected runs of repeated / near-duplicate
+    /// tool outputs, each collapsed to its first member with a count; the raw
+    /// content of every folded output is retained for expand, search, and copy.
+    /// Keyboard/mouse navigation jumps the main view to the next fold lead and
+    /// toggles a span open. The fold model rebuilds incrementally only on a
+    /// transcript revision bump, so an idle session pays nothing.
+    ToggleDuplicateFolds,
+    /// Open / close the Error Lenses overlay (`Alt+x` default; §12.5.6). A
+    /// fullscreen list of the actionable error lines detected inside failed tool
+    /// outputs — each classified (rustc / cargo / test / permission / network /
+    /// panic / sandbox), carrying its message and any extracted `file:line`
+    /// location — with keyboard/mouse navigation that jumps the main view to the
+    /// failing entry. The lens model rebuilds incrementally only on a transcript
+    /// revision bump, so an idle session pays nothing.
+    ToggleErrorLens,
+    /// Open / close the Transcript Health Markers overlay (`Alt+n` default;
+    /// §12.5.7). A fullscreen list of the health/status markers detected on the
+    /// transcript — a failed tool, a failed subagent, a failed turn, output
+    /// elided to a preview, or a large output blob — each carrying its short
+    /// message and severity, with keyboard/mouse navigation that jumps the main
+    /// view to the marked entry so the user can see what was hidden. The marker
+    /// model rebuilds incrementally only on a transcript revision bump, so an
+    /// idle session pays nothing.
+    ToggleHealthMarkers,
+    /// Open / close the Semantic Turn Outline overlay (`Alt+s` default; §12.2.1).
+    /// A navigable structural map of the session — user prompts, assistant
+    /// answers, tool runs, errors, reasoning, plans, diffs, and subagent
+    /// breadcrumbs — each with a short deterministic title; keyboard/mouse
+    /// navigation jumps the main view to the logical transcript row of the
+    /// selected node. The outline rebuilds incrementally only on a transcript
+    /// revision bump, so an idle session pays nothing.
+    ToggleTurnOutline,
+    /// Open / close the Collapsible Reasoning/Tool Lanes overlay (`Alt+z`
+    /// default; §12.2.2). A per-entry panel that splits the focused transcript
+    /// entry into foldable lanes — reasoning, assistant text, tool input, tool
+    /// output, system notice, approval, error, and plan — each with a collapse
+    /// toggle so whole lanes can be folded away to read the transcript at a
+    /// higher altitude. Collapse state is persisted by `(entry_id, lane_id)` in
+    /// app state, so a folded lane survives every redraw and resize; an errored
+    /// lane always keeps its visible header. The panel rebuilds incrementally
+    /// only on a focused-entry / revision / collapse change, so an idle session
+    /// pays nothing.
+    ToggleLaneFold,
+    /// Open / close the Pinned Compare View (`Alt+t` default; §12.2.3). Pins the
+    /// focused transcript entry into one pane and shows it side-by-side (or
+    /// stacked, on a narrow terminal) against the live transcript — or a second
+    /// pinned entry — so old and new content can be compared. Each pane keeps its
+    /// own scroll; `Tab` (or a click) flips which pane the keyboard/wheel drives;
+    /// `x` toggles a line-based clean-text diff. The view lives inside the Ctrl+T
+    /// overlay (it compares against what the overlay shows) and paints nothing at
+    /// idle. Reuses the §11G.10 detail-pane split machinery.
+    TogglePinnedCompare,
+    /// Drop a Reading Position Bookmark at the entry currently at the top of the
+    /// viewport (`Alt+;` default; §12.2.4). A bookmark is a durable
+    /// reading-position anchor (distinct from a transient jump mark): it is keyed
+    /// by the stable transcript entry id, so it survives appends, resize, folds,
+    /// and filters until the user deletes it. The first drop with no name is an
+    /// anonymous bookmark; the bookmark list overlay can name/rename it later.
+    /// Costs nothing until pressed.
+    DropBookmark,
+    /// Open / close the Reading Position Bookmarks overlay (`Alt+q` default;
+    /// §12.2.4). A list of every bookmark in transcript-reading order; the cursor
+    /// (↑↓/kj, plus n/p for next/previous) selects one and Enter jumps the main
+    /// view to its anchored entry. `r` renames, `d`/Delete deletes, Esc/Alt+q
+    /// closes. The list lives in app state (not recomputed from cells) so it is
+    /// stable across redraws and resize; an idle session that never opens it pays
+    /// nothing.
+    ToggleBookmarks,
+    /// Open / close the Session Timeline overlay (`Alt+9` default; §12.2.6). A
+    /// compact chronological event view of the session — prompts, turns, tool
+    /// runs, approvals, edits, errors, and other high-signal state changes —
+    /// rendered as a rail/list and grouped by turn, each with a short
+    /// deterministic label and an ok/failed/pending status. The cursor (↑↓/kj,
+    /// plus Enter/→/l to jump) scrolls the main view to the transcript row the
+    /// selected event stands for; `f` cycles a per-kind filter. The timeline
+    /// rebuilds incrementally only on a transcript revision bump, so an idle
+    /// session pays nothing.
+    ToggleSessionTimeline,
+    /// Open / close the Subagent Timeline Panel (`Alt+5` default; §12.8.1). A
+    /// persistent, navigable list of the session's running and completed
+    /// subagents/tasks on a timeline — each row carrying the subagent's id/name,
+    /// role, lifecycle status (running/done/failed/capped), latest activity,
+    /// elapsed time, tool count, cost (where the child reported it), and an
+    /// attention flag for failures and cap rejections. The cursor (↑↓/kj, plus
+    /// n/p for next/previous) selects a row and Enter/→/l jumps the main view to
+    /// that subagent's conversation; `f` cycles a per-status filter. The panel is
+    /// projected from the live subagent-pane records and rebuilds incrementally
+    /// only on a subagent event, so an idle session pays nothing.
+    ToggleSubagentTimeline,
+    /// Annotate the focused (or top-visible) transcript entry with a short private
+    /// note (`Alt+/` default; §12.2.5). The note is attached to the stable
+    /// transcript entry id and stored only in session UI metadata, never in the
+    /// model transcript, so it never enters model context. A small inline marker
+    /// appears on the annotated entry's row; the note is editable in the
+    /// annotations overlay's composer. Costs nothing until pressed.
+    AnnotateEntry,
+    /// Open / close the Entry Annotations overlay (`Alt+\` default; §12.2.5). A
+    /// list of every annotation in transcript-reading order; the cursor (↑↓/kj,
+    /// plus n/p for next/previous) selects one and Enter jumps the main view to its
+    /// anchored entry. `e` edits the note in the composer, `d`/Delete deletes,
+    /// Esc/Alt+\ closes. The list lives in app state (not recomputed from cells) so
+    /// it is stable across redraws and resize; an idle session that never opens it
+    /// pays nothing.
+    ToggleAnnotations,
+    /// Mark a "What Changed Since Here?" point and open its delta overlay (`Alt+0`
+    /// default; §12.2.7). The anchor is the focused (or top-visible) transcript
+    /// entry's stable id; opening the overlay scans every later transcript event
+    /// and surfaces the changes observed since — file edits, commands/tests,
+    /// errors, checkpoints, approval decisions, and other tool results — as a
+    /// grouped, summarized delta. The cursor (↑↓/kj, plus n/p for next/previous)
+    /// selects a change and Enter/→/l jumps the main view to the entry it stands
+    /// for; `m` re-marks the anchor at the current reading position. The delta
+    /// rebuilds incrementally only on an anchor move or a transcript revision bump,
+    /// so an idle session pays nothing. Uses honest "observed since" language — it
+    /// reports only what this session's transcript recorded, never a full project
+    /// history.
+    ToggleChangesSince,
+    /// Open the Contextual Action Palette (`Alt+Enter` default; §12.1.2) for the
+    /// currently focused transcript unit — the focused entry (`Ctrl+↑/↓`) when one
+    /// is focused, else the top-visible entry. The palette lists only the actions
+    /// that apply to what is under focus (copy, copy code, copy tool output, quote
+    /// into composer, annotate, open in detail, expand/collapse, related entries,
+    /// jump) and runs the highlighted one with Enter — or a click on its row. Each
+    /// action routes to the same handler its own chord already drives, so the menu
+    /// never introduces new behavior. Closed is the resting state, so a session
+    /// that never opens it pays nothing.
+    OpenActionPalette,
+    /// Open / close the Universal Command Palette (`Ctrl+Alt+P` default; §12.1.1).
+    /// One discoverable, fuzzy-searchable modal that lists every app command — the
+    /// rebindable keymap actions plus the slash-command help table — with the
+    /// current binding and a short description, and runs the highlighted command
+    /// with Enter (keyboard) or a click (mouse). Slash commands that take a
+    /// parameter are handed back to the composer as a second step. The palette is
+    /// built only on open, so an unopened session pays nothing.
+    ToggleCommandPalette,
+    /// Open / close the Hover Preview popover (`Alt+1` default; §12.1.4) for the
+    /// currently focused transcript unit — the focused entry (`Ctrl+↑/↓`) when one
+    /// is focused, else the top-visible entry. The keyboard twin of a stable mouse
+    /// hover: it shows a quiet, noncommittal preview (the entry's title + a bounded
+    /// excerpt) without stealing focus or changing layout. The same focused entry's
+    /// primary action (open in detail) stays on its own `Ctrl+Enter` chord — this
+    /// verb only previews. Closed is the resting state, so a session that never
+    /// opens it pays nothing.
+    ToggleHoverPreview,
+    /// Toggle Mouse Hover Intent (`Ctrl+Alt+H` default; §12.1.3). When on (the
+    /// default), the transcript card under the pointer — or, when the terminal
+    /// reports no mouse motion, the keyboard-focused card — gains a restrained,
+    /// debounced emphasis (brighter, bolded header hint) without changing row
+    /// heights. A wheel scroll, drag, or active selection suppresses the reveal.
+    /// The verb flips the affordance off for users who prefer none; the resting
+    /// state paints nothing and schedules no redraw, so it costs nothing idle.
+    ToggleHoverIntent,
+    /// Show / hide the Clickable Breadcrumbs strip (`Alt+2` default; §12.1.5). A
+    /// compact `session ▸ turn ▸ entry` trail (with an `overlay`/`search` suffix)
+    /// that orients long sessions. While shown it is keyboard-focusable —
+    /// Left/Right move the focused crumb, Enter jumps to it — and each crumb is a
+    /// click target; while hidden it paints nothing and schedules no redraw, so it
+    /// costs nothing idle.
+    ToggleBreadcrumbs,
+    /// Rename / label the focused (or top-visible) transcript entry inline
+    /// (`Ctrl+Alt+R` default; §12.1.7). Opens a small in-place editor seeded with the
+    /// entry's current label (empty for a fresh one); typing edits it, Enter saves,
+    /// Esc cancels, a blank save clears it. The label is UI-only metadata that
+    /// paints as a small badge on the row and never enters the model transcript.
+    /// The resting state stores nothing and paints nothing, so it costs nothing
+    /// idle.
+    RenameFocusedEntry,
+    /// Dismiss the gentle First-Run Interaction Hint currently shown (`Ctrl+Alt+N`
+    /// default; §12.1.8). The keyboard twin of clicking the dim hint strip: it
+    /// retires the visible hint (latched seen for the session) so it never returns.
+    /// When no hint is showing it is a no-op that falls through, so it never steals
+    /// a key from the composer or transcript. Once every hint is seen the feature is
+    /// quiet and this verb does nothing, costing nothing idle.
+    DismissFirstRunHint,
+    /// Preview the selected subagent timeline row (`Alt+6` default; §12.8.2). The
+    /// keyboard twin of a stable mouse hover over a subagent row: it shows a quiet,
+    /// noncommittal popover (the subagent's status, last activity, and metrics)
+    /// without resizing the pane or stealing focus. A second press (or any other
+    /// key, click, or scroll) dismisses it. A no-op (status hint) when no subagent
+    /// row is selected. Closed is the resting state, so a session that never opens
+    /// it pays nothing.
+    PreviewSubagent,
+    /// Jump to the selected subagent's transcript / detail pane (`Ctrl+Alt+D`
+    /// default; §12.8.2). The keyboard twin of a double-click on a subagent row: it
+    /// opens that subagent's transcript while preserving the prior conversation +
+    /// scroll as a return anchor (Esc returns). A capped subagent (no transcript)
+    /// resolves to a select-only no-op. When no subagent row is selected it falls
+    /// through, so the chord never steals a key from the composer.
+    JumpToSubagent,
+    /// Promote the selected subagent's result into a follow-up prompt (`Ctrl+Alt+Q`
+    /// default; §12.8.4). Distills the subagent's completion summary / failure
+    /// diagnostic / latest activity into a clean, plain-text prompt and drops it in
+    /// the composer (when idle) or queues it behind the running turn — never
+    /// auto-submitted. The keyboard twin of the timeline panel's `y` promote key. A
+    /// no-op (status hint) when no subagent row is selected, so the chord never
+    /// steals a key from the composer.
+    PromoteSubagentResult,
+    /// Quick-jump to the subagent that most needs attention (`Ctrl+Alt+Z`
+    /// default; §12.8.6 Attention Routing). Routes the user to the
+    /// single highest-priority subagent that needs a look — a failure, a cap
+    /// rejection, a blocker, an awaited approval, or a pinned completion — landing
+    /// on it the same way the subagent timeline's Enter jump does (opens its
+    /// conversation, preserving the prior scroll). A no-op (status hint) when
+    /// nothing wants attention, so the chord never steals a key when the session is
+    /// calm. The mouse twin is a click on the status-line attention indicator.
+    JumpToAttention,
+    /// Open the Compare Subagent Outputs view over the two marked subagents
+    /// (`Alt+7` default; §12.8.3). Two subagents are marked from the Subagent
+    /// Timeline Panel (the `c` key there, or a marked-row click); this verb opens
+    /// the side-by-side (wide) / stacked (narrow) compare view over them — each
+    /// pane independently scrolled, `Tab` (or a click) flips which pane the
+    /// keyboard/wheel drives, and `x` toggles a line-based clean-text diff. A
+    /// no-op (status hint) when fewer than two subagents are marked. Reuses the
+    /// §12.2.3 Pinned Compare View split + diff machinery. Costs nothing until two
+    /// are marked and the view is opened.
+    ToggleSubagentCompare,
+    /// Open / close the Live Review Board overlay (`Ctrl+Alt+O` default; §12.8.5).
+    /// A fan-out orchestration dashboard that groups the session's in-flight and
+    /// finished subagents/workers into status lanes — running, blocked (failed),
+    /// capped (cap-rejected, kept visible), and completed — so a glance reads
+    /// "what is running, what needs a look, what finished" across a parallel
+    /// delegation. The board is derived from the same live subagent-pane records the
+    /// Subagent Timeline Panel (§12.8.1) projects, so the two views never disagree;
+    /// it never infers a runtime "queued" lane from cap rejection. The cursor (↑↓/kj,
+    /// plus n/p) walks the flattened lanes by stable id and Enter/→/l jumps the main
+    /// view to that worker's conversation; a row click selects + jumps. The board
+    /// rebuilds incrementally only on a subagent event, so an idle session pays
+    /// nothing.
+    ToggleReviewBoard,
+    /// Open / close the Actionable Tool Outputs overlay (`Ctrl+Alt+A` default;
+    /// §12.3.1) for the focused (or top-visible) tool result. It scans that result's
+    /// output for actionable elements — file paths, URLs, error lines, diff hunks,
+    /// and shell commands — and lists each as a row offering safe copy/jump
+    /// affordances (copy the element to the clipboard, or jump the main view to the
+    /// source result). Keyboard (↑↓ select, Enter copy, j jump, Esc close) and mouse
+    /// (click a row to copy). Retry/run degrade to copy so nothing bypasses a sandbox
+    /// or an approval gate. The items are a one-shot snapshot taken on open, so the
+    /// resting state stores nothing and an idle session pays nothing.
+    ToggleToolActions,
+    /// Open / close the Scratchpad Pane (`Alt+4` default; §12.3.3). A persistent,
+    /// session-scoped notes/composition side-pane: the live transcript stays on
+    /// the left while an editable scratch buffer collects observations, quotes,
+    /// and draft prompts. The buffer survives across turns (it lives in session UI
+    /// state, never the model transcript) and never enters model context unless
+    /// the user explicitly inserts it into the composer (`Ctrl+I`) or queues it as
+    /// a prompt (`Ctrl+Q`). While open the pane owns the keyboard for editing
+    /// (composer-style insert/delete/cursor/newline); a quote-append and a clear
+    /// verb fill it. Keyboard- and mouse-driven; closed is the resting state, so a
+    /// session that never opens it pays nothing.
+    ToggleScratchpad,
+    /// Open / close the Prompt Templates picker (`Ctrl+Alt+T` default; §12.3.6).
+    /// Reusable parameterised prompt templates — e.g. `Review {file}` — shown as
+    /// queue cards with editable slots. The picker lists saved templates; selecting
+    /// one instantiates a card whose `{slot}`s the user fills (Tab/↑↓ to move
+    /// between slots, type to edit) before enqueueing or running the resolved
+    /// prompt. Missing/blank slots BLOCK execution with inline status (the spec's
+    /// "Missing/invalid slots block execution with inline status"). The template
+    /// store survives across turns; closed is the resting state, so a session that
+    /// never opens it pays nothing. Keyboard- and mouse-driven.
+    ToggleTemplates,
+    /// Replayable Interaction Macros (§12.3.7): arm / disarm macro RECORDING
+    /// (`Ctrl+Alt+K` default). While armed, every committed logical command (the
+    /// canonical keymap action a keyboard chord or a mouse affordance dispatches)
+    /// is appended to the in-progress macro; pressing the verb again stops
+    /// recording and stores the macro for replay. Noise — hover, mouse move,
+    /// ticks, resize, toasts — is ignored by construction (it commits no keymap
+    /// action). Costs nothing until pressed; an idle session never records.
+    ToggleMacroRecord,
+    /// Replayable Interaction Macros (§12.3.7): REPLAY the most recently recorded
+    /// macro (`Ctrl+Alt+J` default). Re-dispatches each recorded logical command
+    /// through the same dispatcher a live press uses, so replay never bypasses an
+    /// approval gate and is indistinguishable from the user performing the steps.
+    /// Visible (a progress strip) and cancellable (Esc / the record toggle). A
+    /// no-op when no macro has been recorded yet; costs nothing until pressed.
+    ReplayMacro,
+    /// Open / close the Keybinding Editor UI overlay (`Ctrl+Alt+B` default;
+    /// §12.7.1). An interactive view of every rebindable action with its current
+    /// binding, override flag, and terminal-compat note — sourced straight from
+    /// this `Action` registry and the live `KeymapResolver` so it lists exactly
+    /// what the TUI dispatches. The cursor (↑↓/kj, Home/End/PageUp/PageDown)
+    /// selects a row; Enter (or a click) captures the next chord as the new
+    /// binding, warning on a collision and refusing a reserved recovery key
+    /// (`Ctrl+C`/`Esc`/`Ctrl+D`); `r`/Delete resets a row to its default. Commits
+    /// persist to `~/.squeezy/keybindings.toml` and rebuild the resolver live. The
+    /// overlay does not exist until opened, so an idle session pays nothing.
+    ToggleKeybindingEditor,
+    /// Theme Editor UI (§12.7.2): open / close the interactive theme color editor
+    /// (`Ctrl+Alt+E` default). A fullscreen overlay that picks/previews colors for
+    /// the active theme's semantic palette roles (accent, error, dim, selection, …)
+    /// with a live preview, persisting each committed override to the user-scope
+    /// config. Costs nothing until opened; an idle session never paints it.
+    OpenThemeEditor,
+    /// Per-Workspace UI Profile (§12.7.4): open / close the workspace UI-profile
+    /// overlay (`Ctrl+Alt+W` default). A fullscreen overlay that shows the UI
+    /// preferences (density, transcript detail, minimap pane, theme) remembered
+    /// for the current workspace and lets the user save the live ones, restore the
+    /// saved ones, or reset them — persisting per workspace path outside the repo.
+    /// Costs nothing until opened; an idle session never paints it.
+    OpenWorkspaceProfile,
+    /// Per-Terminal Profiles (§12.7.3): open / close the terminal-profile editor
+    /// (`Ctrl+Alt+G` default). A fullscreen overlay that shows the detected
+    /// terminal capabilities and lets the user adapt the per-terminal UX policy
+    /// (glyph set, mouse mode, color depth) — built-in defaults per detected
+    /// terminal, user-overridable, persisted to the user-scope config. Costs
+    /// nothing until opened; an idle session never paints it.
+    OpenTerminalProfile,
+    /// Gesture Settings (§12.7.5): open / close the gesture-settings editor
+    /// (`Ctrl+Alt+I` default). A fullscreen overlay that tunes mouse/trackpad
+    /// gesture behaviour (scroll speed, Shift-wheel pan, hover dwell, double-click
+    /// action, drag-select) — built-in defaults single-sourced from the
+    /// interaction timing constants, user-overridable, persisted to the user-scope
+    /// config. Every value has a keyboard path (↑↓ field, ←→/Space/+/- adjust),
+    /// since mouse reporting may be disabled. Costs nothing until opened; an idle
+    /// session never paints it.
+    OpenGestureSettings,
+    /// Minimal Glyph Mode (§12.7.6): open / close the glyph-mode picker
+    /// (`Ctrl+Alt+U` default). A fullscreen overlay that lets the user swap
+    /// Squeezy's decorative / wide-Unicode chrome (spinners, rails, fold markers,
+    /// scrollbar, box-drawing) for ASCII-safe equivalents on limited terminals —
+    /// three fidelity levels (Unicode / Compact / ASCII), togglable and persisted
+    /// to the user-scope config. Costs nothing until opened; an idle session never
+    /// paints it.
+    OpenGlyphMode,
+    /// Smart Split Panes (§12.4.2): open / close the split-layout inspector
+    /// (`Ctrl+Alt+V` default). A small overlay that runs the §12.4.2 layout solver
+    /// over the live terminal and shows where it would place a secondary pane
+    /// (detail / scratch / compare) beside or below the transcript — choosing the
+    /// orientation from the terminal aspect, degrading to a single column when too
+    /// narrow. The cursor (↑↓) picks the pane kind / orientation / split ratio row,
+    /// ←→/Space adjust the focused row, `r`/Delete reset, Esc/the toggle close. The
+    /// overlay does not exist until opened, so an idle session pays nothing.
+    ToggleSmartSplit,
+    /// Toggle Presentation Mode (`Ctrl+Alt+C` default; §12.4.6). The screen-share
+    /// / demo display mode: it elevates the resolved Adaptive Density to the
+    /// spacious expanded layout (reusing the §12.4.1 density table) and suppresses
+    /// the metadata detail line (cost / account / provider / tokens / full paths)
+    /// so a live screen-share does not expose it. Display-only — the transcript,
+    /// the cost snapshot, and every persisted value are untouched (hiding, not
+    /// redaction), so leaving the mode (or the `/reveal` one-shot command) brings
+    /// every value straight back. The enabled-state is persisted to
+    /// `[tui].presentation` so it survives a restart (always re-hidden — the
+    /// reveal is never persisted). The mouse twin is a click on the status-line
+    /// `[present]` indicator.
+    TogglePresentation,
+    /// Toggle Zen Mode (§12.4.5): the distraction-free layout (`Ctrl+Alt+.`
+    /// default). Hides the secondary chrome — the minimap turn rail, the
+    /// breadcrumbs strip, the docked auxiliary panel, and the detailed status block
+    /// (condensed to one terse line) — to focus the surface on the transcript and
+    /// composer, while blocking approvals/errors and every reachable command
+    /// (search / copy / queue / help) stay live. The pick is persisted to
+    /// `[tui].zen` so it survives a restart. The mouse twin is a click on the
+    /// minimal zen status line. Pure layout policy: one `bool` per painted frame,
+    /// no idle redraw.
+    ToggleZenMode,
+    /// Terminal Restore Command (§12.9.2): forcibly return a wedged terminal to a
+    /// sane state (`Ctrl+Alt+,` default). Leaves the alternate screen, disables raw
+    /// mode and every input mode (mouse, bracketed paste, focus, alternate scroll),
+    /// resets keyboard-enhancement flags + title, shows the hardware cursor, then
+    /// re-enters the fullscreen surface and forces a full repaint — recovery from a
+    /// corrupted screen WITHOUT exiting the session or purging scrollback. Reuses
+    /// the single-sourced emergency-teardown / enter-setup byte machinery; the
+    /// `/terminal-reset` slash command is the discoverable twin. There is no mouse
+    /// affordance: a wedged terminal may not report clicks, so recovery stays on the
+    /// always-reachable keyboard/command surface.
+    RestoreTerminal,
+    /// Toggle the Last-Known-Good Layout Fallback (§12.9.3) diagnostics line
+    /// (`Ctrl+Alt+/` default). A hidden debug surface that rides inside the
+    /// render-metrics HUD: it reports whether a good layout snapshot is held, its
+    /// size, and how many times this session a degenerate frame was repainted from
+    /// the last-known-good geometry instead of committed broken. The fallback
+    /// itself is always active in the render path (no toggle); this only reveals
+    /// its status. There is no mouse affordance — like the latency / dogfood debug
+    /// overlays it lives on the keyboard/command surface only.
+    ToggleLayoutFallbackDiag,
+    /// Automatic Degraded-Mode Suggestions (§12.9.4): accept the proactively-shown
+    /// degraded-mode suggestion (`Ctrl+Alt+;` default), applying the suggested
+    /// minimal-glyph chrome / compact density / mouse-off modes to the live session
+    /// in one keystroke. A no-op fall-through when no suggestion is showing, so the
+    /// chord never steals a key from the composer. The mouse twin is a click on the
+    /// banner's `[accept]` affordance. Costs nothing until a degraded terminal is
+    /// detected; an idle, non-degraded session never paints the banner.
+    AcceptDegradedSuggestion,
+    /// Automatic Degraded-Mode Suggestions (§12.9.4): dismiss the proactively-shown
+    /// degraded-mode suggestion (`Ctrl+Alt+'` default), latching it for the session
+    /// so the same suggestion never nags again. A no-op fall-through when no
+    /// suggestion is showing. The mouse twin is a click on the banner's `[dismiss]`
+    /// affordance. Costs nothing until a degraded terminal is detected.
+    DismissDegradedSuggestion,
+    /// Session Auto-Save Checkpoints For UI State (§12.9.5): open / close the
+    /// read-only checkpoint status overlay (`Ctrl+Alt+[` default). The session's
+    /// UI state (scroll anchor, focused entry, active search, minimap pane) is
+    /// auto-saved on a debounced cadence and restored on relaunch / after a
+    /// crash; this overlay shows the last saved checkpoint and lets the user
+    /// manually restore it (`r`) or forget it (`x`). The mouse twin is a click on
+    /// the overlay's `[restore]` affordance. Costs nothing until opened; the
+    /// background auto-save adds only a fingerprint check on iterations the UI
+    /// already changed on, so an idle session pays nothing.
+    OpenSessionCheckpoint,
 }
 
 impl Action {
@@ -62,26 +659,202 @@ impl Action {
         match self {
             Self::ToggleConfigScreen => "toggle_config_screen",
             Self::ToggleTranscriptOverlay => "transcript_overlay",
+            Self::OpenSearch => "open_search",
             Self::ToggleTaskPanel => "toggle_task_panel",
             Self::CopyLastAssistant => "copy_last_assistant",
+            Self::CopyFocusedEntry => "copy_focused_entry",
+            Self::CopyCurrentToolOutput => "copy_tool_output",
+            Self::CopyCodeBlock => "copy_code_block",
+            Self::CopyAllCode => "copy_all_code",
+            Self::CopyViewport => "copy_viewport",
+            Self::CopyFullTranscript => "copy_full_transcript",
+            Self::CopySelection => "copy_selection",
+            Self::QuoteSelectionToCompose => "quote_selection_to_compose",
+            Self::AddSelectionToSet => "add_selection_to_set",
+            Self::CopyMultiSelection => "copy_multi_selection",
+            Self::SaveSnippetFromSelection => "save_snippet_from_selection",
+            Self::ToggleSnippets => "toggle_snippets",
             Self::RestoreCancelledPrompt => "restore_cancelled_prompt",
             Self::ScrollTranscriptPageUp => "page_up",
             Self::ScrollTranscriptPageDown => "page_down",
             Self::TranscriptHome => "transcript_home",
             Self::TranscriptEnd => "transcript_end",
+            Self::JumpPrevUserTurn => "jump_prev_user_turn",
+            Self::JumpNextUserTurn => "jump_next_user_turn",
+            Self::JumpPrevAssistant => "jump_prev_assistant",
+            Self::JumpNextAssistant => "jump_next_assistant",
+            Self::JumpPrevToolCall => "jump_prev_tool_call",
+            Self::JumpNextToolCall => "jump_next_tool_call",
+            Self::JumpPrevError => "jump_prev_error",
+            Self::JumpNextError => "jump_next_error",
+            Self::FocusPrevEntry => "focus_prev_entry",
+            Self::FocusNextEntry => "focus_next_entry",
+            Self::ToggleFocusedFold => "toggle_focused_fold",
+            Self::OpenFocusedInDetail => "open_focused_in_detail",
+            Self::QueueUndo => "queue_undo",
+            Self::ToggleLatencyOverlay => "toggle_latency_overlay",
+            Self::ToggleDogfoodMetrics => "toggle_dogfood_metrics",
+            Self::SetJumpMark => "set_jump_mark",
+            Self::JumpToMark => "jump_to_mark",
+            Self::ToggleMinimap => "toggle_minimap",
+            Self::ToggleSoftWrap => "toggle_soft_wrap",
+            Self::ScrollBlockLeft => "scroll_block_left",
+            Self::ScrollBlockRight => "scroll_block_right",
+            Self::CycleDensity => "cycle_density",
+            Self::CycleDockPanel => "cycle_dock_panel",
+            Self::ToggleHyperlinks => "toggle_hyperlinks",
+            Self::ToggleClipboardHistory => "toggle_clipboard_history",
+            Self::BuildSessionBundle => "build_session_bundle",
+            Self::OpenComposerInEditor => "open_composer_in_editor",
+            Self::CycleSemanticFilter => "cycle_semantic_filter",
+            Self::ToggleTranscriptIndex => "toggle_transcript_index",
+            Self::ToggleRelatedLinks => "toggle_related_links",
+            Self::ToggleDuplicateFolds => "toggle_duplicate_folds",
+            Self::ToggleErrorLens => "toggle_error_lens",
+            Self::ToggleHealthMarkers => "toggle_health_markers",
+            Self::ToggleTurnOutline => "toggle_turn_outline",
+            Self::ToggleLaneFold => "toggle_lane_fold",
+            Self::TogglePinnedCompare => "toggle_pinned_compare",
+            Self::DropBookmark => "drop_bookmark",
+            Self::ToggleBookmarks => "toggle_bookmarks",
+            Self::ToggleSessionTimeline => "toggle_session_timeline",
+            Self::ToggleSubagentTimeline => "toggle_subagent_timeline",
+            Self::AnnotateEntry => "annotate_entry",
+            Self::ToggleAnnotations => "toggle_annotations",
+            Self::ToggleChangesSince => "toggle_changes_since",
+            Self::OpenActionPalette => "open_action_palette",
+            Self::ToggleCommandPalette => "toggle_command_palette",
+            Self::ToggleHoverPreview => "toggle_hover_preview",
+            Self::ToggleHoverIntent => "toggle_hover_intent",
+            Self::ToggleBreadcrumbs => "toggle_breadcrumbs",
+            Self::RenameFocusedEntry => "rename_focused_entry",
+            Self::DismissFirstRunHint => "dismiss_first_run_hint",
+            Self::PreviewSubagent => "preview_subagent",
+            Self::JumpToSubagent => "jump_to_subagent",
+            Self::PromoteSubagentResult => "promote_subagent_result",
+            Self::JumpToAttention => "jump_to_attention",
+            Self::ToggleSubagentCompare => "toggle_subagent_compare",
+            Self::ToggleReviewBoard => "toggle_review_board",
+            Self::ToggleToolActions => "toggle_tool_actions",
+            Self::ToggleScratchpad => "toggle_scratchpad",
+            Self::ToggleTemplates => "toggle_templates",
+            Self::ToggleMacroRecord => "toggle_macro_record",
+            Self::ReplayMacro => "replay_macro",
+            Self::ToggleKeybindingEditor => "toggle_keybinding_editor",
+            Self::OpenThemeEditor => "open_theme_editor",
+            Self::OpenWorkspaceProfile => "open_workspace_profile",
+            Self::OpenTerminalProfile => "open_terminal_profile",
+            Self::OpenGestureSettings => "open_gesture_settings",
+            Self::OpenGlyphMode => "open_glyph_mode",
+            Self::ToggleSmartSplit => "toggle_smart_split",
+            Self::TogglePresentation => "toggle_presentation",
+            Self::ToggleZenMode => "toggle_zen_mode",
+            Self::RestoreTerminal => "restore_terminal",
+            Self::ToggleLayoutFallbackDiag => "toggle_layout_fallback_diag",
+            Self::AcceptDegradedSuggestion => "accept_degraded_suggestion",
+            Self::DismissDegradedSuggestion => "dismiss_degraded_suggestion",
+            Self::OpenSessionCheckpoint => "open_session_checkpoint",
         }
     }
 
     pub(crate) const ALL: &'static [Action] = &[
         Action::ToggleConfigScreen,
         Action::ToggleTranscriptOverlay,
+        Action::OpenSearch,
         Action::ToggleTaskPanel,
         Action::CopyLastAssistant,
+        Action::CopyFocusedEntry,
+        Action::CopyCurrentToolOutput,
+        Action::CopyCodeBlock,
+        Action::CopyAllCode,
+        Action::CopyViewport,
+        Action::CopyFullTranscript,
+        Action::CopySelection,
+        Action::QuoteSelectionToCompose,
+        Action::AddSelectionToSet,
+        Action::CopyMultiSelection,
+        Action::SaveSnippetFromSelection,
+        Action::ToggleSnippets,
         Action::RestoreCancelledPrompt,
         Action::ScrollTranscriptPageUp,
         Action::ScrollTranscriptPageDown,
         Action::TranscriptHome,
         Action::TranscriptEnd,
+        Action::JumpPrevUserTurn,
+        Action::JumpNextUserTurn,
+        Action::JumpPrevAssistant,
+        Action::JumpNextAssistant,
+        Action::JumpPrevToolCall,
+        Action::JumpNextToolCall,
+        Action::JumpPrevError,
+        Action::JumpNextError,
+        Action::FocusPrevEntry,
+        Action::FocusNextEntry,
+        Action::ToggleFocusedFold,
+        Action::OpenFocusedInDetail,
+        Action::QueueUndo,
+        Action::ToggleLatencyOverlay,
+        Action::ToggleDogfoodMetrics,
+        Action::SetJumpMark,
+        Action::JumpToMark,
+        Action::ToggleMinimap,
+        Action::ToggleSoftWrap,
+        Action::ScrollBlockLeft,
+        Action::ScrollBlockRight,
+        Action::CycleDensity,
+        Action::CycleDockPanel,
+        Action::ToggleHyperlinks,
+        Action::ToggleClipboardHistory,
+        Action::BuildSessionBundle,
+        Action::OpenComposerInEditor,
+        Action::CycleSemanticFilter,
+        Action::ToggleTranscriptIndex,
+        Action::ToggleRelatedLinks,
+        Action::ToggleDuplicateFolds,
+        Action::ToggleErrorLens,
+        Action::ToggleHealthMarkers,
+        Action::ToggleTurnOutline,
+        Action::ToggleLaneFold,
+        Action::TogglePinnedCompare,
+        Action::DropBookmark,
+        Action::ToggleBookmarks,
+        Action::ToggleSessionTimeline,
+        Action::ToggleSubagentTimeline,
+        Action::AnnotateEntry,
+        Action::ToggleAnnotations,
+        Action::ToggleChangesSince,
+        Action::OpenActionPalette,
+        Action::ToggleCommandPalette,
+        Action::ToggleHoverPreview,
+        Action::ToggleHoverIntent,
+        Action::ToggleBreadcrumbs,
+        Action::RenameFocusedEntry,
+        Action::DismissFirstRunHint,
+        Action::PreviewSubagent,
+        Action::JumpToSubagent,
+        Action::PromoteSubagentResult,
+        Action::JumpToAttention,
+        Action::ToggleSubagentCompare,
+        Action::ToggleReviewBoard,
+        Action::ToggleToolActions,
+        Action::ToggleScratchpad,
+        Action::ToggleTemplates,
+        Action::ToggleMacroRecord,
+        Action::ReplayMacro,
+        Action::ToggleKeybindingEditor,
+        Action::OpenThemeEditor,
+        Action::OpenWorkspaceProfile,
+        Action::OpenTerminalProfile,
+        Action::OpenGestureSettings,
+        Action::OpenGlyphMode,
+        Action::ToggleSmartSplit,
+        Action::TogglePresentation,
+        Action::ToggleZenMode,
+        Action::RestoreTerminal,
+        Action::ToggleLayoutFallbackDiag,
+        Action::AcceptDegradedSuggestion,
+        Action::DismissDegradedSuggestion,
+        Action::OpenSessionCheckpoint,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -113,9 +886,310 @@ impl Action {
             Self::ScrollTranscriptPageDown => Some("terminal-dependent"),
             // Home/End, Ctrl+Y, and Ctrl+R are broadly portable across
             // Linux terminals — no annotation needed.
-            Self::TranscriptHome
+            // New copy / navigation / direct-manipulation actions added by the
+            // alt-screen renderer work. Alt-based chords, Ctrl+arrows, and
+            // Ctrl+Enter are the classically unreliable ones across Linux
+            // terminals, tmux, and SSH (Meta/Alt encoding, arrow modifiers, and
+            // the Ctrl+Enter vs Enter ambiguity that needs keyboard enhancement).
+            Self::CopyFocusedEntry
+            | Self::CopyCurrentToolOutput
+            | Self::CopyCodeBlock
+            // Code-Aware Copy is `Alt+j` — the same Meta/Alt encoding that is
+            // unreliable across Linux terminals, tmux, and SSH as the rest of
+            // the copy chords.
+            | Self::CopyAllCode
+            | Self::CopyViewport
+            | Self::CopyFullTranscript
+            | Self::CopySelection
+            // Multi-Cursor-Like Transcript Selection (§12.1.6): add-to-set is
+            // `Alt+d` (Meta/Alt encoding) and the combined copy is `Ctrl+Alt+Y`
+            // (Ctrl+Alt/Meta) — both the classically-unreliable case across Linux
+            // terminals, tmux, and SSH as the rest of the copy/nav family.
+            | Self::AddSelectionToSet
+            | Self::CopyMultiSelection
+            // Prompt Snippets From Selection (§12.3.2): save-from-selection is
+            // `Alt+3` (an Alt+digit chord) and the picker toggle is `Ctrl+Alt+S`
+            // (a Ctrl+Alt/Meta chord) — both the classically-unreliable Meta/Alt
+            // encoding case across Linux terminals, tmux, and SSH as the rest of
+            // the nav/copy/overlay family.
+            | Self::SaveSnippetFromSelection
+            | Self::ToggleSnippets
+            | Self::JumpPrevUserTurn
+            | Self::JumpNextUserTurn
+            | Self::JumpPrevAssistant
+            | Self::JumpNextAssistant
+            | Self::JumpPrevToolCall
+            | Self::JumpNextToolCall
+            | Self::JumpPrevError
+            | Self::JumpNextError
+            | Self::FocusPrevEntry
+            | Self::FocusNextEntry
+            // Ctrl+Alt+L and Ctrl+Alt+M are Ctrl+Alt (Meta) chords — Alt
+            // encoding is the classically unreliable case across Linux
+            // terminals, tmux, and SSH.
+            | Self::ToggleLatencyOverlay
+            | Self::ToggleDogfoodMetrics
+            // Jump-mark chords are `Alt`+key (`Alt+m` / `Alt+'`) — the same
+            // Meta/Alt encoding that is unreliable across Linux terminals,
+            // tmux, and SSH as the copy / jump-nav chords above.
+            | Self::SetJumpMark
+            | Self::JumpToMark
+            // Minimap toggle is `Alt+r` — the same Meta/Alt encoding case.
+            | Self::ToggleMinimap
+            // Wide-block horizontal-nav chords are `Alt`+key (`Alt+w`/`Alt+h`/
+            // `Alt+l`) — the same Meta/Alt encoding that is unreliable across
+            // Linux terminals, tmux, and SSH as the copy / jump-nav chords above.
+            | Self::ToggleSoftWrap
+            | Self::ScrollBlockLeft
+            | Self::ScrollBlockRight
+            // Adaptive Density cycle (§12.4.1) is `Ctrl+Alt+X` — a Ctrl+Alt/Meta
+            // chord, the same classically-unreliable Meta encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family. The always-available equivalent is a click on the
+            // status-line density indicator.
+            | Self::CycleDensity
+            // Dockable Panels cycle (§12.4.4) is `Ctrl+Alt+F` — a Ctrl+Alt/Meta
+            // chord, the same classically-unreliable Meta encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family. The always-available equivalent is a click on the docked
+            // panel's header.
+            | Self::CycleDockPanel
+            // Hyperlink-mode toggle is `Alt+8` — the same Meta/Alt encoding case.
+            | Self::ToggleHyperlinks
+            // Clipboard-history picker toggle is `Alt+p` — the same Meta/Alt
+            // encoding that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleClipboardHistory
+            // Session-bundle build is `Alt+b` — the same Meta/Alt encoding case.
+            | Self::BuildSessionBundle
+            // External-editor handoff is `Alt+e` — the same Meta/Alt encoding
+            // case as the rest of the nav/copy family.
+            | Self::OpenComposerInEditor
+            // Semantic-filter cycle is `Alt+f` — the same Meta/Alt encoding case.
+            | Self::CycleSemanticFilter
+            // Transcript-index overlay toggle is `Alt+i` — the same Meta/Alt
+            // encoding that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleTranscriptIndex
+            // Related-Entry Links overlay toggle is `Alt+g` — the same Meta/Alt
+            // encoding case.
+            | Self::ToggleRelatedLinks
+            // Duplicate-fold overlay toggle is `Alt+u` — the same Meta/Alt
+            // encoding that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleDuplicateFolds
+            // Error-Lens overlay toggle is `Alt+x` — the same Meta/Alt encoding
+            // that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleErrorLens
+            // Transcript-Health-Markers overlay toggle is `Alt+n` — the same
+            // Meta/Alt encoding case as the rest of the nav/overlay family.
+            | Self::ToggleHealthMarkers
+            // Semantic-Turn-Outline overlay toggle is `Alt+s` — the same Meta/Alt
+            // encoding case as the rest of the nav/overlay family.
+            | Self::ToggleTurnOutline
+            // Collapsible-Reasoning/Tool-Lanes overlay toggle is `Alt+z` — the
+            // same Meta/Alt encoding case as the rest of the nav/overlay family.
+            | Self::ToggleLaneFold
+            // Pinned-Compare-View overlay toggle is `Alt+t` — the same Meta/Alt
+            // encoding case as the rest of the nav/overlay family.
+            | Self::TogglePinnedCompare
+            // Reading Position Bookmarks (§12.2.4): drop is `Alt+;`, the list
+            // overlay is `Alt+q` — both Meta/Alt chords, the same
+            // terminal-dependent encoding case as the rest of the nav/overlay
+            // family.
+            | Self::DropBookmark
+            | Self::ToggleBookmarks
+            // Session Timeline overlay toggle is `Alt+9` — an Alt+digit chord,
+            // the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleSessionTimeline
+            // Subagent Timeline Panel toggle is `Alt+5` — an Alt+digit chord,
+            // the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleSubagentTimeline
+            // Entry Annotations (§12.2.5): annotate is `Alt+/`, the list overlay
+            // is `Alt+\` — both Meta/Alt chords, the same terminal-dependent
+            // encoding case as the rest of the nav/overlay family.
+            | Self::AnnotateEntry
+            | Self::ToggleAnnotations
+            // What Changed Since Here? overlay toggle is `Alt+0` — an Alt+digit
+            // chord, the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleChangesSince
+            // Contextual Action Palette (§12.1.2) opens with `Alt+Enter` — an
+            // Alt+Enter chord whose Meta-modifier encoding is exactly the
+            // terminal-dependent case (Linux terminals / tmux / SSH may swallow or
+            // remap it) the renderer plan flags for Alt chords.
+            | Self::OpenActionPalette
+            // Universal Command Palette toggle is `Ctrl+Alt+P` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M` debug
+            // chords above.
+            | Self::ToggleCommandPalette
+            // Hover Preview popover toggle is `Alt+1` — an Alt+digit chord, the
+            // same Meta/Alt encoding that is unreliable across Linux terminals,
+            // tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleHoverPreview
+            // Mouse Hover Intent toggle is `Ctrl+Alt+H` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M`/
+            // `Ctrl+Alt+P` chords above.
+            | Self::ToggleHoverIntent
+            // Clickable Breadcrumbs strip toggle is `Alt+2` — an Alt+digit chord,
+            // the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleBreadcrumbs
+            // Inline Rename Labels editor is `Ctrl+Alt+R` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M`/
+            // `Ctrl+Alt+P`/`Ctrl+Alt+H` chords.
+            | Self::RenameFocusedEntry
+            // First-Run Interaction Hint dismissal is `Ctrl+Alt+N` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P` chords
+            // above.
+            | Self::DismissFirstRunHint
+            // Subagent Hover Preview (§12.8.2): the preview verb is `Alt+6` (an
+            // Alt+digit chord) and the jump verb is `Ctrl+Alt+D` (a Ctrl+Alt /
+            // Meta chord) — both the same Meta/Alt encoding that is unreliable
+            // across Linux terminals, tmux, and SSH as the rest of the
+            // nav/overlay family. The always-available equivalents are the pane's
+            // own ↑↓ select + Enter open keys.
+            | Self::PreviewSubagent
+            | Self::JumpToSubagent
+            // Promote Subagent Result To Prompt (§12.8.4): the promote verb is
+            // `Ctrl+Alt+Q` (a Ctrl+Alt / Meta chord) — the same Meta encoding that
+            // is unreliable across Linux terminals, tmux, and SSH as the rest of the
+            // Ctrl+Alt overlay/picker family. The always-available equivalent is the
+            // subagent timeline panel's own `y` promote key.
+            | Self::PromoteSubagentResult
+            // Attention Routing (§12.8.6): the quick-jump verb is `Ctrl+Alt+Z` (a
+            // Ctrl+Alt / Meta chord) — the same Meta encoding that is unreliable
+            // across Linux terminals, tmux, and SSH as the rest of the Ctrl+Alt
+            // overlay/picker family. The always-available equivalent is a click on
+            // the status-line attention indicator and the subagent timeline panel's
+            // own ↑↓ select + Enter open keys.
+            | Self::JumpToAttention
+            // Compare Subagent Outputs (§12.8.3) opens with `Alt+7` — an Alt+digit
+            // chord, the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family. The
+            // always-available equivalent is marking two rows + opening from the
+            // subagent timeline panel's own keys.
+            | Self::ToggleSubagentCompare
+            // Live Review Board overlay toggle is `Ctrl+Alt+O` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family. The always-available equivalent is the §12.8.1 subagent
+            // timeline panel's own ↑↓ select + Enter open keys over the same
+            // workers.
+            | Self::ToggleReviewBoard
+            // Actionable Tool Outputs overlay toggle is `Ctrl+Alt+A` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P`/
+            // `Ctrl+Alt+R`/`Ctrl+Alt+N` chords above.
+            | Self::ToggleToolActions
+            // Scratchpad Pane toggle is `Alt+4` — an Alt+digit chord, the same
+            // Meta/Alt encoding that is unreliable across Linux terminals, tmux,
+            // and SSH as the rest of the nav/copy/overlay family.
+            | Self::ToggleScratchpad
+            // Prompt Templates picker toggle is `Ctrl+Alt+T` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+A`/`Ctrl+Alt+H`/
+            // `Ctrl+Alt+P` chords above.
+            | Self::ToggleTemplates
+            // Replayable Interaction Macros (§12.3.7): record toggle is
+            // `Ctrl+Alt+K` and replay is `Ctrl+Alt+J` — both Ctrl+Alt (Meta)
+            // chords, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+A`/`Ctrl+Alt+H`/
+            // `Ctrl+Alt+P`/`Ctrl+Alt+T` chords above.
+            | Self::ToggleMacroRecord
+            | Self::ReplayMacro
+            // Keybinding Editor UI (§12.7.1): the overlay toggle is `Ctrl+Alt+B`
+            // — a Ctrl+Alt (Meta) chord, the same classically-unreliable encoding
+            // across Linux terminals, tmux, and SSH as the `Ctrl+Alt+K`/
+            // `Ctrl+Alt+J`/`Ctrl+Alt+T` chords above.
+            | Self::ToggleKeybindingEditor
+            // Theme Editor UI (§12.7.2) opens with `Ctrl+Alt+E` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+K`/`Ctrl+Alt+J` macro chords
+            // and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenThemeEditor
+            // Per-Workspace UI Profile (§12.7.4) opens with `Ctrl+Alt+W` — a
+            // Ctrl+Alt (Meta) chord, the same classically-unreliable encoding
+            // across Linux terminals, tmux, and SSH as the `Ctrl+Alt+E` theme
+            // editor and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenWorkspaceProfile
+            // Per-Terminal Profiles (§12.7.3) opens with `Ctrl+Alt+G` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+E`/`Ctrl+Alt+B` editor
+            // chords and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenTerminalProfile
+            // Gesture Settings (§12.7.5) opens with `Ctrl+Alt+I` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+G`/`Ctrl+Alt+E`/`Ctrl+Alt+B`
+            // editor chords and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenGestureSettings
+            // Minimal Glyph Mode (§12.7.6) opens with `Ctrl+Alt+U` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+G`/`Ctrl+Alt+W` profile
+            // chords and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenGlyphMode
+            // Smart Split Panes (§12.4.2) opens with `Ctrl+Alt+V` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family above. The always-available equivalent is the overlay's own
+            // ↑↓/←→ keys once opened.
+            | Self::ToggleSmartSplit
+            // Presentation Mode toggle (§12.4.6) is `Ctrl+Alt+C` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family above. The always-available equivalent is a click on the
+            // status-line `[present]` indicator.
+            | Self::TogglePresentation
+            // Zen Mode toggle (§12.4.5) is `Ctrl+Alt+.` — a Ctrl+Alt (Meta) chord,
+            // the same classically-unreliable encoding across Linux terminals,
+            // tmux, and SSH as the rest of the Ctrl+Alt overlay/policy family above.
+            // The always-available equivalent is a click on the minimal zen status
+            // line that the mode itself paints.
+            | Self::ToggleZenMode
+            // Terminal Restore Command (§12.9.2) is `Ctrl+Alt+,` — a Ctrl+Alt
+            // (Meta) punctuation chord, the same classically-unreliable encoding
+            // across Linux terminals, tmux, and SSH as the Zen `Ctrl+Alt+.` policy
+            // chord above. The always-available equivalent is the `/terminal-reset`
+            // slash command, which the user can type even if the chord is swallowed
+            // by a wedged terminal.
+            | Self::RestoreTerminal
+            // Last-Known-Good Layout Fallback diagnostics toggle (§12.9.3) is
+            // `Ctrl+Alt+/` — a Ctrl+Alt (Meta) punctuation chord, the same
+            // classically-unreliable encoding across Linux terminals, tmux, and SSH
+            // as the rest of the Ctrl+Alt debug/policy family above. There is no
+            // mouse twin (a hidden debug surface), so it is honestly flagged
+            // terminal-dependent.
+            | Self::ToggleLayoutFallbackDiag
+            // Automatic Degraded-Mode Suggestions (§12.9.4) accept/dismiss are
+            // `Ctrl+Alt+;` / `Ctrl+Alt+'` — Ctrl+Alt (Meta) punctuation chords, the
+            // same classically-unreliable encoding across Linux terminals, tmux, and
+            // SSH as the Zen `Ctrl+Alt+.` / Restore `Ctrl+Alt+,` policy chords above.
+            // The always-available equivalent is a click on the banner's
+            // `[accept]` / `[dismiss]` affordances.
+            | Self::AcceptDegradedSuggestion
+            | Self::DismissDegradedSuggestion
+            // Session Auto-Save Checkpoints (§12.9.5) opens with `Ctrl+Alt+[` — a
+            // Ctrl+Alt (Meta) punctuation chord, the same classically-unreliable
+            // encoding across Linux terminals, tmux, and SSH as the Zen / Restore /
+            // Layout-Fallback / degraded-mode policy chords above (and `Ctrl+Alt+[`
+            // can collide with the CSI/`ESC` prefix on some terminals). The
+            // always-available equivalent is a click on the overlay's `[restore]`
+            // affordance once opened; the auto-save itself needs no key at all.
+            | Self::OpenSessionCheckpoint
+            | Self::OpenFocusedInDetail => Some("terminal-dependent"),
+            // Plain keys and broadly-portable Ctrl chords. `>` is a bare
+            // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
+            // portable across terminals, tmux, and SSH.
+            Self::OpenSearch
+            | Self::ToggleFocusedFold
+            | Self::QueueUndo
+            | Self::TranscriptHome
             | Self::TranscriptEnd
             | Self::CopyLastAssistant
+            | Self::QuoteSelectionToCompose
             | Self::RestoreCancelledPrompt => None,
         }
     }
@@ -129,8 +1203,56 @@ impl Action {
             Self::ToggleTranscriptOverlay => {
                 KeyBinding::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
             }
+            Self::OpenSearch => KeyBinding::new(KeyCode::Char('/'), KeyModifiers::NONE),
             Self::ToggleTaskPanel => KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             Self::CopyLastAssistant => KeyBinding::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            // Semantic-copy chords use `Alt`+letter to avoid the terminal
+            // flow-control / host collisions of bare `Ctrl`-letters (see the
+            // jump-navigation note below); the letters c/o/k/v/a are free.
+            Self::CopyFocusedEntry => KeyBinding::new(KeyCode::Char('c'), KeyModifiers::ALT),
+            Self::CopyCurrentToolOutput => KeyBinding::new(KeyCode::Char('o'), KeyModifiers::ALT),
+            Self::CopyCodeBlock => KeyBinding::new(KeyCode::Char('k'), KeyModifiers::ALT),
+            // Code-Aware Copy (§12.5.5). `Alt+j` sits next to the single-block
+            // `Alt+k`; `j` is free among the semantic-copy Alt letters.
+            Self::CopyAllCode => KeyBinding::new(KeyCode::Char('j'), KeyModifiers::ALT),
+            Self::CopyViewport => KeyBinding::new(KeyCode::Char('v'), KeyModifiers::ALT),
+            Self::CopyFullTranscript => KeyBinding::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            Self::CopySelection => KeyBinding::new(KeyCode::Char('y'), KeyModifiers::ALT),
+            // Quote-to-compose. `>` is the conventional "quote" glyph; it is a
+            // shifted printable key with no Ctrl/Alt chord. The composer
+            // fall-through is gated in the dispatch (only fires with an active
+            // selection), so binding the bare `>` here never steals normal
+            // typing. `>` is captured as `KeyCode::Char('>')`; the lookup folds
+            // away an incidental SHIFT (see `KeyBinding::new`).
+            Self::QuoteSelectionToCompose => {
+                KeyBinding::new(KeyCode::Char('>'), KeyModifiers::NONE)
+            }
+            // Multi-Cursor-Like Transcript Selection (§12.1.6). `Alt+d`
+            // ("disjoint add") commits the live range into the set; `d` is free
+            // among the semantic-copy/nav Alt letters. The combined copy uses the
+            // obscure `Ctrl+Alt+Y` chord, sitting next to the single-selection
+            // copy's `Alt+y` so the family stays mnemonic without colliding.
+            Self::AddSelectionToSet => KeyBinding::new(KeyCode::Char('d'), KeyModifiers::ALT),
+            Self::CopyMultiSelection => KeyBinding::new(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Prompt Snippets From Selection (§12.3.2). `Alt+3` saves the active
+            // selection as a snippet — the next free `Alt`+digit after `Alt+1`
+            // (hover preview) and `Alt+2` (breadcrumbs); every bare `Alt` letter in
+            // the nav/copy/overlay family is taken, so the digit is the free,
+            // composer-clear pick. The picker overlay opens with `Ctrl+Alt+S` —
+            // `S` recalls "Snippet" and follows the `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`); bare `Alt+s` is already the
+            // turn-outline overlay, so the Ctrl+Alt modifier keeps the picker
+            // distinct and clear of every composer chord.
+            Self::SaveSnippetFromSelection => {
+                KeyBinding::new(KeyCode::Char('3'), KeyModifiers::ALT)
+            }
+            Self::ToggleSnippets => KeyBinding::new(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
             Self::RestoreCancelledPrompt => {
                 KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
             }
@@ -140,6 +1262,488 @@ impl Action {
             }
             Self::TranscriptHome => KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
             Self::TranscriptEnd => KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
+            // Jump navigation defaults use `Alt`+key chords. Single-`Ctrl`
+            // letters are deliberately avoided (terminal flow-control / host
+            // collisions); `normalise_control_byte` canonicalises `META`→`ALT`
+            // so these match regardless of the terminal protocol level.
+            Self::JumpPrevUserTurn => KeyBinding::new(KeyCode::Up, KeyModifiers::ALT),
+            Self::JumpNextUserTurn => KeyBinding::new(KeyCode::Down, KeyModifiers::ALT),
+            Self::JumpPrevAssistant => KeyBinding::new(KeyCode::Left, KeyModifiers::ALT),
+            Self::JumpNextAssistant => KeyBinding::new(KeyCode::Right, KeyModifiers::ALT),
+            Self::JumpPrevToolCall => KeyBinding::new(KeyCode::Char(','), KeyModifiers::ALT),
+            Self::JumpNextToolCall => KeyBinding::new(KeyCode::Char('.'), KeyModifiers::ALT),
+            Self::JumpPrevError => KeyBinding::new(KeyCode::Char('['), KeyModifiers::ALT),
+            Self::JumpNextError => KeyBinding::new(KeyCode::Char(']'), KeyModifiers::ALT),
+            // Per-entry fold cursor. `Alt`+arrow is already the user/assistant
+            // jump nav, so the fold cursor uses `Ctrl`+arrow. `Ctrl+O` toggles
+            // the focused entry's fold — the keyboard twin of the mouse caret
+            // click — and `Ctrl+Enter` opens the focused entry in the Ctrl+T
+            // detail overlay (both free chords in the composer).
+            Self::FocusPrevEntry => KeyBinding::new(KeyCode::Up, KeyModifiers::CONTROL),
+            Self::FocusNextEntry => KeyBinding::new(KeyCode::Down, KeyModifiers::CONTROL),
+            Self::ToggleFocusedFold => KeyBinding::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            Self::OpenFocusedInDetail => KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            // Prompt-queue undo. Binds to bare `u`, claimed modally by the open
+            // reorder overlay; `dispatch_keymap_action` gates it on the overlay
+            // being open, so outside the overlay `u` keeps its composer meaning.
+            // Bare `u` is safe to bind here precisely because of that gate.
+            Self::QueueUndo => KeyBinding::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            // Hidden latency-budget overlay toggle. `Ctrl+Alt+L` is a
+            // deliberately obscure debug chord — never a normal composer
+            // keystroke — so the overlay stays out of the way while remaining
+            // reachable at runtime (alongside the `SQUEEZY_LATENCY_OVERLAY`
+            // env opt-in).
+            Self::ToggleLatencyOverlay => KeyBinding::new(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Hidden dogfood-telemetry overlay toggle. `Ctrl+Alt+M` is a
+            // deliberately obscure debug chord — never a normal composer
+            // keystroke — so the `/metrics` snapshot stays out of the way while
+            // remaining reachable at runtime (alongside the
+            // `SQUEEZY_DOGFOOD_METRICS` env opt-in). `m` (not the Enter-
+            // colliding bare `Ctrl+M`) carries the explicit Alt modifier, so it
+            // is distinct from carriage return.
+            Self::ToggleDogfoodMetrics => KeyBinding::new(
+                KeyCode::Char('m'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Jump marks (§11.2 / 11G.2). `Alt`+key chords matching the rest of
+            // the navigation/copy family: `Alt+m` ("mark") sets, `Alt+'`
+            // (the vi mark-jump key) jumps back. Bare `Alt` letters/punctuation
+            // c/o/k/v/a/y/,/./[/] are taken; m and ' are free.
+            Self::SetJumpMark => KeyBinding::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            Self::JumpToMark => KeyBinding::new(KeyCode::Char('\''), KeyModifiers::ALT),
+            // Minimap turn rail (§11.2 / 11G.3). `Alt+r` ("rail") matches the
+            // navigation/copy family's `Alt`+key style. Bare `Alt` letters
+            // c/o/k/v/a/y/m/' and punctuation ,/./[/] are taken; r is free
+            // (`Ctrl+R` is the cancelled-prompt restore, a distinct chord).
+            Self::ToggleMinimap => KeyBinding::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            // Wide-block horizontal navigation (§11.2 / 11G.4). `Alt`+key chords
+            // matching the rest of the navigation/copy family: `Alt+w` ("wrap")
+            // toggles soft-wrap, `Alt+h`/`Alt+l` (the vi left/right keys) pan the
+            // no-wrap view. Bare `Alt` letters c/o/k/v/a/y/m/r are taken; w/h/l are
+            // free.
+            Self::ToggleSoftWrap => KeyBinding::new(KeyCode::Char('w'), KeyModifiers::ALT),
+            Self::ScrollBlockLeft => KeyBinding::new(KeyCode::Char('h'), KeyModifiers::ALT),
+            Self::ScrollBlockRight => KeyBinding::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            // Adaptive Density cycle (§12.4.1). `Ctrl+Alt+X` — every bare
+            // `Alt+letter` in the nav/view family is taken (`Alt+v` is Copy
+            // Viewport) and `Ctrl+Alt+V` is the §12.4.2 Smart Split overlay, so
+            // the cycle takes the next free `Ctrl+Alt` letter (`C`, `F`, and `X`
+            // are the only ones left) while staying clear of every composer chord.
+            Self::CycleDensity => KeyBinding::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Dockable Panels cycle (§12.4.4). `Ctrl+Alt+F` — `F` recalls "fix to
+            // an edge". With `Ctrl+Alt+X` now taken by Adaptive Density, `C` and
+            // `F` are the last free `Ctrl+Alt` letters; `F` is the more mnemonic
+            // of the two for a dock affordance and stays clear of every composer
+            // chord.
+            Self::CycleDockPanel => KeyBinding::new(
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Hyperlink-mode cycle (§11.5 / 11G.5). `Alt+8` — the `8` recalls
+            // "OSC 8". Bare `Alt` letters in the nav/copy family are taken;
+            // `Alt`+digit is free and mnemonic.
+            Self::ToggleHyperlinks => KeyBinding::new(KeyCode::Char('8'), KeyModifiers::ALT),
+            // Clipboard-history picker (§12.6.1). `Alt+p` — `p` recalls "paste
+            // history". Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/
+            // r/w/h/l) are taken; `p` is free (`Ctrl+P` is the task-panel toggle,
+            // a distinct chord).
+            Self::ToggleClipboardHistory => KeyBinding::new(KeyCode::Char('p'), KeyModifiers::ALT),
+            // Session bundle (§12.6.6). `Alt+b` — `b` recalls "bundle". Bare
+            // `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p) are
+            // taken; `b` is free.
+            Self::BuildSessionBundle => KeyBinding::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            // External Editor Handoff (§12.6.5). `Alt+e` — `e` recalls "edit".
+            // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p)
+            // are taken; `e` is free.
+            Self::OpenComposerInEditor => KeyBinding::new(KeyCode::Char('e'), KeyModifiers::ALT),
+            // Main-view Semantic Filter cycle (§12.5.2). `Alt+f` — `f` recalls
+            // "filter". Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/
+            // r/w/h/l/p/b/e) are taken; `f` is free.
+            Self::CycleSemanticFilter => KeyBinding::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            // Local Transcript Index (§12.5.1). `Alt+i` — `i` recalls "index".
+            // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p/
+            // b/e/f) are taken; `i` is free.
+            Self::ToggleTranscriptIndex => KeyBinding::new(KeyCode::Char('i'), KeyModifiers::ALT),
+            // Related-Entry Links (§12.5.3). `Alt+g` — `g` recalls "graph" /
+            // "go to related". Bare `Alt` letters in the nav/copy family
+            // (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i) are taken; `g` is free.
+            Self::ToggleRelatedLinks => KeyBinding::new(KeyCode::Char('g'), KeyModifiers::ALT),
+            // Duplicate-Output Folds (§12.5.4). `Alt+u` — `Alt+d` is the
+            // composer's delete-word-forward shortcut and `Alt+g` is the
+            // Related-Entry Links toggle; bare `Alt` letters in the nav/copy
+            // family (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g) are taken, so `u` is the
+            // free letter that stays clear of the composer chords.
+            Self::ToggleDuplicateFolds => KeyBinding::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            // Error Lenses (§12.5.6). `Alt+x` — `x` recalls "eXamine the error".
+            // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p/
+            // b/e/f/i/g/u) are taken; `x` is free and stays clear of the composer
+            // chords.
+            Self::ToggleErrorLens => KeyBinding::new(KeyCode::Char('x'), KeyModifiers::ALT),
+            // Transcript Health Markers (§12.5.7). `Alt+n` — `n` recalls
+            // "notices" / "health". Bare `Alt` letters in the nav/copy family
+            // (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x) are taken; `n` is free and
+            // stays clear of the composer chords.
+            Self::ToggleHealthMarkers => KeyBinding::new(KeyCode::Char('n'), KeyModifiers::ALT),
+            // Semantic Turn Outline (§12.2.1). `Alt+s` ("structure"/"semantic
+            // outline"); `s` is free among the overlay Alt letters.
+            Self::ToggleTurnOutline => KeyBinding::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            // Collapsible Reasoning/Tool Lanes (§12.2.2). `Alt+z` ("zoom out" to a
+            // higher reading altitude by collapsing lanes); `z` is free among the
+            // overlay Alt letters.
+            Self::ToggleLaneFold => KeyBinding::new(KeyCode::Char('z'), KeyModifiers::ALT),
+            // Pinned Compare View (§12.2.3). `Alt+t` — `t` recalls "Two panes" /
+            // "compare Transcript". `Alt+d` (the other free letter) collides with
+            // the composer's delete-word-forward; among the remaining free Alt
+            // letters `t` is the mnemonic pick. Distinct from `Ctrl+T` (the
+            // transcript-overlay toggle); the modifier disambiguates them.
+            Self::TogglePinnedCompare => KeyBinding::new(KeyCode::Char('t'), KeyModifiers::ALT),
+            // Reading Position Bookmarks (§12.2.4). `Alt+;` drops a bookmark ("`;`"
+            // is a free, easy-to-reach punctuation key — `Alt+t` is now the Pinned
+            // Compare View toggle); `Alt+q` opens the bookmark list overlay (`q`
+            // for the "quick-jump" list). Bare `Alt` letters in the nav/copy/
+            // overlay family (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x/n/s/z/t) are
+            // taken; `q` and `;` are free.
+            Self::DropBookmark => KeyBinding::new(KeyCode::Char(';'), KeyModifiers::ALT),
+            Self::ToggleBookmarks => KeyBinding::new(KeyCode::Char('q'), KeyModifiers::ALT),
+            // Session Timeline (§12.2.6). `Alt+9` — every bare `Alt` letter in the
+            // nav/copy/overlay family is taken, so the timeline takes the next
+            // free `Alt`+digit after `Alt+8` (hyperlinks). `9` is mnemonic-free
+            // but unambiguous and stays clear of every composer chord.
+            Self::ToggleSessionTimeline => KeyBinding::new(KeyCode::Char('9'), KeyModifiers::ALT),
+            Self::ToggleSubagentTimeline => KeyBinding::new(KeyCode::Char('5'), KeyModifiers::ALT),
+            // Entry Annotations (§12.2.5). `Alt+/` annotates the focused entry
+            // (`/` is a free punctuation key — the "note" slash; the bare Alt
+            // letters c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x/n/s/z/t/q are taken),
+            // and `Alt+\` opens the annotations list overlay (the adjacent free
+            // punctuation key).
+            Self::AnnotateEntry => KeyBinding::new(KeyCode::Char('/'), KeyModifiers::ALT),
+            Self::ToggleAnnotations => KeyBinding::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+            // What Changed Since Here? (§12.2.7). `Alt+0` — the next free `Alt`+digit
+            // after `Alt+8` (hyperlinks) and `Alt+9` (session timeline); it sits
+            // beside the timeline chord it complements (mark a point, review the
+            // delta) and every bare `Alt` letter in the nav/copy/overlay family is
+            // taken. Mnemonic-free but unambiguous and clear of every composer chord.
+            Self::ToggleChangesSince => KeyBinding::new(KeyCode::Char('0'), KeyModifiers::ALT),
+            // Contextual Action Palette (§12.1.2). `Alt+Enter` — the classic
+            // "act on the focused thing" chord, free of every composer key (plain
+            // Enter submits, `Ctrl+Enter` opens detail, `Alt+Enter` is the next
+            // natural Enter-family chord) and of every bare `Alt` letter/digit/
+            // punctuation already claimed by the nav/copy/overlay family. Mnemonic
+            // and unambiguous: a context menu for what is under focus.
+            Self::OpenActionPalette => KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
+            // Universal Command Palette (§12.1.1). `Ctrl+Alt+P` — `P` recalls
+            // "Palette" and follows the existing `Ctrl+Alt+letter` debug-chord
+            // style (`Ctrl+Alt+L`/`Ctrl+Alt+M`). It is free: bare `Ctrl+P` is the
+            // task-panel toggle and bare `Alt+p` is the clipboard-history picker,
+            // so the Ctrl+Alt modifier keeps the palette distinct from both while
+            // staying clear of every composer chord.
+            Self::ToggleCommandPalette => KeyBinding::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Hover Preview popover (§12.1.4). `Alt+1` — the first free `Alt`+digit
+            // (`Alt+8`/`Alt+9`/`Alt+0` are hyperlinks / session timeline / changes-
+            // since); every bare `Alt` letter in the nav/copy/overlay family is
+            // taken. The `1` reads as "level-1 / quick peek". It stays clear of every
+            // composer chord and of the `Alt+Enter` action palette / `Ctrl+Enter`
+            // detail chords.
+            Self::ToggleHoverPreview => KeyBinding::new(KeyCode::Char('1'), KeyModifiers::ALT),
+            // Mouse Hover Intent toggle (§12.1.3). `Ctrl+Alt+H` — `H` recalls
+            // "Hover" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`). It is free: bare `Ctrl+H`
+            // is classically ambiguous with Backspace, and every bare `Alt`
+            // letter is already claimed by the nav/copy/overlay family, so the
+            // Ctrl+Alt modifier keeps the toggle distinct and clear of every
+            // composer chord.
+            Self::ToggleHoverIntent => KeyBinding::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Clickable Breadcrumbs (§12.1.5). `Alt+2` — the next free `Alt`+digit
+            // after `Alt+1` (hover preview); `Alt+8`/`Alt+9`/`Alt+0` are
+            // hyperlinks / session timeline / changes-since, and every bare `Alt`
+            // letter in the nav/copy/overlay family is taken. The `2` reads as
+            // "level-2 / where am I"; it stays clear of every composer chord and of
+            // the `Alt+Enter` action-palette / `Ctrl+Enter` detail chords.
+            Self::ToggleBreadcrumbs => KeyBinding::new(KeyCode::Char('2'), KeyModifiers::ALT),
+            // Inline Rename Labels (§12.1.7). `Ctrl+Alt+R` — `R` recalls "Rename"
+            // and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`). It is free:
+            // bare `Alt+R` is already the minimap toggle and every other bare `Alt`
+            // letter in the nav/copy/overlay family is taken, so the Ctrl+Alt
+            // modifier keeps the rename verb distinct and clear of every composer
+            // chord and of the `Alt+Enter`/`Ctrl+Enter` chords.
+            Self::RenameFocusedEntry => KeyBinding::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // First-Run Interaction Hint dismissal (§12.1.8). `Ctrl+Alt+N` — `N`
+            // recalls "notice / next" and follows the existing `Ctrl+Alt+letter`
+            // style (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`). It is
+            // free: bare `Alt+n` is the health-markers overlay, and the Ctrl+Alt
+            // modifier keeps the dismissal distinct and clear of every composer
+            // chord. It is a no-op when no hint is showing, so the chord never
+            // steals a key from the surface beneath.
+            Self::DismissFirstRunHint => KeyBinding::new(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Subagent Hover Preview (§12.8.2). `Alt+6` previews the selected
+            // subagent row — the next free `Alt`+digit after `Alt+4` (scratchpad)
+            // and `Alt+5` (the §12.8.1 subagent-timeline overlay it sits beside);
+            // `Alt+1`/`Alt+2`/`Alt+3` are hover preview / breadcrumbs / save-snippet
+            // and `Alt+8`/`Alt+9`/`Alt+0` are hyperlinks / session timeline /
+            // changes-since. Every bare `Alt` letter in the nav/copy/overlay family
+            // is taken, so the digit is the free, composer-clear pick.
+            Self::PreviewSubagent => KeyBinding::new(KeyCode::Char('6'), KeyModifiers::ALT),
+            // `Ctrl+Alt+D` jumps to the selected subagent's transcript — `D` recalls
+            // "Delegate / Detail" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+H`/`Ctrl+Alt+P`/`Ctrl+Alt+R`/`Ctrl+Alt+N`). It is free:
+            // bare `Alt+d` is the multi-cursor add-selection verb, so the Ctrl+Alt
+            // modifier keeps the jump distinct and clear of every composer chord.
+            Self::JumpToSubagent => KeyBinding::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Promote Subagent Result To Prompt (§12.8.4). `Ctrl+Alt+Q` — `Q`
+            // recalls "Queue" (the active-turn destination) and follows the existing
+            // `Ctrl+Alt+letter` style (`Ctrl+Alt+D` jump / `Ctrl+Alt+A` tool actions
+            // / `Ctrl+Alt+H`/`P`/`R`/`N`). It is free: bare `Alt+q` is the bookmarks
+            // overlay, so the Ctrl+Alt modifier keeps the promote verb distinct and
+            // clear of every composer chord. The in-panel `y` promote key reaches the
+            // same handler for terminals that swallow the Meta chord.
+            Self::PromoteSubagentResult => KeyBinding::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Attention Routing (§12.8.6). `Ctrl+Alt+Z` quick-jumps to the
+            // subagent that most needs attention — `Z` is the next free `Ctrl+Alt`
+            // letter (every other `Ctrl+Alt+letter` in the overlay/picker family —
+            // `L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/`T`/`K`/`J`/`B`/`E`/`W`/`G`/`D`/`I`/
+            // `U`/`Q` — is taken), and bare `Alt+z` is the lane-fold overlay, so the
+            // Ctrl+Alt modifier keeps the jump distinct from it while staying clear
+            // of every composer chord.
+            Self::JumpToAttention => KeyBinding::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Compare Subagent Outputs (§12.8.3). `Alt+7` — the next free
+            // `Alt`+digit after `Alt+6` (subagent hover preview) and beside
+            // `Alt+5` (the §12.8.1 subagent-timeline panel its marks come from);
+            // `Alt+8`/`Alt+9`/`Alt+0` are hyperlinks / session timeline /
+            // changes-since. Every bare `Alt` letter in the nav/copy/overlay
+            // family is taken, so the digit is the free, composer-clear pick.
+            Self::ToggleSubagentCompare => KeyBinding::new(KeyCode::Char('7'), KeyModifiers::ALT),
+            // Live Review Board (§12.8.5). `Ctrl+Alt+O` — `O` recalls
+            // "Orchestration" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+A`/`Ctrl+Alt+D`/`Ctrl+Alt+Q`/`Ctrl+Alt+H`). It is free:
+            // bare `Alt+o` is the copy-current-tool-output verb and bare `Ctrl+O` is
+            // the fold toggle, so the Ctrl+Alt modifier keeps the board distinct and
+            // clear of every composer chord. The §12.8.1 timeline panel reaches the
+            // same workers for terminals that swallow the Meta chord.
+            Self::ToggleReviewBoard => KeyBinding::new(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Actionable Tool Outputs (§12.3.1). `Ctrl+Alt+A` — `A` recalls
+            // "Actions" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`/`Ctrl+Alt+H`/`Ctrl+Alt+R`/
+            // `Ctrl+Alt+N`). It is free: bare `Alt+a` is the full-transcript copy
+            // and every other bare `Alt` letter in the nav/copy/overlay family is
+            // taken, so the Ctrl+Alt modifier keeps the verb distinct and clear of
+            // every composer chord and of the `Alt+Enter`/`Ctrl+Enter` chords.
+            Self::ToggleToolActions => KeyBinding::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Scratchpad Pane (§12.3.3). `Alt+4` — the next free `Alt`+digit after
+            // `Alt+3` (save-snippet-from-selection); `Alt+1`/`Alt+2` are hover
+            // preview / breadcrumbs and `Alt+8`/`Alt+9`/`Alt+0` are hyperlinks /
+            // session timeline / changes-since. Every bare `Alt` letter in the
+            // nav/copy/overlay family is taken, so the digit is the free,
+            // composer-clear pick; it sits beside the snippets save chord it
+            // complements (capture a bit, stash it in the pad). The in-pane
+            // send-to-composer / queue verbs use `Ctrl+I` / `Ctrl+Q` (handled by
+            // the pane's own modal key handler, not rebindable here).
+            Self::ToggleScratchpad => KeyBinding::new(KeyCode::Char('4'), KeyModifiers::ALT),
+            // Prompt Templates picker (§12.3.6). `Ctrl+Alt+T` — the next free
+            // `Ctrl+Alt` letter after `Ctrl+Alt+S` (snippets), `Ctrl+Alt+A`
+            // (tool actions), `Ctrl+Alt+H`/`Ctrl+Alt+P`/`Ctrl+Alt+R`/`Ctrl+Alt+N`.
+            // `T` reads as "template" and pairs naturally with the snippets chord
+            // it sits beside (both are reusable-prompt stashes). The plain `Ctrl+T`
+            // (transcript overlay) and `Alt+t` (pinned compare) are distinct
+            // chords. The in-card slot-fill / enqueue verbs are handled by the
+            // picker's own modal key handler, not rebindable here.
+            Self::ToggleTemplates => KeyBinding::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Replayable Interaction Macros (§12.3.7). `Ctrl+Alt+K` arms / disarms
+            // recording ("Kapture") and `Ctrl+Alt+J` replays ("re-do, J next to
+            // K"): both are free `Ctrl+Alt` letters — `Ctrl+Alt+L`/`M`/`P`/`S`/`A`/
+            // `H`/`R`/`N`/`T` are taken by the debug/overlay/picker chords above,
+            // and the bare `Alt+k`/`Alt+j` chords are the copy-code-block /
+            // copy-all-code verbs, so the Ctrl+Alt modifier keeps the macro verbs
+            // distinct from both while staying clear of every composer chord.
+            Self::ToggleMacroRecord => KeyBinding::new(
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            Self::ReplayMacro => KeyBinding::new(
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Keybinding Editor UI (§12.7.1). `Ctrl+Alt+B` — `B` recalls
+            // "Bindings" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/`T`/`K`/`J`). It is free:
+            // bare `Alt+b` is the session-bundle build verb, so the Ctrl+Alt
+            // modifier keeps the editor distinct from it while staying clear of
+            // every composer chord.
+            Self::ToggleKeybindingEditor => KeyBinding::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Theme Editor UI (§12.7.2). `Ctrl+Alt+E` ("Edit theme") is a free
+            // `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/
+            // `T`/`B` are taken by the macro/debug/overlay/picker/keybinding chords
+            // above, and the bare `Alt+e` chord is the external-editor handoff verb,
+            // so the Ctrl+Alt modifier keeps the theme-editor verb distinct from both
+            // while staying clear of every composer chord.
+            Self::OpenThemeEditor => KeyBinding::new(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Per-Workspace UI Profile (§12.7.4). `Ctrl+Alt+W` ("Workspace") is a
+            // free `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/
+            // `R`/`N`/`T`/`B`/`E` are taken by the macro/debug/overlay/picker/
+            // keybinding/theme chords above, and the bare `Alt+w` chord is the
+            // soft-wrap toggle, so the Ctrl+Alt modifier keeps the workspace-
+            // profile verb distinct from both while staying clear of every
+            // composer chord.
+            Self::OpenWorkspaceProfile => KeyBinding::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Per-Terminal Profiles (§12.7.3). `Ctrl+Alt+G` is a free `Ctrl+Alt`
+            // letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/`T`/`B`/`E`/
+            // `W`/`Y` are taken by the macro/debug/overlay/picker/editor/workspace
+            // chords above, so the Ctrl+Alt modifier keeps the terminal-profile
+            // verb distinct while staying clear of every composer chord.
+            Self::OpenTerminalProfile => KeyBinding::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Gesture Settings (§12.7.5). `Ctrl+Alt+I` ("Input") is a free
+            // `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/
+            // `T`/`B`/`E`/`W`/`G`/`Y` are taken by the macro/debug/overlay/picker/
+            // editor/profile chords above, so the Ctrl+Alt modifier keeps the
+            // gesture-settings verb distinct while staying clear of every composer
+            // chord.
+            Self::OpenGestureSettings => KeyBinding::new(
+                KeyCode::Char('i'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Minimal Glyph Mode (§12.7.6). `Ctrl+Alt+U` (mnemonic: Unicode) is a
+            // free `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/
+            // `N`/`T`/`B`/`E`/`W`/`Y`/`G`/`D`/`I` are taken by the macro/debug/
+            // overlay/picker/editor/workspace/terminal/gesture chords above, so the
+            // Ctrl+Alt modifier keeps the glyph-mode verb distinct while staying clear
+            // of every composer chord.
+            Self::OpenGlyphMode => KeyBinding::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Smart Split Panes (§12.4.2). `Ctrl+Alt+V` (mnemonic: split View) is a
+            // free `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/
+            // `N`/`T`/`B`/`E`/`W`/`Y`/`G`/`D`/`I`/`U`/`Q`/`O`/`Z` are taken by the
+            // macro/debug/overlay/picker/editor/profile/subagent chords above, and
+            // bare `Alt+v` is the copy-viewport verb, so the Ctrl+Alt modifier keeps
+            // the split inspector distinct from it while staying clear of every
+            // composer chord.
+            Self::ToggleSmartSplit => KeyBinding::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Presentation Mode (§12.4.6). `Ctrl+Alt+C` (mnemonic: screen-share
+            // Cards) is the last free `Ctrl+Alt` letter — `Ctrl+Alt+A`/`B`/`D`..`Z`
+            // are taken by the macro/debug/overlay/picker/editor/profile/density/
+            // dock/subagent chords above, and bare `Alt+c` is the copy-focused-entry
+            // verb, so the Ctrl+Alt modifier keeps the presentation toggle distinct
+            // from it while staying clear of every composer chord.
+            Self::TogglePresentation => KeyBinding::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Zen Mode (§12.4.5). Every `Ctrl+Alt` LETTER is taken (the §12.4.6
+            // Presentation toggle above claimed the last free one, `Ctrl+Alt+C`),
+            // and every `Alt`+letter / `Alt`+digit chord is a copy/nav/overlay verb,
+            // so Zen takes `Ctrl+Alt+.` — a free `Ctrl+Alt` punctuation chord (no
+            // other action binds `Ctrl+Alt`+punctuation). It stays in the same
+            // Ctrl+Alt overlay/policy family while colliding with nothing; the
+            // always-available equivalent is a click on the minimal zen status line.
+            Self::ToggleZenMode => KeyBinding::new(
+                KeyCode::Char('.'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Terminal Restore Command (§12.9.2). `Ctrl+Alt+,` is a free `Ctrl+Alt`
+            // punctuation chord — every `Ctrl+Alt` LETTER is taken by the overlay /
+            // picker / editor / policy family, the §12.4.5 Zen toggle claimed the
+            // companion `Ctrl+Alt+.`, and bare `Alt+,` is the previous-tool-call nav
+            // verb, so the Ctrl+Alt modifier keeps the recovery verb distinct from
+            // it while staying clear of every composer chord. The `/terminal-reset`
+            // slash command is the always-typeable twin for a terminal that swallows
+            // the chord.
+            Self::RestoreTerminal => KeyBinding::new(
+                KeyCode::Char(','),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Last-Known-Good Layout Fallback diagnostics toggle (§12.9.3).
+            // `Ctrl+Alt+/` is a free `Ctrl+Alt` punctuation chord — every
+            // `Ctrl+Alt` LETTER is taken by the overlay / picker / editor / policy
+            // family, the Zen and Terminal-Restore verbs claimed `Ctrl+Alt+.` and
+            // `Ctrl+Alt+,`, and bare `/` (OpenSearch) and `Alt+/` (AnnotateEntry)
+            // are distinct from the Ctrl+Alt chord — so this stays clear of every
+            // other binding while sitting alongside the other hidden debug toggles.
+            Self::ToggleLayoutFallbackDiag => KeyBinding::new(
+                KeyCode::Char('/'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Automatic Degraded-Mode Suggestions (§12.9.4). Every `Ctrl+Alt` LETTER
+            // is taken (the §12.4.6 Presentation toggle claimed the last free one,
+            // `Ctrl+Alt+C`), and the Zen / Restore / Layout-Fallback policy chords
+            // claimed `Ctrl+Alt+.` / `Ctrl+Alt+,` / `Ctrl+Alt+/`, so accept/dismiss
+            // take the next two free `Ctrl+Alt` punctuation chords: `Ctrl+Alt+;`
+            // (accept) and `Ctrl+Alt+'` (dismiss). No other action binds
+            // `Ctrl+Alt`+`;`/`'`, so they stay in the same Ctrl+Alt overlay/policy
+            // family while colliding with nothing; the always-available equivalents
+            // are clicks on the banner affordances.
+            Self::AcceptDegradedSuggestion => KeyBinding::new(
+                KeyCode::Char(';'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            Self::DismissDegradedSuggestion => KeyBinding::new(
+                KeyCode::Char('\''),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Session Auto-Save Checkpoints (§12.9.5). `Ctrl+Alt+[` is a free
+            // `Ctrl+Alt` punctuation chord — every `Ctrl+Alt` LETTER is taken by
+            // the overlay / picker / editor / policy family, the Zen / Restore /
+            // Layout-Fallback / degraded-mode verbs claimed `Ctrl+Alt+.` /
+            // `Ctrl+Alt+,` / `Ctrl+Alt+/` / `Ctrl+Alt+;` / `Ctrl+Alt+'`, and bare
+            // `Alt+[` is the previous-error nav verb (distinct from the Ctrl+Alt
+            // chord) — so this stays clear of every other binding while sitting
+            // alongside the §12.9 recovery family. The overlay's `[restore]` click
+            // affordance is the always-available twin.
+            Self::OpenSessionCheckpoint => KeyBinding::new(
+                KeyCode::Char('['),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
         }
     }
 }
@@ -179,7 +1783,14 @@ impl KeyBinding {
 fn normalise_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyModifiers {
     let mut out = modifiers;
     if let KeyCode::Char(ch) = code
-        && ch.is_ascii_uppercase()
+        // Uppercase letters and shifted ASCII symbols (`>`, `?`, `!`, …) already
+        // encode the shift in the produced glyph, so an additional SHIFT
+        // modifier is redundant and terminal-dependent — fold it away so a
+        // `>`-bound action matches whether or not the terminal also reports
+        // SHIFT. Alphanumerics keep SHIFT (a Shift+letter is its own glyph; a
+        // Shift+digit is a separate symbol the terminal already reports as that
+        // symbol's char).
+        && (ch.is_ascii_uppercase() || (ch.is_ascii_graphic() && !ch.is_ascii_alphanumeric()))
     {
         out.remove(KeyModifiers::SHIFT);
     }
@@ -199,6 +1810,11 @@ pub(crate) struct KeymapResolver {
     /// Bindings the user supplied that did not parse as a keyspec,
     /// surfaced via `/keymap`.
     pub(crate) invalid_bindings: Vec<(String, String, String)>,
+    /// Bindings the user supplied that landed on a reserved recovery key
+    /// (`Ctrl+C` / `Esc` / `Ctrl+D`) and were therefore skipped (the action keeps
+    /// its compiled-in default). Each entry is `(slug, spec, reserved_label)`,
+    /// surfaced via `/keymap` so the user learns why the override was ignored.
+    pub(crate) reserved_bindings: Vec<(String, String, String)>,
 }
 
 impl KeymapResolver {
@@ -213,6 +1829,13 @@ impl KeymapResolver {
         }
         let mut unknown_actions = Vec::new();
         let mut invalid_bindings = Vec::new();
+        let mut reserved_bindings = Vec::new();
+        // Actions the user explicitly rebound. These win the reverse-lookup
+        // collision over default-bound actions: an explicit `Alt+k = page_up`
+        // override must take effect even if some *default*-bound action also
+        // sits on `Alt+k` (otherwise a freshly-added default could silently
+        // shadow the user's deliberate choice).
+        let mut overridden: std::collections::BTreeSet<Action> = std::collections::BTreeSet::new();
         for (slug, spec) in overrides {
             let Some(action) = Action::from_slug(slug) else {
                 unknown_actions.push((slug.clone(), spec.clone()));
@@ -220,20 +1843,38 @@ impl KeymapResolver {
             };
             match parse_keyspec(spec) {
                 Some(binding) => {
+                    // Reject a reserved recovery binding (`Ctrl+C` / `Esc` /
+                    // `Ctrl+D`) the same way the `keybindings.toml` file path and
+                    // the in-TUI editor already do. Without this the `[tui.keymap]`
+                    // settings surface could bind an action onto turn-interrupt /
+                    // exit and strand the user with no way out (deep-review #24).
+                    // Skip the override (the action keeps its default) and record
+                    // it as a diagnostic for `/keymap`.
+                    if let Some(label) = crate::keymap_config::reserved_label(&binding) {
+                        reserved_bindings.push((slug.clone(), spec.clone(), label.to_string()));
+                        continue;
+                    }
                     bindings.insert(action, binding);
+                    overridden.insert(action);
                 }
                 None => {
                     invalid_bindings.push((slug.clone(), spec.clone(), action.slug().to_string()));
                 }
             }
         }
-        // Build the reverse lookup. If two actions land on the same
-        // binding the alphabetically-earlier action wins so `/keymap`
-        // and `lookup` agree on a deterministic pick; the loser keeps
-        // its binding visible so `/keymap` can flag the collision.
-        // Action's BTreeMap iteration is sorted, so the first insert
-        // is the alphabetically-earliest.
+        // Build the reverse lookup. Overridden actions are inserted first so an
+        // explicit user rebind beats a colliding default; within each tier the
+        // alphabetically-earlier action wins so `/keymap` and `lookup` agree on
+        // a deterministic pick. The loser keeps its binding visible so
+        // `/keymap` can flag the collision. `bindings` (a BTreeMap) iterates in
+        // sorted action order, so the first insert per tier is the
+        // alphabetically-earliest.
         let mut by_key: HashMap<KeyBinding, Action> = HashMap::new();
+        for (action, binding) in &bindings {
+            if overridden.contains(action) {
+                by_key.entry(*binding).or_insert(*action);
+            }
+        }
         for (action, binding) in &bindings {
             by_key.entry(*binding).or_insert(*action);
         }
@@ -242,6 +1883,7 @@ impl KeymapResolver {
             bindings,
             unknown_actions,
             invalid_bindings,
+            reserved_bindings,
         }
     }
 
@@ -377,7 +2019,7 @@ fn eq_any_ignore_ascii_case(token: &str, candidates: &[&str]) -> bool {
 }
 
 fn format_binding(code: KeyCode, modifiers: KeyModifiers) -> String {
-    let key = format_keycode(code);
+    let key = format_keycode(code, modifiers);
     let mut out = String::new();
     if modifiers.contains(KeyModifiers::CONTROL) {
         out.push_str("Ctrl");
@@ -410,7 +2052,7 @@ fn format_binding(code: KeyCode, modifiers: KeyModifiers) -> String {
     }
 }
 
-fn format_keycode(code: KeyCode) -> String {
+fn format_keycode(code: KeyCode, modifiers: KeyModifiers) -> String {
     match code {
         KeyCode::Enter => "Enter".to_string(),
         KeyCode::Tab => "Tab".to_string(),
@@ -429,10 +2071,25 @@ fn format_keycode(code: KeyCode) -> String {
         KeyCode::Down => "Down".to_string(),
         KeyCode::F(n) => format!("F{n}"),
         KeyCode::Char(' ') => "Space".to_string(),
-        KeyCode::Char(ch) => {
-            let upper = ch.to_ascii_uppercase();
-            upper.to_string()
+        // For a BARE char (no Ctrl/Alt/Shift) emit the REAL char so `display()`
+        // round-trips through `parse_keyspec`/`KeyBinding::new` identically
+        // (deep-review #31). The old unconditional uppercase turned a bare
+        // `Char('u')` into `"U"`, which parsed back as `Char('U')` and never
+        // matched the live `Char('u')` key event — silently dropping the rebind
+        // (`KeyBinding::new` only case-folds when Ctrl/Alt is present, so a bare
+        // uppercase letter stays uppercased and misses).
+        //
+        // A modified letter keeps the uppercase convention ("Ctrl+O", "Alt+K",
+        // "Shift+A"): a Ctrl/Alt letter is lowercased again by `KeyBinding::new`
+        // on parse-back so it round-trips regardless of case, and a Shift+letter
+        // genuinely is the uppercase glyph.
+        KeyCode::Char(ch)
+            if modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            ch.to_ascii_uppercase().to_string()
         }
+        KeyCode::Char(ch) => ch.to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -502,6 +2159,13 @@ pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
         lines.push("Invalid key specs (default kept):".to_string());
         for (slug, spec, _) in &resolver.invalid_bindings {
             lines.push(format!("  {slug} = {spec:?}"));
+        }
+    }
+    if !resolver.reserved_bindings.is_empty() {
+        lines.push(String::new());
+        lines.push("Reserved recovery keys (override skipped, default kept):".to_string());
+        for (slug, spec, label) in &resolver.reserved_bindings {
+            lines.push(format!("  {slug} = {spec:?} ({label} is reserved)"));
         }
     }
     lines.join("\n")

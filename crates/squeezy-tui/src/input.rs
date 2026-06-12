@@ -343,6 +343,20 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         &[PermissionCapability::Edit],
     ),
     slash("/keymap", "list current key bindings"),
+    slash_args_caps(
+        "/export",
+        "export the transcript (md/txt/json) to a file, clipboard, stdout, or dir",
+        true,
+        "<md|txt|json> [clipboard|stdout|dir:<name>|<path>]",
+        &[PermissionCapability::Edit],
+    ),
+    slash_args_caps(
+        "/bundle",
+        "build a shareable session bundle (transcript + manifest + checksum, redacted)",
+        true,
+        "[md|json] [no-redact]",
+        &[PermissionCapability::Edit],
+    ),
     slash(
         "/terminal",
         "show terminal diagnostic info (TTY, TERM, clipboard, notifications, shell)",
@@ -576,6 +590,10 @@ pub(crate) fn clear_input(app: &mut TuiApp) {
     app.input.clear();
     app.input_cursor = 0;
     app.clear_prompt_attachments();
+    // Clearing the composer abandons any in-progress queued-prompt edit
+    // (§11G.8): a fresh prompt typed afterwards must never be mistaken for a
+    // save against the previously-edited item.
+    app.editing_queue_id = None;
     clamp_slash_menu_index(app);
 }
 

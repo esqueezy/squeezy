@@ -180,3 +180,171 @@ async fn pump_until_idle_yields_on_pending_approval_then_respond_clears() {
     assert!(!harness.respond_approval());
     assert!(!harness.respond_deny());
 }
+
+/// Regression for deep-review #117. `pump_until_idle` used to drain the queue
+/// with a bare `pop_front` + `start_user_turn`, bypassing the production
+/// `drain_prompt_queue_if_idle` gating. A `Manual`-conditioned front prompt must
+/// be LEFT parked (never auto-run) — the bare pop would have run it.
+#[tokio::test]
+async fn pump_until_idle_leaves_a_manual_conditioned_prompt_parked() {
+    let mut harness = build_harness();
+    {
+        let app = harness.app_mut();
+        app.prompt_queue.push_back("manual-only".to_string());
+        crate::enqueue_queue_id(app);
+        let id = *app.prompt_queue_ids.front().expect("id stamped");
+        app.prompt_queue_conditions
+            .set(id, crate::queue_conditions::QueueCondition::Manual);
+        // Arm the pump exactly as a turn-finish would.
+        app.auto_drain_queue = true;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), harness.pump_until_idle())
+        .await
+        .expect("pump must return promptly, not spin on the parked prompt")
+        .expect("pump_until_idle returns Ok with a parked prompt");
+
+    // The Manual prompt is still queued (parked), and no model turn was started.
+    assert!(
+        !harness.is_turn_active(),
+        "a Manual-conditioned prompt must not be auto-run by the harness pump",
+    );
+    let app = harness.app_mut();
+    assert_eq!(
+        app.prompt_queue.iter().cloned().collect::<Vec<_>>(),
+        vec!["manual-only".to_string()],
+        "the parked prompt stays in the queue",
+    );
+}
+
+/// Companion to the above: a queued slash command must be DISPATCHED as a command
+/// (via `submit_queued_input`), not started as a raw model turn. The bare-pop
+/// harness path sent the slash text straight to `start_user_turn`.
+#[tokio::test]
+async fn pump_until_idle_dispatches_a_queued_slash_command() {
+    let mut harness = build_harness();
+    {
+        let app = harness.app_mut();
+        app.push_transcript_item(crate::TranscriptItem::user("old context"));
+        app.prompt_queue.push_back("/clear".to_string());
+        crate::enqueue_queue_id(app);
+        app.auto_drain_queue = true;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), harness.pump_until_idle())
+        .await
+        .expect("pump must return promptly")
+        .expect("pump_until_idle returns Ok after dispatching the slash command");
+
+    assert!(
+        !harness.is_turn_active(),
+        "a queued /clear is a command, not a model turn",
+    );
+    let app = harness.app_mut();
+    assert!(
+        app.prompt_queue.is_empty(),
+        "the queued slash entry was consumed by the drain",
+    );
+    assert!(
+        app.terminal_clear_pending,
+        "/clear was dispatched as a command (it requested a hard terminal clear)",
+    );
+}
+
+/// Regression for deep-review #78: `TuiHarness::new` must mirror `run_inner`'s
+/// pre-paint preamble and restore the saved per-workspace UI profile (§12.7.4)
+/// — but only when the profile store is explicitly pinned via
+/// `SQUEEZY_UI_PROFILE_DIR`, so eval stays deterministic and never reads the
+/// operator's real `~/.squeezy/projects`. Before the fix the harness stopped at
+/// `apply_theme_overrides` -> `Agent::new` -> `new_with_clipboard` and never
+/// restored, so `show_minimap` stayed at its `false` default even with a saved
+/// profile flipping it on.
+#[test]
+fn harness_restores_workspace_profile_when_store_pinned() {
+    use crate::workspace_profile;
+
+    // Serialize against the shared profile-dir lock (the same one the unit and
+    // integration profile tests take) so no other test mutates the global
+    // `SQUEEZY_UI_PROFILE_DIR` while we have it pinned.
+    let _lock = workspace_profile::PROFILE_DIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prior = std::env::var_os(workspace_profile::PROFILE_DIR_ENV);
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let store = std::env::temp_dir().join(format!("squeezy_harness_profile_store_{nonce}"));
+    let workspace = std::env::temp_dir().join(format!("squeezy_harness_profile_ws_{nonce}"));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+
+    // SAFETY: serialized by `PROFILE_DIR_TEST_LOCK` held in `_lock`.
+    unsafe {
+        std::env::set_var(workspace_profile::PROFILE_DIR_ENV, &store);
+    }
+
+    // Save a profile for this workspace that flips `minimap` ON (its app default
+    // is `false`), so a successful restore is observable as `show_minimap == true`.
+    let profile = workspace_profile::UiProfile {
+        version: workspace_profile::PROFILE_SCHEMA_VERSION,
+        minimap: Some(true),
+        ..Default::default()
+    };
+    workspace_profile::save(&workspace, &profile).expect("save profile to scratch store");
+
+    let config = AppConfig {
+        model: "stub-model".to_string(),
+        workspace_root: workspace.clone(),
+        ..AppConfig::default()
+    };
+    let provider: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+    let mut harness = TuiHarness::new(config, SessionMode::Build, provider, 80, 24, None)
+        .expect("harness builds with stub provider");
+
+    assert!(
+        harness.app_mut().show_minimap,
+        "harness must restore the saved per-workspace profile (minimap flipped on)",
+    );
+
+    // SAFETY: serialized by `PROFILE_DIR_TEST_LOCK` held in `_lock`; restore prior.
+    unsafe {
+        match &prior {
+            Some(prev) => std::env::set_var(workspace_profile::PROFILE_DIR_ENV, prev),
+            None => std::env::remove_var(workspace_profile::PROFILE_DIR_ENV),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Companion to the above: with the profile store NOT pinned (the production-eval
+/// default), the harness must SKIP the restore so eval runs never read the real
+/// `~/.squeezy/projects` tree and stay deterministic. `show_minimap` keeps its
+/// `false` default regardless of what any on-disk profile says.
+#[test]
+fn harness_skips_workspace_profile_when_store_unpinned() {
+    use crate::workspace_profile;
+
+    let _lock = workspace_profile::PROFILE_DIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prior = std::env::var_os(workspace_profile::PROFILE_DIR_ENV);
+    // SAFETY: serialized by `PROFILE_DIR_TEST_LOCK` held in `_lock`.
+    unsafe {
+        std::env::remove_var(workspace_profile::PROFILE_DIR_ENV);
+    }
+
+    let mut harness = build_harness();
+    assert!(
+        !harness.app_mut().show_minimap,
+        "with the store unpinned the harness must not restore any profile",
+    );
+
+    // SAFETY: serialized by `PROFILE_DIR_TEST_LOCK` held in `_lock`; restore prior.
+    unsafe {
+        if let Some(prev) = &prior {
+            std::env::set_var(workspace_profile::PROFILE_DIR_ENV, prev);
+        }
+    }
+}

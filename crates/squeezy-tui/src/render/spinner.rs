@@ -35,7 +35,7 @@ impl SpinnerStyle {
         }
     }
 
-    fn frames(self) -> &'static [&'static str] {
+    pub(crate) fn frames(self) -> &'static [&'static str] {
         match self {
             Self::Twinkle => &["·", "⋆", "✦", "✧", "✦", "⋆"],
             Self::Scintillate => &["✶", "✷", "✸", "✹", "✺", "✹", "✸", "✷"],
