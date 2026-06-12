@@ -31565,6 +31565,189 @@ async fn ctrl_c_with_no_selection_keeps_interrupt_and_copies_nothing() {
 }
 
 #[tokio::test]
+async fn cmd_c_copies_the_active_selection_then_clears_it() {
+    // ⌘C is forwarded to the app by kitty-protocol terminals (iTerm2, kitty,
+    // WezTerm, Ghostty) as SUPER+'c'. Handling it in-app is what keeps the
+    // emulator's own copy path — and iTerm2's "mouse reporting has prevented
+    // making a selection" nag — from ever firing (Claude Code parity).
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("the prompt"));
+    app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 30, y));
+    assert!(app.selection.is_some(), "the drag armed a selection");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+    )
+    .await
+    .expect("cmd+c copies");
+
+    assert_eq!(
+        writes.lock().unwrap().clone().as_slice(),
+        ["copy this exact phrase"],
+        "⌘C with a selection copies the selected clean text",
+    );
+    assert!(
+        app.selection.is_none(),
+        "⌘C clears the selection highlight after copying",
+    );
+}
+
+#[tokio::test]
+async fn cmd_c_with_no_selection_is_inert_and_never_arms_exit() {
+    // Unlike Ctrl+C, ⌘C with no selection must NOT interrupt the turn or arm
+    // exit-confirm — it is a pure copy chord. It is consumed (never typing a
+    // 'c' into the composer) and leaves a gentle status hint.
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("answer"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+    assert!(app.selection.is_none(), "no selection armed");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+    )
+    .await
+    .expect("cmd+c is inert");
+
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "⌘C with no selection copies nothing",
+    );
+    assert!(
+        !app.exit_confirm_armed,
+        "⌘C must never arm the exit confirmation",
+    );
+    assert!(app.input.is_empty(), "⌘C must not type into the composer",);
+    assert!(
+        app.status.contains("nothing selected"),
+        "⌘C with no selection leaves a hint, got: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn ctrl_shift_c_copies_the_active_selection_in_both_letter_cases() {
+    // Ctrl+Shift+C is the conventional terminal copy chord. Kitty's
+    // REPORT_ALTERNATE_KEYS delivers the base-layout 'c' with SHIFT set, while
+    // other protocol levels deliver the shifted 'C' codepoint — both must
+    // copy. (Matched before normalise_control_byte, which would strip the
+    // SHIFT bit and fold the chord into plain Ctrl+C.)
+    for code in [KeyCode::Char('c'), KeyCode::Char('C')] {
+        let mut agent = test_agent(SessionMode::Build);
+        let writes = Arc::new(StdMutex::new(Vec::new()));
+        let mut app = test_app_with_clipboard(
+            SessionMode::Build,
+            Box::new(RecordingClipboard {
+                writes: writes.clone(),
+                error: None,
+            }),
+        );
+        app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+        let buffer = render_transcript_to_buffer(&app, 40, 12);
+        let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+        handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+        handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
+        handle_mouse(&mut app, left_up(x + 30, y));
+        assert!(app.selection.is_some(), "the drag armed a selection");
+
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        )
+        .await
+        .expect("ctrl+shift+c copies");
+
+        assert_eq!(
+            writes.lock().unwrap().clone().as_slice(),
+            ["copy this exact phrase"],
+            "Ctrl+Shift+{code:?} with a selection copies the selected text",
+        );
+        assert!(
+            app.selection.is_none(),
+            "Ctrl+Shift+{code:?} clears the highlight after copying",
+        );
+        assert!(
+            !app.exit_confirm_armed,
+            "Ctrl+Shift+{code:?} never arms exit-confirm",
+        );
+    }
+}
+
+#[tokio::test]
+async fn cmd_c_copies_the_selection_even_while_the_config_screen_is_open() {
+    // The copy-chord intercept sits in front of every modal surface so a
+    // visible selection is copyable from anywhere — here the config screen,
+    // which otherwise swallows all keys.
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 30, y));
+    assert!(app.selection.is_some(), "the drag armed a selection");
+
+    app.config_screen = Some(config_screen::ConfigScreenState::new(
+        test_config(SessionMode::Build),
+        None,
+    ));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+    )
+    .await
+    .expect("cmd+c copies over the config screen");
+
+    assert_eq!(
+        writes.lock().unwrap().clone().as_slice(),
+        ["copy this exact phrase"],
+        "⌘C copies the selection even with a modal overlay open",
+    );
+    assert!(
+        app.config_screen.is_some(),
+        "the config screen stays open — ⌘C only copies",
+    );
+}
+
+#[tokio::test]
 async fn copy_with_no_selection_does_not_send_empty_selection_text() {
     // Guards the routing: a copy chord with no active selection falls back to
     // the semantic unit (the last assistant message), never an empty send.

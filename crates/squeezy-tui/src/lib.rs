@@ -4470,6 +4470,36 @@ fn copy_active_selection(app: &mut TuiApp) -> bool {
     true
 }
 
+/// Copy whichever app-level selection is active. Today that is the
+/// transcript/overlay visual selection; the screen-level selection will hook
+/// in here so every copy chord (`⌘C`, `Ctrl+Shift+C`, `Ctrl+C`) shares one
+/// funnel. Returns `true` when something was copied. Does NOT clear the
+/// selection — callers decide (explicit copy chords clear, copy-on-release
+/// keeps the highlight for quote/add-to-set follow-ups).
+fn copy_any_active_selection(app: &mut TuiApp) -> bool {
+    copy_active_selection(app)
+}
+
+/// True for the system-convention copy chords: `⌘C` (kitty-protocol
+/// terminals — iTerm2, kitty, WezTerm, Ghostty — deliver the Command key as
+/// `SUPER`) and `Ctrl+Shift+C` (the conventional terminal copy chord). Both
+/// letter cases are accepted: kitty's `REPORT_ALTERNATE_KEYS` reports the
+/// base-layout `'c'` with `SHIFT` set, while other protocol levels deliver
+/// the shifted `'C'` codepoint. `META` is deliberately NOT treated as `⌘`:
+/// Esc-prefixed meta carries Alt semantics and `Alt+C` belongs to the keymap
+/// (`CopyFocusedEntry`). Must be evaluated BEFORE [`normalise_control_byte`],
+/// which strips `SHIFT` from Ctrl+letter combos and would fold
+/// `Ctrl+Shift+C` into plain `Ctrl+C`.
+fn is_copy_chord(key: &KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::SUPER)
+        || key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+}
+
 /// Multi-Cursor-Like Transcript Selection (§12.1.6): commit the live visual
 /// selection into the disjoint [`TuiApp::selection_set`] and clear the live one
 /// so the next gesture starts a fresh non-contiguous range. Returns `true` when
@@ -7544,6 +7574,37 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // `⌘C` / `Ctrl+Shift+C` — the system-convention copy chords (Claude Code
+    // fullscreen parity). Matched BEFORE `normalise_control_byte` because
+    // normalisation strips SHIFT from Ctrl+letter combos (folding
+    // `Ctrl+Shift+C` into plain `Ctrl+C`). Handling `⌘C` in-app is what keeps
+    // the emulator's own copy path — and iTerm2's "mouse reporting has
+    // prevented making a selection" nag — out of the picture: kitty-protocol
+    // terminals forward the chord to us instead of running their native copy.
+    // Sits in front of every modal overlay on purpose so a visible selection
+    // is copyable from anywhere (the keybinding editor consequently cannot
+    // capture these two chords for rebinding — they are fixed, like the
+    // emulator conventions they mirror). With no selection the chord is a
+    // consumed no-op hint: it must never type a letter and, unlike `Ctrl+C`,
+    // never arms interrupt/exit-confirm. Terminals without the kitty protocol
+    // never deliver `⌘C`, and their `Ctrl+Shift+C` arrives as the raw `0x03`
+    // byte — i.e. plain `Ctrl+C`, whose arm below still copies-with-selection,
+    // so the chord degrades gracefully rather than silently dying.
+    if is_copy_chord(&key) {
+        // Any keypress while a turn-done notification is up acknowledges it
+        // (mirrors the post-normalisation path this intercept bypasses).
+        if app.terminal_title_state == TerminalTitleState::Notification {
+            app.terminal_title_state = TerminalTitleState::Cleared;
+        }
+        if copy_any_active_selection(app) {
+            app.selection = None;
+        } else {
+            app.status = "nothing selected — drag with the mouse to select text".to_string();
+        }
+        app.needs_redraw = true;
+        return Ok(false);
+    }
+
     // Normalise raw ASCII control bytes into their canonical
     // `Char(<lowercase letter>) + CONTROL` form before any dispatcher
     // sees them. Terminals that do not fully honour kitty's
@@ -8111,8 +8172,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // selection, and Ctrl+C copies it to the system clipboard (pbcopy on a
         // local session, deep-review #11). Copies, clears the highlight, and
         // consumes the key. With NO selection, Ctrl+C keeps its interrupt /
-        // exit-confirm behavior below.
-        if copy_active_selection(app) {
+        // exit-confirm behavior below. Shares the copy funnel with the
+        // `⌘C`/`Ctrl+Shift+C` intercept at the top of `handle_key`.
+        if copy_any_active_selection(app) {
             app.selection = None;
             app.needs_redraw = true;
             return Ok(false);
