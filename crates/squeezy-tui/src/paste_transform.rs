@@ -1,10 +1,10 @@
-//! Paste Transform Menu (§12.6.2).
+//! Paste Transform Question (§12.6.2).
 //!
 //! Bracketed paste already routes a pasted block into the composer (small
 //! pastes type inline; a paste over [`crate::LARGE_PASTE_CHAR_THRESHOLD`]
 //! collapses into a `[Pasted text #N]` attachment token; a paste over
 //! [`crate::paste_preview::VERY_LARGE_PASTE_CHAR_THRESHOLD`] parks in the
-//! confirm/cancel safety modal). What none of those offer is a *choice of
+//! inline confirm/cancel safety question). What none of those offer is a *choice of
 //! shape*: when a paste is **structured** — multiline, ANSI-laden, or a
 //! recognized diff/JSON/code/log block — the user often wants it wrapped a
 //! particular way before it lands (quoted, fenced as a code block, or with
@@ -19,12 +19,12 @@
 //!     stats (chars, lines, bytes, whether it carries ANSI escapes) and the
 //!     classified kind.
 //!   - [`should_open_transform_menu`] decides whether a payload is "structured"
-//!     enough to warrant the menu at all; an ordinary one-line paste flows
+//!     enough to warrant the question at all; an ordinary one-line paste flows
 //!     straight through untouched.
 //!   - [`PasteTransform`] is the set of shapes the menu offers, and
 //!     [`apply_transform`] is the single pure function that turns the pending
 //!     text into the string the composer receives.
-//!   - [`PasteTransformMenu`] is the selectable overlay state: the payload, the
+//!   - [`PasteTransformMenu`] is the selectable inline-question state: the payload, the
 //!     ordered list of offered transforms, and the cursor. `lib.rs` owns the
 //!     state slot, the render call, and the keyboard/mouse wiring; this module
 //!     owns the math, the classification, and the text.
@@ -349,13 +349,13 @@ impl PastePayload {
 }
 
 /// Whether a normalized paste is "structured" enough to open the transform
-/// menu. Conservative: an ordinary single-line paste (a path, a URL, one log
+/// question. Conservative: an ordinary single-line paste (a path, a URL, one log
 /// line) is *not* structured and flows straight through. The menu opens when
 /// the paste is multiline OR carries ANSI escapes OR was classified as a
 /// recognized structured kind (diff/JSON/code/log).
 ///
 /// The caller has already decided this paste is below the very-large safety
-/// threshold (that path owns its own modal); this gate only governs the
+/// threshold (that path owns its own inline question); this gate only governs the
 /// in-between "structured but not huge" pastes.
 pub(crate) fn should_open_transform_menu(payload: &PastePayload) -> bool {
     if payload.has_ansi {
@@ -368,7 +368,7 @@ pub(crate) fn should_open_transform_menu(payload: &PastePayload) -> bool {
     }
 }
 
-/// The selectable transform-menu overlay state: the captured payload, the
+/// The selectable transform-question state: the captured payload, the
 /// ordered list of offered transforms, and the cursor. The offered list is
 /// fixed except that Strip ANSI is omitted when the payload has no escapes (so
 /// the menu never offers a no-op on clean text).
@@ -471,15 +471,6 @@ impl PasteTransformMenu {
             None
         }
     }
-}
-
-/// Conservative structure classification of `text`, exposed for the Large Paste
-/// Staging view (§12.6.3) so a huge paste's header reports the same kind label
-/// the transform menu would. `line_count` is passed in (already computed by the
-/// caller) to avoid recounting. A thin re-export of [`classify`] so the
-/// classification heuristics live in exactly one place.
-pub(crate) fn classify_text(text: &str, line_count: usize) -> PasteKind {
-    classify(text, line_count)
 }
 
 /// Conservative structure classification of `text`. `line_count` is passed in

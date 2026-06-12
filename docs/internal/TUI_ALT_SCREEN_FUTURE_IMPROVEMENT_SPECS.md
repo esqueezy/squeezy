@@ -562,21 +562,20 @@ Each item uses the same shape:
   raw text when requested. Path/diff/code detection should recognize Unix paths, Windows paths, and
   macOS/Linux shell prompts without treating terminal escape sequences as executable input.
 
-### Large Paste Staging
+### Large Paste Inline Question
 
-- **Spec:** Huge pastes are staged before entering composer/context. The staging view shows byte/line/
-  token estimates, type, preview, warnings, and actions: insert, quote, code block, temp file,
-  attach, queue, split, summarize, copy preview, cancel.
-- **Steps:** Add paste thresholds and temp-backed storage for large payloads. Build searchable/
-  selectable staging overlay. Integrate with queue/attachments/export. Delete staged temp data on
-  cancel/exit unless saved.
-- **Verify:** Test thresholds, cleanup, cancel/insert, range insertion, huge payload render perf, and
-  inert display of pasted escape sequences.
+- **Spec:** Very large and huge pastes use the same inline accept/discard question that ordinary
+  large-paste safety uses. The prompt shows byte/line/character estimates and a bounded preview
+  before any pasted text enters composer/context; it does not swap to a bespoke full-screen paste UI.
+- **Steps:** Keep one large-paste threshold path and render the question in the shared
+  below-composer prompt band. Clicks on Accept/Discard resolve the paste, while clicks and drags
+  outside the question continue to reach normal transcript selection.
+- **Verify:** Test thresholds, cancel/insert, huge payload render perf, inert display of pasted
+  escape sequences, and transcript selection while the inline question is pending.
 - **Deps/Risks:** Large data can freeze wrapping/search or inject terminal controls if written raw;
-  sanitize display and require explicit commit.
-- **Platform notes:** Temp-backed staging must use the platform temp/state directory abstraction
-  rather than hardcoded `/tmp`; cleanup must work on Windows where open files cannot always be
-  deleted or atomically replaced.
+  keep previews bounded/sanitized and require explicit commit.
+- **Platform notes:** No temp-backed staging store is required for this paste category; platform temp
+  files remain relevant only to explicit export/editor-handoff flows.
 
 ### Export Destinations
 
@@ -595,8 +594,8 @@ Each item uses the same shape:
 
 ### External Editor Handoff
 
-- **Spec:** Users can edit composer text, queue items, staged pastes, export buffers, or template
-  slots in `$VISUAL`/`$EDITOR`, then re-import with accept/reopen/discard/save draft.
+- **Spec:** Users can edit composer text, queue items, export buffers, or template slots in
+  `$VISUAL`/`$EDITOR`, then re-import with accept/reopen/discard/save draft.
 - **Steps:** Add `EditorHandoffRequest`, editor resolution, clean terminal suspend/restore, temp file
   with syntax extension, editor subprocess, diff/summary confirmation, and cleanup.
 - **Verify:** Fake editor tests for modify/unchanged/fail/sleep, terminal restore on failure,

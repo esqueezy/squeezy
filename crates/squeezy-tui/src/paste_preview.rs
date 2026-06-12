@@ -11,14 +11,15 @@
 //! This module owns the pure model for that confirmation:
 //!
 //!   - [`is_very_large_paste`] decides whether a normalized paste is big enough
-//!     to warrant the modal at all (anything smaller flows straight through the
+//!     to warrant the question at all (anything smaller flows straight through the
 //!     existing inline / attachment paths untouched).
 //!   - [`PastePreview`] captures the pending text plus its summary stats (chars,
-//!     lines, bytes) and produces the bounded preview body the modal paints —
-//!     a head window of the first lines, each clipped to the modal width, with
+//!     lines, bytes) and produces the bounded preview body the inline question
+//!     paints — a head window of the first lines, each clipped to the question
+//!     width, with
 //!     a "+N more lines" marker so a huge block never tries to render in full.
 //!   - [`PasteDecision`] is the confirm/cancel verdict the key/mouse handlers in
-//!     `lib.rs` resolve the modal with.
+//!     `lib.rs` resolve the question with.
 //!
 //! It is deliberately terminal-free: it depends only on the pending [`String`]
 //! and the geometry numbers the caller passes in, so every branch (clipping,
@@ -27,22 +28,23 @@
 //! keyboard/mouse wiring; this module owns the math and the text.
 
 /// Pastes at or below this many characters never trigger the confirmation
-/// modal — they keep their existing behavior (inline insert for small pastes,
-/// `[Pasted text #N]` attachment for the merely-large ones). The modal is for
+/// question — they keep their existing behavior (inline insert for small pastes,
+/// `[Pasted text #N]` attachment for the merely-large ones). The question is for
 /// the *accidental dump* case: a clipboard so large that silently swallowing it
 /// into the composer would surprise the user. Set well above
 /// [`crate::LARGE_PASTE_CHAR_THRESHOLD`] (1_000) so the two thresholds do not
 /// fight: 1k..=10k still auto-attaches, only >10k prompts.
 pub(crate) const VERY_LARGE_PASTE_CHAR_THRESHOLD: usize = 10_000;
 
-/// Largest number of preview body lines the modal renders. A very large paste
-/// can be thousands of lines; showing a bounded head window keeps the modal a
+/// Largest number of preview body lines the inline question renders. A very
+/// large paste can be thousands of lines; showing a bounded head window keeps the
+/// question a
 /// fixed size and the render cost constant regardless of paste size. Lines past
 /// this are summarized by the "+N more lines" marker.
 pub(crate) const PREVIEW_MAX_LINES: usize = 12;
 
 /// Whether a normalized paste is large enough to warrant the confirmation
-/// modal. The caller passes text that has already been newline-normalized
+/// question. The caller passes text that has already been newline-normalized
 /// (CRLF/CR → LF). Counts characters, not bytes, so a multi-byte-heavy block
 /// is judged by what the user perceives as length rather than UTF-8 weight.
 pub(crate) fn is_very_large_paste(text: &str) -> bool {
@@ -62,7 +64,7 @@ pub(crate) enum PasteDecision {
 /// A pending large paste awaiting the user's confirm/cancel decision.
 ///
 /// Owns the full pending text (so confirming inserts exactly what was pasted)
-/// plus the precomputed summary stats the modal header shows. The body lines
+/// plus the precomputed summary stats the question header shows. The body lines
 /// are derived on demand from [`preview_lines`](Self::preview_lines) so the
 /// struct stays cheap to hold and the clipping reflows on resize.
 #[derive(Debug, Clone)]
@@ -129,7 +131,7 @@ impl PastePreview {
         self.byte_count
     }
 
-    /// A one-line summary of the pending paste for the modal header, e.g.
+    /// A one-line summary of the pending paste for the question header, e.g.
     /// `"3,420 chars · 89 lines · 3,500 bytes"`. Singular/plural aware so a
     /// one-line block reads "1 line".
     pub(crate) fn summary(&self) -> String {
@@ -141,10 +143,10 @@ impl PastePreview {
         )
     }
 
-    /// The bounded preview body the modal paints: at most [`PREVIEW_MAX_LINES`]
+    /// The bounded preview body the inline question paints: at most [`PREVIEW_MAX_LINES`]
     /// lines, each clipped to `width` columns (by character, with a trailing `…`
     /// when clipped), followed by a `"+N more lines"` marker when the paste has
-    /// more lines than the window shows. `width` is the modal's inner content
+    /// more lines than the window shows. `width` is the question's inner content
     /// width; a `0` width yields fully-clipped lines but never panics.
     ///
     /// Returned as owned `String`s so the caller can style them into `Line`s
@@ -191,8 +193,8 @@ fn line_count(text: &str) -> usize {
 /// Clip `raw` to `width` characters, appending a `…` when truncated. Operates on
 /// `char`s (not bytes) so multi-byte glyphs are never split. A `width` of 0
 /// collapses to just the ellipsis marker for a non-empty line, or empty for an
-/// empty line. Tabs/control chars are passed through unchanged — the modal
-/// paragraph widget renders them; this function only bounds length.
+/// empty line. Tabs/control chars are passed through unchanged — the inline
+/// question paragraph widget renders them; this function only bounds length.
 fn clip_line(raw: &str, width: usize) -> String {
     let char_count = raw.chars().count();
     if char_count <= width {
