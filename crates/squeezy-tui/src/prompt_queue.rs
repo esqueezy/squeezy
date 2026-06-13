@@ -295,7 +295,11 @@ pub(crate) fn render_lines(
                     crate::render::theme::quiet()
                 }),
             ),
-            crate::prompt_queue_multiselect::marker_span(is_tagged),
+            if group_active {
+                crate::prompt_queue_multiselect::marker_span(is_tagged)
+            } else {
+                Span::raw("   ")
+            },
             crate::queue_groups::group_marker_span(group),
             crate::queue_conditions::condition_marker_span(condition, outcome),
             Span::raw(" "),
