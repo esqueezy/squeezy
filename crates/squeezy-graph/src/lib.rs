@@ -25,8 +25,8 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict,
-    VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler, filesystem_paths_match,
+    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict, PriorFileMeta,
+    PriorFileMetadata, VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler, filesystem_paths_match,
 };
 use tracing::{error, warn};
 
@@ -2583,7 +2583,11 @@ impl GraphManager {
             .as_ref()
             .map(|_| graph_store_metadata(&root, &crawl_options));
         let crawler = WorkspaceCrawler::try_new(crawl_options)?;
-        let snapshot = crawler.crawl(&root)?;
+        // Warm start: reuse the persisted per-file fingerprints so the crawl
+        // skips the full read+hash of files whose size and mtime are unchanged.
+        let prior_fingerprints = load_prior_fingerprints(store.as_deref(), store_metadata.as_ref());
+        let snapshot =
+            crawler.crawl_with_prior(&root, &prior_metadata_view(&prior_fingerprints))?;
         warn_case_collisions(&snapshot.files);
         let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
@@ -2837,7 +2841,16 @@ impl GraphManager {
             });
         }
 
-        let snapshot = self.crawler.crawl(&self.root)?;
+        // Incremental refresh re-crawls the whole workspace, but the vast
+        // majority of files are unchanged between refreshes. Feed the prior
+        // fingerprints in so unchanged files are stat-checked instead of fully
+        // re-read+hashed, keeping refresh cost proportional to the change set
+        // rather than the workspace size.
+        let prior_fingerprints =
+            load_prior_fingerprints(self.store.as_deref(), self.store_metadata.as_ref());
+        let snapshot = self
+            .crawler
+            .crawl_with_prior(&self.root, &prior_metadata_view(&prior_fingerprints))?;
         warn_case_collisions(&snapshot.files);
         let files_seen = snapshot.files.len();
         let coverage = snapshot.coverage.clone();
@@ -3250,6 +3263,84 @@ fn load_resolver_cache(
         entries_missed: 0,
         import_graph_loaded: true,
     })
+}
+
+/// Per-file fingerprint deserialised from a persisted graph partition. Only
+/// the fields the crawl's mtime/size fast-path needs are pulled out of the
+/// stored `ParsedFile` JSON; serde ignores everything else, so reading these
+/// is far cheaper than materialising the whole parse result.
+#[derive(Deserialize)]
+struct PersistedFingerprint {
+    file: PersistedFingerprintFile,
+}
+
+#[derive(Deserialize)]
+struct PersistedFingerprintFile {
+    relative_path: String,
+    hash: ContentHash,
+    size_bytes: u64,
+    modified_unix_millis: u128,
+}
+
+/// Owned prior-crawl fingerprints, keyed by relative path. Borrowed as a
+/// [`PriorFileMetadata`] when handed to the crawl.
+type PriorFingerprints = HashMap<String, (u64, u128, ContentHash)>;
+
+/// Load the prior crawl's per-file fingerprints so the next crawl can skip the
+/// full read+hash of unchanged files (see
+/// [`WorkspaceCrawler::crawl_with_prior`]).
+///
+/// Returns empty (forcing a from-scratch read+hash) when there is no store, no
+/// persisted metadata, or the persisted metadata no longer matches the current
+/// crawl options. The metadata gate mirrors [`load_persisted_partitions`]:
+/// when it does not match, the persisted partitions are stale and about to be
+/// cleared, so their fingerprints must not be trusted.
+fn load_prior_fingerprints(
+    store: Option<&GraphStore>,
+    expected_metadata: Option<&GraphStoreMetadata>,
+) -> PriorFingerprints {
+    let Some(store) = store else {
+        return PriorFingerprints::new();
+    };
+    let metadata_matches = match (store.graph_metadata(), expected_metadata) {
+        (Ok(Some(existing)), Some(expected)) => existing == *expected,
+        _ => false,
+    };
+    if !metadata_matches {
+        return PriorFingerprints::new();
+    }
+    match store.graph_partition_entries::<PersistedFingerprint>() {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|(_, fingerprint)| {
+                let file = fingerprint.file;
+                (
+                    file.relative_path,
+                    (file.size_bytes, file.modified_unix_millis, file.hash),
+                )
+            })
+            .collect(),
+        // A read or decode failure here only costs us the fast-path; the crawl
+        // still produces correct output by reading+hashing every file.
+        Err(_) => PriorFingerprints::new(),
+    }
+}
+
+/// Borrow the owned fingerprints as the map shape the crawl consumes.
+fn prior_metadata_view(fingerprints: &PriorFingerprints) -> PriorFileMetadata<'_> {
+    fingerprints
+        .iter()
+        .map(|(path, (size_bytes, modified_unix_millis, hash))| {
+            (
+                path.as_str(),
+                PriorFileMeta {
+                    size_bytes: *size_bytes,
+                    modified_unix_millis: *modified_unix_millis,
+                    hash,
+                },
+            )
+        })
+        .collect()
 }
 
 fn load_persisted_partitions(
