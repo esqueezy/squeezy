@@ -5253,12 +5253,16 @@ fn toggle_scratchpad(app: &mut TuiApp) {
 /// the buffer is blank, else a count plus the in-pane verb legend.
 fn scratchpad_open_status(app: &TuiApp) -> String {
     if app.scratchpad.is_empty() {
-        "scratchpad (empty) — type notes · Ctrl+L append selection · Esc/Alt+4 close".to_string()
+        format!(
+            "scratchpad (empty) — type notes · Ctrl+L append selection · Esc/{} close",
+            key_hint(app, keymap::Action::ToggleScratchpad)
+        )
     } else {
         format!(
-            "scratchpad: {} chars, {} lines — Ctrl+I insert to composer · Ctrl+Q queue · Esc close",
+            "scratchpad: {} chars, {} lines — Ctrl+I insert · Ctrl+Q queue · Ctrl+L append · Ctrl+K clear · Esc/{} close",
             app.scratchpad.char_count(),
             app.scratchpad.line_count(),
+            key_hint(app, keymap::Action::ToggleScratchpad),
         )
     }
 }
