@@ -9177,6 +9177,86 @@ async fn plan_mode_request_user_input_rejects_freeform_when_disallowed() {
 }
 
 #[tokio::test]
+async fn plan_mode_request_user_input_empty_choices_enables_freeform() {
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                // No choices and allow_freeform omitted: the schema advertises
+                // this as a free-form question, so the request must arrive with
+                // allow_freeform forced on rather than as an unanswerable modal.
+                arguments: json!({
+                    "question": "What should the new module be called?"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut saw_freeform_request = false;
+    let mut completed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested {
+                request,
+                response_tx,
+                ..
+            } => {
+                assert!(
+                    request.choices.is_empty(),
+                    "request carried choices it was not given"
+                );
+                assert!(
+                    request.allow_freeform,
+                    "an empty-choices question must enable freeform input"
+                );
+                saw_freeform_request = true;
+                let _ = response_tx.send(RequestUserInputResponse::freeform("widgets"));
+            }
+            AgentEvent::Completed { .. } => {
+                completed = true;
+                break;
+            }
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_freeform_request,
+        "agent must emit a request_user_input event for the empty-choices question"
+    );
+    assert!(
+        completed,
+        "turn must complete once the free-form answer is provided"
+    );
+}
+
+#[tokio::test]
 async fn build_mode_refuses_request_user_input_call() {
     use super::REQUEST_USER_INPUT_TOOL_NAME;
 

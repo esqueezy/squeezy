@@ -349,7 +349,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     break;
                 }
                 AgentEvent::RequestUserInputRequested {
-                    request,
+                    mut request,
                     response_tx,
                     ..
                 } => {
@@ -357,6 +357,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         let _ = previous
                             .response_tx
                             .send(RequestUserInputResponse::cancelled());
+                    }
+                    // A choices-less question is only answerable as free-form; force
+                    // it on so the modal always offers an answer box rather than an
+                    // unanswerable surface with no rows and no input.
+                    if request.choices.is_empty() {
+                        request.allow_freeform = true;
                     }
                     app.status = format!("plan-mode question: {}", request.question);
                     app.pending_request_user_input = Some(PendingRequestUserInput {

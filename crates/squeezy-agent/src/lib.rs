@@ -10430,22 +10430,28 @@ async fn handle_request_user_input_call(
         );
     }
 
+    let choices: Vec<RequestUserInputChoice> = args
+        .choices
+        .into_iter()
+        .map(|c| RequestUserInputChoice {
+            label: c.label,
+            value: c.value,
+        })
+        .collect();
+
+    // The schema advertises an empty/omitted choices array as a request for
+    // free-form input. Honour that contract so a model following it does not
+    // strand the user in a modal with neither choice rows nor an answer box.
+    let allow_freeform = args.allow_freeform || choices.is_empty();
+
     let request = RequestUserInputRequest {
         question,
-        choices: args
-            .choices
-            .into_iter()
-            .map(|c| RequestUserInputChoice {
-                label: c.label,
-                value: c.value,
-            })
-            .collect(),
-        allow_freeform: args.allow_freeform,
+        choices,
+        allow_freeform,
     };
     // Capture the question contract for post-response validation; the request
     // itself is moved into the event below.
     let offered_values: Vec<String> = request.choices.iter().map(|c| c.value.clone()).collect();
-    let allow_freeform = request.allow_freeform;
 
     let (response_tx, response_rx) = oneshot::channel::<RequestUserInputResponse>();
     if context
