@@ -34180,6 +34180,65 @@ async fn run_selected_next_escapes_a_paused_group_and_runs_the_chosen_prompt() {
 }
 
 #[tokio::test]
+async fn drain_prunes_group_membership_so_the_closed_strip_count_stays_truthful() {
+    // The queue strip renders the group summary even with the overlay closed, so
+    // the drain pump must prune a group's drained members as it goes — otherwise
+    // the strip shows a stale count (or a fully-drained ghost group) until the
+    // user next opens the overlay.
+    let mut app = queue_app(&["skip-me", "stay-grouped"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let id0 = queue_id_at(&app, 0);
+    let id1 = queue_id_at(&app, 1);
+    app.prompt_queue_groups
+        .create_group(&[id0, id1])
+        .expect("group both prompts");
+    assert_eq!(app.prompt_queue_groups.groups()[0].members.len(), 2);
+    // Front prompt: skip-bound after a success. Second: Manual so the pump parks
+    // at it after the drop without spawning a turn.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle front to if-failed");
+    }
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle second to manual");
+    }
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(app.turn_rx.is_none(), "no turn spawned by the skip-drop");
+    // The dropped member was pruned from the group: the strip count is now 1.
+    assert_eq!(
+        app.prompt_queue_groups.groups()[0].members.len(),
+        1,
+        "the drained member is pruned from the group"
+    );
+    assert!(
+        app.prompt_queue_groups.group_of_item(id1).is_some(),
+        "the surviving member still belongs to the group"
+    );
+}
+
+#[tokio::test]
 async fn condition_skip_drop_is_recoverable_via_queue_undo() {
     // A condition-skip drop (an `IfPrevFailed` prompt after a SUCCEEDED turn)
     // silently removes a prompt the user wrote. The drain pump must record it on

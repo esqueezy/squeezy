@@ -24438,11 +24438,13 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
     while app.turn_rx.is_none() && !prompt_queue_drain_blocked(app) {
         // Keep the id sidecar aligned before consulting the group/condition models
         // so a front-drain since the last tick can't stale the pause / condition
-        // lookup. Prune conditions for any drained id too, so the gate never reads
-        // a phantom condition.
+        // lookup. Prune conditions and group membership for any drained id too, so
+        // the gate never reads a phantom condition and the closed-overlay queue
+        // strip never shows a stale member count or an emptied group.
         sync_queue_ids(app);
         let live_ids = queue_live_ids(app);
         app.prompt_queue_conditions.retain_live(&live_ids);
+        app.prompt_queue_groups.retain_live(&live_ids);
         match queue_drain_action(app) {
             queue_conditions::DrainAction::Run(index) => {
                 let Some(next) = app.prompt_queue.remove(index) else {
