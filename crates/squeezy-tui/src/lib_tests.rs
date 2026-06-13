@@ -48799,6 +48799,69 @@ fn screen_selection_works_on_the_config_page() {
     );
 }
 
+#[test]
+fn drag_from_a_clickable_row_retroactively_selects_text() {
+    // A press on an interactive row fires its click on Down (no selection yet);
+    // moving the pointer before release turns the gesture into a text selection.
+    // Driven on the clipboard-history picker, whose entry rows are click-targets.
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history.record("ENTRY payload text", "entry");
+    app.clipboard_history_open = true;
+    let _ = render_full_to_buffer(&app, 80, 30);
+
+    // A cell that is chrome AND a registered clipboard-entry click-target.
+    let mut spot = None;
+    'outer: for row in 0..30u16 {
+        for col in 0..80u16 {
+            if cell_is_chrome(&app, col, row)
+                && matches!(
+                    app.click_target_at(col, row),
+                    Some((interaction::TargetKey::ClipboardEntry(_), _))
+                )
+            {
+                spot = Some((col, row));
+                break 'outer;
+            }
+        }
+    }
+    let (col, row) = spot.expect("the picker has a clickable entry row");
+
+    // Press: the picker handles the click; no screen selection is armed.
+    handle_mouse(&mut app, left_down(col, row, KeyModifiers::NONE));
+    assert!(
+        app.screen_selection.is_none(),
+        "a press on a clickable row fires its click, not a selection",
+    );
+
+    // Drag off the press cell: retroactively becomes a text selection.
+    handle_mouse(&mut app, left_drag(col.saturating_add(4), row));
+    assert!(
+        app.screen_selection.is_some(),
+        "dragging from a clickable row selects its text",
+    );
+}
+
+#[test]
+fn retroactive_drag_arm_does_not_hijack_a_transcript_selection() {
+    // The guard: while a transcript selection is live, a drag must extend THAT
+    // selection (app.selection), never spawn a screen-buffer selection.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("selectable body text here"));
+    let buffer = render_full_to_buffer(&app, 60, 24);
+    let (tx, ty) = find_text_cell(&buffer, "selectable body").expect("painted");
+
+    handle_mouse(&mut app, left_down(tx, ty, KeyModifiers::NONE));
+    assert!(
+        app.selection.is_some(),
+        "transcript press armed its selection"
+    );
+    handle_mouse(&mut app, left_drag(tx + 5, ty));
+    assert!(
+        app.screen_selection.is_none(),
+        "the retroactive arm must not hijack a live transcript selection",
+    );
+}
+
 // =====================================================================
 // Composer native-grade cursor motion: ⌘ line, ⌘↑↓ / Ctrl+Home/End doc,
 // with Shift-extend.
