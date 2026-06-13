@@ -33489,6 +33489,14 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     None
 }
 
+/// True when the only active work is the blocking `/diff` git snapshot — no
+/// model turn is running. This snapshot runs on `spawn_blocking` with no
+/// cancellation token, so Esc cannot interrupt it; the working line must not
+/// advertise an interrupt affordance in this state.
+fn diff_only_active(app: &TuiApp) -> bool {
+    app.pending_diff.is_some() && app.turn_rx.is_none() && app.cancel.is_none()
+}
+
 fn turn_in_progress(app: &TuiApp) -> bool {
     app.turn_rx.is_some()
         || app.cancel.is_some()
@@ -33566,11 +33574,14 @@ fn working_line(app: &TuiApp) -> Line<'static> {
     } else {
         working_word_spans(app)
     });
+    let duration = format_turn_duration(current_turn_duration(app));
+    let progress = if diff_only_active(app) {
+        format!(" ({duration})")
+    } else {
+        format!(" ({duration} • esc to interrupt)")
+    };
     spans.push(Span::styled(
-        format!(
-            " ({} • esc to interrupt)",
-            format_turn_duration(current_turn_duration(app))
-        ),
+        progress,
         Style::default().fg(crate::render::theme::quiet()),
     ));
     if let Some(call) = app

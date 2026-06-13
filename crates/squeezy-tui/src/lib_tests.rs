@@ -3429,6 +3429,40 @@ async fn cancelled_turn_with_no_partial_adds_no_assistant_item() {
     );
 }
 
+#[test]
+fn working_line_omits_interrupt_hint_during_diff_only() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = tokio::sync::oneshot::channel::<PendingDiffResult>();
+    app.pending_diff = Some(rx);
+    app.pending_diff_started_at = Some(Instant::now());
+
+    let text: String = working_line(&app)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        !text.contains("esc to interrupt"),
+        "the uninterruptible diff snapshot must not advertise an interrupt: {text:?}",
+    );
+}
+
+#[test]
+fn working_line_shows_interrupt_hint_during_model_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+
+    let text: String = working_line(&app)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        text.contains("esc to interrupt"),
+        "a live model turn must still advertise the interrupt affordance: {text:?}",
+    );
+}
+
 #[tokio::test]
 async fn status_line_cost_ticks_live_and_survives_cancel() {
     let mut app = test_app(SessionMode::Build);
