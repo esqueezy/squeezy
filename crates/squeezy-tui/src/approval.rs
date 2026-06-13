@@ -7,7 +7,9 @@
 //! Decision keys: `Y` / `Enter` approve once, `A` / `P` always allow
 //! for the project, `N` / `D` deny. The hint row leads with the primary
 //! verbs (`Enter` approve once, `A` always allow, `N` deny); `Y`, `P` and
-//! `D` stay bound as silent aliases for muscle-memory compatibility.
+//! `D` stay bound as silent aliases for muscle-memory compatibility. A
+//! persistent project-deny ("Never allow … in this repo") sits last in the
+//! menu, reachable with the arrow keys + `Enter`.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};

@@ -25216,6 +25216,7 @@ fn send_approval_decision(
         }
         ApprovalChoice::ApproveProject => format!("approved {tool_name} (session only)"),
         ApprovalChoice::Deny => format!("denied {tool_name}"),
+        ApprovalChoice::DenyProject => format!("saved repo deny for {tool_name}"),
     };
     true
 }
@@ -25225,6 +25226,7 @@ enum ApprovalChoice {
     Approve,
     ApproveProject,
     Deny,
+    DenyProject,
 }
 
 #[derive(Debug, Clone)]
@@ -25269,6 +25271,16 @@ fn approval_deny() -> ApprovalOption {
     )
 }
 
+fn approval_deny_project(request: &ToolApprovalRequest) -> ApprovalOption {
+    let (label, hint) = capability_project_deny_label(request);
+    ApprovalOption {
+        choice: ApprovalChoice::DenyProject,
+        label,
+        hint,
+        decision: ToolApprovalDecision::DenyRuleProject,
+    }
+}
+
 /// Build the per-capability allow/deny menu for a pending approval. The
 /// menu keeps the obvious one-shot decision first, then offers one
 /// project-scoped allow rule for users who want to persist the decision.
@@ -25292,20 +25304,22 @@ fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
         hint: project_hint,
         decision: ToolApprovalDecision::AllowRuleProject,
     };
-    vec![approval_once(), project, approval_deny()]
+    vec![
+        approval_once(),
+        project,
+        approval_deny(),
+        approval_deny_project(request),
+    ]
 }
 
-/// Returns `(project_label, project_hint)` for the persistent allow option.
-/// Each label names the capability-specific target (binary, host, MCP
-/// server/tool, write root) so the prompt makes the persisted rule shape
-/// visible without forcing the user to read the rule-preview line.
-fn capability_project_label(
+/// Extract the capability-specific scope name (binary, host, MCP server/tool,
+/// write/read path) together with its `(kind, hint_kind)` label words for this
+/// request, or `None` when no concrete scope is available (so the caller falls
+/// back to a generic label). Shared by the allow and deny project-rule labels
+/// so the two never drift in how they name a target.
+fn capability_scope_and_kind(
     request: &ToolApprovalRequest,
-) -> (
-    std::borrow::Cow<'static, str>,
-    std::borrow::Cow<'static, str>,
-) {
-    use std::borrow::Cow;
+) -> Option<(String, &'static str, &'static str)> {
     let permission = &request.permission;
     let scope_name: Option<String> = match permission.capability {
         PermissionCapability::Shell => permission
@@ -25342,20 +25356,14 @@ fn capability_project_label(
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => None,
     };
-    let Some(scope) = scope_name.and_then(|s| {
+    let scope = scope_name.and_then(|s| {
         let trimmed = s.trim().to_string();
         if trimmed.is_empty() || trimmed == "*" {
             None
         } else {
             Some(trimmed)
         }
-    }) else {
-        return (
-            Cow::Borrowed("Always approve this command in this repo"),
-            Cow::Borrowed("save a project rule"),
-        );
-    };
-    let scope_display = compact_text(&scope, 60);
+    })?;
     let (kind, hint_kind) = match permission.capability {
         PermissionCapability::Shell => ("command", "command"),
         PermissionCapability::Network => ("host", "host"),
@@ -25366,6 +25374,51 @@ fn capability_project_label(
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => unreachable!(),
     };
+    Some((scope, kind, hint_kind))
+}
+
+/// Returns `(deny_label, deny_hint)` for the persistent project-deny option,
+/// naming the same capability scope as the allow option so the two read as a
+/// matched pair.
+fn capability_project_deny_label(
+    request: &ToolApprovalRequest,
+) -> (
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+) {
+    use std::borrow::Cow;
+    let Some((scope, kind, hint_kind)) = capability_scope_and_kind(request) else {
+        return (
+            Cow::Borrowed("Never allow this command in this repo"),
+            Cow::Borrowed("save a project deny rule"),
+        );
+    };
+    let scope_display = compact_text(&scope, 60);
+    (
+        Cow::Owned(format!("Never allow {kind} {scope_display} in this repo")),
+        Cow::Owned(format!("save a project {hint_kind} deny rule")),
+    )
+}
+
+/// Returns `(project_label, project_hint)` for the persistent allow option.
+/// Each label names the capability-specific target (binary, host, MCP
+/// server/tool, write root) so the prompt makes the persisted rule shape
+/// visible without forcing the user to read the rule-preview line.
+fn capability_project_label(
+    request: &ToolApprovalRequest,
+) -> (
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+) {
+    use std::borrow::Cow;
+    let permission = &request.permission;
+    let Some((scope, kind, hint_kind)) = capability_scope_and_kind(request) else {
+        return (
+            Cow::Borrowed("Always approve this command in this repo"),
+            Cow::Borrowed("save a project rule"),
+        );
+    };
+    let scope_display = compact_text(&scope, 60);
     // On Windows, warn when the shell prefix being persisted is broad
     // (covers all commands run via pwsh, cmd, etc.) because the lower sandbox
     // tiers leave approval as the boundary for reads and/or network.
@@ -25828,7 +25881,7 @@ fn format_approval_menu_lines(
 /// they travel with the options they describe. The status line no longer
 /// carries them.
 fn approval_keybind_hint() -> &'static str {
-    "Up/Down choose · Enter approve once · A always allow · N deny · Esc cancel"
+    "Up/Down choose · Enter approve once · A always allow · N deny · ↓ for never allow · Esc cancel"
 }
 
 fn approval_footer_line() -> Line<'static> {

@@ -10229,6 +10229,62 @@ async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
 }
 
 #[test]
+fn approval_menu_offers_scope_aware_persistent_deny() {
+    let mut request = sample_approval_request();
+    request.permission.capability = PermissionCapability::Shell;
+    request.tool_name = "shell".to_string();
+    request
+        .permission
+        .metadata
+        .insert("binary".to_string(), "curl".to_string());
+
+    let options = approval_options_for(&request);
+    let deny_project = options
+        .iter()
+        .find(|opt| opt.decision == ToolApprovalDecision::DenyRuleProject)
+        .expect("persistent project-deny option missing");
+    assert_eq!(deny_project.choice, ApprovalChoice::DenyProject);
+    assert!(
+        deny_project
+            .label
+            .contains("Never allow command curl in this repo"),
+        "deny label should name the scope: {}",
+        deny_project.label
+    );
+}
+
+#[tokio::test]
+async fn approval_menu_sends_persistent_deny_from_last_option() {
+    let mut app = test_app(SessionMode::Build);
+    let request = sample_approval_request();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request,
+        decision_tx,
+    });
+
+    // Walk to the final (persistent-deny) menu entry, then confirm.
+    for _ in 0..3 {
+        assert!(handle_approval_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ));
+    }
+    assert_eq!(app.approval_selection_index, 3);
+    assert!(handle_approval_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    ));
+
+    assert_eq!(
+        decision_rx.await.expect("approval decision"),
+        ToolApprovalDecision::DenyRuleProject
+    );
+    assert!(app.pending_approval.is_none());
+    assert!(app.status.contains("saved repo deny"), "{}", app.status);
+}
+
+#[test]
 fn approval_menu_renders_below_prompt_without_border_box() {
     let mut app = test_app(SessionMode::Build);
     let request = sample_approval_request();
