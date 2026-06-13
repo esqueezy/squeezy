@@ -45685,11 +45685,20 @@ impl RepoStatus {
         if snapshot.vcs.kind != VcsKind::Git {
             return Self::none();
         }
+        // Reuse the snapshot's fallback-aware default branch (origin/HEAD ->
+        // init.defaultBranch -> origin/main -> origin/master -> main ->
+        // master) so the branch delta still resolves in local-only repos or
+        // ones missing origin/HEAD, instead of re-deriving it from a single
+        // origin/HEAD lookup.
+        let branch_changes = snapshot
+            .vcs
+            .default_branch
+            .as_deref()
+            .and_then(|default_branch| probe_branch_changes(workspace_root, default_branch));
         let branch = snapshot
             .vcs
             .branch
             .or_else(|| snapshot.vcs.head.map(|head| short_commit(&head)));
-        let branch_changes = probe_branch_changes(workspace_root);
         Self {
             branch,
             changed_files: snapshot.summary.files_changed,
@@ -45799,20 +45808,14 @@ fn probe_pull_request(workspace_root: &std::path::Path, branch: &str) -> Option<
     stdout.trim().parse::<u64>().ok()
 }
 
-/// Parse `git diff --shortstat <default>...HEAD` into `(added, removed)`.
-/// Returns `None` if not in a git repo, the default branch can't be
-/// determined, or git fails for any reason.
-fn probe_branch_changes(workspace_root: &std::path::Path) -> Option<(u32, u32)> {
+/// Parse `git diff --shortstat <default_branch>...HEAD` into
+/// `(added, removed)`. `default_branch` comes from the snapshot's
+/// fallback-aware resolution; returns `None` if git fails for any reason.
+fn probe_branch_changes(
+    workspace_root: &std::path::Path,
+    default_branch: &str,
+) -> Option<(u32, u32)> {
     use std::process::Command;
-    let default_branch = Command::new("git")
-        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        .current_dir(workspace_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
     let output = Command::new("git")
         .args(["diff", "--shortstat"])
         .arg(format!("{default_branch}...HEAD"))
