@@ -267,6 +267,9 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
     for path in path_list.iter().copied().take(4) {
         lines.push(plain_white(format!("✎ {path}")));
     }
+    if path_list.len() > 4 {
+        lines.push(dim(format!("… (+{} more file(s))", path_list.len() - 4)));
+    }
     if let Some(root) = permission.metadata.get("write_root") {
         lines.push(dim(format!("write root {root}")));
     }
