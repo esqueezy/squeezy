@@ -18146,7 +18146,7 @@ fn queue_cycle_condition_by_id(app: &mut TuiApp, id: u64) -> bool {
     app.status = if now.is_always() {
         "queued prompt runs always (condition cleared)".to_string()
     } else {
-        format!("queued prompt runs {} (§ condition)", now.label())
+        format!("queued prompt runs {} (condition set)", now.label())
     };
     app.needs_redraw = true;
     true
