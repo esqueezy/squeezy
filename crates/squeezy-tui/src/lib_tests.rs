@@ -3931,6 +3931,44 @@ async fn proposed_plan_block_opens_post_plan_choice_prompt() {
 }
 
 #[tokio::test]
+async fn build_mode_proposed_plan_tag_passes_through_untouched() {
+    // Outside Plan mode a literal <proposed_plan> tag is ordinary prose: it
+    // must stream verbatim with no plan card, no plan-choice modal, and no
+    // stripping of the surrounding narration.
+    let root = temp_workspace("build_plan_passthrough");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "before <proposed_plan>\nstep 1\n</proposed_plan> after".to_string(),
+    })
+    .await
+    .expect("send delta");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.pending_assistant.text(),
+        "before <proposed_plan>\nstep 1\n</proposed_plan> after",
+        "Build-mode delta must stream through verbatim"
+    );
+    assert!(
+        app.pending_plan_choice.is_none(),
+        "Build mode must not open a plan-choice modal"
+    );
+    let plan_cards = app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry.kind, TranscriptEntryKind::PlanCard(_)))
+        .count();
+    assert_eq!(plan_cards, 0, "Build mode must not push a plan card");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn completed_transcript_is_plan_free_after_stream_extraction() {
     let root = temp_workspace("completed_plan_free");
     let config = test_config_with_root(SessionMode::Plan, root.clone());

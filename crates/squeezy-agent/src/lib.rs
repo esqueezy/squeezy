@@ -8483,10 +8483,10 @@ impl TurnRuntime {
                 let visible_assistant_text = merge_retried_visible_assistant_text(
                     &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                    load_session_mode(&self.session_mode) == SessionMode::Plan,
                 );
-                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
-                    &visible_assistant_text,
-                ));
+                let message =
+                    TranscriptItem::assistant(self.display_assistant_text(&visible_assistant_text));
                 self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
@@ -8602,6 +8602,7 @@ impl TurnRuntime {
                         merge_retried_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         ),
                         raw_assistant_text,
                         &mut conversation,
@@ -8648,6 +8649,7 @@ impl TurnRuntime {
                         merge_retried_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         ),
                         raw_assistant_text,
                         &mut conversation,
@@ -8694,6 +8696,7 @@ impl TurnRuntime {
                         merge_retried_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         ),
                         raw_assistant_text,
                         &mut conversation,
@@ -8810,6 +8813,7 @@ impl TurnRuntime {
                     let preserved_visible_chars = append_deferred_visible_assistant_text(
                         &mut deferred_retry_visible_assistant,
                         &raw_assistant_text,
+                        load_session_mode(&self.session_mode) == SessionMode::Plan,
                     );
                     if !raw_assistant_text.trim().is_empty() {
                         conversation.push(redact_input_item(
@@ -8934,6 +8938,7 @@ impl TurnRuntime {
                         append_deferred_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         )
                     } else {
                         0
@@ -9029,10 +9034,10 @@ impl TurnRuntime {
                 let visible_assistant_text = merge_retried_visible_assistant_text(
                     &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                    load_session_mode(&self.session_mode) == SessionMode::Plan,
                 );
-                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
-                    &visible_assistant_text,
-                ));
+                let message =
+                    TranscriptItem::assistant(self.display_assistant_text(&visible_assistant_text));
                 self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
@@ -9144,6 +9149,7 @@ impl TurnRuntime {
                 let visible_assistant_text = merge_retried_visible_assistant_text(
                     &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                    load_session_mode(&self.session_mode) == SessionMode::Plan,
                 );
                 self.finish_soft_completion(
                     reason,
@@ -9367,6 +9373,7 @@ impl TurnRuntime {
         let visible_assistant_text = merge_retried_visible_assistant_text(
             &mut deferred_retry_visible_assistant,
             &raw_assistant_text,
+            load_session_mode(&self.session_mode) == SessionMode::Plan,
         );
         self.finish_soft_completion(
             format!("stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"),
@@ -9752,6 +9759,18 @@ impl TurnRuntime {
             .await;
     }
 
+    /// Assistant text as it should appear in the persisted/displayed
+    /// transcript. The structured Plan card owns proposed-plan rendering, so a
+    /// `<proposed_plan>` block is stripped while the turn ran in Plan mode.
+    /// Outside Plan mode the tag is ordinary prose and survives verbatim.
+    fn display_assistant_text(&self, visible: &str) -> String {
+        if load_session_mode(&self.session_mode) == SessionMode::Plan {
+            plan_mode::strip_proposed_plan_blocks(visible)
+        } else {
+            visible.to_string()
+        }
+    }
+
     /// Fail soft instead of emitting a zero-character answer.
     ///
     /// The repeated-tool-failure guard and the round-budget exhaustion path
@@ -9799,7 +9818,7 @@ impl TurnRuntime {
                 &self.redactor,
             ));
         }
-        let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(&answer));
+        let message = TranscriptItem::assistant(self.display_assistant_text(&answer));
         self.stamp_routing_savings(metrics);
         // Surface the partial-finish as Completed, not Failed: the user got
         // an answer, just an abbreviated one.
@@ -9872,7 +9891,7 @@ impl TurnRuntime {
         state.conversation = conversation.clone();
         state.transcript.push(user_transcript);
         state.transcript.push(TranscriptItem::assistant(
-            plan_mode::strip_proposed_plan_blocks(&visible_assistant_text),
+            self.display_assistant_text(&visible_assistant_text),
         ));
         let mut merged_compaction = context_compaction;
         merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
@@ -9907,9 +9926,9 @@ impl TurnRuntime {
                 &self.redactor,
             ));
         }
-        let assistant = TranscriptItem::assistant_cancelled(plan_mode::strip_proposed_plan_blocks(
-            &partial_assistant_text,
-        ));
+        let assistant = TranscriptItem::assistant_cancelled(
+            self.display_assistant_text(&partial_assistant_text),
+        );
         if !active_turn_is_current(&self.active_turn, self.turn_id) {
             return;
         }
@@ -13109,8 +13128,16 @@ fn is_control_tool_name(name: &str) -> bool {
     )
 }
 
-fn append_deferred_visible_assistant_text(deferred: &mut String, text: &str) -> usize {
-    let display_text = plan_mode::strip_proposed_plan_blocks(text);
+fn append_deferred_visible_assistant_text(
+    deferred: &mut String,
+    text: &str,
+    strip_plan: bool,
+) -> usize {
+    let display_text = if strip_plan {
+        plan_mode::strip_proposed_plan_blocks(text)
+    } else {
+        text.to_string()
+    };
     if display_text.trim().is_empty() {
         return 0;
     }
@@ -13122,9 +13149,17 @@ fn append_deferred_visible_assistant_text(deferred: &mut String, text: &str) -> 
     visible.chars().count()
 }
 
-fn merge_retried_visible_assistant_text(deferred: &mut String, final_text: &str) -> String {
+fn merge_retried_visible_assistant_text(
+    deferred: &mut String,
+    final_text: &str,
+    strip_plan: bool,
+) -> String {
     let prior = std::mem::take(deferred);
-    let final_display = plan_mode::strip_proposed_plan_blocks(final_text);
+    let final_display = if strip_plan {
+        plan_mode::strip_proposed_plan_blocks(final_text)
+    } else {
+        final_text.to_string()
+    };
     if prior.trim().is_empty() {
         return final_display;
     }

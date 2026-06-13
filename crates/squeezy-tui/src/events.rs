@@ -80,6 +80,14 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
+                    // Proposed-plan extraction is a Plan-mode contract. In Build
+                    // mode a literal <proposed_plan> tag is ordinary prose (an
+                    // example, an explanation) and must pass through untouched —
+                    // never stripped or turned into a plan card.
+                    if app.mode != SessionMode::Plan {
+                        app.pending_assistant.push_delta(&delta);
+                        continue;
+                    }
                     let extracted = app.proposed_plan.feed(&delta);
                     if !extracted.passthrough.is_empty() {
                         app.pending_assistant.push_delta(&extracted.passthrough);
