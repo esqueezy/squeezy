@@ -15251,7 +15251,7 @@ async fn slash_feedback_previews_redacted_message_and_prompts_for_decision() {
         .await
     );
 
-    assert_eq!(app.status, "feedback ready: Enter send · Esc discard");
+    assert_eq!(app.status, "feedback ready: Enter/Y send · Esc/N discard");
     assert!(app.pending_feedback.is_some());
     let TranscriptEntryKind::Message(item) = &app.transcript.last().expect("preview").kind else {
         panic!("feedback preview should be a message entry");
@@ -15773,6 +15773,86 @@ async fn clipboard_history_keyboard_delete_and_clear() {
     .unwrap();
     assert!(app.clipboard_history.is_empty(), "the history was cleared");
     assert_eq!(app.status, "clipboard history cleared");
+}
+
+#[tokio::test]
+async fn clipboard_history_clear_confirms_before_wiping_pins() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let keep = app.clipboard_history.record("a", "entry");
+    app.clipboard_history.record("b", "entry");
+    app.clipboard_history.toggle_pin(keep);
+    app.clipboard_history_open = true;
+
+    // First `c` arms a confirm instead of wiping, because an entry is pinned.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.clipboard_history.len(), 2, "nothing wiped on first c");
+    assert_eq!(
+        app.status,
+        "press c again to wipe 1 pinned copy, Esc to cancel"
+    );
+
+    // A non-`c` key disarms the latch so a stray follow-up can't commit.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.clipboard_history.len(),
+        2,
+        "first c after disarm re-arms, never wipes",
+    );
+
+    // Two consecutive `c` presses commit the wipe, pins included.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.clipboard_history.is_empty(),
+        "second c wiped everything"
+    );
+    assert_eq!(app.status, "clipboard history cleared");
+}
+
+#[tokio::test]
+async fn clipboard_history_clear_empty_is_silent_no_op() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history_open = true;
+    app.status = "clipboard history (empty) — Esc to close".to_string();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.clipboard_history.is_empty());
+    assert_eq!(
+        app.status, "clipboard history (empty) — Esc to close",
+        "an empty-history c reports no false 'cleared' success",
+    );
 }
 
 #[tokio::test]
@@ -42729,6 +42809,48 @@ async fn command_palette_enter_runs_a_slash_command_into_the_composer() {
         "a parameter slash command is seeded into the composer with a trailing space",
     );
     assert_eq!(app.input_cursor, app.input.len());
+}
+
+#[tokio::test]
+async fn command_palette_slash_keeps_a_composer_draft_instead_of_overwriting_it() {
+    // Seeding a chosen slash command via `set_input` is a full replace, so it must
+    // not silently discard a half-typed prompt. With a real draft in the composer,
+    // running a slash command from the palette leaves the buffer untouched and tells
+    // the user to clear it first.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    input::set_input(&mut app, "draft I was typing".to_string());
+    app.command_palette_pending = Some(command_palette::PaletteRun::Slash {
+        name: "/help",
+        has_parameter: true,
+    });
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the armed slash command");
+
+    assert_eq!(
+        app.input, "draft I was typing",
+        "the half-typed draft survives the slash command",
+    );
+    assert!(
+        app.status.contains("composer has a draft"),
+        "the status warns the draft blocks the run: {}",
+        app.status,
+    );
+
+    // An empty composer (or one already holding a slash command) still parks the
+    // chosen command, so the guard only protects a real draft.
+    input::clear_input(&mut app);
+    app.command_palette_pending = Some(command_palette::PaletteRun::Slash {
+        name: "/help",
+        has_parameter: true,
+    });
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the armed slash command into an empty composer");
+    assert_eq!(app.input, "/help ");
 }
 
 #[tokio::test]
