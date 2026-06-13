@@ -34127,6 +34127,59 @@ async fn run_selected_next_bypasses_manual_condition_and_runs_the_chosen_prompt(
 }
 
 #[tokio::test]
+async fn run_selected_next_escapes_a_paused_group_and_runs_the_chosen_prompt() {
+    // Run-Selected-Next on a prompt inside a PAUSED group must run it: a paused
+    // group parks every member before its condition is even consulted, so the
+    // chosen prompt has to be pulled out of the group to drain. The rest of the
+    // batch stays parked.
+    let mut app = queue_app(&["batch-a", "batch-b", "loose"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let id_a = queue_id_at(&app, 0);
+    let id_b = queue_id_at(&app, 1);
+    app.prompt_queue_groups
+        .create_group(&[id_a, id_b])
+        .expect("group the first two");
+    let gid = app
+        .prompt_queue_groups
+        .group_id_of_item(id_b)
+        .expect("group id");
+    app.prompt_queue_groups.toggle_paused(gid);
+    assert!(app.prompt_queue_groups.is_item_paused(id_b));
+    // Focus the second member and run it next while idle.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    assert!(
+        queue_run_selected_next(&mut app),
+        "run-selected-next on a paused-group member should act"
+    );
+    // The chosen prompt is promoted to the front, escapes the paused gate, and
+    // the other batch member stays parked.
+    assert_eq!(
+        queue_id_at(&app, 0),
+        id_b,
+        "chosen prompt promoted to front"
+    );
+    assert!(
+        !app.prompt_queue_groups.is_item_paused(id_b),
+        "the chosen prompt left the paused group"
+    );
+    assert!(
+        app.prompt_queue_groups.is_item_paused(id_a),
+        "the rest of the batch stays parked"
+    );
+    assert!(app.auto_drain_queue, "idle run-selected-next arms the pump");
+    // Drive the real pump: the chosen prompt is dispatched, not parked.
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(app.turn_rx.is_some(), "the chosen prompt started a turn");
+    assert_eq!(
+        queue_texts(&app),
+        vec!["batch-a".to_string(), "loose".to_string()],
+        "only the chosen prompt drained; the parked batch member remains"
+    );
+}
+
+#[tokio::test]
 async fn condition_skip_drop_is_recoverable_via_queue_undo() {
     // A condition-skip drop (an `IfPrevFailed` prompt after a SUCCEEDED turn)
     // silently removes a prompt the user wrote. The drain pump must record it on

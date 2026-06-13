@@ -18481,6 +18481,11 @@ fn queue_run_selected_next(app: &mut TuiApp) -> bool {
     if let Some(id) = app.prompt_queue_ids.get(plan.from).copied() {
         app.prompt_queue_conditions
             .set(id, queue_conditions::QueueCondition::Always);
+        // A paused group parks every member before its condition is even
+        // consulted, so the cleared condition alone won't let the chosen prompt
+        // run. Pull just this prompt out of its group so it drains, leaving the
+        // rest of the batch parked.
+        app.prompt_queue_groups.remove_member(id);
     }
     let mut changed = false;
     if plan.moves {
