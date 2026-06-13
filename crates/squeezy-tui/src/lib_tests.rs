@@ -19093,6 +19093,51 @@ fn repo_status_starts_pending_then_drains_from_background() {
 }
 
 #[test]
+fn repo_status_publishes_local_before_pull_request() {
+    let config = test_config(SessionMode::Build);
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+
+    // Local git status lands first on `repo_status_rx`, carrying no PR
+    // number; the branch / changed-files show immediately even before the
+    // network `gh pr view` probe has resolved.
+    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+    status_tx
+        .send(RepoStatus {
+            branch: Some("feature".to_string()),
+            changed_files: 2,
+            operation: None,
+            available: true,
+            pull_request: None,
+            branch_changes: None,
+            pending: false,
+        })
+        .unwrap();
+    app.repo_status_rx = Some(status_rx);
+    drain_repo_status(&mut app);
+
+    assert!(!app.repo.pending);
+    assert_eq!(app.repo.branch.as_deref(), Some("feature"));
+    assert_eq!(app.repo.pull_request, None);
+
+    // The deferred PR probe then lands on its own channel and merges in
+    // without disturbing the already-published local status.
+    let (pr_tx, pr_rx) = tokio::sync::oneshot::channel();
+    pr_tx.send(Some(42u64)).unwrap();
+    app.repo_pr_rx = Some(pr_rx);
+    drain_repo_pr(&mut app);
+
+    assert_eq!(app.repo.branch.as_deref(), Some("feature"));
+    assert_eq!(app.repo.changed_files, 2);
+    assert_eq!(app.repo.pull_request, Some(42));
+}
+
+#[test]
 fn repo_status_handles_non_git_roots() {
     let config = AppConfig {
         workspace_root: std::env::temp_dir(),
@@ -19100,7 +19145,7 @@ fn repo_status_handles_non_git_roots() {
     };
 
     assert_eq!(
-        RepoStatus::detect_at(&config.workspace_root).compact(),
+        RepoStatus::detect_local_at(&config.workspace_root).compact(),
         "repo=none"
     );
 }

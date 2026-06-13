@@ -216,7 +216,7 @@ pub mod testing;
 pub(crate) use events::apply_mcp_status_update;
 pub(crate) use events::{
     drain_agent_events, drain_job_events, drain_pending_diff, drain_pending_mention_walk,
-    drain_plan_housekeeping, drain_repo_status,
+    drain_plan_housekeeping, drain_repo_pr, drain_repo_status,
 };
 #[cfg(test)]
 pub(crate) use input::set_input;
@@ -1008,11 +1008,28 @@ async fn run_inner_with_terminal(
     // largest contributor to time-to-interactive; nothing on the input
     // path depends on the result, so the status bar fills in once it lands.
     let (repo_status_tx, repo_status_rx) = oneshot::channel::<RepoStatus>();
+    let (repo_pr_tx, repo_pr_rx) = oneshot::channel::<Option<u64>>();
     let repo_status_root = config.workspace_root.clone();
     tokio::task::spawn_blocking(move || {
-        let _ = repo_status_tx.send(RepoStatus::detect_at(&repo_status_root));
+        // Publish the local git status (branch + changed files + branch
+        // delta) first so the status bar fills in immediately, then run the
+        // network `gh pr view` probe on its own channel where a slow or
+        // hung `gh` can only delay the PR number, never the local status.
+        let local = RepoStatus::detect_local_at(&repo_status_root);
+        let branch = local.branch.clone();
+        let available = local.available;
+        let _ = repo_status_tx.send(local);
+        let pull_request = if available {
+            branch
+                .as_deref()
+                .and_then(|b| probe_pull_request(&repo_status_root, b))
+        } else {
+            None
+        };
+        let _ = repo_pr_tx.send(pull_request);
     });
     app.repo_status_rx = Some(repo_status_rx);
+    app.repo_pr_rx = Some(repo_pr_rx);
     // Per-Workspace UI Profile (§12.7.4): restore the UI preferences remembered
     // for this workspace path (density, transcript detail, minimap pane, theme)
     // before the first paint, so the session opens exactly as the user left it
@@ -1135,6 +1152,7 @@ async fn run_inner_with_terminal(
         // therefore coalesces into a single frame.
         drain_plan_housekeeping(&mut app);
         drain_repo_status(&mut app);
+        drain_repo_pr(&mut app);
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
         if app.auto_drain_queue {
@@ -45652,10 +45670,14 @@ struct RepoStatus {
 }
 
 impl RepoStatus {
-    /// Run the repo-status probes against `workspace_root`. Spawns git/`gh`
-    /// subprocesses, so callers must keep this off the latency-critical
-    /// startup path (see the deferral in `run_inner_with_terminal`).
-    fn detect_at(workspace_root: &std::path::Path) -> Self {
+    /// Run the local-only repo-status probes against `workspace_root`. Spawns
+    /// git subprocesses (snapshot + branch diff) but never the network `gh`
+    /// probe, so the branch / changed-files / branch-delta fields publish
+    /// immediately and a slow `gh pr view` can't hold them hostage. The PR
+    /// number lands separately via [`probe_pull_request`]. Keep this off the
+    /// latency-critical startup path (see the deferral in
+    /// `run_inner_with_terminal`).
+    fn detect_local_at(workspace_root: &std::path::Path) -> Self {
         let Ok(vcs) = GitVcs::open(workspace_root) else {
             return Self::none();
         };
@@ -45667,16 +45689,13 @@ impl RepoStatus {
             .vcs
             .branch
             .or_else(|| snapshot.vcs.head.map(|head| short_commit(&head)));
-        let pull_request = branch
-            .as_deref()
-            .and_then(|b| probe_pull_request(workspace_root, b));
         let branch_changes = probe_branch_changes(workspace_root);
         Self {
             branch,
             changed_files: snapshot.summary.files_changed,
             operation: snapshot.vcs.operation_state,
             available: true,
-            pull_request,
+            pull_request: None,
             branch_changes,
             pending: false,
         }
@@ -45729,12 +45748,18 @@ fn short_commit(head: &str) -> String {
     head.chars().take(7).collect()
 }
 
+/// Bound on the `gh pr view` probe. A missing/unauthenticated/hung `gh`
+/// must never wedge the status bar's PR field, so the probe is killed past
+/// this deadline and the field stays `None`.
+const PULL_REQUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Look up the open pull-request number for `branch` via the `gh` CLI.
-/// Returns `None` if `gh` is missing, unauthenticated, or no open PR exists.
-/// Runs at startup; users see the result update across TUI restarts.
+/// Returns `None` if `gh` is missing, unauthenticated, no open PR exists, or
+/// the probe exceeds [`PULL_REQUEST_PROBE_TIMEOUT`]. Runs off the boot path
+/// on its own channel so local git status never waits on it.
 fn probe_pull_request(workspace_root: &std::path::Path, branch: &str) -> Option<u64> {
-    use std::process::Command;
-    let output = Command::new("gh")
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("gh")
         .arg("pr")
         .arg("view")
         .arg(branch)
@@ -45743,12 +45768,34 @@ fn probe_pull_request(workspace_root: &std::path::Path, branch: &str) -> Option<
         .arg("-q")
         .arg(".number")
         .current_dir(workspace_root)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let deadline = Instant::now() + PULL_REQUEST_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
     }
-    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut stdout = String::new();
+    use std::io::Read;
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
     stdout.trim().parse::<u64>().ok()
 }
 
@@ -46563,6 +46610,11 @@ pub(crate) struct TuiApp {
     /// subprocesses dominate time-to-interactive, so they run off the boot
     /// path and the status bar shows a neutral placeholder until this lands.
     pub(crate) repo_status_rx: Option<oneshot::Receiver<RepoStatus>>,
+    /// Receives the open pull-request number from the deferred `gh pr view`
+    /// probe. Separate from `repo_status_rx` so the network probe lands on
+    /// its own channel and a slow/hung `gh` only delays the PR number, never
+    /// the local branch / changed-files status.
+    pub(crate) repo_pr_rx: Option<oneshot::Receiver<Option<u64>>>,
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) approval_selection_index: usize,
@@ -47909,6 +47961,7 @@ impl TuiApp {
             notifications: VecDeque::new(),
             plan_housekeeping_rx: None,
             repo_status_rx: None,
+            repo_pr_rx: None,
             cancel: None,
             pending_approval: None,
             approval_selection_index: 0,

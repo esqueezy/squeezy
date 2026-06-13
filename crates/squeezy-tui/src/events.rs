@@ -873,11 +873,39 @@ pub(crate) fn drain_repo_status(app: &mut TuiApp) {
     };
     match rx.try_recv() {
         Ok(status) => {
+            // The local-only probe lands first and never carries a PR
+            // number; the deferred `gh pr view` result arrives separately on
+            // `repo_pr_rx`. Preserve a PR number that already landed (if the
+            // probes raced) rather than clobbering it back to `None`.
+            let pull_request = status.pull_request.or(app.repo.pull_request);
             app.repo = status;
+            app.repo.pull_request = pull_request;
             app.needs_redraw = true;
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
             app.repo_status_rx = Some(rx);
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+    }
+}
+
+/// Merge the deferred `gh pr view` result into the status bar once the
+/// network probe lands. Runs on its own channel so a slow/hung `gh` only
+/// delays the PR number, never the local branch / changed-files status that
+/// `drain_repo_status` already published.
+pub(crate) fn drain_repo_pr(app: &mut TuiApp) {
+    let Some(mut rx) = app.repo_pr_rx.take() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(pull_request) => {
+            if app.repo.pull_request != pull_request {
+                app.repo.pull_request = pull_request;
+                app.needs_redraw = true;
+            }
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            app.repo_pr_rx = Some(rx);
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
     }
