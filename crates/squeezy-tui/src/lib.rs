@@ -44222,6 +44222,37 @@ fn register_attention_indicator_target(app: &TuiApp, status_area: Rect) {
     );
 }
 
+/// Truncate `label` to at most `cells` display columns, appending an ellipsis
+/// when a cut is needed (the ellipsis itself costs one cell, so the result is
+/// never wider than `cells`). Width-aware so a wide-glyph (CJK / 2-cell) label
+/// is bounded by columns painted, not chars; used by the breadcrumb renderer's
+/// overflow branch so the deepest crumb stays on-surface rather than being
+/// clipped off the right edge by `Paragraph`.
+fn truncate_label_to_cells(label: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(label) <= cells {
+        return label.to_string();
+    }
+    if cells == 1 {
+        return "\u{2026}".to_string();
+    }
+    let budget = cells - 1;
+    let mut out = String::new();
+    let mut running = 0usize;
+    for ch in label.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if running + w > budget {
+            break;
+        }
+        out.push(ch);
+        running += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
 /// Paint the Clickable Breadcrumbs strip (§12.1.5) on a single `row` and register
 /// one [`interaction::ChromeKey::BreadcrumbCrumb`] click target per crumb. The
 /// trail is BUILT FRESH from the current model here (never cached), so it always
@@ -44294,6 +44325,8 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
     } else {
         // Root … deepest. Always show the first and last crumb; collapse the
         // middle to a single ellipsis so the trail still orients on a narrow row.
+        // The deepest crumb is then truncated to whatever columns remain so it —
+        // the user's current location — is never clipped off the right edge.
         if let Some(first) = model.get(0) {
             push_crumb(&mut spans, &mut crumb_rects, &mut col, 0, &first.label);
         }
@@ -44303,10 +44336,15 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
             col += 1;
         }
         if count > 1 {
-            push_sep(&mut spans, &mut col);
+            let used = col + UnicodeWidthStr::width(breadcrumbs::SEPARATOR);
+            let avail = width.saturating_sub(used);
             let last = count - 1;
-            if let Some(crumb) = model.get(last) {
-                push_crumb(&mut spans, &mut crumb_rects, &mut col, last, &crumb.label);
+            if avail > 0
+                && let Some(crumb) = model.get(last)
+            {
+                push_sep(&mut spans, &mut col);
+                let label = truncate_label_to_cells(&crumb.label, avail);
+                push_crumb(&mut spans, &mut crumb_rects, &mut col, last, &label);
             }
         }
     }
