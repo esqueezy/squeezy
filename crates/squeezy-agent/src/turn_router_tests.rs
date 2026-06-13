@@ -39,6 +39,10 @@ fn default_routing_config() -> RoutingConfig {
         extra_heuristic_verbs: Vec::new(),
         linux_sandbox_sensitive_parent:
             squeezy_core::DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT,
+        tier_effort: squeezy_core::DEFAULT_ROUTING_TIER_EFFORT,
+        effort_weak: None,
+        effort_medium: None,
+        effort_strong: None,
     }
 }
 

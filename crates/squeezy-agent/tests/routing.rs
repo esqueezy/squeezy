@@ -563,6 +563,64 @@ async fn cheap_provider_error_retries_once_on_parent() {
     );
 }
 
+#[tokio::test]
+async fn tier_effort_runs_weak_rung_at_low_effort() {
+    // With tier_effort on (default) and no user pin, a weak-routed turn runs at
+    // low reasoning effort — effort tracks the rung, not one global value.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
+    let agent = Agent::new(config_with_routing(), provider.clone());
+    let _ = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
+    assert_eq!(
+        requests[0].reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Low),
+        "weak rung runs at low effort under tier_effort"
+    );
+}
+
+#[tokio::test]
+async fn explicit_effort_pin_overrides_tier_effort() {
+    // A user /effort pin is a hard override on every rung.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
+    let mut config = config_with_routing();
+    config.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::High),
+        "an explicit effort pin wins over the rung default"
+    );
+}
+
+#[tokio::test]
+async fn tier_effort_off_keeps_provider_default_effort() {
+    // tier_effort=false restores the pre-feature behavior: no effort field
+    // (provider default) when the user hasn't pinned one.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
+    let mut config = config_with_routing();
+    config.routing.tier_effort = false;
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].reasoning_effort, None,
+        "tier_effort off sends no effort when unpinned"
+    );
+}
+
 // Guard against the test runtime hanging if the agent task gets stuck
 // in a route-then-cancel ping-pong. 30s is well above the agent's own
 // classification / judge / dispatch budget on any reasonable host.

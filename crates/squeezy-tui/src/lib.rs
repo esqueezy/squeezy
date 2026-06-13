@@ -45722,6 +45722,11 @@ pub(crate) struct TuiApp {
     /// events, surfaced as a `⤳tier` suffix in the status line, and cleared by
     /// `note_turn_finished`.
     pub(crate) active_routed_model: Option<String>,
+    /// The reasoning effort the live routed rung runs at (tier-effort), or
+    /// `None` when the rung uses the provider default. Set from `TurnRouted`,
+    /// shown live by the `reasoning-effort` status item, cleared by
+    /// `note_turn_finished`.
+    pub(crate) active_routed_effort: Option<squeezy_core::ReasoningEffort>,
     /// Mirror of `AppConfig::reasoning_effort`. `None` means "let the
     /// model choose"; the status-line `reasoning-effort` item hides
     /// itself in that case and shows the level (`low`, `medium`, …)
@@ -47370,6 +47375,7 @@ impl TuiApp {
             version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
             active_routed_model: None,
+            active_routed_effort: None,
             reasoning_effort: config.reasoning_effort,
             directory: compact_path(&config.workspace_root),
             language_summary,
@@ -47913,6 +47919,7 @@ impl TuiApp {
         // The routed-model badge describes the live turn only; the next turn
         // re-derives it from its own routing decision.
         self.active_routed_model = None;
+        self.active_routed_effort = None;
         // Best-effort off-tab attention surface; the in-terminal toast and
         // title glyph already cover the on-screen case. We ignore any IO
         // error here because failing to notify is strictly less important

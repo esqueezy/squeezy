@@ -6146,6 +6146,47 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Reasoning effort for the live routed rung. Effort is a cost lever orthogonal
+/// to model choice, so a routed turn runs each rung at the effort it warrants
+/// (weak→low … strong→high) instead of one global effort for every rung.
+///
+/// Precedence: an explicit user pin (`config.reasoning_effort`) always wins and
+/// behaves exactly as [`request_reasoning_effort`]. Otherwise, when tier-effort
+/// is enabled and routing is on, the rung's effort
+/// ([`RoutingConfig::effort_for_tier`] → [`ModelTier::default_effort`]) is used.
+/// With tier-effort off, or routing disabled, we fall back to the global path so
+/// behavior is unchanged. The capability gate runs against the LIVE routed
+/// `model` (not `config.model`), so a non-reasoning rung correctly drops the
+/// field even when the parent supports effort.
+fn request_reasoning_effort_for_tier(
+    config: &AppConfig,
+    provider_name: &str,
+    model: &str,
+    tier: ModelTier,
+) -> Option<squeezy_core::ReasoningEffort> {
+    let routing = &config.routing;
+    let effort = match config.reasoning_effort {
+        // User pin: hard override, every rung.
+        Some(pinned) => pinned,
+        // No pin, but tier-effort disabled or routing off: preserve the global
+        // (None → provider default) behavior.
+        None if !routing.tier_effort || !routing.enabled => return None,
+        // No pin: a per-tier override wins for any rung. With no override,
+        // cheaper rungs get their shallower default effort, but the Strong
+        // (parent) rung keeps the provider/model default — so enabling
+        // tier-effort never silently deepens (and raises the cost of)
+        // un-rerouted turns. Opt into a deeper flagship via `effort_strong`.
+        None => match routing.effort_for_tier(tier) {
+            Some(over) => over,
+            None if tier == ModelTier::Strong => return None,
+            None => tier.default_effort(),
+        },
+    };
+    capabilities_for(provider_name, model)
+        .filter(|capabilities| capabilities.reasoning_effort)
+        .map(|_| effort)
+}
+
 /// Effective reasoning effort for a spawned subagent of `kind`.
 ///
 /// Catalog roles override the parent's inherited global effort with their
@@ -6388,7 +6429,13 @@ impl TurnRuntime {
     /// it into `ConversationState` for resume, spawns telemetry, and emits the
     /// `TurnRouted` event. The caller updates `current_model` / `current_tier` /
     /// `on_cheap_turn` / re-arms the detector locally before calling this.
-    async fn emit_escalation(&self, from_model: String, to_model: String, reason_token: &str) {
+    async fn emit_escalation(
+        &self,
+        from_model: String,
+        to_model: String,
+        to_tier: ModelTier,
+        reason_token: &str,
+    ) {
         let sticky_remaining = {
             let mut state = self.routing_state.lock().expect("routing state lock");
             state
@@ -6402,6 +6449,12 @@ impl TurnRuntime {
             .set_routing_sticky_remaining_turns(sticky_remaining);
         self.telemetry
             .spawn(TelemetryEvent::routing_escalated(reason_token));
+        let effort = request_reasoning_effort_for_tier(
+            &self.config,
+            self.provider.name(),
+            &to_model,
+            to_tier,
+        );
         let _ = self
             .tx
             .send(AgentEvent::TurnRouted {
@@ -6409,6 +6462,7 @@ impl TurnRuntime {
                 from: from_model,
                 to: to_model,
                 reason: format!("escalated_{reason_token}"),
+                effort,
             })
             .await;
     }
@@ -7535,6 +7589,7 @@ impl TurnRuntime {
                         from: parent_model_str.clone(),
                         to: parent_model_str.clone(),
                         reason: "reroute_skipped_context".to_string(),
+                        effort: None,
                     })
                     .await;
                 on_cheap_turn = false;
@@ -7554,6 +7609,12 @@ impl TurnRuntime {
             if let Some(reason_label) = decision.reason_label() {
                 self.telemetry
                     .spawn(TelemetryEvent::routing_routed(&reason_label));
+                let effort = request_reasoning_effort_for_tier(
+                    &self.config,
+                    self.provider.name(),
+                    &current_model,
+                    current_tier,
+                );
                 let _ = self
                     .tx
                     .send(AgentEvent::TurnRouted {
@@ -7561,6 +7622,7 @@ impl TurnRuntime {
                         from: parent_model_str.clone(),
                         to: current_model.to_string(),
                         reason: reason_label,
+                        effort,
                     })
                     .await;
             }
@@ -7856,8 +7918,13 @@ impl TurnRuntime {
                     broker.metrics.tool_errors,
                     broker.metrics.budget_denials,
                 );
-                self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
-                    .await;
+                self.emit_escalation(
+                    from_model,
+                    to_model.to_string(),
+                    current_tier,
+                    reason.as_str(),
+                )
+                .await;
             }
             // Tell the model which rung it is on — and, after an escalation, tell
             // the strong model not to trust the weaker model's earlier work
@@ -7880,7 +7947,12 @@ impl TurnRuntime {
                 frequency_penalty: self.config.frequency_penalty,
                 presence_penalty: self.config.presence_penalty,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
-                reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
+                reasoning_effort: request_reasoning_effort_for_tier(
+                    &self.config,
+                    self.provider.name(),
+                    &current_model,
+                    current_tier,
+                ),
                 previous_response_id: previous_response_id.clone(),
                 cache_key: None,
                 cache: self.session_prompt_cache_key().into(),
@@ -8144,8 +8216,13 @@ impl TurnRuntime {
                                 broker.metrics.tool_errors,
                                 broker.metrics.budget_denials,
                             );
-                            self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
-                                .await;
+                            self.emit_escalation(
+                                from_model,
+                                to_model.to_string(),
+                                current_tier,
+                                reason.as_str(),
+                            )
+                            .await;
                         }
                     }
                     LlmEvent::Refusal { content } => {
@@ -8418,8 +8495,13 @@ impl TurnRuntime {
                     current_tier = ModelTier::Strong;
                     on_cheap_turn = false;
                     broker.metrics.escalated_to_parent = true;
-                    self.emit_escalation(from_model, parent_model_str.clone(), reason.as_str())
-                        .await;
+                    self.emit_escalation(
+                        from_model,
+                        parent_model_str.clone(),
+                        ModelTier::Strong,
+                        reason.as_str(),
+                    )
+                    .await;
                     continue;
                 }
                 // Terminal stream error after retries are exhausted (most
@@ -9204,8 +9286,13 @@ impl TurnRuntime {
                         broker.metrics.tool_errors,
                         broker.metrics.budget_denials,
                     );
-                    self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
-                        .await;
+                    self.emit_escalation(
+                        from_model,
+                        to_model.to_string(),
+                        current_tier,
+                        reason.as_str(),
+                    )
+                    .await;
                 }
             }
 
@@ -18593,12 +18680,15 @@ pub enum AgentEvent {
     /// used; `to` is the model the next round will dispatch on; `reason`
     /// is a short stable token (`heuristic_slam_dunk_<rule>`,
     /// `llm_judge`, `user_explicit`, `escalated_<signal>`) so TUI and
-    /// eval consumers can match on it without parsing prose.
+    /// eval consumers can match on it without parsing prose. `effort` is the
+    /// reasoning effort the `to` rung will run at (tier-effort), or `None` when
+    /// the rung uses the provider default — surfaced as a live indicator.
     TurnRouted {
         turn_id: TurnId,
         from: String,
         to: String,
         reason: String,
+        effort: Option<squeezy_core::ReasoningEffort>,
     },
 }
 
