@@ -15251,7 +15251,7 @@ async fn slash_feedback_previews_redacted_message_and_prompts_for_decision() {
         .await
     );
 
-    assert_eq!(app.status, "feedback ready: Enter send · Esc discard");
+    assert_eq!(app.status, "feedback ready: Enter/Y send · Esc/N discard");
     assert!(app.pending_feedback.is_some());
     let TranscriptEntryKind::Message(item) = &app.transcript.last().expect("preview").kind else {
         panic!("feedback preview should be a message entry");

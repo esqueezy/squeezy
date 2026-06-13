@@ -22127,7 +22127,7 @@ async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                     feedback.message
                 );
                 app.pending_feedback = Some(feedback);
-                app.status = "feedback ready: Enter send · Esc discard".to_string();
+                app.status = "feedback ready: Enter/Y send · Esc/N discard".to_string();
                 app.push_transcript_item(TranscriptItem::system(preview));
             }
             Err(error) => set_status_notice(app, format!("feedback preview failed: {error}")),
