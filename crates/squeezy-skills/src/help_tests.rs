@@ -457,6 +457,28 @@ fn slash_command_help_table_has_no_duplicate_names() {
 }
 
 #[test]
+fn tui_topic_summary_does_not_advertise_unregistered_commands() {
+    // The `tui` topic summary hand-lists the slash vocabulary and cannot import
+    // the live registry across crates, so it drifts. Guard the two failure modes:
+    // it must not name commands the registry never had (or hides from the menu),
+    // and it must name commands that have since been added.
+    let help = SqueezyHelp::new("");
+    let body = help.answer_topic("tui").render_markdown();
+    for phantom in ["/attachments", "/detach", "/skill"] {
+        assert!(
+            !body.contains(phantom),
+            "tui summary must not advertise {phantom}, which is not in the slash menu: {body}"
+        );
+    }
+    for present in ["/bundle", "/export", "/statusline", "/mcp", "/terminal"] {
+        assert!(
+            body.contains(present),
+            "tui summary must list the registered command {present}: {body}"
+        );
+    }
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = bundled_doc_paths().into_iter().collect::<BTreeSet<_>>();
     let topics = [
