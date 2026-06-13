@@ -500,7 +500,7 @@ const W3_THEMES = [
   { key: '12.6-clipboard', phase: 'After Phase 5', units: [
     'clipboard.rs core: history ring buffer + OSC52 (limit/chunk) + pbcopy/wl-copy/xclip/clip.exe + temp-file provider chain, trace-testable without a live clipboard',
     'paste detection heuristics (diff/json/log/code/path) + transform preview modal (plain/quote/code/attach/queue/cancel) via interaction+modal; bracketed-paste safe',
-    'large-paste staging: threshold + temp-backed store + overlay (byte/line/token estimates) + insert/quote/code/tempfile/attach/queue/split/summarize actions',
+    'large-paste inline question: threshold + bounded preview (byte/line/token estimates) + accept/discard in the shared below-composer prompt band',
     'export request/format/destination + atomic writers + redaction pass + preview modal (text/md/json/html) over transcript_surface rows',
     'external editor handoff in terminal_guard.rs: leave alt-screen, restore modes, spawn $VISUAL/$EDITOR (POSIX+Windows PATHEXT), diff/summary re-import, signal/panic cleanup',
     'session bundle: manifest schema + isolated atomic writer + checksum + sanitization + preview modal' ] },

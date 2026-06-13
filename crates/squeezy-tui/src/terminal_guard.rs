@@ -489,10 +489,10 @@ impl TerminalGuard {
 
         // 2. Run the editor on a temp file under the platform temp dir (never a
         //    hardcoded /tmp). A dedicated monotonic counter + the pid keep the
-        //    leaf unique; it is bumped per staging so back-to-back handoffs do
+        //    leaf unique; it is bumped per handoff so back-to-back editor runs do
         //    not collide (the queue id counter only advances on enqueue/sync).
-        let seq = app.next_temp_file_nonce;
-        app.next_temp_file_nonce += 1;
+        let seq = app.editor_handoff_temp_nonce;
+        app.editor_handoff_temp_nonce += 1;
         let dir = std::env::temp_dir();
         let outcome = editor_handoff::run_handoff(
             &request.command,
