@@ -484,6 +484,10 @@ jobs:
         # coverage rises.
         env:
           MIN_LINE_COVERAGE: "72"
+          # Deepest async agent/harness tests overflow the default ~2 MiB
+          # libtest thread stack on every platform; nextest forwards this env
+          # to each test process.
+          RUST_MIN_STACK: "16777216"
         run: |
           set -o pipefail
           status=0
