@@ -29513,11 +29513,15 @@ fn render_related_links_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
     let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(1);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, relation) in relations.iter().enumerate().take(rows) {
+    // Scroll the relation list so the selected row stays visible when an entry has
+    // more relations than fit the modal — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, relation) in relations.iter().enumerate().skip(first).take(rows) {
+        let index = offset;
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (offset - first) as u16,
             width: inner.width,
             height: 1,
         };
@@ -29637,11 +29641,21 @@ fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, span) in app.duplicate_folds.spans().iter().enumerate().take(rows) {
+    // Scroll the fold list so the selected row stays visible when detected folds
+    // exceed the visible rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (index, span) in app
+        .duplicate_folds
+        .spans()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (index - first) as u16,
             width: inner.width,
             height: 1,
         };
@@ -29667,7 +29681,7 @@ fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             ),
             Span::styled(format!("{state} "), label_style),
             Span::styled(
-                format!("{:<18}", format!("x{} output", span.count())),
+                format!("{:<18}", format!("x{} outputs", span.count())),
                 label_style,
             ),
             Span::styled(
@@ -29744,11 +29758,22 @@ fn render_error_lens_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, lens) in app.error_lenses.lenses().iter().enumerate().take(rows) {
+    // Scroll the lens list so the selected row stays visible when lenses exceed the
+    // visible rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, lens) in app
+        .error_lenses
+        .lenses()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
+        let index = offset;
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (offset - first) as u16,
             width: inner.width,
             height: 1,
         };
@@ -29866,11 +29891,21 @@ fn render_health_markers_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, marker) in app.health_markers.markers().iter().enumerate().take(rows) {
+    // Scroll the marker list so the selected row stays visible when markers exceed
+    // the visible rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (index, marker) in app
+        .health_markers
+        .markers()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (index - first) as u16,
             width: inner.width,
             height: 1,
         };

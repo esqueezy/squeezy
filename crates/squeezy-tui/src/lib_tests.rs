@@ -38143,7 +38143,7 @@ async fn duplicate_folds_alt_u_opens_overlay_and_lists_folds() {
     assert_eq!(app.duplicate_folds.spans()[0].count(), 3, "three members");
     assert_eq!(app.duplicate_folds.hidden_count(), 2, "two hidden");
     // The summary appears in the header and a row shows the fold count.
-    assert!(out.contains("x3 output"), "fold count row:\n{out}");
+    assert!(out.contains("x3 outputs"), "fold count row:\n{out}");
 }
 
 #[tokio::test]
