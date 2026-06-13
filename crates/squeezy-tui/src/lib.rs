@@ -32373,9 +32373,10 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
         return;
     }
 
-    // Clamp the cursor to the visible count so a command that vanished (e.g. after a
-    // query change) can never leave the cursor past the end.
-    let selected = palette.selected().min(visible_count - 1);
+    // Clamp the cursor to the already-computed visible count so a command that
+    // vanished (e.g. after a query change) can never leave the cursor past the end,
+    // without re-scoring every entry a second time this frame.
+    let selected = palette.selected_within(visible_count);
     let list_top = inner.y.saturating_add(3);
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
