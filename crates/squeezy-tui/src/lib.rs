@@ -25164,6 +25164,7 @@ fn format_request_user_input_menu_lines(
     request: &RequestUserInputRequest,
     selected: usize,
     input: &str,
+    answer_cursor: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![{
         let mut spans = vec![Span::styled(
@@ -25252,14 +25253,19 @@ fn format_request_user_input_menu_lines(
                 Style::default().fg(crate::render::theme::quiet()),
             ));
         } else {
-            // Render the answer with an inline cursor block. The cursor
-            // sits at `answer_cursor` bytes, which we don't have here —
-            // approximate by drawing the whole answer followed by a
-            // block. Accurate cursor placement is the caller's job; for
-            // now this gives the user a visible "I'm typing in the right
-            // box" affordance.
-            spans.push(Span::styled(compact_text(input, 200), entry_style));
+            // Render the answer with an inline cursor block at the real
+            // edit position. Split the raw answer at the byte cursor and
+            // compact each half independently so the block lands exactly
+            // where the user is typing, even mid-text.
+            let mut cursor = answer_cursor.min(input.len());
+            while cursor > 0 && !input.is_char_boundary(cursor) {
+                cursor -= 1;
+            }
+            let head = compact_text(&input[..cursor], 200);
+            let tail = compact_text(&input[cursor..], 200);
+            spans.push(Span::styled(head, entry_style));
             spans.push(Span::styled("▌", cursor_style));
+            spans.push(Span::styled(tail, entry_style));
         }
         lines.push(Line::from(spans));
     }
@@ -33094,6 +33100,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
                 &pending.request,
                 pending.selection_index,
                 &pending.answer,
+                pending.answer_cursor,
             ),
             width,
         )
@@ -33150,6 +33157,7 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
             &pending.request,
             pending.selection_index,
             &pending.answer,
+            pending.answer_cursor,
         )
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         format_plan_choice_menu_lines(pending)

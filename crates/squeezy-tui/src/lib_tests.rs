@@ -9312,7 +9312,7 @@ fn plan_mode_question_marks_freeform_answer_when_selected() {
         allow_freeform: true,
     };
 
-    let lines = format_request_user_input_menu_lines(&request, request.choices.len(), "lm");
+    let lines = format_request_user_input_menu_lines(&request, request.choices.len(), "lm", 2);
     let answer = lines
         .iter()
         .find(|line| {
@@ -9353,7 +9353,7 @@ fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
         allow_freeform: false,
     };
 
-    let lines = format_request_user_input_menu_lines(&request, 0, "");
+    let lines = format_request_user_input_menu_lines(&request, 0, "", 0);
     let selected = lines
         .iter()
         .find(|line| {
