@@ -796,14 +796,19 @@ fn credential_check(inline: Option<&str>, env_name: &str) -> (Status, String) {
                 key_source_label(resolved.source, env_name)
             ),
         ),
-        Err(_) => (
-            Status::Warn,
-            format!(
-                "{env_name} not set; export it, set [providers.<name>] api_key = \"…\" in \
-                 ~/.squeezy/settings.toml, or run `squeezy auth set <provider>`"
-            ),
-        ),
+        Err(_) => (Status::Warn, missing_key_remediation(env_name)),
     }
+}
+
+/// Actionable remediation shown when no credential resolves for a
+/// provider: names the canonical env var and the three ways to supply a
+/// key. Shared so the credential row and the live-probe skip row speak
+/// with one voice instead of the probe path's bare "env var is unset".
+fn missing_key_remediation(env_name: &str) -> String {
+    format!(
+        "{env_name} not set; export it, set [providers.<name>] api_key = \"…\" in \
+         ~/.squeezy/settings.toml, or run `squeezy auth set <provider>`"
+    )
 }
 
 const DEFAULT_OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
@@ -2686,22 +2691,30 @@ pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String
     };
     match provider {
         ProviderConfig::OpenAi(c) => {
-            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
-            probe_openai_compatible(&client, &c.base_url, key, None).await
+            let Some(key) = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env) else {
+                return (Status::Warn, probe_skip_missing_key(&c.api_key_env));
+            };
+            probe_openai_compatible(&client, &c.base_url, Some(key), None).await
         }
         ProviderConfig::Anthropic(c) => {
             // Anthropic added `GET /v1/models` in 2024; reuse the same shape
             // as OpenAI-compatible, but with the `x-api-key` header.
-            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
-            probe_anthropic(&client, &c.base_url, key).await
+            let Some(key) = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env) else {
+                return (Status::Warn, probe_skip_missing_key(&c.api_key_env));
+            };
+            probe_anthropic(&client, &c.base_url, Some(key)).await
         }
         ProviderConfig::Google(c) => {
-            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
-            probe_google(&client, &c.base_url, key).await
+            let Some(key) = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env) else {
+                return (Status::Warn, probe_skip_missing_key(&c.api_key_env));
+            };
+            probe_google(&client, &c.base_url, Some(key)).await
         }
         ProviderConfig::AzureOpenAi(c) => {
-            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
-            probe_azure_openai(&client, &c.base_url, &c.api_version, key).await
+            let Some(key) = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env) else {
+                return (Status::Warn, probe_skip_missing_key(&c.api_key_env));
+            };
+            probe_azure_openai(&client, &c.base_url, &c.api_version, Some(key)).await
         }
         ProviderConfig::Bedrock(_) => (
             Status::Warn,
@@ -2730,8 +2743,10 @@ pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String
             for (key, value) in &c.extra_headers {
                 extra.push((key.as_str(), value.as_str()));
             }
-            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
-            probe_openai_compatible(&client, &c.base_url, key, Some(extra)).await
+            let Some(key) = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env) else {
+                return (Status::Warn, probe_skip_missing_key(&c.api_key_env));
+            };
+            probe_openai_compatible(&client, &c.base_url, Some(key), Some(extra)).await
         }
     }
 }
@@ -2744,6 +2759,14 @@ fn resolve_probe_key(inline: Option<&str>, env_name: &str) -> Option<String> {
     resolve_api_key_with_inline(inline, env_name)
         .ok()
         .map(|resolved| resolved.value)
+}
+
+/// Detail for the live-probe skip row when no credential resolves.
+/// Reuses [`missing_key_remediation`] so a scoped `--only probe:<provider>`
+/// run still hands the user the same actionable fix the credential row
+/// shows, instead of a dead-end "API key env var is unset".
+fn probe_skip_missing_key(env_name: &str) -> String {
+    format!("skipping probe: {}", missing_key_remediation(env_name))
 }
 
 async fn probe_openai_compatible(
