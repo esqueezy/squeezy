@@ -48703,6 +48703,41 @@ async fn cmd_left_right_jump_to_line_ends_in_multiline_composer() {
 }
 
 #[tokio::test]
+async fn ctrl_a_and_ctrl_e_jump_to_current_line_ends() {
+    // Emacs/readline caret motion — and the landing point for iTerm2's "Natural
+    // Text Editing" preset, which sends ⌘← as Ctrl+A and ⌘→ as Ctrl+E. Both are
+    // scoped to the CURRENT line, mirroring ⌘←/⌘→.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abc\ndefg".to_string()); // line 2 = bytes 4..8
+    app.input_cursor = 6; // within line 2
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL,
+    )
+    .await;
+    assert_eq!(
+        app.input_cursor, 8,
+        "Ctrl+E (⌘→ under Natural Text Editing) → current line end",
+    );
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL,
+    )
+    .await;
+    assert_eq!(
+        app.input_cursor, 4,
+        "Ctrl+A (⌘← under Natural Text Editing) → current line start",
+    );
+}
+
+#[tokio::test]
 async fn cmd_up_down_and_ctrl_home_end_jump_to_doc_ends() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
