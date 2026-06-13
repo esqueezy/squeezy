@@ -27326,7 +27326,7 @@ fn render_clipboard_history_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 24, title);
+    let inner = modal::surface(frame, area, 100, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -27556,7 +27556,7 @@ fn render_keybinding_editor_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 28, title);
+    let inner = modal::surface(frame, area, 100, 28, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -27785,7 +27785,7 @@ fn render_snippets_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 24, title);
+    let inner = modal::surface(frame, area, 100, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -28034,7 +28034,7 @@ fn render_templates_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 24, title);
+    let inner = modal::surface(frame, area, 100, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -28806,7 +28806,7 @@ fn render_theme_editor_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 78, 22, title);
+    let inner = modal::surface(frame, area, 78, 22, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29034,7 +29034,7 @@ fn render_workspace_profile_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 16, title);
+    let inner = modal::surface(frame, area, 72, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29169,7 +29169,7 @@ fn render_session_checkpoint_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 64, 14, title);
+    let inner = modal::surface(frame, area, 64, 14, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29396,7 +29396,7 @@ fn render_terminal_profile_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 16, title);
+    let inner = modal::surface(frame, area, 72, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29566,7 +29566,7 @@ fn render_gesture_settings_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 74, 18, title);
+    let inner = modal::surface(frame, area, 74, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29719,7 +29719,7 @@ fn render_glyph_mode_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 14, title);
+    let inner = modal::surface(frame, area, 72, 14, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29872,7 +29872,7 @@ fn render_smart_split_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 16, title);
+    let inner = modal::surface(frame, area, 72, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         app.smart_split_rect_cache.set(None);
         return;
@@ -30143,7 +30143,7 @@ fn render_transcript_index_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 18, title);
+    let inner = modal::surface(frame, area, 72, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30244,7 +30244,7 @@ fn render_related_links_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 18, title);
+    let inner = modal::surface(frame, area, 72, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30389,7 +30389,7 @@ fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 18, title);
+    let inner = modal::surface(frame, area, 72, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30506,7 +30506,7 @@ fn render_error_lens_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 20, title);
+    let inner = modal::surface(frame, area, 88, 20, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30639,7 +30639,7 @@ fn render_health_markers_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 20, title);
+    let inner = modal::surface(frame, area, 88, 20, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30761,7 +30761,7 @@ fn render_turn_outline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30923,7 +30923,7 @@ fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 92, 26, title);
+    let inner = modal::surface(frame, area, 92, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31091,7 +31091,7 @@ fn render_review_board_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 28, title);
+    let inner = modal::surface(frame, area, 100, 28, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31326,7 +31326,7 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 96, 26, title);
+    let inner = modal::surface(frame, area, 96, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31580,7 +31580,7 @@ fn render_subagent_compare_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
     ]);
     // Paint the modal box and clear behind it, then split the SAME inner rect the
     // off-frame geometry probe uses.
-    let _ = modal::surface(frame, area, 200, 60, title);
+    let _ = modal::surface(frame, area, 200, 60, title, app.glyph_mode);
     let inner = subagent_compare_inner(area);
     if inner.width == 0 || inner.height == 0 {
         app.subagent_compare_rect_cache.set(None);
@@ -31745,7 +31745,7 @@ fn render_changes_since_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 92, 26, title);
+    let inner = modal::surface(frame, area, 92, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31908,7 +31908,7 @@ fn render_action_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 56, 16, title);
+    let inner = modal::surface(frame, area, 56, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32036,7 +32036,7 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 20, title);
+    let inner = modal::surface(frame, area, 88, 20, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32397,7 +32397,7 @@ fn render_lane_fold_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32460,18 +32460,19 @@ fn render_lane_fold_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
         let body_shown = lane.body_visible();
         let caret = if is_selected { "\u{203a} " } else { "  " };
-        // The disclosure glyph (▼ expanded / ▶ collapsed) doubles with the
-        // textual "(hidden)" tag below so the fold state never relies on the glyph
-        // (or its color) alone. Both glyphs are in the accessibility chrome-glyph
-        // allow-list.
+        // The disclosure glyph (▼ expanded / ▶ collapsed) routes through the glyph
+        // tokens (§12.7.6), so an ASCII opt-in paints `v`/`>` instead of triangle
+        // tofu. It doubles with the textual "(hidden)" tag below so the fold state
+        // never relies on the glyph (or its color) alone.
+        let tokens = app.glyph_mode.tokens();
         let disclosure = if body_shown {
             Span::styled(
-                "\u{25bc} ",
+                format!("{} ", tokens.collapse),
                 Style::default().fg(crate::render::theme::secondary()),
             )
         } else {
             Span::styled(
-                "\u{25b6} ",
+                format!("{} ", tokens.expand),
                 Style::default().fg(crate::render::theme::quiet()),
             )
         };
@@ -32564,7 +32565,7 @@ fn render_bookmarks_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32716,7 +32717,7 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 92, 26, title);
+    let inner = modal::surface(frame, area, 92, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32893,7 +32894,7 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -33071,7 +33072,7 @@ fn render_editor_handoff_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 90, 22, title);
+    let inner = modal::surface(frame, area, 90, 22, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
