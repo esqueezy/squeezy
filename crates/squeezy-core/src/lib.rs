@@ -14886,7 +14886,7 @@ impl ContentHash {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileId(pub String);
 
 impl FileId {
