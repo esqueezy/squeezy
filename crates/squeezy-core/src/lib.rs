@@ -9995,12 +9995,15 @@ impl ToolOutputVerbosity {
 #[serde(rename_all = "snake_case")]
 pub enum ShellDiffInline {
     /// Render unified-diff output from shell commands in full, bypassing the
-    /// collapsed-card head/tail preview cap. Default — a `git diff` card is
-    /// only useful when every hunk is visible.
+    /// collapsed-card head/tail preview cap. Opt-in for users who want a
+    /// `git diff` the agent runs to show every hunk inline.
     Full,
     /// Keep shell-produced diffs on the same head/tail preview budget as
-    /// other shell output. For users who run `git diff` against large files
-    /// often enough that uncapped inline diffs overwhelm the transcript.
+    /// other shell output. Default — a `git diff` the agent runs to inspect
+    /// the tree is incidental noise, not a file modification the user needs
+    /// to review, so it collapses like any other shell output (the user can
+    /// still expand the card). Edits the agent makes (`apply_patch`,
+    /// `write_file`) keep their uncapped diff regardless.
     Folded,
 }
 
@@ -10269,8 +10272,8 @@ pub struct TuiConfig {
     /// slugs and unparseable specs are surfaced by the TUI when
     /// `/keymap` is invoked.
     pub keymap: BTreeMap<String, String>,
-    /// Whether `git diff`-style output from shell tools renders in full
-    /// (default) or stays under the collapsed-card head/tail preview cap.
+    /// Whether `git diff`-style output from shell tools stays under the
+    /// collapsed-card head/tail preview cap (default) or renders in full.
     pub shell_diff_inline: ShellDiffInline,
 }
 
@@ -10310,7 +10313,9 @@ impl TuiConfig {
             persist_prompt_history: settings.persist_prompt_history.unwrap_or(false),
             copy_on_select: settings.copy_on_select.unwrap_or(true),
             keymap: settings.keymap.unwrap_or_default(),
-            shell_diff_inline: settings.shell_diff_inline.unwrap_or(ShellDiffInline::Full),
+            shell_diff_inline: settings
+                .shell_diff_inline
+                .unwrap_or(ShellDiffInline::Folded),
         }
     }
 }

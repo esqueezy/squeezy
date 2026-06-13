@@ -12,8 +12,8 @@ Squeezy splits the dial three ways. Assistant text is governed by
 `ResponseVerbosity` (`/verbosity`). Inline preview of tool output in
 the transcript is governed by `ToolOutputVerbosity` (`/tool-verbosity`).
 Unified-diff stdout from shell commands has its own switch,
-`ShellDiffInline` (`tui.shell_diff_inline`), because `git diff` is the
-one tool whose value collapses if you head/tail-cap it. Each setting is
+`ShellDiffInline` (`tui.shell_diff_inline`), so a user who wants every
+hunk of a `git diff` the agent runs inline can opt into it. Each setting is
 session-scoped. Response verbosity can change the provider request
 (`text_verbosity` or a short prompt fragment); tool-output verbosity and
 shell-diff folding control transcript/TUI rendering and do not shrink
@@ -63,19 +63,22 @@ pub enum ToolOutputVerbosity {
 #[serde(rename_all = "snake_case")]
 pub enum ShellDiffInline {
     /// Render unified-diff output from shell commands in full, bypassing the
-    /// collapsed-card head/tail preview cap. Default — a `git diff` card is
-    /// only useful when every hunk is visible.
+    /// collapsed-card head/tail preview cap. Opt-in for users who want a
+    /// `git diff` the agent runs to show every hunk inline.
     Full,
     /// Keep shell-produced diffs on the same head/tail preview budget as
-    /// other shell output. For users who run `git diff` against large files
-    /// often enough that uncapped inline diffs overwhelm the transcript.
+    /// other shell output. Default — a `git diff` the agent runs to inspect
+    /// the tree is incidental noise, not a file modification the user needs
+    /// to review.
     Folded,
 }
 ```
 
-The docstrings carry the design call: default `Full` because head/tail
-truncation discards every intermediate hunk; `Folded` is an opt-in for
-users whose diffs are big enough to overwhelm the transcript.
+The docstrings carry the design call: default `Folded` because a `git diff`
+the agent runs is incidental inspection, not a file edit — it shouldn't push
+the transcript open by default. `Full` is the opt-in for users who want every
+hunk inline. Edits the agent makes (`apply_patch`/`write_file`) keep their
+uncapped diff regardless of this switch.
 
 ### Defaults
 
@@ -92,11 +95,11 @@ tool_output_verbosity: settings
     .tool_output_verbosity
     .unwrap_or(ToolOutputVerbosity::Compact),
 ...
-shell_diff_inline: settings.shell_diff_inline.unwrap_or(ShellDiffInline::Full),
+shell_diff_inline: settings.shell_diff_inline.unwrap_or(ShellDiffInline::Folded),
 ```
 
 Out of the box: assistant output is `Normal`, tool-output previews
-are `Compact` (smallest), shell diffs render in full.
+are `Compact` (smallest), shell diffs fold onto the normal preview cap.
 
 ### Slash command parsing
 
@@ -163,8 +166,8 @@ and on every settings hot-reload.
 ```rust
 // crates/squeezy-tui/src/lib.rs:146-167
 /// Process-wide override for `tui.shell_diff_inline`, pinned by the TuiApp
-/// at startup and re-applied on settings hot-reload. Encoded as `0 = Full
-/// (default)`, `1 = Folded`. A static lets the deeply-nested render path
+/// at startup and re-applied on settings hot-reload. Encoded as `0 = Folded
+/// (default)`, `1 = Full`. A static lets the deeply-nested render path
 /// consult the setting without threading it through every formatter, the
 /// same pattern the palette uses for tone/accent overrides.
 static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
@@ -172,8 +175,8 @@ static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
 
 fn shell_diff_inline_setting() -> ShellDiffInline {
     match SHELL_DIFF_INLINE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => ShellDiffInline::Folded,
-        _ => ShellDiffInline::Full,
+        1 => ShellDiffInline::Full,
+        _ => ShellDiffInline::Folded,
     }
 }
 ```
@@ -341,11 +344,14 @@ a `…` ellipsis sandwiched between three head and three tail lines.
 The full output stays on disk in the session log; if the model needs
 it later, `read_tool_output` returns it without re-streaming.
 
-If the user runs `git diff` during this session, the unified-diff
-detection in `shell_output_is_unified_diff` plus the default
-`ShellDiffInline::Full` causes the diff to render in full, bypassing
-the preview cap entirely — Compact for arbitrary noisy stdout, Full
-for the one stream where compaction defeats the purpose.
+If the agent runs `git diff` during this session, the unified-diff
+detection in `shell_output_is_unified_diff` fires, but under the default
+`ShellDiffInline::Folded` the diff stays on the same Compact head/tail
+preview cap as any other shell output — a diff the agent ran to inspect
+the tree is incidental noise, not a file edit the user must review (the
+user can still expand the card). Setting `ShellDiffInline::Full` opts
+into rendering such diffs in full, bypassing the preview cap. Edits the
+agent makes (`apply_patch`/`write_file`) bypass the cap regardless.
 
 ## Edge cases & limits
 
