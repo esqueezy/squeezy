@@ -13618,7 +13618,14 @@ fn toggle_command_palette(app: &mut TuiApp) {
         app.command_palette = None;
         app.status = "command palette closed".to_string();
     } else {
-        let palette = command_palette::CommandPalette::build(&app.keymap, app.turn_rx.is_some());
+        let palette = command_palette::CommandPalette::build(
+            &app.keymap,
+            app.turn_rx.is_some(),
+            input::SlashMenuVisibility {
+                checkpoints_enabled: app.checkpoints_enabled,
+                reviewer_enabled: app.reviewer_enabled,
+            },
+        );
         app.status = format!(
             "command palette: {} commands \u{00b7} type to filter \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter run \u{00b7} Esc close",
             palette.len(),
@@ -41533,8 +41540,38 @@ fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         .unwrap_or(0)
         .max(12);
     let task_active = turn_in_progress(app);
+    // Category headers are a browse-only affordance: shown for the bare-`/`
+    // list, suppressed the moment the user types a needle (the list is then a
+    // flat, fuzzy-ranked set where grouping would only scatter the best match).
+    let browsing = input::slash_menu_browsing(app);
+    let mut last_category: Option<input::SlashCategory> = None;
     let mut lines = Vec::new();
     for (index, command) in visible.iter().enumerate() {
+        // Emit a header whenever the group changes — including for the first
+        // visible row, so a window scrolled into the middle of a group still
+        // shows which group it is in. Headers are not selectable and do not
+        // consume a `slash_menu_index`, which keeps the selection/window math
+        // operating purely over commands.
+        if browsing {
+            let category = command.category();
+            if last_category != Some(category) {
+                last_category = Some(category);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        category.title(),
+                        Style::default()
+                            .fg(crate::render::theme::secondary())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", category.blurb()),
+                        Style::default()
+                            .fg(crate::render::theme::quiet())
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+        }
         let absolute_index =
             slash_menu_window_start(suggestions.len(), app.slash_menu_index).saturating_add(index);
         let selected = absolute_index
@@ -43997,6 +44034,10 @@ pub(crate) struct TuiApp {
     /// is the effective compaction/nudge budget.
     pub(crate) status_context_window_tokens: Option<u64>,
     pub(crate) checkpoints_enabled: bool,
+    /// Mirror of `config.permissions.ai_reviewer.enabled`. Gates the `/reviewer`
+    /// slash command so it is only offered under the Auto-review preset, where
+    /// the reviewer actually produces decisions to show.
+    pub(crate) reviewer_enabled: bool,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) subagent_pane: SubagentPaneState,
     pub(crate) selected_entry: Option<usize>,
@@ -45446,6 +45487,7 @@ impl TuiApp {
             status_context_input_tokens: None,
             status_context_window_tokens: None,
             checkpoints_enabled: config.checkpoints_enabled,
+            reviewer_enabled: config.permissions.ai_reviewer.enabled,
             transcript,
             subagent_pane: SubagentPaneState::default(),
             selected_entry: None,
@@ -45711,6 +45753,7 @@ impl TuiApp {
         self.status_context_input_tokens = None;
         self.status_context_window_tokens = None;
         self.checkpoints_enabled = config.checkpoints_enabled;
+        self.reviewer_enabled = config.permissions.ai_reviewer.enabled;
         self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
         self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());
         self.status_line_use_colors = config.tui.status_line_use_colors;
