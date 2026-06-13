@@ -12849,9 +12849,10 @@ fn toggle_subagent_compare(app: &mut TuiApp) {
     // Opening the compare view closes the timeline panel: the compare view owns
     // the surface, so leaving the panel open behind it would fight for routing.
     app.subagent_timeline_open = false;
-    app.status =
-        "compare subagents: Tab focus \u{00b7} scroll keys move active pane \u{00b7} x diff \u{00b7} Alt+7/Esc close"
-            .to_string();
+    app.status = format!(
+        "compare subagents: Tab focus \u{00b7} scroll keys move active pane \u{00b7} x diff \u{00b7} {}/Esc close",
+        key_hint(app, keymap::Action::ToggleSubagentCompare)
+    );
     app.needs_redraw = true;
 }
 
@@ -30755,8 +30756,9 @@ fn render_subagent_compare_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         return;
     };
     let mode_note = format!(
-        "\u{2014} {} \u{00b7} Tab focus \u{00b7} x diff \u{00b7} Alt+7/Esc close ",
+        "\u{2014} {} \u{00b7} Tab focus \u{00b7} x diff \u{00b7} {}/Esc close ",
         state.mode.label(),
+        key_hint(app, keymap::Action::ToggleSubagentCompare),
     );
     let title = Line::from(vec![
         Span::styled(
