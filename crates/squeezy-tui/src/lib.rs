@@ -14930,7 +14930,7 @@ fn lane_fold_set_all(app: &mut TuiApp, collapse: bool) {
 
 // ---- Reading Position Bookmarks (§12.2.4) ----
 
-/// `Alt+t`: drop a Reading Position Bookmark at the entry currently at the top of
+/// `Alt+;`: drop a Reading Position Bookmark at the entry currently at the top of
 /// the viewport (§12.2.4). The bookmark anchors to the entry's stable id, so it
 /// survives every later append, resize, fold, and filter. Dropped anonymous (the
 /// overlay can name it later). A no-op (status hint) on an empty transcript.
@@ -14962,7 +14962,7 @@ fn toggle_bookmarks(app: &mut TuiApp) {
         // at the rebuild site instead.
         app.bookmarks_selected = bookmark_cursor_near_current(app);
         app.status = if app.bookmarks.is_empty() {
-            "bookmarks (none yet) — Alt+t to drop one \u{00b7} Esc close".to_string()
+            "bookmarks (none yet) — Alt+; to drop one \u{00b7} Esc close".to_string()
         } else {
             format!(
                 "bookmarks: {} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} r rename \u{00b7} d delete \u{00b7} Esc close",
@@ -31679,7 +31679,7 @@ fn render_bookmarks_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ])
     } else if count == 0 {
         Line::from(Span::styled(
-            "No bookmarks yet \u{2014} Alt+t drops one at the current position.",
+            "No bookmarks yet \u{2014} Alt+; drops one at the current position.",
             Style::default().fg(crate::render::theme::quiet()),
         ))
     } else {
