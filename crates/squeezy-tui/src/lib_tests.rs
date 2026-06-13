@@ -15776,6 +15776,86 @@ async fn clipboard_history_keyboard_delete_and_clear() {
 }
 
 #[tokio::test]
+async fn clipboard_history_clear_confirms_before_wiping_pins() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let keep = app.clipboard_history.record("a", "entry");
+    app.clipboard_history.record("b", "entry");
+    app.clipboard_history.toggle_pin(keep);
+    app.clipboard_history_open = true;
+
+    // First `c` arms a confirm instead of wiping, because an entry is pinned.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.clipboard_history.len(), 2, "nothing wiped on first c");
+    assert_eq!(
+        app.status,
+        "press c again to wipe 1 pinned copy, Esc to cancel"
+    );
+
+    // A non-`c` key disarms the latch so a stray follow-up can't commit.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.clipboard_history.len(),
+        2,
+        "first c after disarm re-arms, never wipes",
+    );
+
+    // Two consecutive `c` presses commit the wipe, pins included.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.clipboard_history.is_empty(),
+        "second c wiped everything"
+    );
+    assert_eq!(app.status, "clipboard history cleared");
+}
+
+#[tokio::test]
+async fn clipboard_history_clear_empty_is_silent_no_op() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history_open = true;
+    app.status = "clipboard history (empty) — Esc to close".to_string();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.clipboard_history.is_empty());
+    assert_eq!(
+        app.status, "clipboard history (empty) — Esc to close",
+        "an empty-history c reports no false 'cleared' success",
+    );
+}
+
+#[tokio::test]
 async fn clipboard_history_esc_closes_without_leaking_to_composer() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);

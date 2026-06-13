@@ -11059,6 +11059,7 @@ fn toggle_minimap(app: &mut TuiApp) {
 /// the new state. Sets `needs_redraw` so the toggle paints immediately.
 fn toggle_clipboard_history(app: &mut TuiApp) {
     app.clipboard_history_open = !app.clipboard_history_open;
+    app.clipboard_clear_armed = false;
     app.status = if app.clipboard_history_open {
         if app.clipboard_history.is_empty() {
             "clipboard history (empty) — Esc to close".to_string()
@@ -11089,6 +11090,48 @@ fn count_label_entries(count: usize) -> String {
 /// before-the-global-keymap consumption: Esc/Alt+p close, Up/Down move the
 /// selection, Enter re-copies the selected entry, `d` deletes it, `p` toggles its
 /// pin, and `c` clears the whole history.
+///
+/// The clipboard-history `clear` verb, shared by the keyboard `c` and the
+/// `[ Clear all ]` mouse button. With no pinned entries it wipes immediately —
+/// the one-action privacy escape the picker promises. The instant any entry is
+/// pinned (the user's explicit "keep this" signal) the first invocation only
+/// arms a confirm; the caller commits on the second consecutive `c`. An
+/// already-empty history is a silent no-op, matching `d`.
+fn clear_clipboard_history(app: &mut TuiApp) {
+    if app.clipboard_history.is_empty() {
+        app.clipboard_clear_armed = false;
+        return;
+    }
+    let pinned = app
+        .clipboard_history
+        .entries()
+        .iter()
+        .filter(|e| e.pinned)
+        .count();
+    if pinned > 0 && !app.clipboard_clear_armed {
+        app.clipboard_clear_armed = true;
+        app.status = format!(
+            "press c again to wipe {}, Esc to cancel",
+            count_label_pins(pinned),
+        );
+        app.needs_redraw = true;
+        return;
+    }
+    app.clipboard_history.clear();
+    app.clipboard_clear_armed = false;
+    app.status = "clipboard history cleared".to_string();
+    app.needs_redraw = true;
+}
+
+/// `"N pinned copies"` / `"1 pinned copy"` for the clear-confirm prompt.
+fn count_label_pins(count: usize) -> String {
+    if count == 1 {
+        "1 pinned copy".to_string()
+    } else {
+        format!("{count} pinned copies")
+    }
+}
+
 fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if !app.clipboard_history_open {
         return false;
@@ -11098,9 +11141,15 @@ fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     // modal swallows below.
     if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleClipboardHistory) {
         app.clipboard_history_open = false;
+        app.clipboard_clear_armed = false;
         app.status = "clipboard history closed".to_string();
         app.needs_redraw = true;
         return true;
+    }
+    // The clear-confirm latch only survives a second consecutive `c`; any other
+    // key (including Esc) disarms it so a stray follow-up can't commit the wipe.
+    if !matches!(key.code, KeyCode::Char('c')) {
+        app.clipboard_clear_armed = false;
     }
     match key.code {
         KeyCode::Esc => {
@@ -11126,9 +11175,7 @@ fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             toggle_pin_selected_clipboard_entry(app);
         }
         KeyCode::Char('c') => {
-            app.clipboard_history.clear();
-            app.status = "clipboard history cleared".to_string();
-            app.needs_redraw = true;
+            clear_clipboard_history(app);
         }
         // Swallow every other key so the picker is modal: a stray keystroke
         // cannot leak into the composer underneath while the overlay owns focus.
@@ -18739,22 +18786,23 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // construction. Select resolves the row by its stable id; re-copy/delete
         // act on it; clear wipes the whole history.
         interaction::Action::ClipboardSelect(id) => {
+            app.clipboard_clear_armed = false;
             if app.clipboard_history.select_id(id) {
                 app.needs_redraw = true;
             }
         }
         interaction::Action::ClipboardRecopy(id) => {
+            app.clipboard_clear_armed = false;
             app.clipboard_history.select_id(id);
             recopy_clipboard_entry(app, id);
         }
         interaction::Action::ClipboardDelete(id) => {
+            app.clipboard_clear_armed = false;
             app.clipboard_history.select_id(id);
             delete_selected_clipboard_entry(app);
         }
         interaction::Action::ClipboardClear => {
-            app.clipboard_history.clear();
-            app.status = "clipboard history cleared".to_string();
-            app.needs_redraw = true;
+            clear_clipboard_history(app);
         }
         // Prompt Snippets picker (§12.3.2). Each routes through the same handler
         // the keyboard verb drives, so mouse/keyboard parity holds by
@@ -46289,6 +46337,12 @@ pub(crate) struct TuiApp {
     /// picker owns key/mouse routing. Toggled by the `ToggleClipboardHistory`
     /// keymap action.
     pub(crate) clipboard_history_open: bool,
+    /// Confirm latch for the clipboard-history `clear` verb when pinned entries
+    /// are present (§12.6.1). The first `c` (or `[ Clear all ]` click) arms this
+    /// and asks for confirmation rather than wiping; the second consecutive `c`
+    /// commits. Any other key, Esc, or closing the picker disarms it, so a single
+    /// mistyped `c` can never destroy a pinned copy.
+    pub(crate) clipboard_clear_armed: bool,
     /// Prompt Snippets From Selection (§12.3.2): a bounded, session-scoped store
     /// of named prompt snippets captured from transcript selections. Drives the
     /// picker overlay; starts empty and stays cheap at idle.
@@ -47607,6 +47661,7 @@ impl TuiApp {
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),
             clipboard_history: clipboard_history::ClipboardHistoryStore::new(),
             clipboard_history_open: false,
+            clipboard_clear_armed: false,
             snippets: snippet_store::SnippetStore::new(),
             snippets_open: false,
             scratchpad: scratchpad::Scratchpad::new(),
