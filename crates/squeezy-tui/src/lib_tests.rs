@@ -43431,6 +43431,103 @@ async fn command_palette_enter_runs_a_slash_command_into_the_composer() {
 }
 
 #[tokio::test]
+async fn command_palette_marks_slash_rows_as_filling_the_composer() {
+    // Enter does two different things by row type: a keymap action runs at once,
+    // but a slash row only fills the composer (the user presses Enter again to
+    // send). The global "Enter run" header would misrepresent the slash path, so
+    // each slash row carries an honest per-row marker — with "+args" for one that
+    // still needs an argument — while keymap-action rows carry none.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Inspect the single rendered row whose label column carries `name`.
+    let row_for = |rendered: &str, name: &str| -> String {
+        rendered
+            .lines()
+            .find(|line| line.contains(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("row for {name} not found:\n{rendered}"))
+            .to_string()
+    };
+
+    open_command_palette(&mut app, &mut agent).await;
+    for ch in "/cost".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let parameterless = render_to_string(&app, 100, 30);
+    let cost_row = row_for(&parameterless, "/cost");
+    assert!(
+        cost_row.contains("fills composer"),
+        "a parameterless slash row is marked as filling the composer: {cost_row:?}"
+    );
+    assert!(
+        !cost_row.contains("+args"),
+        "a parameterless slash row carries no +args marker: {cost_row:?}"
+    );
+
+    // Re-filter to a parameterized slash command: the marker gains "+args".
+    for _ in 0.."/cost".len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await
+        .expect("clear query");
+    }
+    for ch in "/theme".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let parameterized = render_to_string(&app, 100, 30);
+    let theme_row = row_for(&parameterized, "/theme");
+    assert!(
+        theme_row.contains("fills composer +args"),
+        "a parameterized slash row is marked as filling the composer with args: {theme_row:?}"
+    );
+
+    // A keymap-action row never claims it fills the composer — Enter runs it.
+    for _ in 0.."/theme".len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await
+        .expect("clear query");
+    }
+    for ch in "timeline".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let action_only = render_to_string(&app, 100, 30);
+    assert!(
+        action_only.contains("Toggle session timeline"),
+        "the keymap action row is listed:\n{action_only}"
+    );
+    assert!(
+        !action_only.contains("fills composer"),
+        "a keymap-action row must not claim it fills the composer:\n{action_only}"
+    );
+}
+
+#[tokio::test]
 async fn command_palette_slash_keeps_a_composer_draft_instead_of_overwriting_it() {
     // Seeding a chosen slash command via `set_input` is a full replace, so it must
     // not silently discard a half-typed prompt. With a real draft in the composer,

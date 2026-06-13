@@ -32634,7 +32634,7 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
                 )
             }
         };
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 caret,
                 Style::default().fg(if is_selected {
@@ -32645,7 +32645,26 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             ),
             Span::styled(format!("{:<32} ", entry.label), label_style),
             detail_span,
-        ]);
+        ];
+        // A slash row does not run on Enter — it fills the composer (the spec's
+        // "second step"), so the user presses Enter again to send. Mark it so the
+        // header's "Enter run" is honest per row: a keymap action runs at once, a
+        // slash command lands in the composer (with a trailing space for one that
+        // still needs arguments).
+        if let command_palette::PaletteRun::Slash { has_parameter, .. } = entry.run
+            && !disabled
+        {
+            let hint = if has_parameter {
+                " \u{00b7} fills composer +args"
+            } else {
+                " \u{00b7} fills composer"
+            };
+            spans.push(Span::styled(
+                hint,
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        }
+        let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), row_rect);
 
         // Register the whole row as a click target keyed by its VISIBLE index so a
