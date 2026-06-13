@@ -692,7 +692,7 @@ async fn keyboard_jump_opens_overlay_and_esc_restores_return_anchor() {
         .subagent_return_anchor
         .expect("a return anchor is stored");
     assert_eq!(anchor.prior_selected, 2);
-    assert!(anchor.prior_was_main);
+    assert!(anchor.prior_was_main());
 
     // Esc closes the overlay AND restores the return state (active source back to
     // main), so the jump never strands the user.
@@ -50166,4 +50166,83 @@ fn rejected_subagent_reports_no_elapsed() {
         elapsed, None,
         "a cap-rejected subagent has no honest elapsed"
     );
+}
+
+#[test]
+fn jump_return_restores_main_scroll_not_tail() {
+    let mut app = app_with_two_subagents();
+    // The user is reading the main conversation scrolled up by 4 lines.
+    app.subagent_pane.active = ConversationSource::Main;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(4);
+
+    assert!(
+        jump_to_subagent_index(&mut app, 1),
+        "jump opens the subagent"
+    );
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(2)
+    ));
+
+    assert!(restore_subagent_return_anchor(&mut app));
+    assert!(matches!(app.subagent_pane.active, ConversationSource::Main));
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        4,
+        "return restores the prior main scroll, not the tail",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[test]
+fn jump_return_from_subagent_restores_prior_subagent_and_scroll() {
+    let mut app = app_with_two_subagents();
+    // The user is already viewing subagent #1, scrolled up by 2 lines.
+    app.subagent_pane.active = ConversationSource::Subagent(1);
+    let idx_a = app
+        .subagent_pane
+        .records
+        .iter()
+        .position(|r| r.id == 1)
+        .unwrap();
+    app.subagent_pane.records[idx_a].scroll = scroll::ScrollState::scrolled_up(2);
+
+    // Jump to subagent #2 (record index 1).
+    assert!(jump_to_subagent_index(&mut app, 1));
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(2)
+    ));
+
+    // Return lands back on subagent #1 with its scroll, not on main or the tail.
+    assert!(restore_subagent_return_anchor(&mut app));
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(1)
+    ));
+    let idx_a = app
+        .subagent_pane
+        .records
+        .iter()
+        .position(|r| r.id == 1)
+        .unwrap();
+    assert_eq!(
+        app.subagent_pane.records[idx_a].scroll.from_bottom(),
+        2,
+        "return restores the prior subagent's scroll",
+    );
+}
+
+#[test]
+fn jump_return_heals_to_main_when_prior_subagent_pruned() {
+    let mut app = app_with_two_subagents();
+    app.subagent_pane.active = ConversationSource::Subagent(1);
+
+    assert!(jump_to_subagent_index(&mut app, 1));
+    // The prior subagent (#1) is pruned before the user returns.
+    app.subagent_pane.records.retain(|r| r.id != 1);
+
+    // Restore must not panic and degrades gracefully to the main conversation.
+    assert!(restore_subagent_return_anchor(&mut app));
+    assert!(matches!(app.subagent_pane.active, ConversationSource::Main));
 }

@@ -13989,11 +13989,15 @@ fn jump_to_subagent_index(app: &mut TuiApp, index: usize) -> bool {
         return false;
     }
     // Capture the return anchor BEFORE mutating the active source, so a back
-    // command restores exactly where the user was.
-    let prior_was_main = matches!(app.subagent_pane.active, ConversationSource::Main);
+    // command restores exactly where the user was — the prior source (main or a
+    // subagent, since a jump can chain from one subagent to another) and that
+    // source's scroll position.
+    let prior_source = app.subagent_pane.active;
+    let prior_scroll = active_transcript_scroll(app);
     app.subagent_return_anchor = Some(subagent_preview::SubagentReturnAnchor::new(
         app.subagent_pane.selected,
-        prior_was_main,
+        prior_source,
+        prior_scroll,
     ));
     // Pin the cursor + active source onto the jumped-to subagent, then surface its
     // transcript via the same full-screen overlay the Enter path uses.
@@ -14013,18 +14017,30 @@ fn jump_to_subagent_index(app: &mut TuiApp, index: usize) -> bool {
 
 /// Restore the conversation the user was on before a subagent jump (§12.8.2),
 /// consuming the return anchor. Returns `true` when an anchor was outstanding (so
-/// the caller knows the back command did something). Re-pins the prior pane
-/// selection and active source; a stale anchor (the prior subagent pruned away)
-/// degrades gracefully to the main conversation.
+/// the caller knows the back command did something). Restores the prior active
+/// source and that source's scroll position; a stale anchor (the prior subagent
+/// pruned away) degrades gracefully to the main conversation.
 fn restore_subagent_return_anchor(app: &mut TuiApp) -> bool {
     let Some(anchor) = app.subagent_return_anchor.take() else {
         return false;
     };
-    app.subagent_pane.active = ConversationSource::Main;
+    // Restore the prior source, healing to main when the prior subagent record is
+    // gone, so a return never strands the user on a vanished conversation.
+    let restored_source = match anchor.prior_source {
+        ConversationSource::Subagent(id)
+            if app.subagent_pane.records.iter().any(|r| r.id == id) =>
+        {
+            ConversationSource::Subagent(id)
+        }
+        _ => ConversationSource::Main,
+    };
+    app.subagent_pane.active = restored_source;
     app.subagent_pane.focused = false;
     app.subagent_pane.selected = anchor.prior_selected.min(app.subagent_pane.records.len());
-    let _ = anchor.prior_was_main;
-    active_transcript_scroll_mut(app).pin_to_bottom();
+    // Re-apply the prior scroll onto the now-active source (the accessor routes to
+    // main's transcript or the active subagent's record), so a scrolled-up reader
+    // resumes there and a follower keeps following the tail.
+    *active_transcript_scroll_mut(app) = anchor.prior_scroll;
     app.clamp_subagent_selection();
     app.status = "returned from subagent".to_string();
     app.needs_redraw = true;
