@@ -22808,6 +22808,12 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
         "  - native text selection: hold {}+drag to bypass mouse capture; SQUEEZY_MOUSE_CAPTURE=0 frees the mouse entirely",
         app.native_select_label
     ));
+    lines.push(
+        "  - copy: drag to select (auto-copies on release) then paste, or Ctrl+Shift+C".to_string(),
+    );
+    lines.push(
+        "  - ⌘C copies in-app only if your emulator forwards Command — in iTerm2 remap Left Command in Settings → Profiles → Keys; otherwise use Ctrl+Shift+C / paste".to_string(),
+    );
     lines.push("  - shell: set SQUEEZY_SHELL (e.g. SQUEEZY_SHELL=/bin/bash)".to_string());
     lines.join("\n")
 }
