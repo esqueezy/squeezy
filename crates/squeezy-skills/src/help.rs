@@ -1388,9 +1388,11 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/revert-turn",
-        what: "Revert the files changed during the most recent turn checkpoint.",
-        syntax: "/revert-turn",
-        examples: &["/revert-turn  — undo all file changes made in the last turn"],
+        what: "Revert the files changed during a turn checkpoint. Run /checkpoints to list turn ids.",
+        syntax: "/revert-turn <turn_id>",
+        examples: &[
+            "/revert-turn abc123  — undo the file changes from that turn (run /checkpoints for ids)",
+        ],
         available_during_turn: false,
         capability_note: Some("Requires: [edit, destructive]"),
         related: &["checkpoints"],

@@ -301,7 +301,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/revert-turn",
         description: "undo all file edits from one turn",
         available_during_task: false,
-        parameter_hint: None,
+        parameter_hint: Some("<turn_id>"),
         capabilities: &[
             PermissionCapability::Edit,
             PermissionCapability::Destructive,

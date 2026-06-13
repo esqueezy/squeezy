@@ -645,6 +645,22 @@ fn extract_doc_intro_returns_short_paragraph_unchanged() {
 }
 
 #[test]
+fn revert_turn_help_shows_required_turn_id() {
+    // The dispatch parser requires `<turn_id>` (require_id) and errors on a bare
+    // `/revert-turn`; the help syntax must teach the argument so the documented
+    // form does not immediately fail.
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help /revert-turn")
+        .expect("revert-turn answer");
+    let body = answer.render_markdown();
+    assert!(
+        body.contains("<turn_id>"),
+        "/revert-turn help must show the required <turn_id>: {body}"
+    );
+}
+
+#[test]
 fn providers_topic_names_gateway_presets_not_just_first_party() {
     // The supported surface is far wider than the curated first-party vendors;
     // the summary must surface at least one OpenAI-compatible gateway so a
