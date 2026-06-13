@@ -44424,7 +44424,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         };
     }
     if app.subagent_pane.focused {
-        return "Up/Down switch · Enter scroll · Del clear done · type/Esc back to prompt"
+        return "Up/Down switch · Enter open · Del clear done · type/Esc back to prompt"
             .to_string();
     }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
