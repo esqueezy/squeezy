@@ -32828,6 +32828,19 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         } else {
             Style::default().fg(crate::render::theme::quiet())
         };
+        let counter = format!("  ({used}/{})", annotations::ANNOTATION_TEXT_LIMIT);
+        let hints = "  \u{00b7} Enter save \u{00b7} Esc cancel";
+        // Budget the editable region so the caret, counter, and key hints stay
+        // on-screen even at the full character limit: the verb, counter, and
+        // hints all reserve their painted width, and the buffer is shown as a
+        // tail slice ending at the caret so the user always sees what they are
+        // typing. One column is held for the caret block itself.
+        let reserved = UnicodeWidthStr::width(verb)
+            + UnicodeWidthStr::width(counter.as_str())
+            + UnicodeWidthStr::width(hints)
+            + 1;
+        let buf_budget = (inner.width as usize).saturating_sub(reserved);
+        let shown = truncate_label_to_cells_tail(buf, buf_budget);
         Line::from(vec![
             Span::styled(
                 verb,
@@ -32836,17 +32849,11 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{buf}\u{2588}"),
+                format!("{shown}\u{2588}"),
                 Style::default().fg(crate::render::theme::foreground()),
             ),
-            Span::styled(
-                format!("  ({used}/{})", annotations::ANNOTATION_TEXT_LIMIT),
-                counter_style,
-            ),
-            Span::styled(
-                "  \u{00b7} Enter save \u{00b7} Esc cancel",
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
+            Span::styled(counter, counter_style),
+            Span::styled(hints, Style::default().fg(crate::render::theme::quiet())),
         ])
     } else if count == 0 {
         Line::from(Span::styled(
@@ -44691,6 +44698,37 @@ fn truncate_label_to_cells(label: &str, cells: usize) -> String {
         running += w;
     }
     out.push('\u{2026}');
+    out
+}
+
+/// Keep the rightmost `cells` display columns of `label`, prepending an ellipsis
+/// when the head was cut (the ellipsis costs one cell, so the result is never
+/// wider than `cells`). The mirror of [`truncate_label_to_cells`] for an input
+/// field whose caret lives at the end: the tail of what was typed stays in view
+/// while a fixed counter/hint suffix to its right is guaranteed room.
+fn truncate_label_to_cells_tail(label: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(label) <= cells {
+        return label.to_string();
+    }
+    if cells == 1 {
+        return "\u{2026}".to_string();
+    }
+    let budget = cells - 1;
+    let mut tail: Vec<char> = Vec::new();
+    let mut running = 0usize;
+    for ch in label.chars().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if running + w > budget {
+            break;
+        }
+        tail.push(ch);
+        running += w;
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(tail.into_iter().rev());
     out
 }
 

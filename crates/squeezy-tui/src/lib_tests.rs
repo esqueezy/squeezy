@@ -50851,3 +50851,49 @@ fn tool_actions_label_budget_reserves_room_for_affordance_suffix() {
         "painted width {painted} exceeds inner width {inner_width}",
     );
 }
+
+#[test]
+fn annotation_editor_tail_keeps_caret_counter_and_hints_visible() {
+    // Reproduce the editor header budget at the full annotation limit on an
+    // 88-wide modal (inner.width 86): the verb, counter, hints, and caret are
+    // reserved, and the buffer is shown as a tail slice. The caret, counter,
+    // and hints must all still fit on the single header row.
+    let inner_width: usize = 86;
+    let verb = "note: ";
+    let buf = "x".repeat(annotations::ANNOTATION_TEXT_LIMIT);
+    let used = buf.chars().count();
+    let counter = format!("  ({used}/{})", annotations::ANNOTATION_TEXT_LIMIT);
+    let hints = "  \u{00b7} Enter save \u{00b7} Esc cancel";
+
+    let reserved = UnicodeWidthStr::width(verb)
+        + UnicodeWidthStr::width(counter.as_str())
+        + UnicodeWidthStr::width(hints)
+        + 1;
+    let buf_budget = inner_width.saturating_sub(reserved);
+    assert!(
+        buf_budget > 0,
+        "the buffer must keep some room on an 86-col row"
+    );
+
+    let shown = truncate_label_to_cells_tail(&buf, buf_budget);
+    assert!(
+        UnicodeWidthStr::width(shown.as_str()) <= buf_budget,
+        "tail slice {shown:?} exceeds its budget {buf_budget}",
+    );
+    assert!(
+        shown.starts_with('\u{2026}'),
+        "an overflowing buffer should lead with an ellipsis: {shown:?}",
+    );
+
+    // verb + tail + caret(1) + counter + hints must fit the row, so none of the
+    // trailing affordances are clipped off-screen.
+    let painted = UnicodeWidthStr::width(verb)
+        + UnicodeWidthStr::width(shown.as_str())
+        + 1
+        + UnicodeWidthStr::width(counter.as_str())
+        + UnicodeWidthStr::width(hints);
+    assert!(
+        painted <= inner_width,
+        "painted header width {painted} exceeds inner width {inner_width}",
+    );
+}
