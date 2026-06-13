@@ -13939,7 +13939,10 @@ fn toggle_subagent_preview(app: &mut TuiApp) {
         "read-only".to_string()
     };
     app.subagent_preview = Some(preview);
-    app.status = format!("subagent preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / Alt+6 close");
+    app.status = format!(
+        "subagent preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / {} close",
+        key_hint(app, keymap::Action::PreviewSubagent)
+    );
     app.needs_redraw = true;
 }
 
