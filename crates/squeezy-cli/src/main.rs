@@ -4324,14 +4324,26 @@ async fn run_startup_model_selector(
     save_startup_model_selection(&settings_path, &selection)?;
     Ok(Some(StartupSetupSelection {
         question_count,
-        open_config_section: if picked.open_theme_config {
-            Some(squeezy_core::config_schema::SectionId::Themes)
-        } else {
-            picked
-                .open_model_config
-                .then_some(squeezy_core::config_schema::SectionId::Models)
-        },
+        open_config_section: startup_follow_up_section(
+            picked.open_model_config,
+            picked.open_theme_config,
+        ),
     }))
+}
+
+/// Resolve which single config section a finished startup picker should open
+/// next. Only one section can be opened, so the model/key step the picker
+/// promised takes precedence over the cosmetic theme step: a provider that
+/// still needs a key must never be silently skipped in favor of theming.
+fn startup_follow_up_section(
+    open_model_config: bool,
+    open_theme_config: bool,
+) -> Option<squeezy_core::config_schema::SectionId> {
+    if open_model_config {
+        Some(squeezy_core::config_schema::SectionId::Models)
+    } else {
+        open_theme_config.then_some(squeezy_core::config_schema::SectionId::Themes)
+    }
 }
 
 async fn detect_provider_choices(config: &AppConfig) -> Vec<ProviderChoice> {

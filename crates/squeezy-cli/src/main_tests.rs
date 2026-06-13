@@ -2402,3 +2402,23 @@ fn hosted_provider_choice_requires_setup_when_no_key_anywhere() {
         choice.label
     );
 }
+
+#[test]
+fn startup_follow_up_section_prefers_model_config_over_theme() {
+    use squeezy_core::config_schema::SectionId;
+    assert_eq!(
+        startup_follow_up_section(true, true),
+        Some(SectionId::Models),
+        "the key/model step must win when both follow-ups are requested"
+    );
+    assert_eq!(
+        startup_follow_up_section(true, false),
+        Some(SectionId::Models)
+    );
+    assert_eq!(
+        startup_follow_up_section(false, true),
+        Some(SectionId::Themes),
+        "the theme step still opens when no model config is needed"
+    );
+    assert_eq!(startup_follow_up_section(false, false), None);
+}
