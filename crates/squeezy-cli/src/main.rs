@@ -922,8 +922,19 @@ async fn run() -> squeezy_core::Result<()> {
 
     squeezy_core::startup_trace::mark("model_selector_done");
 
-    let onboarding = prepare_repo_profile(&mut config);
-    squeezy_core::startup_trace::mark("repo_profile_done");
+    // Defer the repo-profile crawl off first paint. `ensure_repo_profile`
+    // walks the workspace, shells out to git four times, and reads/writes
+    // repos.toml — none of which any startup consumer touches until the
+    // print-mode summary / TUI `StartupProfile` is assembled below. Run it on
+    // a blocking pool so terminal-enter and the placeholder paint overlap the
+    // crawl, then join just before its first consumer. Capture clones of the
+    // two inputs the crawl needs (`workspace_root`, `graph`) so `config` stays
+    // un-borrowed for `TelemetryClient::from_config` and session resolution.
+    let repo_profile_workspace_root = config.workspace_root.clone();
+    let repo_profile_graph = config.graph.clone();
+    let repo_profile_handle = tokio::task::spawn_blocking(move || {
+        ensure_repo_profile(&repo_profile_workspace_root, &repo_profile_graph)
+    });
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
@@ -987,6 +998,22 @@ async fn run() -> squeezy_core::Result<()> {
         None
     };
     squeezy_core::startup_trace::mark("session_resolved");
+
+    // Join the deferred repo-profile crawl before its first consumer: the
+    // print-mode `onboarding.visible_summary` below and the TUI
+    // `StartupProfile` further down, plus the `config.instructions` mutation
+    // (read only at agent build). A `JoinError` (panic in the blocking task)
+    // is mapped to a `Tool` error so `prepare_repo_profile_from_load` keeps the
+    // existing "Repo profile unavailable" warning behavior rather than aborting.
+    let repo_profile_loaded = match repo_profile_handle.await {
+        Ok(loaded) => loaded,
+        Err(join_error) => Err(SqueezyError::Tool(format!(
+            "repo profile task failed: {join_error}"
+        ))),
+    };
+    let onboarding = prepare_repo_profile_from_load(&mut config, repo_profile_loaded);
+    squeezy_core::startup_trace::mark("repo_profile_done");
+
     if prompt_mode_active {
         let provider = provider_from_app_config(&config);
         let prompts = print_mode::resolve_prompt_inputs(
