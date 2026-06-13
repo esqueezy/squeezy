@@ -42812,6 +42812,48 @@ async fn command_palette_enter_runs_a_slash_command_into_the_composer() {
 }
 
 #[tokio::test]
+async fn command_palette_slash_keeps_a_composer_draft_instead_of_overwriting_it() {
+    // Seeding a chosen slash command via `set_input` is a full replace, so it must
+    // not silently discard a half-typed prompt. With a real draft in the composer,
+    // running a slash command from the palette leaves the buffer untouched and tells
+    // the user to clear it first.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    input::set_input(&mut app, "draft I was typing".to_string());
+    app.command_palette_pending = Some(command_palette::PaletteRun::Slash {
+        name: "/help",
+        has_parameter: true,
+    });
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the armed slash command");
+
+    assert_eq!(
+        app.input, "draft I was typing",
+        "the half-typed draft survives the slash command",
+    );
+    assert!(
+        app.status.contains("composer has a draft"),
+        "the status warns the draft blocks the run: {}",
+        app.status,
+    );
+
+    // An empty composer (or one already holding a slash command) still parks the
+    // chosen command, so the guard only protects a real draft.
+    input::clear_input(&mut app);
+    app.command_palette_pending = Some(command_palette::PaletteRun::Slash {
+        name: "/help",
+        has_parameter: true,
+    });
+    drain_command_palette_run(&mut app, &mut agent)
+        .await
+        .expect("drain the armed slash command into an empty composer");
+    assert_eq!(app.input, "/help ");
+}
+
+#[tokio::test]
 async fn command_palette_mouse_click_runs_a_command() {
     let mut app = test_app(SessionMode::Build);
     app.set_test_frame_size(100, 30);

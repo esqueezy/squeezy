@@ -15032,6 +15032,19 @@ async fn drain_command_palette_run(app: &mut TuiApp, agent: &mut Agent) -> Resul
             // slash-menu / cursor invariants). A parameter command leaves a trailing
             // space and parks the user there to complete it; a parameterless command
             // is filled in ready to send with Enter.
+            //
+            // `set_input` is a full replace, so seeding the command over a half-typed
+            // prompt would silently discard the user's draft (and its attachments).
+            // When the composer holds a real draft (non-blank and not itself a slash
+            // command), leave it intact and tell the user to clear it first instead.
+            let draft_present =
+                !app.input.trim().is_empty() && !app.input.trim_start().starts_with('/');
+            if draft_present {
+                app.status =
+                    format!("composer has a draft — clear it (Ctrl+U) before running {name}");
+                app.needs_redraw = true;
+                return Ok(());
+            }
             let text = if has_parameter {
                 format!("{name} ")
             } else {
