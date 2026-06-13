@@ -1719,6 +1719,14 @@ impl Agent {
         telemetry: TelemetryClient,
     ) -> squeezy_core::Result<(Self, Vec<HydratedTranscriptItem>)> {
         let store = SessionStore::open(&config);
+        // The resolver and metadata reader see archived sessions, but the
+        // writer and `SessionHandle::dir` use the live root only. Revive an
+        // archived session back into the live tree before opening it so
+        // resume reads/writes a real directory instead of a phantom live
+        // path and failing with a misleading "not resumable" error.
+        if store.is_archived(session_id) {
+            store.unarchive_session(session_id)?;
+        }
         let handle = store.open_session(session_id.to_string());
         // Prefer the durable snapshot, but fall back to replaying
         // events.jsonl when:
