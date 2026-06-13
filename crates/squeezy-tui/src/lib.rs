@@ -14703,6 +14703,34 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             }
             app.needs_redraw = true;
         }
+        // Page/Home/End jump the cursor across the long registry (~150 rows, far
+        // more than fit on screen) so a command near the bottom is a few keypresses
+        // away, not ~130. The Ctrl+P/Ctrl+N arms above are CONTROL-guarded, so these
+        // plain keys never collide with typed query characters.
+        KeyCode::Home => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.move_to_top();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::End => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.move_to_bottom();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::PageUp => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.page(false);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::PageDown => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.page(true);
+            }
+            app.needs_redraw = true;
+        }
         KeyCode::Backspace => {
             if let Some(palette) = app.command_palette.as_mut() {
                 palette.pop_char();
@@ -31884,7 +31912,7 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
     } else {
         Line::from(Span::styled(
             format!(
-                "{visible_count}/{total} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter run \u{00b7} Esc close",
+                "{visible_count}/{total} \u{00b7} \u{2191}\u{2193} select \u{00b7} PgUp/PgDn page \u{00b7} Enter run \u{00b7} Esc close",
             ),
             Style::default()
                 .fg(crate::render::theme::secondary())
