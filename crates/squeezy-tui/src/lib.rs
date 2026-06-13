@@ -2000,6 +2000,14 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
             return;
         }
     };
+    // A file touch that leaves the effective settings unchanged must not
+    // announce a reload. The watcher already ignores byte-identical re-saves;
+    // this also covers a comment- or whitespace-only external edit whose parsed
+    // config matches what is already live, so an idle session never accumulates
+    // a stack of "settings reloaded from disk" status lines.
+    if new_cfg == *agent.config() {
+        return;
+    }
     // Mirror an external theme edit into the runtime palette override
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
