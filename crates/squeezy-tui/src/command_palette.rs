@@ -88,16 +88,14 @@ impl CommandPalette {
     /// compiled-in action / slash registries. The order is stable: keymap actions
     /// first (in [`Action::ALL`] order), then slash commands (in
     /// [`SLASH_COMMANDS`] order), so an empty query always lists the same set in
-    /// the same order. `during_task` gates a slash command's availability the same
-    /// way the composer menu does, surfacing a disabled reason rather than hiding it.
-    /// `visibility` applies the same feature gates as the slash menu (e.g. checkpoint
-    /// commands when checkpointing is off, `/reviewer` when Auto-review is off), so a
-    /// gated command stays out of this parallel discovery surface too.
-    pub(crate) fn build(
-        keymap: &KeymapResolver,
-        during_task: bool,
-        visibility: SlashMenuVisibility,
-    ) -> Self {
+    /// the same order. A task-blocked slash command is listed and runnable like any
+    /// other: selecting it seeds the composer, and pressing Enter during a turn
+    /// queues it behind the running turn — exactly as typing it directly does — so
+    /// the palette and the typed path can never apply different policy to the same
+    /// command. `visibility` applies the same feature gates as the slash menu (e.g.
+    /// checkpoint commands when checkpointing is off, `/reviewer` when Auto-review is
+    /// off), so a gated command stays out of this parallel discovery surface too.
+    pub(crate) fn build(keymap: &KeymapResolver, visibility: SlashMenuVisibility) -> Self {
         let mut entries: Vec<CommandEntry> = Vec::new();
         for action in Action::ALL.iter().copied() {
             // Never list the palette's own toggle inside the palette — running it
@@ -120,16 +118,11 @@ impl CommandPalette {
             if !command.visible(visibility) {
                 continue;
             }
-            // A command that is not available during a task is disabled while a turn
-            // is running (`during_task`); the row stays listed with an honest reason
-            // rather than vanishing, matching the spec's "disabled reasons".
-            let disabled_reason = (during_task && !command.available_during_task)
-                .then(|| "unavailable while a turn is running".to_string());
             entries.push(CommandEntry {
                 label: command.name.to_string(),
                 description: command.description.to_string(),
                 binding: String::new(),
-                disabled_reason,
+                disabled_reason: None,
                 run: PaletteRun::Slash {
                     name: command.name,
                     has_parameter: command.parameter_hint.is_some(),

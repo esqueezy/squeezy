@@ -14637,7 +14637,6 @@ fn toggle_command_palette(app: &mut TuiApp) {
     } else {
         let palette = command_palette::CommandPalette::build(
             &app.keymap,
-            app.turn_rx.is_some(),
             input::SlashMenuVisibility {
                 checkpoints_enabled: app.checkpoints_enabled,
                 reviewer_enabled: app.reviewer_enabled,
