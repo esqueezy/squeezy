@@ -65,6 +65,12 @@ pub(crate) fn render_preview_parts(request: &ToolApprovalRequest) -> PreviewPart
             ),
         ]));
     }
+    // The permission engine's own verdict rationale (e.g. "pre-classifier
+    // requires approval: …" or the AI reviewer's note) is distinct from the
+    // assistant's `Why:` transcript snippet; surface it on its own labeled,
+    // dimmed row so a real policy reason is visible even when the transcript
+    // snippet is empty.
+    append_policy_reason(&mut context, &request.reason);
     let mut subject = Vec::new();
     match permission.capability {
         PermissionCapability::Shell => append_shell(&mut subject, permission),
@@ -135,6 +141,44 @@ fn append_context(lines: &mut Vec<Line<'static>>, context: &str) -> bool {
         ]));
     }
     true
+}
+
+/// Append a dimmed `Policy: <reason>` block carrying the permission engine's
+/// verdict rationale. No-op when the reason is empty/whitespace so a request
+/// without a policy note adds no spurious row. Wrapped at the same width as the
+/// `Why:` block and labeled distinctly so it never reads as the assistant's own
+/// rationale.
+fn append_policy_reason(lines: &mut Vec<Line<'static>>, reason: &str) {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let wrapped = wrap_words(&trimmed.replace('\n', " "), APPROVAL_CONTEXT_WRAP);
+    let Some((first, rest)) = wrapped.split_first() else {
+        return;
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "Policy: ",
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            first.to_string(),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]));
+    for line in rest {
+        lines.push(Line::from(vec![
+            Span::raw("          "),
+            Span::styled(
+                line.to_string(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]));
+    }
 }
 
 fn header_line(request: &ToolApprovalRequest) -> Line<'static> {

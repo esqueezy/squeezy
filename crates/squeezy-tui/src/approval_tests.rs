@@ -391,6 +391,65 @@ fn whitespace_context_emits_no_rationale_placeholder() {
 }
 
 #[test]
+fn policy_reason_renders_when_transcript_snippet_is_absent() {
+    // When the assistant transcript snippet is empty but the permission engine
+    // had a real reason for asking, the user must still see that policy
+    // rationale rather than only "(no rationale provided)".
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "curl https://example.com",
+        &[("command", "curl https://example.com")],
+    );
+    req.context = None;
+    req.reason = "pre-classifier requires approval: network egress".to_string();
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("Policy: ") && out.contains("network egress"),
+        "policy reason missing: {out}"
+    );
+    assert!(
+        out.contains("(no rationale provided)"),
+        "transcript Why row should still state its absence: {out}"
+    );
+}
+
+#[test]
+fn policy_reason_and_transcript_render_as_distinct_rows() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "grep -r ERROR",
+        &[("command", "grep -r ERROR logs/")],
+    );
+    req.context = Some("You asked me to inspect logs.".to_string());
+    req.reason = "ai reviewer flagged broad search".to_string();
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("Why: "), "transcript row missing: {out}");
+    assert!(out.contains("You asked me to inspect logs."), "{out}");
+    assert!(
+        out.contains("Policy: ") && out.contains("ai reviewer flagged broad search"),
+        "policy reason row missing: {out}"
+    );
+}
+
+#[test]
+fn empty_policy_reason_emits_no_row() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "ls",
+        &[("command", "ls")],
+    );
+    req.reason = "   ".to_string();
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("Policy:"),
+        "whitespace-only reason must not emit a Policy row: {out}"
+    );
+}
+
+#[test]
 fn approval_preview_separates_rationale_command_rule_and_choices() {
     let mut req = request_with(
         "shell",
