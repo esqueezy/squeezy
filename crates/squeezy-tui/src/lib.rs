@@ -1738,7 +1738,13 @@ fn apply_mcp_action(
                 snapshot_active_scope_for_undo(app);
                 if let Err(err) = persist_mcp_toggle(app, &server, enabled) {
                     pop_undo_snapshot(app);
-                    feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
+                    feedback.push(
+                        format!(
+                            "mcp toggle applied for this session only \
+                             (reverts on restart) — settings.toml write failed: {err}"
+                        ),
+                        Severity::Warn,
+                    );
                 }
             }
             agent.set_mcp_server_enabled_in_background(server, enabled);
@@ -1755,7 +1761,13 @@ fn apply_mcp_action(
                 snapshot_active_scope_for_undo(app);
                 if let Err(err) = persist_mcp_add(app, &name, &server) {
                     pop_undo_snapshot(app);
-                    feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
+                    feedback.push(
+                        format!(
+                            "mcp add applied for this session only \
+                             (reverts on restart) — settings.toml write failed: {err}"
+                        ),
+                        Severity::Warn,
+                    );
                 }
             }
             let mut next = app
@@ -1815,7 +1827,13 @@ fn apply_mcp_action(
                         // Drop the unused undo entry — the write
                         // failed so there is nothing to revert.
                         pop_undo_snapshot(app);
-                        feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
+                        feedback.push(
+                            format!(
+                                "mcp remove applied for this session only \
+                                 (reverts on restart) — settings.toml write failed: {err}"
+                            ),
+                            Severity::Warn,
+                        );
                     }
                 }
             }
