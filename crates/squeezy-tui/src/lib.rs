@@ -26907,9 +26907,10 @@ fn render_keybinding_editor_list(
     }
     let visible = list_rect.height as usize;
     let selected = editor.selected_index();
-    // Scroll the window so the selected row stays visible.
+    // Scroll the window so the selected row stays roughly centered.
+    let half = visible / 2;
     let start = selected
-        .saturating_sub(visible.saturating_sub(1))
+        .saturating_sub(half)
         .min(rows.len().saturating_sub(visible.min(rows.len())));
     let end = (start + visible).min(rows.len());
     // Pad the slug column so the bindings line up.
