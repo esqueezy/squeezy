@@ -43502,7 +43502,7 @@ async fn hover_preview_alt_1_opens_popover_for_focused_unit() {
     assert!(out.contains("Preview"), "popover header paints:\n{out}");
     assert!(out.contains("tool output"), "kind tag paints:\n{out}");
     assert!(
-        out.contains("double-click / Enter to open"),
+        out.contains("double-click / Ctrl+Enter to open"),
         "activation hint paints:\n{out}",
     );
 }

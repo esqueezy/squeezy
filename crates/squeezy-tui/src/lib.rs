@@ -13574,7 +13574,7 @@ fn toggle_hover_preview(app: &mut TuiApp) {
     };
     let hint = preview.activate_hint();
     let verb = if preview.can_activate() {
-        "Enter opens"
+        "Ctrl+Enter opens"
     } else {
         "read-only"
     };
