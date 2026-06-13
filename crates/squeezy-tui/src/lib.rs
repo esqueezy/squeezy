@@ -14426,9 +14426,13 @@ fn first_run_hint_message(app: &TuiApp, id: first_run_hints::HintId) -> String {
         // representative chord shown, matching how the breadcrumbs/jump family names
         // its forward verb.
         first_run_hints::HintId::Jump => key_hint(app, keymap::Action::JumpNextUserTurn),
-        // The Hover hint carries no chord (it names the focus keys inline), so the
-        // substitution argument is ignored.
-        first_run_hints::HintId::Hover => String::new(),
+        // Focusing a card has two verbs (prev/next entry); the hint names both so
+        // the "↑/↓" affordance survives a rebind of either direction.
+        first_run_hints::HintId::Hover => format!(
+            "{}/{}",
+            key_hint(app, keymap::Action::FocusPrevEntry),
+            key_hint(app, keymap::Action::FocusNextEntry)
+        ),
     };
     id.message(&chord)
 }
