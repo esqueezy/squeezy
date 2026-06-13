@@ -34004,7 +34004,7 @@ fn search_status_text(state: &search::SearchState) -> String {
 }
 
 /// Width (in cells) of the disclosure-caret hit zone at the start of a card
-/// header row. The caret glyph (`>`/`v`, see [`render::button`]) plus its
+/// header row. The fold disclosure glyph (see [`render::button`]) plus its
 /// padding occupy the leading columns; a click there toggles the entry's fold,
 /// while a click on the rest of the header focuses the entry.
 const CARD_CARET_WIDTH: u16 = 3;
@@ -43715,6 +43715,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         app.turn_rx.is_some(),
         queue_open,
         Some(queue_groups_summary.as_str()),
+        app.glyph_mode.tokens(),
     );
     let extra_height = queue_overlay_lines.len()
         + overlay_lines.len()
