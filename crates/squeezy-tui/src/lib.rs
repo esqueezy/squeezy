@@ -2698,9 +2698,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     //     chrome.
     // ARMING a new selection is gated per-surface: a pre-pass right below for the
     // swallow-all overlays that interact only through registered click-targets,
-    // and a main-view/config bottom fallback at the end of `handle_mouse` that
-    // runs AFTER every scrollbar / smart-split / subagent-compare / transcript /
-    // composer handler has had first crack.
+    // a main-view/config bottom fallback at the end of `handle_mouse` (for free
+    // chrome), and a retroactive drag-arm just below this block (for cells that
+    // ALSO take a click — a config / picker row, a subagent-compare pane — where
+    // the click fires on Down and the drag then selects). All run AFTER every
+    // scrollbar / smart-split / subagent-compare / transcript / composer handler
+    // has had first crack.
+    //
+    // Record every left press cell up front (before any dispatch) so the
+    // retroactive drag-arm knows where the gesture began; cleared on release.
+    match mouse.kind {
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            app.last_left_press = Some((mouse.column, mouse.row));
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            app.last_left_press = None;
+        }
+        _ => {}
+    }
     match mouse.kind {
         MouseEventKind::Drag(crossterm::event::MouseButton::Left)
             if app.screen_selection.is_some() =>
@@ -2735,6 +2750,35 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             clear_screen_selection(app);
         }
         _ => {}
+    }
+
+    // Retroactive text selection: a drag whose PRESS landed on an interactive
+    // cell — a config / picker row, a subagent-compare pane, any chrome cell that
+    // also takes a click — becomes a screen-buffer selection once the pointer
+    // moves off the press cell. The press already fired its click on Down (rows
+    // select, panes focus), so this adds "drag to select text" on top, matching
+    // native / Claude-Code behavior. Strongly guarded: it never fires while
+    // another gesture owns the pointer (an active screen / transcript / composer
+    // selection, a scrollbar thumb drag, or a queue reorder), and only when the
+    // press cell is CHROME (outside the transcript & composer text, which run
+    // their own selection). Subsequent Drag/Up are handled by the active-selection
+    // block above once this arms.
+    if let MouseEventKind::Drag(crossterm::event::MouseButton::Left) = mouse.kind
+        && app.screen_selection.is_none()
+        && app.selection.is_none()
+        && app.input_selection.is_none()
+        && app.scrollbar_drag.is_none()
+        && app.prompt_queue_drag.is_none()
+        && let Some((press_col, press_row)) = app.last_left_press
+        && (press_col != mouse.column || press_row != mouse.row)
+        && cell_is_chrome(app, press_col, press_row)
+    {
+        arm_screen_selection(app, press_col, press_row);
+        if let Some(sel) = app.screen_selection.as_mut() {
+            sel.cursor_col = mouse.column;
+            sel.cursor_row = mouse.row;
+        }
+        return true;
     }
 
     // ARM a screen selection on a left press over the dead space of a swallow-all
@@ -46065,6 +46109,13 @@ pub(crate) struct TuiApp {
     /// drifts off the 1-cell gutter stays captured instead of falling through to
     /// text selection. An off-gutter PRESS never arms it.
     pub(crate) scrollbar_drag: Option<ScrollbarDragSurface>,
+    /// The cell of the most recent left-button PRESS, recorded for every Down at
+    /// the top of `handle_mouse` (before any surface dispatch). Lets a drag that
+    /// began on an interactive cell (a config / picker row, a subagent-compare
+    /// pane) retroactively become a text selection once the pointer moves — the
+    /// press still fired its click on Down, but moving before release means the
+    /// user wants to select text. Cleared on release.
+    pub(crate) last_left_press: Option<(u16, u16)>,
     /// Open reorder overlay state. `None` when the overlay is closed;
     /// the queue itself lives on `prompt_queue` regardless.
     pub(crate) prompt_queue_overlay: Option<prompt_queue::PromptQueueState>,
@@ -46598,6 +46649,7 @@ impl TuiApp {
             }),
             hyperlink_override: None,
             last_click: None,
+            last_left_press: None,
             main_scroll_anim: None,
             // Smooth/eased scroll for large jumps. Honour a reduced-motion /
             // instant-scroll switch: `SQUEEZY_REDUCE_MOTION` (truthy) and the
