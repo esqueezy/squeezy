@@ -59,16 +59,26 @@ pub(crate) struct CommandEntry {
     /// `Some(reason)` when the command cannot run in the current context; the row
     /// is shown dimmed and Enter/click report the reason instead of running it.
     pub(crate) disabled_reason: Option<String>,
+    /// Extra tokens folded into the fuzzy haystack but not shown on the row: a
+    /// slash command's parameter hint (so a query for `high-contrast` or `json`
+    /// finds the command whose only mention of that token is its argument syntax)
+    /// and its capability badge slugs (so `edit` / `net` surface the commands that
+    /// carry that badge). Empty for keymap-action entries.
+    search_extra: String,
     /// What running this entry does.
     pub(crate) run: PaletteRun,
 }
 
 impl CommandEntry {
-    /// The text the fuzzy filter scores against: label + description + binding, so
-    /// a query can match the human label ("timeline"), the slug ("session_timeline"),
-    /// or the chord ("alt+9").
+    /// The text the fuzzy filter scores against: label + description + binding +
+    /// the hidden `search_extra` tokens, so a query can match the human label
+    /// ("timeline"), the slug ("session_timeline"), the chord ("alt+9"), a
+    /// parameter-syntax token ("high-contrast"), or a capability badge ("edit").
     fn haystack(&self) -> String {
-        format!("{} {} {}", self.label, self.description, self.binding)
+        format!(
+            "{} {} {} {}",
+            self.label, self.description, self.binding, self.search_extra
+        )
     }
 }
 
@@ -108,6 +118,7 @@ impl CommandPalette {
                 description: action.slug().to_string(),
                 binding: keymap.binding(action).display(),
                 disabled_reason: None,
+                search_extra: String::new(),
                 run: PaletteRun::Action(action),
             });
         }
@@ -118,11 +129,20 @@ impl CommandPalette {
             if !command.visible(visibility) {
                 continue;
             }
+            // Fold the parameter hint and capability badges into the hidden search
+            // tokens so a query for an argument value or a capability finds the
+            // command even when neither appears in its label or description.
+            let mut search_extra = command.parameter_hint.unwrap_or_default().to_string();
+            for badge in command.capability_badges() {
+                search_extra.push(' ');
+                search_extra.push_str(badge);
+            }
             entries.push(CommandEntry {
                 label: command.name.to_string(),
                 description: command.description.to_string(),
                 binding: String::new(),
                 disabled_reason: None,
+                search_extra,
                 run: PaletteRun::Slash {
                     name: command.name,
                     has_parameter: command.parameter_hint.is_some(),

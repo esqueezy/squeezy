@@ -200,6 +200,43 @@ fn query_can_match_the_binding_chord() {
 }
 
 #[test]
+fn query_can_match_a_parameter_hint_token() {
+    // A parameter-syntax token that lives only in a command's argument hint — never
+    // in its label or description — must still be searchable.
+    let surfaces = |needle: &str, name: &str| {
+        let mut palette = idle_palette();
+        for ch in needle.chars() {
+            palette.push_char(ch);
+        }
+        palette.visible().iter().any(|e| e.label == name)
+    };
+    // `high-contrast` appears only in /theme's parameter hint.
+    assert!(
+        surfaces("high-contrast", "/theme"),
+        "/theme should be findable by its `high-contrast` argument value"
+    );
+    // `json` appears only in /export's parameter hint, not its description.
+    assert!(
+        surfaces("json", "/export"),
+        "/export should be findable by its `json` argument value"
+    );
+}
+
+#[test]
+fn query_can_match_a_capability_badge() {
+    // Searching a capability slug surfaces the commands that carry that badge, even
+    // when the slug appears nowhere in their label or description.
+    let mut palette = idle_palette();
+    for ch in "edit".chars() {
+        palette.push_char(ch);
+    }
+    assert!(
+        palette.visible().iter().any(|e| e.label == "/config"),
+        "an edit-capability command should surface when searching `edit`"
+    );
+}
+
+#[test]
 fn no_match_yields_empty_visible_and_safe_cursor() {
     let mut palette = idle_palette();
     for ch in "zzqqxx-not-a-command".chars() {
