@@ -1075,6 +1075,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["tui", "doctor"],
     },
     SlashCommandHelp {
+        name: "/terminal-reset",
+        what: "Force-reset a wedged terminal: leave the alt-screen, reset terminal modes, show the cursor, and re-enter the fullscreen surface. The typeable twin of the Ctrl+Alt+, restore chord, for when the chord itself is swallowed by a corrupted terminal.",
+        syntax: "/terminal-reset",
+        examples: &["/terminal-reset  — recover a garbled or stuck terminal"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["terminal", "tui", "keymap"],
+    },
+    SlashCommandHelp {
         name: "/attach",
         what: "Insert a file or directory token in the prompt editor as attached context.",
         syntax: "/attach <path>",

@@ -364,6 +364,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "/terminal",
         "show terminal diagnostics (TTY, clipboard, shell)",
     ),
+    // A recovery verb that must stay available mid-turn, when a wedged terminal
+    // is most likely; handled in `handle_slash_command` ahead of the dispatch
+    // parser, so listing it here is purely additive.
+    slash(
+        "/terminal-reset",
+        "force-reset a wedged terminal (leave alt-screen, reset modes)",
+    ),
 ];
 
 /// Grouping used by the bare-`/` browse menu. Each command belongs to exactly
@@ -490,7 +497,9 @@ impl SlashCommand {
                 SlashCategory::Export
             }
             "/config" | "/model" | "/permissions" | "/theme" | "/mcp" | "/tool-verbosity"
-            | "/statusline" | "/keymap" | "/terminal" | "/reviewer" => SlashCategory::Settings,
+            | "/statusline" | "/keymap" | "/terminal" | "/terminal-reset" | "/reviewer" => {
+                SlashCategory::Settings
+            }
             other => unreachable!("slash command {other} is not assigned to a SlashCategory"),
         }
     }
