@@ -4794,14 +4794,25 @@ fn copy_active_selection(app: &mut TuiApp) -> bool {
 /// Copy whichever app-level selection is active so every copy chord (`⌘C`,
 /// `Ctrl+Shift+C`, `Ctrl+C`) shares one funnel. A live COMPOSER selection wins
 /// over the transcript selection — the user is selecting in the prompt box, so
-/// the chord copies that substring verbatim. Returns `true` when something was
-/// copied. Does NOT clear the selection — callers decide (explicit copy chords
-/// clear via [`clear_all_text_selections`], copy-on-release keeps the highlight
-/// for quote/add-to-set follow-ups).
+/// the chord copies that substring verbatim. When the disjoint multi-select set
+/// holds committed ranges the chord copies the whole set (plus any live
+/// transcript range), so the standard copy never silently drops the highlighted
+/// committed ranges. Returns `true` when something was copied. Does NOT clear the
+/// selection — callers decide (explicit copy chords clear via
+/// [`clear_all_text_selections`], copy-on-release keeps the highlight for
+/// quote/add-to-set follow-ups).
 fn copy_any_active_selection(app: &mut TuiApp) -> bool {
     // Precedence matches the mutually-exclusive arming order: a live screen
-    // (chrome) selection, else the composer, else the transcript.
-    copy_screen_selection(app) || copy_input_selection(app) || copy_active_selection(app)
+    // (chrome) selection, else the composer, else the transcript. The transcript
+    // tier copies the committed multi-select set (combined with any live range)
+    // when it is non-empty, so the highlighted set is never silently dropped.
+    copy_screen_selection(app)
+        || copy_input_selection(app)
+        || if app.selection_set.is_empty() {
+            copy_active_selection(app)
+        } else {
+            copy_multi_selection(app)
+        }
 }
 
 /// Copy the live screen-buffer (chrome) selection by reading the painted glyphs

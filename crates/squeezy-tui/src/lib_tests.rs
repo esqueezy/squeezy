@@ -15475,6 +15475,106 @@ async fn alt_c_copies_focused_entry_through_row_model() {
     assert!(app.status.contains("copied entry"), "{}", app.status);
 }
 
+/// Build a whole-row MAIN-surface selection over the painted transcript row
+/// whose text contains `needle`. Mirrors the row-resolution other selection
+/// tests use so the range is independent of inter-row chrome geometry.
+fn whole_row_main_selection(app: &TuiApp, needle: &str, width: u16) -> selection::Selection {
+    let rows = main_surface_rows(app);
+    let row = rows
+        .iter()
+        .position(|line| crate::transcript_surface::plain_text_of_line(line).contains(needle))
+        .expect("needle row present");
+    let len = crate::transcript_surface::plain_text_of_line(&rows[row])
+        .chars()
+        .count();
+    let mut sel = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos::new(row, 0),
+        selection::SelectionMode::Row,
+        width,
+    );
+    sel.cursor = selection::Pos::new(row, len);
+    sel
+}
+
+#[test]
+fn standard_copy_chord_copies_the_committed_multi_select_set() {
+    // A set-only selection (committed disjoint ranges, no live range) must be
+    // copied by the standard copy funnel, not reported as "nothing selected".
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("alpha line"));
+    app.push_transcript_item(TranscriptItem::assistant("beta line"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+
+    assert!(
+        app.selection_set
+            .add(whole_row_main_selection(&app, "alpha line", 40))
+    );
+    assert!(
+        app.selection_set
+            .add(whole_row_main_selection(&app, "beta line", 40))
+    );
+    app.selection = None;
+
+    assert!(
+        copy_any_active_selection(&mut app),
+        "the standard copy funnel copies the committed set"
+    );
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write");
+    assert!(
+        copied[0].contains("alpha line") && copied[0].contains("beta line"),
+        "both committed ranges were copied: {:?}",
+        copied[0]
+    );
+    assert_ne!(
+        app.status, "nothing selected — drag with the mouse to select text",
+        "a set-only copy must not fall through to the empty-selection status"
+    );
+}
+
+#[test]
+fn standard_copy_chord_combines_the_set_with_a_live_range() {
+    // With BOTH a live transcript selection and a non-empty set, the standard
+    // chord copies all ranges (set + live), not just the live one.
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("alpha line"));
+    app.push_transcript_item(TranscriptItem::assistant("beta line"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+
+    assert!(
+        app.selection_set
+            .add(whole_row_main_selection(&app, "alpha line", 40))
+    );
+    app.selection = Some(whole_row_main_selection(&app, "beta line", 40));
+
+    assert!(
+        copy_any_active_selection(&mut app),
+        "the combined copy lands"
+    );
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write");
+    assert!(
+        copied[0].contains("alpha line") && copied[0].contains("beta line"),
+        "the set and the live range were both copied: {:?}",
+        copied[0]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Code-Aware Copy/Export (§12.5.5)
 // ---------------------------------------------------------------------------
