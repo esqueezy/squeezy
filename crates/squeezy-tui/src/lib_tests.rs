@@ -42166,6 +42166,57 @@ async fn review_board_ctrl_alt_o_opens_and_groups_workers_into_lanes() {
     assert!(out.contains('-'), "dash for missing metrics:\n{out}");
 }
 
+/// A fan-out large enough to overflow the fixed-height board modal keeps the
+/// selected card on screen: the cursor card's caret paints and a card far above
+/// it is scrolled out of the window.
+#[test]
+fn review_board_scrolls_to_keep_cursor_visible() {
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &test_config(SessionMode::Build),
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+
+    let sources: Vec<subagent_timeline::SubagentTimelineSource> = (0..40)
+        .map(|i| subagent_timeline::SubagentTimelineSource {
+            id: 1000 + i,
+            agent: format!("worker{i:02}"),
+            status: subagent_timeline::SubagentTimelineStatus::Running,
+            latest: "working".to_string(),
+            elapsed_secs: Some(10),
+            tool_count: 1,
+            cost_micros: None,
+        })
+        .collect();
+    let fingerprint = review_board::ReviewBoard::fingerprint_of(sources.iter());
+    app.review_board.rebuild_if_stale(fingerprint, &sources);
+    app.review_board_open = true;
+
+    // Park the cursor on the last card — far past the bottom of a 28-row modal.
+    let last_id = app
+        .review_board
+        .card_at(app.review_board.len() - 1)
+        .map(|card| card.id)
+        .expect("last card");
+    app.review_board_cursor = Some(last_id);
+
+    let out = render_to_string(&app, 100, 28);
+
+    // The selected card scrolled into view, caret and all.
+    assert!(out.contains('\u{203a}'), "selected caret paints:\n{out}");
+    assert!(
+        out.contains("worker39"),
+        "last (selected) worker is visible:\n{out}"
+    );
+    // The first worker is far above the window and must be scrolled out.
+    assert!(
+        !out.contains("worker00"),
+        "first worker is scrolled out of view:\n{out}"
+    );
+}
+
 /// The keyboard path: ↑↓ walk the cursor across the lanes by stable id, and Enter
 /// opens the selected worker's conversation (overlay), leaving a return anchor.
 #[tokio::test]

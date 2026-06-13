@@ -31021,91 +31021,130 @@ fn render_review_board_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
     }
 
     // Lay the lanes out top-to-bottom: a bold lane header, then its worker rows,
-    // then a blank spacer. The cursor row gets a caret + emphasis. Every row is
-    // clamped to the inner rect so a tall fan-out never paints past the box.
+    // then a blank spacer. Build the flat visual-row sequence first so a scroll
+    // window can be derived around the cursor card — a tall fan-out can push the
+    // selected card below the fixed-height modal otherwise.
+    enum VisualRow<'a> {
+        LaneHeader(review_board::ReviewLane),
+        Card(&'a review_board::ReviewCard),
+        Spacer,
+    }
+    let mut rows: Vec<VisualRow> = Vec::new();
+    let mut cursor_row: Option<usize> = None;
+    for lane in app.review_board.present_lanes() {
+        rows.push(VisualRow::LaneHeader(lane));
+        for card in app.review_board.cards_in(lane) {
+            if Some(card.id) == cursor_id {
+                cursor_row = Some(rows.len());
+            }
+            rows.push(VisualRow::Card(card));
+        }
+        rows.push(VisualRow::Spacer);
+    }
+
     let list_top = inner.y.saturating_add(2);
     let list_bottom = inner.y.saturating_add(inner.height);
-    let mut y = list_top;
-    'lanes: for lane in app.review_board.present_lanes() {
+    let visible_height = list_bottom.saturating_sub(list_top) as usize;
+    if visible_height == 0 {
+        return;
+    }
+
+    // Scroll offset (in visual rows) so the cursor card stays inside the
+    // window. Derived each frame from the cursor position, so no persistent
+    // scroll state is needed.
+    let mut offset = 0usize;
+    if let Some(cursor_row) = cursor_row {
+        if cursor_row >= visible_height {
+            offset = cursor_row + 1 - visible_height;
+        }
+        if cursor_row < offset {
+            offset = cursor_row;
+        }
+    }
+
+    for (idx, row) in rows.iter().enumerate() {
+        if idx < offset {
+            continue;
+        }
+        let y = list_top + (idx - offset) as u16;
         if y >= list_bottom {
             break;
         }
-        // Lane header: "Running (2)" — color *and* the title text + count.
-        let count = app.review_board.count_in(lane);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("{} ({count})", lane.title()),
-                review_lane_style(lane).add_modifier(Modifier::BOLD),
-            ))),
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            },
-        );
-        y = y.saturating_add(1);
-
-        for card in app.review_board.cards_in(lane) {
-            if y >= list_bottom {
-                break 'lanes;
+        match row {
+            VisualRow::Spacer => {}
+            VisualRow::LaneHeader(lane) => {
+                // Lane header: "Running (2)" — color *and* the title text + count.
+                let count = app.review_board.count_in(*lane);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("{} ({count})", lane.title()),
+                        review_lane_style(*lane).add_modifier(Modifier::BOLD),
+                    ))),
+                    Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
             }
-            let is_selected = Some(card.id) == cursor_id;
-            let row_rect = Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            };
-            let caret = if is_selected { "  \u{203a} " } else { "    " };
-            let label_style = if is_selected {
-                Style::default()
-                    .fg(crate::render::theme::secondary())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(crate::render::theme::foreground())
-            };
-            let line = Line::from(vec![
-                Span::styled(
-                    caret,
-                    Style::default().fg(if is_selected {
-                        crate::render::theme::secondary()
-                    } else {
-                        crate::render::theme::quiet()
-                    }),
-                ),
-                Span::styled(
-                    format!("{:<16} ", format!("{} #{}", card.agent, card.ordinal)),
-                    label_style,
-                ),
-                Span::styled(
-                    format!("{:>6} ", card.elapsed_clock()),
-                    Style::default().fg(crate::render::theme::quiet()),
-                ),
-                Span::styled(
-                    format!("{:<9} ", format!("tools {}", card.tool_count)),
-                    Style::default().fg(crate::render::theme::quiet()),
-                ),
-                Span::styled(
-                    format!("{:<13} ", card.cost_label()),
-                    Style::default().fg(crate::render::theme::quiet()),
-                ),
-                Span::styled(card.latest.clone(), label_style),
-            ]);
-            frame.render_widget(Paragraph::new(line), row_rect);
+            VisualRow::Card(card) => {
+                let is_selected = Some(card.id) == cursor_id;
+                let row_rect = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                };
+                let caret = if is_selected { "  \u{203a} " } else { "    " };
+                let label_style = if is_selected {
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(crate::render::theme::foreground())
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        caret,
+                        Style::default().fg(if is_selected {
+                            crate::render::theme::secondary()
+                        } else {
+                            crate::render::theme::quiet()
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{:<16} ", format!("{} #{}", card.agent, card.ordinal)),
+                        label_style,
+                    ),
+                    Span::styled(
+                        format!("{:>6} ", card.elapsed_clock()),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(
+                        format!("{:<9} ", format!("tools {}", card.tool_count)),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(
+                        format!("{:<13} ", card.cost_label()),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(card.latest.clone(), label_style),
+                ]);
+                frame.render_widget(Paragraph::new(line), row_rect);
 
-            // Register the whole row as a click target keyed by the worker's STABLE
-            // id (not a flattened index) so a click selects + opens exactly that
-            // worker even as lanes change between frames.
-            app.register_click(
-                row_rect,
-                interaction::TargetKey::Chrome(interaction::ChromeKey::ReviewBoardCard(card.id)),
-                interaction::Action::ReviewBoardSelectJump(card.id),
-            );
-            y = y.saturating_add(1);
+                // Register the whole row as a click target keyed by the worker's STABLE
+                // id (not a flattened index) so a click selects + opens exactly that
+                // worker even as lanes change between frames.
+                app.register_click(
+                    row_rect,
+                    interaction::TargetKey::Chrome(interaction::ChromeKey::ReviewBoardCard(
+                        card.id,
+                    )),
+                    interaction::Action::ReviewBoardSelectJump(card.id),
+                );
+            }
         }
-        // Blank spacer between lanes (when there is room).
-        y = y.saturating_add(1);
     }
 }
 
