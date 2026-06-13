@@ -8792,6 +8792,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        // Emacs-style line-end motion, the mirror of `Ctrl+A` above. Also the
+        // landing point for iTerm2's "Natural Text Editing" preset, which sends
+        // ⌘→ as `Ctrl+E` (and ⌘← as `Ctrl+A`) — so this is what makes ⌘→ jump to
+        // the line end for users on that common preset. Clears any live selection.
+        move_composer_cursor(app, false, move_input_cursor_line_end);
+        return Ok(false);
+    }
+
     // ⌘A selects the whole composer (kitty-protocol terminals forward Command
     // as `SUPER`; exact-match so a stray modifier never hijacks it). No-op when
     // the composer is empty or a fullscreen surface owns the frame — there it
