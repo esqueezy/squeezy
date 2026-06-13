@@ -1495,6 +1495,192 @@ fn personal_folder_name_is_a_negative_but_not_blocking_signal() {
     );
 }
 
+/// Current on-disk size and mtime (unix millis) for a file under `root`,
+/// matching exactly how the crawl computes them.
+fn size_and_mtime(root: &Path, relative_path: &str) -> (u64, u128) {
+    let metadata = fs::metadata(root.join(relative_path)).unwrap();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    (metadata.len(), mtime)
+}
+
+#[test]
+fn prior_metadata_fast_path_reuses_hash_without_reading() {
+    let root = temp_root("prior_fast_path_reuses_hash");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "fn a(){}\n").unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+
+    let (size_bytes, modified_unix_millis) = size_and_mtime(&canonical, "src/lib.rs");
+    // A deliberately wrong hash. If the fast path fires it is reused verbatim,
+    // proving the file was never read+hashed. A real read would overwrite it.
+    let sentinel = ContentHash::new("deadbeefdeadbeef".to_string());
+    let mut prior = PriorFileMetadata::new();
+    prior.insert(
+        "src/lib.rs",
+        PriorFileMeta {
+            size_bytes,
+            modified_unix_millis,
+            hash: &sentinel,
+        },
+    );
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl_with_prior(&canonical, &prior)
+        .unwrap();
+    let record = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/lib.rs")
+        .expect("lib.rs should be kept");
+    assert_eq!(
+        record.hash, sentinel,
+        "unchanged file should reuse the prior hash without re-reading"
+    );
+    assert_eq!(record.language, LanguageKind::Rust);
+}
+
+#[test]
+fn prior_metadata_size_mismatch_falls_back_to_fresh_hash() {
+    let root = temp_root("prior_size_mismatch_falls_back");
+    fs::write(root.join("lib.rs"), "fn a(){}\n").unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+
+    let (_size, modified_unix_millis) = size_and_mtime(&canonical, "lib.rs");
+    let sentinel = ContentHash::new("deadbeefdeadbeef".to_string());
+    let mut prior = PriorFileMetadata::new();
+    prior.insert(
+        "lib.rs",
+        PriorFileMeta {
+            // Wrong size => fast path must NOT fire.
+            size_bytes: 999_999,
+            modified_unix_millis,
+            hash: &sentinel,
+        },
+    );
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl_with_prior(&canonical, &prior)
+        .unwrap();
+    let record = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "lib.rs")
+        .unwrap();
+    assert_eq!(
+        record.hash,
+        ContentHash::new(stable_content_hash(b"fn a(){}\n")),
+        "size mismatch must force a fresh read+hash"
+    );
+    assert_ne!(record.hash, sentinel);
+}
+
+#[test]
+fn prior_metadata_mtime_mismatch_falls_back_to_fresh_hash() {
+    let root = temp_root("prior_mtime_mismatch_falls_back");
+    fs::write(root.join("lib.rs"), "fn a(){}\n").unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+
+    let (size_bytes, _mtime) = size_and_mtime(&canonical, "lib.rs");
+    let sentinel = ContentHash::new("deadbeefdeadbeef".to_string());
+    let mut prior = PriorFileMetadata::new();
+    prior.insert(
+        "lib.rs",
+        PriorFileMeta {
+            size_bytes,
+            modified_unix_millis: 1, // stale mtime => fast path must NOT fire
+            hash: &sentinel,
+        },
+    );
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl_with_prior(&canonical, &prior)
+        .unwrap();
+    let record = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "lib.rs")
+        .unwrap();
+    assert_ne!(
+        record.hash, sentinel,
+        "mtime mismatch must force a fresh read+hash"
+    );
+}
+
+#[test]
+fn prior_metadata_unchanged_crawl_matches_cold_crawl() {
+    let root = temp_root("prior_unchanged_matches_cold");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "fn a(){}\n").unwrap();
+    fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("notes.txt"), "plain text\n").unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+
+    let crawler = WorkspaceCrawler::new(CrawlOptions::default());
+    let cold = crawler.crawl(&canonical).unwrap();
+
+    // Build a prior map from the cold crawl's own records (real hashes), then
+    // re-crawl. Every file is unchanged, so the warm crawl must be identical.
+    let mut prior = PriorFileMetadata::new();
+    for file in &cold.files {
+        prior.insert(
+            file.relative_path.as_str(),
+            PriorFileMeta {
+                size_bytes: file.size_bytes,
+                modified_unix_millis: file.modified_unix_millis,
+                hash: &file.hash,
+            },
+        );
+    }
+    let warm = crawler.crawl_with_prior(&canonical, &prior).unwrap();
+
+    assert_eq!(cold.files, warm.files, "file records must be identical");
+    assert_eq!(cold.unsupported, warm.unsupported);
+    assert_eq!(cold.excluded, warm.excluded);
+    assert_eq!(cold.coverage, warm.coverage);
+    assert_eq!(cold.path_conflicts, warm.path_conflicts);
+}
+
+#[test]
+fn prior_metadata_new_file_takes_full_read_path() {
+    let root = temp_root("prior_new_file_full_read");
+    fs::write(root.join("known.rs"), "fn a(){}\n").unwrap();
+    fs::write(root.join("fresh.rs"), "fn b(){}\n").unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+
+    // Only `known.rs` is in the prior map; `fresh.rs` is new and must be
+    // read+hashed normally.
+    let (size_bytes, modified_unix_millis) = size_and_mtime(&canonical, "known.rs");
+    let known_hash = ContentHash::new(stable_content_hash(b"fn a(){}\n"));
+    let mut prior = PriorFileMetadata::new();
+    prior.insert(
+        "known.rs",
+        PriorFileMeta {
+            size_bytes,
+            modified_unix_millis,
+            hash: &known_hash,
+        },
+    );
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl_with_prior(&canonical, &prior)
+        .unwrap();
+    let fresh = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "fresh.rs")
+        .expect("new file should be crawled");
+    assert_eq!(
+        fresh.hash,
+        ContentHash::new(stable_content_hash(b"fn b(){}\n")),
+        "new file must be read+hashed from disk"
+    );
+}
+
 fn temp_root(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

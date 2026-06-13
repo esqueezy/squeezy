@@ -762,12 +762,25 @@ fn main() -> squeezy_core::Result<()> {
 }
 
 fn run_blocking() -> squeezy_core::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
         .build()
-        .map_err(|err| SqueezyError::Config(format!("failed to build async runtime: {err}")))?
-        .block_on(run())
+        .map_err(|err| SqueezyError::Config(format!("failed to build async runtime: {err}")))?;
+    let result = runtime.block_on(run());
+    // Exit immediately. `run` has already torn down what must be torn down:
+    // session state is persisted, MCP children are killed (the agent dropped,
+    // firing each StdioProcessHandle's process-group SIGTERM plus tokio's
+    // kill_on_drop), and the agent's background tasks are drained. The only
+    // thing that can still be in flight is the workspace graph build on a
+    // `spawn_blocking` thread, which can't be cancelled mid-parse. It is a
+    // best-effort cache — abandoning an unfinished build just means the next
+    // launch rebuilds, and redb is crash-safe so an aborted mid-write recovers
+    // to the last committed state. So return the runtime in the background
+    // rather than blocking on that build: quitting is instant regardless of
+    // repo size.
+    runtime.shutdown_background();
+    result
 }
 
 async fn run() -> squeezy_core::Result<()> {
@@ -922,8 +935,19 @@ async fn run() -> squeezy_core::Result<()> {
 
     squeezy_core::startup_trace::mark("model_selector_done");
 
-    let onboarding = prepare_repo_profile(&mut config);
-    squeezy_core::startup_trace::mark("repo_profile_done");
+    // Defer the repo-profile crawl off first paint. `ensure_repo_profile`
+    // walks the workspace, shells out to git four times, and reads/writes
+    // repos.toml — none of which any startup consumer touches until the
+    // print-mode summary / TUI `StartupProfile` is assembled below. Run it on
+    // a blocking pool so terminal-enter and the placeholder paint overlap the
+    // crawl, then join just before its first consumer. Capture clones of the
+    // two inputs the crawl needs (`workspace_root`, `graph`) so `config` stays
+    // un-borrowed for `TelemetryClient::from_config` and session resolution.
+    let repo_profile_workspace_root = config.workspace_root.clone();
+    let repo_profile_graph = config.graph.clone();
+    let repo_profile_handle = tokio::task::spawn_blocking(move || {
+        ensure_repo_profile(&repo_profile_workspace_root, &repo_profile_graph)
+    });
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
@@ -987,6 +1011,22 @@ async fn run() -> squeezy_core::Result<()> {
         None
     };
     squeezy_core::startup_trace::mark("session_resolved");
+
+    // Join the deferred repo-profile crawl before its first consumer: the
+    // print-mode `onboarding.visible_summary` below and the TUI
+    // `StartupProfile` further down, plus the `config.instructions` mutation
+    // (read only at agent build). A `JoinError` (panic in the blocking task)
+    // is mapped to a `Tool` error so `prepare_repo_profile_from_load` keeps the
+    // existing "Repo profile unavailable" warning behavior rather than aborting.
+    let repo_profile_loaded = match repo_profile_handle.await {
+        Ok(loaded) => loaded,
+        Err(join_error) => Err(SqueezyError::Tool(format!(
+            "repo profile task failed: {join_error}"
+        ))),
+    };
+    let onboarding = prepare_repo_profile_from_load(&mut config, repo_profile_loaded);
+    squeezy_core::startup_trace::mark("repo_profile_done");
+
     if prompt_mode_active {
         let provider = provider_from_app_config(&config);
         let prompts = print_mode::resolve_prompt_inputs(

@@ -345,6 +345,29 @@ pub struct PathConflict {
     pub relative_paths: Vec<String>,
 }
 
+/// Fingerprint of a previously-kept file, supplied by a caller that holds a
+/// persisted snapshot (e.g. the graph store) so the crawl can skip the full
+/// read+hash for files that look unchanged.
+///
+/// A file is treated as unchanged when its current `size_bytes` and
+/// `modified_unix_millis` both match the recorded values; in that case the
+/// crawl reuses `hash` instead of re-reading the whole file. `mtime`+`size`
+/// is the standard staleness heuristic: an edit that preserves both is
+/// possible but rare, and any such file is picked up on the next edit that
+/// does move the mtime. The map only ever contains files that were *kept*
+/// last crawl, so a hit also implies the file already passed the
+/// large/binary/generated screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorFileMeta<'a> {
+    pub size_bytes: u64,
+    pub modified_unix_millis: u128,
+    pub hash: &'a ContentHash,
+}
+
+/// Borrowed view of prior-crawl fingerprints keyed by relative path. Empty
+/// (`crawl`) means every file is read+hashed from scratch.
+pub type PriorFileMetadata<'a> = HashMap<&'a str, PriorFileMeta<'a>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexingDecision {
     pub should_index: bool,
@@ -420,7 +443,30 @@ impl WorkspaceCrawler {
         &self.compiled_policy
     }
 
+    /// Crawl `root`, reading and hashing every kept file from scratch.
     pub fn crawl(&self, root: impl AsRef<Path>) -> Result<WorkspaceSnapshot> {
+        self.crawl_with_prior(root, &PriorFileMetadata::new())
+    }
+
+    /// Crawl `root`, reusing `prior` fingerprints to skip the full read+hash
+    /// of files that look unchanged.
+    ///
+    /// For each kept file whose current size and mtime match a `prior` entry,
+    /// the crawl emits a [`FileRecord`] reusing the recorded hash without ever
+    /// opening the file — turning the dominant 18 MB read+FNV pass on a warm
+    /// reopen / incremental refresh into a `stat`-only pass over the unchanged
+    /// majority. New or size/mtime-mismatched files still take the full
+    /// read+hash+screen path, so changed content is always re-hashed.
+    ///
+    /// Output is identical to [`crawl`](Self::crawl) for unchanged files: the
+    /// same `classify_language` pipeline runs on the reconstructed record, and
+    /// because `prior` only carries previously-*kept* files, a hit also
+    /// implies the file already cleared the large/binary/generated screens.
+    pub fn crawl_with_prior(
+        &self,
+        root: impl AsRef<Path>,
+        prior: &PriorFileMetadata<'_>,
+    ) -> Result<WorkspaceSnapshot> {
         let root = fs::canonicalize(root.as_ref())?;
         let indexing_decision = decide_indexing(&root, self.options.require_indexing_signal);
         if !indexing_decision.should_index {
@@ -436,9 +482,7 @@ impl WorkspaceCrawler {
             });
         }
 
-        // Shared collector for directories pruned during walk. Using a Mutex
-        // is OK because the sequential walker calls the filter closure on
-        // one thread at a time.
+        // Shared collector for directories pruned during walk.
         let pruned_dirs: Arc<Mutex<Vec<ExcludedPath>>> = Arc::new(Mutex::new(Vec::new()));
 
         let mut walker = WalkBuilder::new(&root);
@@ -463,188 +507,37 @@ impl WorkspaceCrawler {
             )
         });
 
-        let mut files = Vec::new();
-        let mut unsupported = Vec::new();
-        let mut excluded = Vec::new();
-        let mut coverage = IndexCoverage::default();
-        let mut walk_errors = Vec::new();
-
-        for entry in walker.build() {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    walk_errors.push(err.to_string());
-                    continue;
-                }
-            };
-
-            let Some(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                continue;
-            }
-            if !file_type.is_file() && !file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.into_path();
-            let relative_path = match relative_path(&root, &path) {
-                Ok(relative_path) => relative_path,
-                Err(err) => {
-                    record_walk_error(&mut walk_errors, &path, err);
-                    continue;
-                }
-            };
-
-            let metadata = match fs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    record_walk_error(&mut walk_errors, &path, err);
-                    continue;
-                }
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let size_bytes = metadata.len();
-            if file_type.is_symlink() {
-                let target = match fs::canonicalize(&path) {
-                    Ok(target) => target,
+        // Read+hash is the dominant cost, so fan the per-file work across the
+        // walker's threads. Each entry only appends to the shared sink under a
+        // brief lock; all I/O (stat, read, hash) happens outside the lock.
+        // Final ordering is restored by the post-crawl sort, so parallel
+        // arrival order does not affect the snapshot.
+        let sink = Mutex::new(CrawlSink::default());
+        walker.build_parallel().run(|| {
+            Box::new(|entry| {
+                let entry = match entry {
+                    Ok(entry) => entry,
                     Err(err) => {
-                        record_walk_error(&mut walk_errors, &path, err);
-                        continue;
+                        sink.lock()
+                            .expect("crawl sink poisoned")
+                            .walk_errors
+                            .push(err.to_string());
+                        return ignore::WalkState::Continue;
                     }
                 };
-                if !target.starts_with(&root) {
-                    // Symlink target lies outside the workspace root. Record it
-                    // in coverage so callers can explain why the file is absent,
-                    // rather than silently omitting it from the index.
-                    record_excluded_file(
-                        &mut excluded,
-                        &mut coverage,
-                        &path,
-                        relative_path,
-                        size_bytes,
-                        ExclusionReason::ExternalSymlink,
-                    );
-                    continue;
+                if let Some(outcome) = self.process_entry(&root, prior, entry) {
+                    sink.lock().expect("crawl sink poisoned").absorb(outcome);
                 }
-            }
-            let detected_language = classify_language(&path);
-            // Java source files frequently contain many nested declarations
-            // in a single file, so we lift the default cap when the user has
-            // not configured an explicit one.
-            let max_file_bytes = if detected_language == LanguageKind::Java
-                && self.options.max_file_bytes == DEFAULT_MAX_FILE_BYTES
-            {
-                DEFAULT_JAVA_MAX_FILE_BYTES
-            } else {
-                self.options.max_file_bytes
-            };
+                ignore::WalkState::Continue
+            })
+        });
 
-            if let Some(reason) = self.compiled_policy.path_reason(&relative_path, false) {
-                record_excluded_file(
-                    &mut excluded,
-                    &mut coverage,
-                    &path,
-                    relative_path,
-                    size_bytes,
-                    reason,
-                );
-                continue;
-            }
-
-            // Cheap rejection: skip the file before reading it when it is
-            // bigger than the per-file byte cap, unless the user opted into
-            // indexing large files via `include_classes = ["large_file"]`.
-            if size_bytes > max_file_bytes
-                && !self
-                    .compiled_policy
-                    .includes_class(ExclusionReason::LargeFile)
-            {
-                record_excluded_file(
-                    &mut excluded,
-                    &mut coverage,
-                    &path,
-                    relative_path,
-                    size_bytes,
-                    ExclusionReason::LargeFile,
-                );
-                continue;
-            }
-
-            let (hash, prefix) = match read_hash_and_prefix(&path) {
-                Ok(result) => result,
-                Err(err) => {
-                    record_walk_error(&mut walk_errors, &path, err);
-                    continue;
-                }
-            };
-            if looks_binary(&prefix) {
-                if self.compiled_policy.includes_class(ExclusionReason::Binary) {
-                    unsupported.push(unsupported_file(
-                        &path,
-                        relative_path.clone(),
-                        extension_string(&path),
-                        size_bytes,
-                        UnsupportedReason::BinaryLike,
-                    ));
-                } else {
-                    record_excluded_file(
-                        &mut excluded,
-                        &mut coverage,
-                        &path,
-                        relative_path,
-                        size_bytes,
-                        ExclusionReason::Binary,
-                    );
-                }
-                continue;
-            }
-            if looks_generated(&prefix)
-                && !self
-                    .compiled_policy
-                    .includes_class(ExclusionReason::Generated)
-            {
-                record_excluded_file(
-                    &mut excluded,
-                    &mut coverage,
-                    &path,
-                    relative_path,
-                    size_bytes,
-                    ExclusionReason::Generated,
-                );
-                continue;
-            }
-
-            if detected_language == LanguageKind::Unsupported {
-                unsupported.push(unsupported_file(
-                    &path,
-                    relative_path.clone(),
-                    extension_string(&path),
-                    size_bytes,
-                    UnsupportedReason::UnsupportedExtension,
-                ));
-            }
-
-            let modified_unix_millis = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis())
-                .unwrap_or_default();
-
-            files.push(FileRecord {
-                id: FileId::new(relative_path.clone()),
-                path,
-                relative_path,
-                hash: ContentHash::new(hash),
-                size_bytes,
-                modified_unix_millis,
-                language: detected_language,
-                freshness: Freshness::Fresh,
-            });
-        }
+        let CrawlSink {
+            mut files,
+            mut unsupported,
+            mut excluded,
+            mut walk_errors,
+        } = sink.into_inner().expect("crawl sink poisoned");
 
         // Order matters: refine first so that ambiguous `.h` files are
         // reclassified to their sibling's language *before* the allow-list
@@ -656,18 +549,30 @@ impl WorkspaceCrawler {
         // Pull pruned directories collected by `filter_entry` into the
         // snapshot. We do this once so each excluded directory shows up
         // exactly once, regardless of how many children it had.
-        let mut pruned_dirs = pruned_dirs
+        let pruned_dirs = pruned_dirs
             .lock()
             .map(|mut guard| std::mem::take(&mut *guard))
             .unwrap_or_default();
-        for entry in pruned_dirs.drain(..) {
-            record_excluded_dir_entry(&mut coverage, &entry);
-            excluded.push(entry);
-        }
+        excluded.extend(pruned_dirs);
 
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         unsupported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         excluded.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        // `walk_errors` arrives in nondeterministic thread order; sort so the
+        // snapshot is stable across runs and reproducible in tests.
+        walk_errors.sort();
+
+        // Coverage (counters and the capped sample paths) is rolled up only
+        // after `excluded` is sorted, so the sampled paths are deterministic
+        // regardless of the order threads finished their entries in.
+        let mut coverage = IndexCoverage::default();
+        for entry in &excluded {
+            if entry.is_dir {
+                record_excluded_dir_entry(&mut coverage, entry);
+            } else {
+                record_excluded_file_coverage(&mut coverage, entry);
+            }
+        }
         let path_conflicts = detect_path_conflicts(&files);
 
         Ok(WorkspaceSnapshot {
@@ -681,10 +586,270 @@ impl WorkspaceCrawler {
             indexing_decision,
         })
     }
+
+    /// Classify and (unless a `prior` fingerprint lets us skip it) read+hash a
+    /// single walk entry, returning the mutations to apply to the shared sink.
+    /// Returns `None` for entries that contribute nothing (directories,
+    /// non-file/non-symlink, sockets reported as files after stat, etc.).
+    fn process_entry(
+        &self,
+        root: &Path,
+        prior: &PriorFileMetadata<'_>,
+        entry: ignore::DirEntry,
+    ) -> Option<EntryOutcome> {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            return None;
+        }
+        if !file_type.is_file() && !file_type.is_symlink() {
+            return None;
+        }
+        let path = entry.into_path();
+        let relative_path = match relative_path(root, &path) {
+            Ok(relative_path) => relative_path,
+            Err(err) => return Some(EntryOutcome::walk_error(&path, err)),
+        };
+
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => return Some(EntryOutcome::walk_error(&path, err)),
+        };
+        if !metadata.is_file() {
+            return None;
+        }
+        let size_bytes = metadata.len();
+        if file_type.is_symlink() {
+            let target = match fs::canonicalize(&path) {
+                Ok(target) => target,
+                Err(err) => return Some(EntryOutcome::walk_error(&path, err)),
+            };
+            if !target.starts_with(root) {
+                // Symlink target lies outside the workspace root. Record it
+                // in coverage so callers can explain why the file is absent,
+                // rather than silently omitting it from the index.
+                return Some(EntryOutcome::excluded(
+                    &path,
+                    relative_path,
+                    size_bytes,
+                    ExclusionReason::ExternalSymlink,
+                ));
+            }
+        }
+        let detected_language = classify_language(&path);
+        // Java source files frequently contain many nested declarations
+        // in a single file, so we lift the default cap when the user has
+        // not configured an explicit one.
+        let max_file_bytes = if detected_language == LanguageKind::Java
+            && self.options.max_file_bytes == DEFAULT_MAX_FILE_BYTES
+        {
+            DEFAULT_JAVA_MAX_FILE_BYTES
+        } else {
+            self.options.max_file_bytes
+        };
+
+        if let Some(reason) = self.compiled_policy.path_reason(&relative_path, false) {
+            return Some(EntryOutcome::excluded(
+                &path,
+                relative_path,
+                size_bytes,
+                reason,
+            ));
+        }
+
+        let modified_unix_millis = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+
+        // Fast path: a previously-kept file whose size and mtime are both
+        // unchanged is treated as unchanged. We reuse the recorded hash and
+        // skip the full read, the large-file screen, and the binary/generated
+        // screens (all of which this file already passed last crawl). The
+        // `classify_language` pipeline still runs fresh below, so language
+        // post-processing is identical to a cold crawl.
+        if let Some(meta) = prior.get(relative_path.as_str())
+            && meta.size_bytes == size_bytes
+            && meta.modified_unix_millis == modified_unix_millis
+        {
+            return Some(self.keep_file(
+                path,
+                relative_path,
+                meta.hash.clone(),
+                size_bytes,
+                modified_unix_millis,
+                detected_language,
+            ));
+        }
+
+        // Cheap rejection: skip the file before reading it when it is
+        // bigger than the per-file byte cap, unless the user opted into
+        // indexing large files via `include_classes = ["large_file"]`.
+        if size_bytes > max_file_bytes
+            && !self
+                .compiled_policy
+                .includes_class(ExclusionReason::LargeFile)
+        {
+            return Some(EntryOutcome::excluded(
+                &path,
+                relative_path,
+                size_bytes,
+                ExclusionReason::LargeFile,
+            ));
+        }
+
+        let (hash, prefix) = match read_hash_and_prefix(&path) {
+            Ok(result) => result,
+            Err(err) => return Some(EntryOutcome::walk_error(&path, err)),
+        };
+        if looks_binary(&prefix) {
+            if self.compiled_policy.includes_class(ExclusionReason::Binary) {
+                return Some(EntryOutcome::unsupported(unsupported_file(
+                    &path,
+                    relative_path.clone(),
+                    extension_string(&path),
+                    size_bytes,
+                    UnsupportedReason::BinaryLike,
+                )));
+            }
+            return Some(EntryOutcome::excluded(
+                &path,
+                relative_path,
+                size_bytes,
+                ExclusionReason::Binary,
+            ));
+        }
+        if looks_generated(&prefix)
+            && !self
+                .compiled_policy
+                .includes_class(ExclusionReason::Generated)
+        {
+            return Some(EntryOutcome::excluded(
+                &path,
+                relative_path,
+                size_bytes,
+                ExclusionReason::Generated,
+            ));
+        }
+
+        Some(self.keep_file(
+            path,
+            relative_path,
+            ContentHash::new(hash),
+            size_bytes,
+            modified_unix_millis,
+            detected_language,
+        ))
+    }
+
+    /// Build the kept-file outcome shared by the fast and read+hash paths:
+    /// an unsupported-extension file is surfaced in coverage *and* kept as a
+    /// fallback record, exactly as the original sequential crawl did.
+    fn keep_file(
+        &self,
+        path: PathBuf,
+        relative_path: String,
+        hash: ContentHash,
+        size_bytes: u64,
+        modified_unix_millis: u128,
+        detected_language: LanguageKind,
+    ) -> EntryOutcome {
+        let unsupported = (detected_language == LanguageKind::Unsupported).then(|| {
+            unsupported_file(
+                &path,
+                relative_path.clone(),
+                extension_string(&path),
+                size_bytes,
+                UnsupportedReason::UnsupportedExtension,
+            )
+        });
+        EntryOutcome {
+            file: Some(FileRecord {
+                id: FileId::new(relative_path.clone()),
+                path,
+                relative_path,
+                hash,
+                size_bytes,
+                modified_unix_millis,
+                language: detected_language,
+                freshness: Freshness::Fresh,
+            }),
+            unsupported,
+            ..EntryOutcome::default()
+        }
+    }
 }
 
-fn record_walk_error(walk_errors: &mut Vec<String>, path: &Path, err: impl std::fmt::Display) {
-    walk_errors.push(format!("{}: {err}", path.display()));
+/// Thread-shared accumulator for a parallel crawl. Each walk entry appends to
+/// this under a brief lock; the expensive read+hash runs before the lock is
+/// taken (see [`EntryOutcome`]). Coverage is rolled up after the crawl from
+/// the sorted `excluded` list, so it is unaffected by thread arrival order.
+#[derive(Default)]
+struct CrawlSink {
+    files: Vec<FileRecord>,
+    unsupported: Vec<UnsupportedFile>,
+    excluded: Vec<ExcludedPath>,
+    walk_errors: Vec<String>,
+}
+
+impl CrawlSink {
+    fn absorb(&mut self, outcome: EntryOutcome) {
+        if let Some(file) = outcome.file {
+            self.files.push(file);
+        }
+        if let Some(unsupported) = outcome.unsupported {
+            self.unsupported.push(unsupported);
+        }
+        if let Some(excluded) = outcome.excluded {
+            self.excluded.push(excluded);
+        }
+        self.walk_errors.extend(outcome.walk_errors);
+    }
+}
+
+/// Outcome of processing a single walk entry, computed off-lock so the shared
+/// [`CrawlSink`] only mutates while appending.
+#[derive(Default)]
+struct EntryOutcome {
+    file: Option<FileRecord>,
+    unsupported: Option<UnsupportedFile>,
+    excluded: Option<ExcludedPath>,
+    walk_errors: Vec<String>,
+}
+
+impl EntryOutcome {
+    fn walk_error(path: &Path, err: impl std::fmt::Display) -> Self {
+        Self {
+            walk_errors: vec![format!("{}: {err}", path.display())],
+            ..Self::default()
+        }
+    }
+
+    fn excluded(
+        path: &Path,
+        relative_path: String,
+        size_bytes: u64,
+        reason: ExclusionReason,
+    ) -> Self {
+        Self {
+            excluded: Some(ExcludedPath {
+                path: path.to_path_buf(),
+                relative_path,
+                size_bytes,
+                reason,
+                is_dir: false,
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn unsupported(unsupported: UnsupportedFile) -> Self {
+        Self {
+            unsupported: Some(unsupported),
+            ..Self::default()
+        }
+    }
 }
 
 fn keep_entry(
@@ -1993,32 +2158,21 @@ fn is_binary_extension(name: &str) -> bool {
     )
 }
 
-fn record_excluded_file(
-    excluded: &mut Vec<ExcludedPath>,
-    coverage: &mut IndexCoverage,
-    path: &Path,
-    relative_path: String,
-    size_bytes: u64,
-    reason: ExclusionReason,
-) {
+/// Roll the already-collected excluded *file* entry into coverage counters
+/// and its capped sample list. Called after `excluded` is sorted so the
+/// sampled paths are deterministic across runs.
+fn record_excluded_file_coverage(coverage: &mut IndexCoverage, file: &ExcludedPath) {
     coverage.skipped_files += 1;
-    coverage.skipped_bytes += size_bytes;
+    coverage.skipped_bytes += file.size_bytes;
     let entry = coverage
         .reasons
-        .entry(reason.as_str().to_string())
+        .entry(file.reason.as_str().to_string())
         .or_default();
     entry.files += 1;
-    entry.bytes += size_bytes;
+    entry.bytes += file.size_bytes;
     if entry.samples.len() < 5 {
-        entry.samples.push(relative_path.clone());
+        entry.samples.push(file.relative_path.clone());
     }
-    excluded.push(ExcludedPath {
-        path: path.to_path_buf(),
-        relative_path,
-        size_bytes,
-        reason,
-        is_dir: false,
-    });
 }
 
 fn record_excluded_dir_entry(coverage: &mut IndexCoverage, entry: &ExcludedPath) {

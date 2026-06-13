@@ -767,6 +767,27 @@ impl GraphStore {
         read_table_json(&table, file_id.0.as_str())
     }
 
+    /// Decode every stored graph partition into `T`, keyed by its `FileId`.
+    ///
+    /// Callers pass a *lightweight* `T` that deserializes only the fields they
+    /// need (serde ignores the rest), so the warm-start path can read each
+    /// file's persisted fingerprint without materialising the full parse
+    /// result. Returns an empty vec if the table has never been written.
+    pub fn graph_partition_entries<T: DeserializeOwned>(&self) -> Result<Vec<(FileId, T)>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(GRAPH_PARTITIONS) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut entries = Vec::new();
+        for entry in table.iter().map_err(store_error)? {
+            let (key, value) = entry.map_err(store_error)?;
+            let decoded: T = decode(value.value())?;
+            entries.push((FileId(key.value().to_string()), decoded));
+        }
+        Ok(entries)
+    }
+
     pub fn remove_graph_partition(&self, file_id: &FileId) -> Result<()> {
         let write = self.begin_write()?;
         {

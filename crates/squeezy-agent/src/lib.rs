@@ -6940,8 +6940,10 @@ impl TurnRuntime {
         // Upgrade any legacy conversation items resumed from disk so the
         // invariant holds for the rest of this turn. Idempotent and
         // cheap for items already in redacted form.
-        let mut conversation =
-            redact_llm_input_items(prior_state.conversation.clone(), &self.redactor);
+        let mut conversation = redact_llm_input_items(
+            std::mem::take(&mut prior_state.conversation),
+            &self.redactor,
+        );
         conversation.push(user_item.clone());
         for image_item in &image_items {
             conversation.push(image_item.clone());
