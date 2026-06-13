@@ -50815,3 +50815,39 @@ fn jump_return_heals_to_main_when_prior_subagent_pruned() {
     assert!(restore_subagent_return_anchor(&mut app));
     assert!(matches!(app.subagent_pane.active, ConversationSource::Main));
 }
+#[test]
+fn tool_actions_label_budget_reserves_room_for_affordance_suffix() {
+    // Mirror render_tool_actions_surface's budget math: an 88-wide modal yields
+    // inner.width 86, the marker (2) + kind tag (10) + affordance suffix are
+    // reserved, and a long path label must be truncated to fit the remainder so
+    // the trailing "(copy/jump)" hint stays on-screen.
+    let inner_width: usize = 86;
+    let suffix = "  (copy/jump)";
+    let reserved = 2 + 10 + UnicodeWidthStr::width(suffix);
+    let budget = inner_width.saturating_sub(reserved).max(8);
+
+    let long_label = "src/".to_string() + &"abcdefghij/".repeat(15) + "module.rs";
+    assert!(
+        UnicodeWidthStr::width(long_label.as_str()) > budget,
+        "fixture must overflow the budget to exercise truncation",
+    );
+
+    let truncated = truncate_label_to_cells(&long_label, budget);
+    assert!(
+        UnicodeWidthStr::width(truncated.as_str()) <= budget,
+        "truncated label {truncated:?} exceeds budget {budget}",
+    );
+    assert!(
+        truncated.ends_with('\u{2026}'),
+        "an overflowing label should carry an ellipsis: {truncated:?}",
+    );
+
+    // The reserved suffix plus the marker/tag plus the budgeted label never
+    // exceed the row width, so the affordance hint cannot be clipped.
+    let painted =
+        2 + 10 + UnicodeWidthStr::width(truncated.as_str()) + UnicodeWidthStr::width(suffix);
+    assert!(
+        painted <= inner_width,
+        "painted width {painted} exceeds inner width {inner_width}",
+    );
+}

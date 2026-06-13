@@ -32021,6 +32021,14 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             .map(|a| a.label())
             .collect::<Vec<_>>()
             .join("/");
+        let suffix = format!("  ({affordances})");
+        // Reserve the marker (2) + kind tag (9 padded + trailing space) and the
+        // affordance suffix so the row's copy/jump hint never clips off-screen;
+        // the display label absorbs whatever width remains. The clipboard still
+        // gets the full slice via the item's `copy_text`.
+        let reserved = 2 + 10 + UnicodeWidthStr::width(suffix.as_str());
+        let budget = (inner.width as usize).saturating_sub(reserved).max(8);
+        let label = truncate_label_to_cells(&item.text, budget);
         let line = Line::from(vec![
             Span::styled(
                 marker,
@@ -32034,11 +32042,8 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
                 format!("{:<9} ", format!("[{}]", item.kind.label())),
                 Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(item.text.clone(), text_style),
-            Span::styled(
-                format!("  ({affordances})"),
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
+            Span::styled(label, text_style),
+            Span::styled(suffix, Style::default().fg(crate::render::theme::quiet())),
         ]);
         frame.render_widget(Paragraph::new(line), row_rect);
 
