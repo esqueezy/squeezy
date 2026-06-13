@@ -15080,7 +15080,7 @@ fn toggle_lane_fold(app: &mut TuiApp) {
             "lane folds (no entry to fold) — Esc to close".to_string()
         } else {
             format!(
-                "lane folds: {} — \u{2191}\u{2193} select \u{00b7} Enter fold \u{00b7} Esc close",
+                "lane folds: {} — \u{2191}\u{2193} select \u{00b7} Enter fold \u{00b7} c/o all \u{00b7} Esc close",
                 app.lane_panel.summary(),
             )
         };
