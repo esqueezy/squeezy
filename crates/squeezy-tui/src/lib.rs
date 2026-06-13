@@ -18247,6 +18247,12 @@ fn queue_run_selected_next(app: &mut TuiApp) -> bool {
             app.prompt_queue.len()
         );
         app.needs_redraw = true;
+    } else {
+        // Front + busy: nothing moved and nothing armed, but the key was
+        // consumed, so confirm the front prompt is already what runs next
+        // (after the live turn finishes) rather than leaving `r` looking dead.
+        app.status = "already at the front — it runs next when the turn finishes".to_string();
+        app.needs_redraw = true;
     }
     changed
 }

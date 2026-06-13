@@ -34719,8 +34719,9 @@ async fn r_on_already_front_prompt_runs_now_when_idle_without_reorder() {
 
 #[tokio::test]
 async fn r_on_already_front_prompt_while_busy_is_inert() {
-    // Front + busy: nothing to move and nothing to run — a quiet no-op that still
-    // consumes the key (the overlay stays open, the composer stays untouched).
+    // Front + busy: nothing to move and nothing to run, but the key was consumed,
+    // so it reports that the front prompt already runs next (the overlay stays
+    // open, the composer stays untouched).
     let mut app = queue_app(&["front", "tail"]);
     let mut agent = test_agent(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(8);
@@ -34745,6 +34746,10 @@ async fn r_on_already_front_prompt_while_busy_is_inert() {
     );
     assert!(app.input.is_empty(), "no key leaks into the composer");
     assert!(app.prompt_queue_undo.is_empty());
+    assert_eq!(
+        app.status, "already at the front — it runs next when the turn finishes",
+        "consumed key gives feedback instead of a silent no-op"
+    );
 }
 
 #[tokio::test]
