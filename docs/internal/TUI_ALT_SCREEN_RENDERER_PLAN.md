@@ -1122,8 +1122,8 @@ make Squeezy feel like a polished terminal-native workbench rather than a chat b
   or quoted into the composer.
 - **(S) Paste transform menu** — paste as plain text, quoted text, code block, file attachment, or
   queued prompt.
-- **(M) Large paste staging** — big pasted content opens a preview with size, line count, and actions
-  before committing to the composer.
+- **(M) Large paste inline question** — big pasted content opens the shared below-composer
+  accept/discard question with size and line counts before committing to the composer.
 - **(M) Export destinations** — export transcript/selection to Markdown, JSON, HTML, clipboard,
   temp file, repo file, or bug-report bundle through one flow.
 - **(S) External editor handoff** — open selected prompt/queue item/export buffer in `$EDITOR`, then

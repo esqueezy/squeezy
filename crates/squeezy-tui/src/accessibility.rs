@@ -643,22 +643,17 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // (`jump_to_entry_id`); `JumpNextUserTurn` (Alt+Down default) is the
         // representative keyboard verb.
         A::MinimapJump(_) => KeyboardPath::Keymap(Action::JumpNextUserTurn),
-        // Large-paste confirm/cancel — the paste-preview modal's own key
+        // Large-paste confirm/cancel — the inline paste question's own key
         // handler owns Enter/`y` (confirm) and Esc/`n` (cancel) before the
         // global keymap sees them, so both reach the same `resolve_paste_preview`
         // handler the buttons click.
-        A::ConfirmPaste => KeyboardPath::Always("paste modal Enter/y"),
-        A::CancelPaste => KeyboardPath::Always("paste modal Esc/n"),
-        // Paste-transform row select (§12.6.2) — the paste-transform menu's own
+        A::ConfirmPaste => KeyboardPath::Always("paste question Enter/y"),
+        A::CancelPaste => KeyboardPath::Always("paste question Esc/n"),
+        // Paste-transform row select (§12.6.2) — the inline paste question's own
         // key handler owns ↑↓/kj (move the cursor) and Enter (apply the selected
         // row) before the global keymap sees them, reaching the same
         // `resolve_paste_transform` handler a row click drives.
-        A::PasteTransformSelect(_) => KeyboardPath::Always("paste menu ↑↓/Enter"),
-        // Large Paste Staging row select (§12.6.3) — the staging overlay's own
-        // key handler owns ↑↓/kj (move the cursor) and Enter (apply the selected
-        // action) before the global keymap sees them, reaching the same
-        // `resolve_paste_staging` handler a row click drives.
-        A::PasteStagingSelect(_) => KeyboardPath::Always("paste staging ↑↓/Enter"),
+        A::PasteTransformSelect(_) => KeyboardPath::Always("paste question ↑↓/Enter"),
         // Clipboard-history picker (§12.6.1) — the picker's own key handler owns
         // Up/Down (select), Enter (re-copy), `d` (delete), and `c` (clear) before
         // the global keymap sees them, so every mouse affordance routes to the

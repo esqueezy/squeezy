@@ -110,16 +110,13 @@ pub(crate) enum ChromeKey {
     JumpToLatest,
     /// The main-view scrollbar gutter.
     ScrollbarGutter,
-    /// The "Accept" button in the large-paste confirmation modal (§11G.6).
+    /// The "Accept" action in the inline large-paste question (§11G.6).
     PasteConfirm,
-    /// The "Discard" button in the large-paste confirmation modal (§11G.6).
+    /// The "Discard" action in the inline large-paste question (§11G.6).
     PasteCancel,
-    /// A row in the paste-transform menu (§12.6.2), keyed by its 0-based index
+    /// A row in the inline paste-transform question (§12.6.2), keyed by its 0-based index
     /// in the offered-transform list so a click selects exactly that shape.
     PasteTransformItem(usize),
-    /// A row in the Large Paste Staging overlay (§12.6.3), keyed by its 0-based
-    /// index in the offered-action list so a click selects exactly that action.
-    PasteStagingItem(usize),
     /// The "Re-copy" button in the clipboard-history picker (§12.6.1).
     ClipboardRecopy,
     /// The "Delete" button in the clipboard-history picker (§12.6.1).
@@ -402,20 +399,16 @@ pub(crate) enum Action {
     /// the top of the viewport. Keyed by the cell's [`EntryId`] so a resize
     /// re-registers the same target at a fresh rail cell.
     MinimapJump(EntryId),
-    /// Confirm the pending large paste in the confirmation modal (§11G.6),
-    /// inserting it into the composer. Mouse twin of the modal's Enter/`y` key.
+    /// Confirm the pending large paste in the inline question (§11G.6),
+    /// inserting it into the composer. Mouse twin of Enter/`y`.
     ConfirmPaste,
-    /// Cancel the pending large paste in the confirmation modal (§11G.6),
-    /// discarding it. Mouse twin of the modal's Esc/`n` key.
+    /// Cancel the pending large paste in the inline question (§11G.6),
+    /// discarding it. Mouse twin of Esc/`n`.
     CancelPaste,
-    /// Select (move the cursor to) the given row in the paste-transform menu
+    /// Select (move the cursor to) the given row in the inline paste-transform question
     /// (§12.6.2) and apply it. Mouse twin of moving the cursor with ↑↓ and
     /// pressing Enter; a click both selects and applies the shape in one go.
     PasteTransformSelect(usize),
-    /// Select (move the cursor to) the given row in the Large Paste Staging
-    /// overlay (§12.6.3) and apply it. Mouse twin of moving the cursor with ↑↓
-    /// and pressing Enter; a click both selects and applies the action in one go.
-    PasteStagingSelect(usize),
     /// Select the given clipboard-history entry (by stable id) in the picker
     /// (§12.6.1). Mouse twin of the picker's Up/Down arrows. Fed by a single
     /// click on a history row.
@@ -738,7 +731,6 @@ impl Action {
         Action::ConfirmPaste,
         Action::CancelPaste,
         Action::PasteTransformSelect(0),
-        Action::PasteStagingSelect(0),
         Action::ClipboardSelect(0),
         Action::ClipboardRecopy(0),
         Action::ClipboardDelete(0),
