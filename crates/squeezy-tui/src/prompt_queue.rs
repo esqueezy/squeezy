@@ -249,10 +249,24 @@ pub(crate) fn render_lines(
         // A collapsed group's member rows stay in place (so the windowing and the
         // hit-target rects never drift) but read as folded — the preview is
         // replaced by the group name on the first member and dimmed elsewhere.
-        let body = if let Some(g) = group.filter(|g| g.collapsed) {
-            format!("{:>2}. ⊟ {} ({})", index + 1, g.name, g.members.len())
-        } else {
-            format!("{:>2}. {}", index + 1, preview(item))
+        let collapsed_g = group.filter(|g| g.collapsed);
+        let is_first_collapsed_member = collapsed_g.is_some()
+            && groups
+                .and_then(|g| index.checked_sub(1).and_then(|p| g.get(p)))
+                .copied()
+                .flatten()
+                .map(|prev| prev.id)
+                != collapsed_g.map(|g| g.id);
+        let (body, body_style) = match collapsed_g {
+            Some(g) if is_first_collapsed_member => (
+                format!("{:>2}. ⊟ {} ({})", index + 1, g.name, g.members.len()),
+                style,
+            ),
+            Some(_) => (
+                format!("{:>2}.  ┊", index + 1),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            None => (format!("{:>2}. {}", index + 1, preview(item)), style),
         };
         let mut spans = vec![
             Span::styled(
@@ -283,7 +297,7 @@ pub(crate) fn render_lines(
             let body = truncate_to_width(&body, body_budget);
             let body_w = UnicodeWidthStr::width(body.as_str());
             let pad = body_budget.saturating_sub(body_w);
-            spans.push(Span::styled(body, style));
+            spans.push(Span::styled(body, body_style));
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
@@ -292,7 +306,7 @@ pub(crate) fn render_lines(
                 Style::default().fg(crate::render::theme::quiet()),
             ));
         } else {
-            spans.push(Span::styled(body, style));
+            spans.push(Span::styled(body, body_style));
         }
         lines.push(Line::from(spans));
     }
