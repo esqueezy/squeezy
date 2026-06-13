@@ -372,6 +372,33 @@ fn append_generic(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest
     lines.push(plain_white(compact_text(&permission.target, 160)));
 }
 
+/// True when an "Always allow" decision for this request would actually be
+/// written to `squeezy.toml`. Mirrors the backend's persistence guard
+/// (`permission_rule_for_persistence`): the backend refuses to persist an
+/// `Allow` rule on the destructive capability or with an effectively-wildcard
+/// target, resolving the call as approve-once instead. The TUI must agree so
+/// the project-allow option and its caption never promise a durable rule the
+/// backend will silently drop.
+pub(crate) fn project_allow_is_persistable(permission: &PermissionRequest) -> bool {
+    if permission.capability == PermissionCapability::Destructive {
+        return false;
+    }
+    let rule_capability = permission
+        .suggested_rules
+        .first()
+        .map(|rule| rule.capability.as_str())
+        .unwrap_or_else(|| permission.capability.as_str());
+    if rule_capability == "destructive" {
+        return false;
+    }
+    let rule_target = permission
+        .suggested_rules
+        .first()
+        .map(|rule| rule.target.as_str())
+        .unwrap_or(permission.target.as_str());
+    !squeezy_core::target_is_effectively_wildcard(rule_target)
+}
+
 fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
     let rule = permission
         .suggested_rules
@@ -391,13 +418,17 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
             Style::default().fg(crate::render::theme::foreground()),
         ),
     ]));
-    // "Always allow" persists this rule to the project settings file (every
-    // approval prompt offers the project-scope option), so name the durable,
-    // project-wide reach rather than letting the scope only surface later in
-    // squeezy.toml. Indented under `Rule:` and dimmed so it reads as a caveat.
-    lines.push(dim(
-        "(saved to squeezy.toml — applies to all matching requests in this project)".to_string(),
-    ));
+    // Name the actual reach of "Always allow": a persistable rule is written to
+    // the project settings file and applies to every future matching request;
+    // a non-persistable one (destructive capability or wildcard target) the
+    // backend can only honour for this session. Indented under `Rule:` and
+    // dimmed so it reads as a caveat.
+    let caption = if project_allow_is_persistable(permission) {
+        "(saved to squeezy.toml — applies to all matching requests in this project)"
+    } else {
+        "(session only — this rule cannot be saved to squeezy.toml)"
+    };
+    lines.push(dim(caption.to_string()));
 }
 
 fn format_rule(permission: &PermissionRequest, rule: &PermissionRule) -> String {

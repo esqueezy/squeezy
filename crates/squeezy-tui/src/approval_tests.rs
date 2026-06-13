@@ -188,6 +188,91 @@ fn rule_preview_names_project_wide_persistence() {
 }
 
 #[test]
+fn rule_preview_warns_when_persistence_is_refused() {
+    // The backend refuses to persist an Allow rule on the destructive
+    // capability, resolving the call as approve-once. The preview must not
+    // promise a durable project rule that will never be written.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Destructive,
+        "rm -rf build",
+        &[("command", "rm -rf build")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("session only — this rule cannot be saved to squeezy.toml"),
+        "non-persistable request must warn the rule is session only: {out}"
+    );
+    assert!(
+        !out.contains("saved to squeezy.toml — applies to all matching requests"),
+        "non-persistable request must not promise durable persistence: {out}"
+    );
+}
+
+#[test]
+fn rule_preview_warns_when_target_is_wildcard() {
+    let mut req = request_with(
+        "webfetch",
+        PermissionCapability::Network,
+        "domain:example.com",
+        &[("host", "example.com")],
+    );
+    req.permission.suggested_rules.push(PermissionRule::new(
+        "network",
+        "*",
+        PermissionMode::Allow,
+        PermissionRuleSource::Session,
+        None,
+    ));
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("session only — this rule cannot be saved to squeezy.toml"),
+        "wildcard-target rule must warn it is session only: {out}"
+    );
+}
+
+#[test]
+fn rule_preview_keeps_durable_caption_for_persistable_request() {
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("saved to squeezy.toml — applies to all matching requests"),
+        "persistable request must keep the durable caption: {out}"
+    );
+    assert!(
+        !out.contains("cannot be saved to squeezy.toml"),
+        "persistable request must not show the session-only caveat: {out}"
+    );
+}
+
+#[test]
+fn approval_menu_marks_session_only_when_persistence_refused() {
+    // The project-allow option for a destructive request is relabeled so the
+    // menu does not offer "Always allow … in this repo" for a call the backend
+    // will only honour once.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Destructive,
+        "rm -rf build",
+        &[("command", "rm -rf build")],
+    );
+    let menu = format_approval_prompt(&req);
+    assert!(
+        menu.contains("Always allow (session only)"),
+        "destructive request should relabel the project-allow option: {menu}"
+    );
+    assert!(
+        !menu.contains("in this repo"),
+        "destructive request must not offer a durable repo rule: {menu}"
+    );
+}
+
+#[test]
 fn edit_preview_lists_paths() {
     let req = request_with(
         "edit",

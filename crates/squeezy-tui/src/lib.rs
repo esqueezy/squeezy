@@ -25207,10 +25207,14 @@ fn send_approval_decision(
     option: ApprovalOption,
 ) -> bool {
     let tool_name = pending.request.tool_name.clone();
+    let persistable = approval::project_allow_is_persistable(&pending.request.permission);
     let _ = pending.decision_tx.send(option.decision);
     app.status = match option.choice {
         ApprovalChoice::Approve => format!("approved {tool_name}"),
-        ApprovalChoice::ApproveProject => format!("saved repo approval for {tool_name}"),
+        ApprovalChoice::ApproveProject if persistable => {
+            format!("saved repo approval for {tool_name}")
+        }
+        ApprovalChoice::ApproveProject => format!("approved {tool_name} (session only)"),
         ApprovalChoice::Deny => format!("denied {tool_name}"),
     };
     true
@@ -25269,7 +25273,19 @@ fn approval_deny() -> ApprovalOption {
 /// menu keeps the obvious one-shot decision first, then offers one
 /// project-scoped allow rule for users who want to persist the decision.
 fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
-    let (project_label, project_hint) = capability_project_label(request);
+    let persistable = approval::project_allow_is_persistable(&request.permission);
+    let (project_label, project_hint) = if persistable {
+        capability_project_label(request)
+    } else {
+        // The backend's persistence guard refuses to save an Allow rule on the
+        // destructive capability or with a wildcard target and resolves the
+        // call as approve-once; label the option for that reach so the prompt
+        // does not promise a durable project rule that will not be written.
+        (
+            std::borrow::Cow::Borrowed("Always allow (session only)"),
+            std::borrow::Cow::Borrowed("cannot be saved to squeezy.toml"),
+        )
+    };
     let project = ApprovalOption {
         choice: ApprovalChoice::ApproveProject,
         label: project_label,
