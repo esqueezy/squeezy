@@ -645,6 +645,27 @@ fn extract_doc_intro_returns_short_paragraph_unchanged() {
 }
 
 #[test]
+fn bundled_skill_docs_do_not_advertise_nonexistent_slash_skill() {
+    // There is no `/skill` user command in the dispatch parser; skills activate
+    // via triggers, the model's `load_skill` tool, or implicit shell use. The
+    // bundled docs must not teach a `/skill` invocation that immediately falls
+    // through as a literal prompt.
+    let targets = [
+        "docs/external/SKILLS.md",
+        "docs/external/PROMPT_TEMPLATES.md",
+    ];
+    for doc in bundled_docs() {
+        if targets.contains(&doc.path) {
+            assert!(
+                !doc.content.contains("/skill"),
+                "{} must not advertise a `/skill` command",
+                doc.path
+            );
+        }
+    }
+}
+
+#[test]
 fn prompt_templates_topic_describes_real_slash_activation() {
     let help = SqueezyHelp::new("");
     let body = help.answer_topic("prompt-templates").body;
