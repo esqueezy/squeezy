@@ -44999,10 +44999,34 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
     } else {
         // Root … deepest. Always show the first and last crumb; collapse the
         // middle to a single ellipsis so the trail still orients on a narrow row.
-        // The deepest crumb is then truncated to whatever columns remain so it —
-        // the user's current location — is never clipped off the right edge.
+        // The first crumb is budgeted so it can never consume the whole row, and
+        // the deepest crumb is then truncated to whatever columns remain — so it,
+        // the user's current location, is never starved off the right edge.
+        let sep_width = UnicodeWidthStr::width(breadcrumbs::SEPARATOR);
+        let last = count - 1;
+        // Columns the chrome after the root consumes before the deepest crumb: the
+        // root→deepest separator plus, when interior crumbs collapse, the middle
+        // " ▸ …". Nothing follows a lone root.
+        let fixed = if count > 1 {
+            sep_width + if count > 2 { sep_width + 1 } else { 0 }
+        } else {
+            0
+        };
+        // When a deeper crumb follows, reserve room for it before painting the
+        // root, so the current location always lands. Half the row keeps the root
+        // meaningful. A lone root keeps the whole width (Paragraph clips the edge).
+        let reserve = if count > 1 {
+            model
+                .get(last)
+                .map(|c| UnicodeWidthStr::width(&c.label).min(width / 2).max(1))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if let Some(first) = model.get(0) {
-            push_crumb(&mut spans, &mut crumb_rects, &mut col, 0, &first.label);
+            let first_budget = width.saturating_sub(fixed + reserve);
+            let label = truncate_label_to_cells(&first.label, first_budget);
+            push_crumb(&mut spans, &mut crumb_rects, &mut col, 0, &label);
         }
         if count > 2 {
             push_sep(&mut spans, &mut col);
@@ -45010,9 +45034,8 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
             col += 1;
         }
         if count > 1 {
-            let used = col + UnicodeWidthStr::width(breadcrumbs::SEPARATOR);
+            let used = col + sep_width;
             let avail = width.saturating_sub(used);
-            let last = count - 1;
             if avail > 0
                 && let Some(crumb) = model.get(last)
             {

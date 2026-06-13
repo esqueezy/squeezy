@@ -51139,3 +51139,43 @@ fn dock_text_line_clips_by_display_cells_not_chars() {
     let fits = dock_text_line("abcd", 4);
     assert_eq!(fits.spans[0].content.as_ref(), "abcd");
 }
+
+#[test]
+fn breadcrumbs_strip_keeps_deepest_crumb_on_a_narrow_row() {
+    let mut app = test_app(SessionMode::Build);
+    // Root tail is the last 8 chars of the session id (8 display cells); a live
+    // search adds the deepest `search:loc` crumb — the user's current location.
+    app.session_id = Some("xxxxxxxxabcdefgh".to_string());
+    let mut search = search::SearchState::open(selection::SelectionSurface::Main, 11);
+    search.query = "loc".to_string();
+    app.search = Some(search);
+
+    // Width 11: the root + separator alone (8 + 3) would consume the whole row, so
+    // the unbudgeted first crumb used to starve the deepest crumb to zero columns.
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 11,
+        height: 1,
+    };
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_breadcrumbs_strip(frame, area, &app))
+        .expect("draw breadcrumbs strip");
+
+    let model = breadcrumbs::BreadcrumbModel::build(&build_breadcrumb_context(&app));
+    let last = model.len() - 1;
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::BreadcrumbCrumb(last),
+        ))
+        .expect("the deepest crumb still registers a click target on a narrow row");
+
+    // The deepest crumb's rect must be on-surface (inside the row).
+    assert!(rect.width > 0, "the deepest crumb gets at least one column");
+    assert!(
+        rect.x >= area.x && rect.x.saturating_add(rect.width) <= area.x + area.width,
+        "the deepest crumb's hit rect stays within the row: {rect:?}",
+    );
+}
