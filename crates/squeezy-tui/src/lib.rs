@@ -3986,8 +3986,42 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                     // transcript Up arm above only fires on a Main selection,
                     // this one only on an input selection).
                     app.selection = None;
-                    input::begin_input_selection(app, pos);
-                    app.input_cursor = pos;
+                    // Multi-click (mirrors the transcript's
+                    // `handle_main_selection_press`): single = caret + drag
+                    // anchor, double = word under the cursor, triple = the whole
+                    // logical line. A non-empty word/line selection then auto-
+                    // copies on release like any other composer selection.
+                    let now = std::time::Instant::now();
+                    let multiplicity = match app.last_click {
+                        Some((at, c, r, count))
+                            if c == mouse.column
+                                && r == mouse.row
+                                && now.duration_since(at).as_millis()
+                                    <= interaction::MULTI_CLICK_MS =>
+                        {
+                            (count + 1).min(3)
+                        }
+                        _ => 1,
+                    };
+                    app.last_click = Some((now, mouse.column, mouse.row, multiplicity));
+                    match multiplicity {
+                        2 => {
+                            let w = input::input_word_bounds(app, pos);
+                            input::begin_input_selection(app, w.start);
+                            input::extend_input_selection(app, w.end);
+                            app.input_cursor = w.end;
+                        }
+                        3 => {
+                            let l = input::input_line_bounds(app, pos);
+                            input::begin_input_selection(app, l.start);
+                            input::extend_input_selection(app, l.end);
+                            app.input_cursor = l.end;
+                        }
+                        _ => {
+                            input::begin_input_selection(app, pos);
+                            app.input_cursor = pos;
+                        }
+                    }
                     return true;
                 }
             }
@@ -4624,10 +4658,12 @@ fn is_copy_chord(key: &KeyEvent) -> bool {
     if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
         return false;
     }
-    key.modifiers.contains(KeyModifiers::SUPER)
-        || key
-            .modifiers
-            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+    // EXACT modifier match (not `contains`, which is a subset test): `⌘C` is
+    // *only* `SUPER`, and the conventional copy chord is *only* `Ctrl+Shift`.
+    // A subset test would also swallow `⌘Alt+C` / `Ctrl+Shift+Alt+C`, stealing
+    // those combos from the keymap against the documented intent.
+    key.modifiers == KeyModifiers::SUPER
+        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
 }
 
 /// Multi-Cursor-Like Transcript Selection (§12.1.6): commit the live visual
@@ -8175,7 +8211,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // this gate, so a single Esc also clears every committed range (not just the
     // live one) in one step.
     if key.code == KeyCode::Esc
-        && (app.selection.is_some() || !app.selection_set.is_empty())
+        && (app.selection.is_some()
+            || !app.selection_set.is_empty()
+            || app.input_selection.is_some())
         && app.config_screen.is_none()
         && app.transcript_overlay.is_none()
         && app.status_line_setup.is_none()
@@ -8185,6 +8223,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     {
         app.selection = None;
         app.selection_set.clear();
+        // The composer selection is part of "an active selection" too, so Esc
+        // dismisses it in the same keystroke (mirrors the mutual-exclusion
+        // clears on press).
+        input::clear_input_selection(app);
         app.status = "selection cleared".to_string();
         return Ok(false);
     }
@@ -8447,6 +8489,26 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
         // Bare emacs-style caret motion: clears any live composer selection.
         move_composer_cursor(app, false, move_input_cursor_line_start);
+        return Ok(false);
+    }
+
+    // ⌘A selects the whole composer (kitty-protocol terminals forward Command
+    // as `SUPER`; exact-match so a stray modifier never hijacks it). No-op when
+    // the composer is empty or a fullscreen surface owns the frame — there it
+    // falls through to that surface. Mutually exclusive with the transcript
+    // selection. Non-kitty terminals never deliver SUPER, so this is inert
+    // there (and ⌘A keeps its prior fall-through behavior).
+    if key.modifiers == KeyModifiers::SUPER
+        && key.code == KeyCode::Char('a')
+        && !app.input.is_empty()
+        && app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+    {
+        app.selection = None;
+        input::begin_input_selection(app, 0);
+        input::extend_input_selection(app, app.input.len());
+        app.input_cursor = app.input.len();
+        app.needs_redraw = true;
         return Ok(false);
     }
 

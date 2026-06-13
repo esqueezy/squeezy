@@ -48596,3 +48596,138 @@ fn composer_press_clears_a_live_transcript_selection_and_vice_versa() {
         "a transcript press drops the live composer selection",
     );
 }
+
+#[test]
+fn copy_chord_requires_exact_modifiers() {
+    // ⌘C is *only* SUPER and the conventional chord is *only* Ctrl+Shift — a
+    // subset test would wrongly swallow ⌘Alt+C / Ctrl+Shift+Alt+C and steal
+    // them from the keymap.
+    let k = |code, mods| KeyEvent::new(code, mods);
+    assert!(is_copy_chord(&k(KeyCode::Char('c'), KeyModifiers::SUPER)));
+    assert!(is_copy_chord(&k(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    assert!(is_copy_chord(&k(
+        KeyCode::Char('C'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    assert!(
+        !is_copy_chord(&k(
+            KeyCode::Char('c'),
+            KeyModifiers::SUPER | KeyModifiers::ALT
+        )),
+        "⌘Alt+C must not be treated as copy",
+    );
+    assert!(
+        !is_copy_chord(&k(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT
+        )),
+        "Ctrl+Shift+Alt+C must not be treated as copy",
+    );
+    assert!(
+        !is_copy_chord(&k(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        "plain Ctrl+C is handled by its own arm, not the copy-chord intercept",
+    );
+}
+
+#[tokio::test]
+async fn esc_clears_a_live_composer_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello".to_string());
+    input::begin_input_selection(&mut app, 0);
+    input::extend_input_selection(&mut app, 5);
+    assert!(app.input_selection.is_some(), "composer selection armed");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+
+    assert!(
+        app.input_selection.is_none(),
+        "Esc clears the composer selection too",
+    );
+    assert!(
+        app.status.contains("selection cleared"),
+        "status reports the clear: {}",
+        app.status
+    );
+}
+
+#[test]
+fn composer_double_click_selects_the_word_and_triple_click_the_line() {
+    let mut app = test_app(SessionMode::Build);
+    // Isolate selection behavior from the copy-on-release path (covered
+    // separately) so this test asserts only the word/line snapping.
+    app.copy_on_select = false;
+    set_input(&mut app, "hello world".to_string());
+    let buffer = render_composer_to_buffer(&app, 40, 6);
+    let (x, y) = find_text_cell(&buffer, "hello world").expect("composer painted");
+
+    // Double-click on the 'w' (byte offset 6) selects "world".
+    handle_mouse(&mut app, left_down(x + 6, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 6, y));
+    handle_mouse(&mut app, left_down(x + 6, y, KeyModifiers::NONE));
+    assert_eq!(
+        input::input_selected_text(&app).as_deref(),
+        Some("world"),
+        "double-click selects the word under the cursor",
+    );
+
+    // A third click at the same cell promotes to the whole logical line.
+    handle_mouse(&mut app, left_up(x + 6, y));
+    handle_mouse(&mut app, left_down(x + 6, y, KeyModifiers::NONE));
+    assert_eq!(
+        input::input_selected_text(&app).as_deref(),
+        Some("hello world"),
+        "triple-click selects the whole logical line",
+    );
+}
+
+#[tokio::test]
+async fn cmd_a_selects_the_whole_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello world".to_string());
+    app.input_cursor = 0;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER),
+    )
+    .await
+    .expect("cmd+a");
+
+    assert_eq!(
+        input::input_selected_text(&app).as_deref(),
+        Some("hello world"),
+        "⌘A selects the whole composer",
+    );
+}
+
+#[tokio::test]
+async fn cmd_a_on_empty_composer_is_a_noop() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.input.is_empty());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER),
+    )
+    .await
+    .expect("cmd+a");
+
+    assert!(
+        app.input_selection.is_none(),
+        "⌘A on an empty composer selects nothing",
+    );
+}

@@ -691,6 +691,45 @@ pub(crate) fn input_selected_text(app: &TuiApp) -> Option<String> {
     Some(app.input[range].to_string())
 }
 
+/// Byte range `[start, end)` of the WORD under byte offset `pos`, snapped within
+/// the logical (`\n`-delimited) line `pos` falls in. Reuses the transcript's
+/// `selection::word_bounds` (a click in whitespace snaps to the whitespace run,
+/// a click past the line end snaps to the trailing word) so composer
+/// double-click selection matches the transcript's word semantics. Used for
+/// composer double-click.
+pub(crate) fn input_word_bounds(app: &TuiApp, pos: usize) -> std::ops::Range<usize> {
+    let text = &app.input;
+    let pos = text_cursor(text, pos);
+    let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = text[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(text.len());
+    let line = &text[line_start..line_end];
+    let col = line[..pos - line_start].chars().count();
+    let char_range = crate::selection::word_bounds(line, col);
+    // Map char offsets back to byte offsets within `line` (+1 sentinel = len).
+    let byte_at: Vec<usize> = line
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(line.len()))
+        .collect();
+    (line_start + byte_at[char_range.start])..(line_start + byte_at[char_range.end])
+}
+
+/// Byte range `[start, end)` of the whole logical (`\n`-delimited) line under
+/// byte offset `pos` — the composer triple-click selection.
+pub(crate) fn input_line_bounds(app: &TuiApp, pos: usize) -> std::ops::Range<usize> {
+    let text = &app.input;
+    let pos = text_cursor(text, pos);
+    let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = text[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(text.len());
+    line_start..line_end
+}
+
 pub(crate) fn clamp_input_cursor(app: &mut TuiApp) {
     app.input_cursor = text_cursor(&app.input, app.input_cursor);
 }
