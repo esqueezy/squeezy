@@ -1326,6 +1326,35 @@ async fn read_file_reports_policy_ignored_reason_and_permission_scope() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn mcp_resource_listing_tools_are_scoped_to_mcp_capability() {
+    let root = temp_workspace("mcp_resource_listing_scope");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    for name in ["mcp_list_resources", "mcp_list_resource_templates"] {
+        let call = ToolCall {
+            call_id: format!("{name}_call"),
+            name: name.to_string(),
+            arguments: json!({ "server": "docs" }),
+        };
+        assert_eq!(
+            registry.permission_scope(&call),
+            PermissionScope::Mcp,
+            "{name} must gate under the MCP scope, not generic Read"
+        );
+
+        let request = registry.permission_request(&call);
+        assert_eq!(request.capability, PermissionCapability::Mcp);
+        assert!(
+            request.target.contains("docs"),
+            "{name} target should name the server, got {}",
+            request.target
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_count_mode_returns_count_without_line_content() {
     let root = temp_workspace("grep_count");

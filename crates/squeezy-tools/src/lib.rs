@@ -2287,8 +2287,9 @@ impl ToolRegistry {
             "write_file" | "notebook_edit" => PermissionScope::Edit,
             "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
-            "mcp_read_resource" => PermissionScope::Mcp,
-            "mcp_list_resources" | "mcp_list_resource_templates" => PermissionScope::Read,
+            "mcp_read_resource" | "mcp_list_resources" | "mcp_list_resource_templates" => {
+                PermissionScope::Mcp
+            }
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "read_file" if self.read_file_targets_ignored_policy(&call.arguments) => {
@@ -2820,6 +2821,27 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
+            "mcp_list_resources" | "mcp_list_resource_templates" => {
+                let server = call
+                    .arguments
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .to_string();
+                metadata.insert("server".to_string(), server.clone());
+                suggested_rules.push(PermissionRule::new(
+                    "mcp",
+                    format!("{server}/resources"),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved MCP resource listing".to_string()),
+                ));
+                (
+                    PermissionCapability::Mcp,
+                    format!("{server}/resources"),
+                    PermissionRisk::Low,
+                )
+            }
             "glob" if tool_include_ignored(&call.arguments) => (
                 PermissionCapability::Search,
                 "ignored:*".to_string(),
@@ -2840,23 +2862,10 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
             ),
-            "checkpoint_check"
-            | "checkpoint_doctor"
-            | "checkpoint_list"
-            | "checkpoint_show"
-            | "diff_context"
-            | "downstream_flow"
-            | "hierarchy"
-            | "plan_patch"
-            | "read_slice"
-            | "read_tool_output"
-            | "repo_map"
-            | "symbol_context"
-            | "upstream_flow"
-            | "list_skills"
-            | "load_skill"
-            | "mcp_list_resources"
-            | "mcp_list_resource_templates" => (
+            "checkpoint_check" | "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show"
+            | "diff_context" | "downstream_flow" | "hierarchy" | "plan_patch" | "read_slice"
+            | "read_tool_output" | "repo_map" | "symbol_context" | "upstream_flow"
+            | "list_skills" | "load_skill" => (
                 PermissionCapability::Read,
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
