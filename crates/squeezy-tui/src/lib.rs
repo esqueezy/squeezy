@@ -266,8 +266,8 @@ pub(crate) const MIRROR_FALLBACK_WIDTH: u16 = 80;
 const SLASH_MENU_MAX_ITEMS: usize = 10;
 
 /// Process-wide override for `tui.shell_diff_inline`, pinned by the TuiApp
-/// at startup and re-applied on settings hot-reload. Encoded as `0 = Full
-/// (default)`, `1 = Folded`. A static lets the deeply-nested render path
+/// at startup and re-applied on settings hot-reload. Encoded as `0 = Folded
+/// (default)`, `1 = Full`. A static lets the deeply-nested render path
 /// consult the setting without threading it through every formatter, the
 /// same pattern the palette uses for tone/accent overrides.
 static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
@@ -275,15 +275,15 @@ static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
 
 fn shell_diff_inline_setting() -> ShellDiffInline {
     match SHELL_DIFF_INLINE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => ShellDiffInline::Folded,
-        _ => ShellDiffInline::Full,
+        1 => ShellDiffInline::Full,
+        _ => ShellDiffInline::Folded,
     }
 }
 
 fn set_shell_diff_inline(setting: ShellDiffInline) {
     let encoded = match setting {
-        ShellDiffInline::Full => 0,
-        ShellDiffInline::Folded => 1,
+        ShellDiffInline::Full => 1,
+        ShellDiffInline::Folded => 0,
     };
     SHELL_DIFF_INLINE_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Relaxed);
 }
@@ -39252,10 +39252,12 @@ fn tool_bypasses_preview_cap(tool_name: &str) -> bool {
 
 /// Same intent as [`tool_bypasses_preview_cap`] but consults the result
 /// content too: a shell command whose stdout is a unified diff (`git diff`,
-/// `git show`, …) should render in full unless the user explicitly opted
-/// into folded shell diffs via `tui.shell_diff_inline = "folded"`. The
-/// diff IS the card; head/tail-capping it discards every hunk past the
-/// first or last five lines.
+/// `git show`, …) renders in full ONLY when the user explicitly opted into
+/// it via `tui.shell_diff_inline = "full"`. By default such diffs are
+/// incidental inspection the agent ran, not a file modification the user
+/// must review, so they stay on the normal head/tail preview cap (the user
+/// can still expand the card). Edits the agent makes (`apply_patch`,
+/// `write_file`) bypass the cap unconditionally via [`tool_bypasses_preview_cap`].
 fn tool_bypasses_preview_cap_for_tool(tool: &ToolTranscript) -> bool {
     if tool_bypasses_preview_cap(tool.result.tool_name.as_str()) {
         return true;

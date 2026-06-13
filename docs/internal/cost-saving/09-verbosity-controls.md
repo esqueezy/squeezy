@@ -12,8 +12,8 @@ Squeezy splits the dial three ways. Assistant text is governed by
 `ResponseVerbosity` (`/verbosity`). Inline preview of tool output in
 the transcript is governed by `ToolOutputVerbosity` (`/tool-verbosity`).
 Unified-diff stdout from shell commands has its own switch,
-`ShellDiffInline` (`tui.shell_diff_inline`), because `git diff` is the
-one tool whose value collapses if you head/tail-cap it. Each setting is
+`ShellDiffInline` (`tui.shell_diff_inline`), so a user who wants every
+hunk of a `git diff` the agent runs inline can opt into it. Each setting is
 session-scoped. Response verbosity can change the provider request
 (`text_verbosity` or a short prompt fragment); tool-output verbosity and
 shell-diff folding control transcript/TUI rendering and do not shrink
@@ -63,19 +63,22 @@ pub enum ToolOutputVerbosity {
 #[serde(rename_all = "snake_case")]
 pub enum ShellDiffInline {
     /// Render unified-diff output from shell commands in full, bypassing the
-    /// collapsed-card head/tail preview cap. Default — a `git diff` card is
-    /// only useful when every hunk is visible.
+    /// collapsed-card head/tail preview cap. Opt-in for users who want a
+    /// `git diff` the agent runs to show every hunk inline.
     Full,
     /// Keep shell-produced diffs on the same head/tail preview budget as
-    /// other shell output. For users who run `git diff` against large files
-    /// often enough that uncapped inline diffs overwhelm the transcript.
+    /// other shell output. Default — a `git diff` the agent runs to inspect
+    /// the tree is incidental noise, not a file modification the user needs
+    /// to review.
     Folded,
 }
 ```
 
-The docstrings carry the design call: default `Full` because head/tail
-truncation discards every intermediate hunk; `Folded` is an opt-in for
-users whose diffs are big enough to overwhelm the transcript.
+The docstrings carry the design call: default `Folded` because a `git diff`
+the agent runs is incidental inspection, not a file edit — it shouldn't push
+the transcript open by default. `Full` is the opt-in for users who want every
+hunk inline. Edits the agent makes (`apply_patch`/`write_file`) keep their
+uncapped diff regardless of this switch.
 
 ### Defaults
 
@@ -92,11 +95,11 @@ tool_output_verbosity: settings
     .tool_output_verbosity
     .unwrap_or(ToolOutputVerbosity::Compact),
 ...
-shell_diff_inline: settings.shell_diff_inline.unwrap_or(ShellDiffInline::Full),
+shell_diff_inline: settings.shell_diff_inline.unwrap_or(ShellDiffInline::Folded),
 ```
 
 Out of the box: assistant output is `Normal`, tool-output previews
-are `Compact` (smallest), shell diffs render in full.
+are `Compact` (smallest), shell diffs fold onto the normal preview cap.
 
 ### Slash command parsing
 
