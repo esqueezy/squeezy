@@ -714,8 +714,13 @@ fn providers_check_marks_inline_api_key_configured() {
     assert!(check.detail.contains("openai=configured"));
 }
 
+// The settings-only inventory must not warn when a section carries no
+// inline/env key: that section may still resolve via credentials.json or
+// the conventional vendor fallback env, which the active provider's
+// `provider:<name>` row checks. This row stays Ok and labels the section
+// `no key in settings` so the two rows do not contradict each other.
 #[test]
-fn providers_check_warns_when_env_unset() {
+fn providers_check_reports_no_key_in_settings_without_warning() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     unsafe {
         env::remove_var("SQUEEZY_DOCTOR_TEST_OPENAI_KEY");
@@ -733,8 +738,8 @@ fn providers_check_warns_when_env_unset() {
         ..SettingsFile::default()
     };
     let check = providers_check(&settings);
-    assert_eq!(check.status, Status::Warn);
-    assert!(check.detail.contains("openai=missing api_key"));
+    assert_eq!(check.status, Status::Ok);
+    assert!(check.detail.contains("openai=no key in settings"));
 }
 
 #[test]

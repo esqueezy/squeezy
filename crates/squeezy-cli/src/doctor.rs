@@ -1535,11 +1535,20 @@ fn load_user_settings() -> SettingsFile {
     SettingsFile::load_optional(&default_settings_path()).unwrap_or_default()
 }
 
-/// Summarize `[providers.*]` blocks in the user's settings: for each section,
-/// say whether it looks usable (`configured`) or is missing its API key
-/// (`missing api_key`). Providers that don't take a key (`bedrock`, `ollama`)
-/// are flagged `keyless`. Empty `[providers]` is reported as `ok` with a note;
-/// the active provider already gets its own `provider:<name>` row.
+/// Summarize the `[providers.*]` blocks in the user's settings file alone:
+/// for each section, report whether settings carry an inline `api_key` or a
+/// configured `api_key_env` that is set (`configured`), or neither
+/// (`no key in settings`). Providers that don't take a key (`bedrock`,
+/// `ollama`) are flagged `keyless`. Empty `[providers]` is reported as `ok`
+/// with a note.
+///
+/// This row inspects user settings only; it deliberately does NOT walk the
+/// full runtime credential chain (`credentials.json`, the conventional
+/// vendor fallback env var, `SQUEEZY_CREDENTIALS_JSON`). The active
+/// provider's `provider:<name>` row resolves through that chain, so a
+/// provider keyed solely by `OPENAI_API_KEY` / `credentials.json` shows
+/// `no key in settings` here while resolving Ok there — the labels keep the
+/// two rows from contradicting each other.
 fn providers_check(settings: &SettingsFile) -> Check {
     let Some(providers) = settings.providers.as_ref().filter(|map| !map.is_empty()) else {
         return Check {
@@ -1550,25 +1559,20 @@ fn providers_check(settings: &SettingsFile) -> Check {
         };
     };
     let mut detail = String::new();
-    let mut missing = 0usize;
     for (name, settings) in providers {
         let state = provider_settings_state(name, settings);
-        if state.starts_with("missing") {
-            missing += 1;
-        }
         if !detail.is_empty() {
             detail.push_str(", ");
         }
         let _ = write!(detail, "{name}={state}");
     }
-    let status = if missing > 0 {
-        Status::Warn
-    } else {
-        Status::Ok
-    };
+    // Settings-only inventory: a section with no inline/env key here may
+    // still resolve via the credential chain that the active provider's
+    // `provider:<name>` row checks, so this row stays informational
+    // rather than warning and contradicting that authoritative row.
     Check {
         name: "providers".to_string(),
-        status,
+        status: Status::Ok,
         detail,
         extra: None,
     }
@@ -1590,7 +1594,7 @@ fn provider_settings_state(name: &str, settings: &ProviderSettings) -> &'static 
     {
         return "configured";
     }
-    "missing api_key"
+    "no key in settings"
 }
 
 /// Summarize configured MCP servers without touching the network: count
