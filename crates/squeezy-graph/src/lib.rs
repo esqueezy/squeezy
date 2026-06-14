@@ -1087,6 +1087,19 @@ impl SemanticGraph {
         symbols
     }
 
+    /// Iterate the graph edges whose source is `from`, in index order, using
+    /// the `edges_by_from` index instead of scanning the full edge vector.
+    /// Callers that only need a subset (a particular [`EdgeKind`], say) can
+    /// filter the returned iterator without materialising an intermediate
+    /// `Vec`.
+    pub fn outgoing_edges(&self, from: &SymbolId) -> impl Iterator<Item = &GraphEdge> + '_ {
+        self.edges_by_from
+            .get(from)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.edges.get(*index))
+    }
+
     pub fn callees(&self, caller: &SymbolId) -> Vec<CallEdgeHit> {
         self.edges_by_from
             .get(caller)
