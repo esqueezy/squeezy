@@ -624,8 +624,14 @@ impl SemanticGraph {
     }
 
     pub fn replace_files(&mut self, files: Vec<ParsedFile>) {
+        // Batch the per-file purge into a single pass. The previous loop called
+        // `remove_file_data` once per file, and each call did its own full
+        // retain over symbols/imports/calls/references/body_hits/facts plus a
+        // full edge retain — O(files_changed × total_rows). Collecting the
+        // changed ids once and retaining a single time makes it O(total_rows).
+        let changed: HashSet<FileId> = files.iter().map(|file| file.file.id.clone()).collect();
+        self.remove_files_data(&changed);
         for file in files {
-            self.remove_file_data(&file.file.id);
             self.insert_parsed_file(file);
         }
         self.rebuild_java_project_facts();
@@ -633,6 +639,54 @@ impl SemanticGraph {
         self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
+    }
+
+    /// Purge all derived data for every file in `file_ids` in a single retain
+    /// pass per collection. Semantically equivalent to calling
+    /// [`Self::remove_file_data`] once per id, but it scans each row vector
+    /// once instead of once per file.
+    fn remove_files_data(&mut self, file_ids: &HashSet<FileId>) {
+        if file_ids.is_empty() {
+            return;
+        }
+        self.files.retain(|id, _| !file_ids.contains(id));
+        self.packages.retain(|id, _| !file_ids.contains(id));
+        self.symbols
+            .retain(|_, symbol| !file_ids.contains(&symbol.file_id));
+        self.imports
+            .retain(|import| !file_ids.contains(&import.file_id));
+        self.calls.retain(|call| !file_ids.contains(&call.file_id));
+        self.references
+            .retain(|reference| !file_ids.contains(&reference.file_id));
+        // Keep `body_hit_text_lower` aligned with `body_hits` (same parallel
+        // vectors as in `remove_file_data`).
+        if self.body_hit_text_lower.len() == self.body_hits.len() {
+            let mut keep = self
+                .body_hits
+                .iter()
+                .map(|hit| !file_ids.contains(&hit.file_id));
+            self.body_hit_text_lower
+                .retain(|_| keep.next().unwrap_or(true));
+        }
+        self.body_hits
+            .retain(|hit| !file_ids.contains(&hit.file_id));
+        self.java_project_facts
+            .retain(|fact| !file_ids.contains(&fact.source_file));
+        self.dotnet_project_facts
+            .retain(|fact| !file_ids.contains(&fact.source_file));
+        self.kotlin_project_facts
+            .retain(|fact| !file_ids.contains(&fact.source_file));
+        // Edges survive only when both endpoints still have a symbol. The
+        // symbol retain above already dropped every removed file's symbols, so
+        // checking membership in the now-current `self.symbols` is correct.
+        self.edges.retain(|edge| {
+            self.symbols.contains_key(&edge.from)
+                && edge
+                    .to
+                    .as_ref()
+                    .map(|to| self.symbols.contains_key(to))
+                    .unwrap_or(true)
+        });
     }
 
     pub fn remove_file(&mut self, file_id: &FileId) {
