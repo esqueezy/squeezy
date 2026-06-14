@@ -2827,7 +2827,7 @@ impl GraphManager {
             // best-effort batch so an encoding or write failure here cannot
             // poison the freshly-built graph.
             let mut batch = GraphWriteBatch::new();
-            manager.extend_resolver_cache_batch(&mut batch);
+            manager.extend_resolver_cache_batch(&mut batch, ResolverCacheScope::Full);
             if !batch.is_empty() {
                 let _ = store.apply_graph_batch(&batch);
             }
@@ -2918,10 +2918,21 @@ impl GraphManager {
     /// commit covers metadata, partitions, and resolver cache in one
     /// fsync. Deletion of stale rows for removed files is handled by
     /// the caller via [`GraphWriteBatch::remove_resolver_entry`].
-    fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch) {
-        for (file_id, file) in &self.graph.files {
+    ///
+    /// `scope` controls how much is re-encoded:
+    ///  - [`ResolverCacheScope::Full`] re-encodes every file entry and always
+    ///    rewrites the import-graph blob (cold build / first persist).
+    ///  - [`ResolverCacheScope::Incremental`] re-encodes only the changed
+    ///    files' entries and rewrites the import-graph blob only when an import
+    ///    edge actually changed — so a one-file refresh no longer pays the cost
+    ///    of re-encoding every resolver row plus the whole adjacency blob.
+    fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch, scope: ResolverCacheScope) {
+        let mut upsert_entry = |file_id: &FileId, batch: &mut GraphWriteBatch| {
+            let Some(file) = self.graph.files.get(file_id) else {
+                return;
+            };
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
-                continue;
+                return;
             };
             let entry = resolver_cache::ResolverFileEntry {
                 fingerprint: resolver_cache::FileFingerprint {
@@ -2933,18 +2944,37 @@ impl GraphManager {
                 supertypes: slot.supertypes.clone(),
                 builder_snapshot: resolver_cache::BuilderSnapshot::default(),
             };
-            if batch.upsert_resolver_entry(file_id, &entry).is_err() {
-                // Encoding failure: skip this file; warm-start will recompute.
-                continue;
+            // Encoding failure: skip this file; warm-start will recompute.
+            let _ = batch.upsert_resolver_entry(file_id, &entry);
+        };
+
+        let rewrite_import_graph = match scope {
+            ResolverCacheScope::Full => {
+                for file_id in self.graph.files.keys() {
+                    upsert_entry(file_id, batch);
+                }
+                true
             }
-        }
-        let mut snapshot = resolver_cache::ResolverSnapshot::new();
-        for (target, importers) in &self.graph.importers_by_file {
-            for importer in importers {
-                snapshot.record_edge(importer, target);
+            ResolverCacheScope::Incremental {
+                changed,
+                import_edges_changed,
+            } => {
+                for file_id in changed {
+                    upsert_entry(file_id, batch);
+                }
+                import_edges_changed
             }
+        };
+
+        if rewrite_import_graph {
+            let mut snapshot = resolver_cache::ResolverSnapshot::new();
+            for (target, importers) in &self.graph.importers_by_file {
+                for importer in importers {
+                    snapshot.record_edge(importer, target);
+                }
+            }
+            let _ = batch.set_import_graph(&snapshot);
         }
-        let _ = batch.set_import_graph(&snapshot);
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
@@ -3299,7 +3329,23 @@ impl GraphManager {
         // the in-memory graph update; the warm-start path will fall back
         // to a full rebuild when it cannot find an entry.
         if let Some(store) = self.store.as_deref() {
-            self.extend_resolver_cache_batch(&mut graph_batch);
+            // Only re-encode the resolver rows for files this refresh touched.
+            // The import-graph blob is regenerated from `importers_by_file`,
+            // which only changes when the semantic edges were rebuilt (a reparse,
+            // a removal, or a metadata/unsupported-flip change), so gate the
+            // blob rewrite on exactly those conditions.
+            let changed_set: HashSet<FileId> = changed_files.iter().cloned().collect();
+            let import_edges_changed = reparsed_files > 0
+                || !removed_files.is_empty()
+                || metadata_refresh_needed
+                || unsupported_purged;
+            self.extend_resolver_cache_batch(
+                &mut graph_batch,
+                ResolverCacheScope::Incremental {
+                    changed: &changed_set,
+                    import_edges_changed,
+                },
+            );
             if !graph_batch.is_empty() {
                 let _ = store.apply_graph_batch(&graph_batch);
             }
@@ -3393,6 +3439,20 @@ fn watcher_path_should_enqueue(root: &Path, policy: &CompiledIndexingPolicy, pat
         return true;
     }
     policy.path_reason(&relative_str, false).is_none()
+}
+
+/// Scope for [`GraphManager::extend_resolver_cache_batch`]: how many
+/// resolver-cache rows to re-encode and whether to rewrite the import-graph
+/// blob.
+enum ResolverCacheScope<'a> {
+    /// Re-encode every file entry and rewrite the import-graph blob.
+    Full,
+    /// Re-encode only `changed` files' entries; rewrite the import-graph blob
+    /// only when `import_edges_changed`.
+    Incremental {
+        changed: &'a HashSet<FileId>,
+        import_edges_changed: bool,
+    },
 }
 
 struct LoadedPartitions {
