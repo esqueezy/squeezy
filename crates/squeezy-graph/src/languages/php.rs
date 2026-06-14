@@ -236,8 +236,12 @@ impl SemanticGraph {
                     // relationship or an explicit `use`, exactly as PHP's PSR-4
                     // autoloader would load it. Gated on the candidate actually
                     // sitting at its PSR-4 path so we never widen to leaf-name
-                    // collisions across unrelated trees.
-                    || self.php_symbol_is_psr4_consistent(symbol, &psr4)
+                    // collisions across unrelated trees. When the reference is
+                    // itself namespace-qualified (`new App\Service\Mailer`) the
+                    // candidate's full dotted identity must equal the reference's,
+                    // so a qualified name only binds the exact autoloaded class.
+                    || (self.php_symbol_is_psr4_consistent(symbol, &psr4)
+                        && php_qualified_reference_matches_symbol(name, symbol))
             })
             .map(|symbol| symbol.id.clone())
             .collect::<Vec<_>>();
@@ -460,6 +464,33 @@ fn psr4_path_matches(prefix: &str, root: &str, dotted_identity: &str, relative_p
     };
     let actual = relative_path.replace('\\', "/");
     actual.eq_ignore_ascii_case(&expected)
+}
+
+/// Reconcile a caller's reference text with a candidate symbol's identity for
+/// PSR-4 acceptance. A bare leaf reference (`Mailer`) matches any candidate the
+/// leaf-name index already returned. A namespace-qualified reference
+/// (`App\Service\Mailer`, optionally fully-qualified with a leading `\`) only
+/// matches when the candidate's dotted `T:` identity equals the reference's
+/// dotted form, so a qualified name binds the one autoloaded class it names.
+fn php_qualified_reference_matches_symbol(reference: &str, symbol: &GraphSymbol) -> bool {
+    let trimmed = reference.trim();
+    if !trimmed.contains('\\') {
+        return true;
+    }
+    let dotted_reference = trimmed
+        .split('\\')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    if dotted_reference.is_empty() {
+        return true;
+    }
+    let Some(identity) = symbol.language_identity.as_deref() else {
+        return false;
+    };
+    let full_type_path = identity.strip_prefix("T:").unwrap_or(identity);
+    full_type_path == dotted_reference
 }
 
 /// True when an `use Foo\Bar [as Alias];` import matches a workspace symbol.
