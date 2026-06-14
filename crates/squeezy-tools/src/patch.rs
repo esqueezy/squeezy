@@ -999,6 +999,7 @@ impl ToolRegistry {
         let mut applied_delta = Vec::with_capacity(staged.ops.len());
         let mut write_failure: Option<(String, String, usize)> = None;
         let mut written: BTreeSet<usize> = BTreeSet::new();
+        let mut changed_abs_paths: Vec<PathBuf> = Vec::new();
         for (idx, op) in staged.ops.iter().enumerate() {
             if write_failure.is_some() {
                 applied_delta.push(op.delta_json_full("skipped", idx, op.exact(), None));
@@ -1007,6 +1008,7 @@ impl ToolRegistry {
             match op.apply(&staged.files, &mut written) {
                 Ok(()) => {
                     applied_delta.push(op.delta_json_full("applied", idx, op.exact(), None));
+                    changed_abs_paths.extend(staged.op_changed_abs_paths(idx));
                 }
                 Err(err) => {
                     let message = err.to_string();
@@ -1021,6 +1023,13 @@ impl ToolRegistry {
             }
         }
         self.invalidate_diff_cache();
+        // Feed the just-mutated paths into the semantic graph's pending-changed
+        // set so the next refresh reparses them even without a live filesystem
+        // watcher. Includes paths touched before a mid-batch failure, since
+        // those edits already hit disk.
+        if !changed_abs_paths.is_empty() {
+            self.record_graph_changed_paths(changed_abs_paths);
+        }
         let exact_delta = write_failure.is_none() && staged.ops.iter().all(|op| op.exact());
         let delta_summary = audit_delta_summary(&applied_delta);
 

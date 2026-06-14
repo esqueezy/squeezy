@@ -6077,6 +6077,27 @@ impl StagedApply {
         from_files + from_ops
     }
 
+    /// Absolute filesystem paths touched by the op at `op_index`, so callers
+    /// can feed them into the semantic graph's pending-changed set. Returns
+    /// both sides of a move (the removed source and the created destination)
+    /// so the graph drops the stale entry and reparses the new one. Empty when
+    /// the index is out of range.
+    pub(crate) fn op_changed_abs_paths(&self, op_index: usize) -> Vec<PathBuf> {
+        match self.ops.get(op_index) {
+            Some(StagedOp::SearchReplace { file_index, .. }) => self
+                .files
+                .get(*file_index)
+                .map(|state| vec![state.path.clone()])
+                .unwrap_or_default(),
+            Some(StagedOp::CreateFile { abs_path, .. }) => vec![abs_path.clone()],
+            Some(StagedOp::DeleteFile { abs_path, .. }) => vec![abs_path.clone()],
+            Some(StagedOp::MoveFile {
+                abs_from, abs_to, ..
+            }) => vec![abs_from.clone(), abs_to.clone()],
+            None => Vec::new(),
+        }
+    }
+
     pub(crate) fn changed_files_json(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for state in &self.files {
