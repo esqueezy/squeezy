@@ -3009,8 +3009,27 @@ impl GraphManager {
         // fingerprints in so unchanged files are stat-checked instead of fully
         // re-read+hashed, keeping refresh cost proportional to the change set
         // rather than the workspace size.
-        let prior_fingerprints =
+        let mut prior_fingerprints =
             load_prior_fingerprints(self.store.as_deref(), self.store_metadata.as_ref());
+        // A path the watcher flagged as changed must be re-read+hashed even if
+        // its size and mtime look unchanged: editors can rewrite a file with
+        // identical length and a clamped/preserved mtime, and some filesystems
+        // round mtime coarsely enough that a fast edit lands in the same tick.
+        // Dropping these paths' prior fingerprints before the crawl forces the
+        // size+mtime fast-path to fall through to a content hash for exactly
+        // the flagged paths, without changing the crawler.
+        let pending_before_crawl = self
+            .pending_changed_paths
+            .lock()
+            .map(|paths| paths.clone())
+            .unwrap_or_default();
+        if !prior_fingerprints.is_empty() && !pending_before_crawl.is_empty() {
+            let pending_relative_keys =
+                relative_keys_for_paths(&self.root, &pending_before_crawl);
+            if !pending_relative_keys.is_empty() {
+                prior_fingerprints.retain(|key, _| !pending_relative_keys.contains(key));
+            }
+        }
         let snapshot = self
             .crawler
             .crawl_with_prior(&self.root, &prior_metadata_view(&prior_fingerprints))?;
@@ -3463,6 +3482,45 @@ struct PersistedFingerprintFile {
 /// Owned prior-crawl fingerprints, keyed by relative path. Borrowed as a
 /// [`PriorFileMetadata`] when handed to the crawl.
 type PriorFingerprints = HashMap<String, (u64, u128, ContentHash)>;
+
+/// Compute the set of crawl-relative path keys (forward-slash separated,
+/// matching the workspace crawler's `relative_path` spelling) for a set of
+/// absolute paths, relative to `root`. Each path is matched against both the
+/// raw `root` and its canonical form so a `root` spelled differently from the
+/// watcher's canonicalised paths (e.g. `/var` vs `/private/var` on macOS) still
+/// produces a usable key. Paths that fall outside `root` are skipped.
+fn relative_keys_for_paths(root: &Path, paths: &HashSet<PathBuf>) -> HashSet<String> {
+    let canonical_root = root.canonicalize().ok();
+    let to_key = |relative: &Path| -> String {
+        let relative = relative.to_string_lossy();
+        if relative.contains('\\') {
+            relative.replace('\\', "/")
+        } else {
+            relative.into_owned()
+        }
+    };
+    let mut keys = HashSet::with_capacity(paths.len());
+    for path in paths {
+        if let Ok(relative) = path.strip_prefix(root) {
+            keys.insert(to_key(relative));
+            continue;
+        }
+        // Fall back to matching against the canonical root, and to the
+        // canonical form of the path itself, so symlinked roots still resolve.
+        if let Some(canonical_root) = &canonical_root {
+            if let Ok(relative) = path.strip_prefix(canonical_root) {
+                keys.insert(to_key(relative));
+                continue;
+            }
+            if let Ok(canonical_path) = path.canonicalize()
+                && let Ok(relative) = canonical_path.strip_prefix(canonical_root)
+            {
+                keys.insert(to_key(relative));
+            }
+        }
+    }
+    keys
+}
 
 /// Load the prior crawl's per-file fingerprints so the next crawl can skip the
 /// full read+hash of unchanged files (see
