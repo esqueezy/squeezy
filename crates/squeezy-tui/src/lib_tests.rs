@@ -9697,8 +9697,8 @@ fn plan_mode_question_renders_with_choices_and_freeform_hint() {
         "first choice missing: {output}"
     );
     assert!(
-        output.contains("● Keep the current layout"),
-        "selected marker missing on second choice: {output}"
+        output.contains("● b) Keep the current layout"),
+        "selected marker + positional label missing on second choice: {output}"
     );
     assert!(
         output.contains("freeform"),
@@ -9791,6 +9791,38 @@ fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
         .expect("selected label");
     assert_ne!(label.style.fg, Some(crate::render::theme::secondary()));
     assert_ne!(label.style.fg, Some(crate::render::theme::accent()));
+}
+
+#[tokio::test]
+async fn plan_mode_question_without_choices_or_freeform_dismisses_on_enter() {
+    let mut app = test_app(SessionMode::Build);
+    let request = RequestUserInputRequest {
+        question: "a question with nothing to answer".to_string(),
+        choices: Vec::new(),
+        allow_freeform: false,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    // Degenerate request: Enter used to silently no-op and trap the modal open
+    // with no exit but Esc. It must now resolve the prompt (sending a response so
+    // the agent unblocks) and close the modal with an explanatory status.
+    assert!(crate::input::handle_request_user_input_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    ));
+    assert!(app.pending_request_user_input.is_none());
+    assert!(
+        response_rx.await.is_ok(),
+        "a response must be delivered so the agent does not hang",
+    );
+    assert!(app.status.contains("no choices"), "{}", app.status);
 }
 
 #[test]
@@ -10386,6 +10418,28 @@ async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
     assert!(app.status.contains("saved repo approval"), "{}", app.status);
 }
 
+#[tokio::test]
+async fn approval_menu_esc_denies_the_run() {
+    let mut app = test_app(SessionMode::Build);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+
+    // The footer advertises "Esc cancel"; Esc must resolve the prompt by denying
+    // this run, not silently no-op and leave the modal (and the tool call) stuck.
+    assert!(handle_approval_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    ));
+    assert_eq!(
+        decision_rx.await.expect("approval decision"),
+        ToolApprovalDecision::DenyOnce
+    );
+    assert!(app.pending_approval.is_none());
+}
+
 #[test]
 fn approval_menu_offers_scope_aware_persistent_deny() {
     let mut request = sample_approval_request();
@@ -10465,7 +10519,8 @@ fn approval_menu_renders_below_prompt_without_border_box() {
         .expect("approval menu");
 
     assert!(approval > prompt, "{output}");
-    assert!(output.contains("› Approve"), "{output}");
+    // The selected (first) option carries the marker, its `[y]` key tag, and label.
+    assert!(output.contains("› [y] Approve"), "{output}");
     assert!(
         output.contains("Always approve this command in this repo"),
         "{output}"
@@ -10474,8 +10529,8 @@ fn approval_menu_renders_below_prompt_without_border_box() {
     assert!(!output.contains("Deny for this session"), "{output}");
     assert!(!output.contains("Approval required"), "{output}");
     assert!(!output.contains('┌'), "{output}");
-    // The keybind hint is folded into the block, not stranded on the status line.
-    assert!(output.contains("approve once"), "{output}");
+    // The navigation hint is folded into the block, not stranded on the status line.
+    assert!(output.contains("Enter confirm"), "{output}");
 }
 
 fn tall_shell_approval() -> ToolApprovalRequest {
@@ -10535,13 +10590,16 @@ fn approval_keybind_hint_lives_in_block_not_status() {
         100,
         100,
     ));
-    assert!(block.contains("approve once"), "{block}");
-    assert!(block.contains("always allow"), "{block}");
+    // The decision keys live inline as per-option tags; the folded footer row
+    // carries the navigation hint.
+    assert!(block.contains("[y]"), "{block}");
+    assert!(block.contains("[a]"), "{block}");
+    assert!(block.contains("Enter confirm"), "{block}");
 
     // The status hint row no longer carries the approval keybindings.
     let hints = format_status_hints(&app);
-    assert!(!hints.contains("always allow"), "{hints}");
-    assert!(!hints.contains("approve once"), "{hints}");
+    assert!(!hints.contains("Enter confirm"), "{hints}");
+    assert!(!hints.contains("[a]"), "{hints}");
 }
 
 #[test]
@@ -10562,7 +10620,7 @@ fn approval_block_capped_always_keeps_options() {
     // Narrow widths wrap the option labels; the capped block must still never
     // exceed its row budget, or ratatui clips a decision off the bottom.
     for width in [80u16, 50, 30, 24] {
-        let full_rows = visual_line_count(&approval_block_full(&req, 0), width);
+        let full_rows = visual_line_count(&approval_block_full(&req, 0, width), width);
         for max in 4u16..=full_rows + 2 {
             let lines = approval_block_capped(&req, 0, max, width);
             let rows = visual_line_count(&lines, width);
@@ -10583,7 +10641,9 @@ fn approval_block_capped_always_keeps_options() {
         roomy.contains("Always approve this command in this repo"),
         "{roomy}"
     );
-    assert!(roomy.contains("approve once"), "{roomy}");
+    assert!(roomy.contains("Enter confirm"), "{roomy}");
+    // The separator rule fences the options off from the folded hint row.
+    assert!(roomy.contains('─'), "{roomy}");
 }
 
 #[test]
@@ -15698,8 +15758,10 @@ async fn slash_feedback_previews_redacted_message_and_prompts_for_decision() {
 
     let output = render_to_string(&app, 100, 24);
     assert!(output.contains("Send feedback?"), "{output}");
-    assert!(output.contains("Enter/Y Send"), "{output}");
-    assert!(output.contains("Esc/N Discard"), "{output}");
+    assert!(output.contains("Enter/Y send"), "{output}");
+    assert!(output.contains("Esc/N discard"), "{output}");
+    // The hint row no longer wears the `›` cursor that made it read as a choice.
+    assert!(!output.contains("› Enter/Y"), "{output}");
 }
 
 #[tokio::test]
@@ -45238,6 +45300,79 @@ fn hover_preview_intent_ms() -> u128 {
 }
 
 #[tokio::test]
+async fn hover_preview_survives_pointer_moving_onto_the_popover() {
+    // Regression (reachability): the popover paints OVER the rows beneath the
+    // previewed header but registers no hit target, so before the reachability
+    // guard a pointer moved onto it landed on unregistered space, fired a
+    // HoverLeave, and dismissed the peek before it could be read. Moving the
+    // pointer INTO the popover's painted rect must KEEP it (so the cost/turn meta
+    // on the answer stays put long enough to land).
+    let mut app = app_with_hover_preview(1);
+    let entry_id = active_transcript_entries(&app)[1].id;
+
+    let _ = render_to_string(&app, 100, 30);
+    let mut hover_cell = None;
+    'scan: for row in 0..30u16 {
+        for col in 0..100u16 {
+            if let Some((interaction::TargetKey::Entry(id), interaction::Action::FocusEntry(_))) =
+                app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                hover_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hover_cell.expect("the entry header registers a focus target");
+
+    let moved = |col, row| crossterm::event::MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // Reveal the preview via a settled hover.
+    handle_mouse(&mut app, moved(col, row));
+    tokio::time::sleep(std::time::Duration::from_millis(
+        (hover_preview_intent_ms() + 40) as u64,
+    ))
+    .await;
+    handle_mouse(&mut app, moved(col, row));
+    assert!(
+        app.hover_preview.is_some(),
+        "a settled hover reveals the preview",
+    );
+
+    // Render so the popover caches its painted rect, then aim a Move at a cell
+    // strictly inside that rect — exactly the spot a user moves to to read it,
+    // and a cell that registers NO Entry target (it overlays the body below).
+    let _ = render_to_string(&app, 100, 30);
+    let rect = app
+        .hover_preview_rect
+        .get()
+        .expect("the painted popover caches its rect");
+    let inside_col = rect.x + rect.width / 2;
+    let inside_row = rect.y + rect.height / 2;
+    assert!(
+        inside_row != row,
+        "the popover sits on a different row than the previewed header",
+    );
+    handle_mouse(&mut app, moved(inside_col, inside_row));
+    assert!(
+        app.hover_preview.is_some(),
+        "moving the pointer onto the popover keeps it (reachable, not self-dismissing)",
+    );
+
+    // Leaving the popover for empty space still dismisses it, as before.
+    handle_mouse(&mut app, moved(99, 29));
+    handle_mouse(&mut app, moved(99, 28));
+    assert!(
+        app.hover_preview.is_none(),
+        "moving fully off the popover and every target dismisses it",
+    );
+}
+
+#[tokio::test]
 async fn hover_preview_renders_across_resizes_without_overflow() {
     let mut app = app_with_hover_preview(1);
     let mut agent = test_agent(SessionMode::Build);
@@ -51166,5 +51301,94 @@ fn breadcrumbs_strip_keeps_deepest_crumb_on_a_narrow_row() {
     assert!(
         rect.x >= area.x && rect.x.saturating_add(rect.width) <= area.x + area.width,
         "the deepest crumb's hit rect stays within the row: {rect:?}",
+    );
+}
+
+/// The meta line names the model that did the turn's main work, when the turn
+/// recorded one — pairing "what ran this" with "what it cost" in the same peek.
+#[test]
+fn entry_preview_meta_names_the_turns_model() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hi")); // turn 1
+    app.push_transcript_item(TranscriptItem::assistant("there"));
+
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    metrics.provider.estimated_usd_micros = Some(12_340);
+    let main_cost = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(12_340),
+        output_tokens: Some(340),
+        ..Default::default()
+    };
+    metrics.model_ledger.record(
+        "anthropic",
+        "claude-opus-4-8",
+        squeezy_core::CostOrigin::Main,
+        &main_cost,
+    );
+    app.turn_costs.insert(1, metrics);
+
+    let entries = active_transcript_entries(&app);
+    let answer_meta =
+        build_entry_preview_meta(&app, &entries[1], turn_for_entry_index(entries, 1)).unwrap();
+    assert!(
+        answer_meta.contains("claude-opus-4-8"),
+        "the meta names the turn's model: {answer_meta}",
+    );
+}
+
+/// `turn_primary_model` picks the main bucket with the largest priced spend (so an
+/// escalation names the model that did the bulk of the work), ignores
+/// subagent-only spend, and returns `None` for a turn with no per-model main cost.
+#[test]
+fn turn_primary_model_picks_the_dominant_main_bucket() {
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    let cheap = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(100),
+        output_tokens: Some(50),
+        ..Default::default()
+    };
+    let pricey = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(9_000),
+        output_tokens: Some(800),
+        ..Default::default()
+    };
+    metrics.model_ledger.record(
+        "anthropic",
+        "claude-haiku-4-5",
+        squeezy_core::CostOrigin::Main,
+        &cheap,
+    );
+    metrics.model_ledger.record(
+        "anthropic",
+        "claude-opus-4-8",
+        squeezy_core::CostOrigin::Main,
+        &pricey,
+    );
+    assert_eq!(
+        turn_primary_model(&metrics),
+        Some("claude-opus-4-8"),
+        "the pricier main bucket wins after an escalation",
+    );
+
+    let mut subagent_only = squeezy_core::TurnMetrics::default();
+    let sub = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(50_000),
+        ..Default::default()
+    };
+    subagent_only.model_ledger.record(
+        "anthropic",
+        "explore-model",
+        squeezy_core::CostOrigin::Subagent,
+        &sub,
+    );
+    assert_eq!(
+        turn_primary_model(&subagent_only),
+        None,
+        "subagent-only spend names no main model",
+    );
+    assert_eq!(
+        turn_primary_model(&squeezy_core::TurnMetrics::default()),
+        None,
+        "a turn with no per-model cost names no model",
     );
 }

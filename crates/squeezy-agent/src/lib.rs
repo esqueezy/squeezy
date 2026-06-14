@@ -5331,6 +5331,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
         exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
         subagents: deps.subagents.clone(),
+        store: None,
         hooks: deps.hooks.clone(),
     };
     let execution = run_subagent(&parent, SubagentKind::DocHelp, request, None).await;
@@ -5643,6 +5644,7 @@ async fn complete_local_tool_turn(
             loaded_tool_schemas,
             exploration_state,
             subagents,
+            store: None,
             hooks,
         },
         &mut broker,
@@ -6154,6 +6156,52 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Reasoning effort for the live routed rung. Effort is a cost lever orthogonal
+/// to model choice, so a routed turn runs each rung at the effort it warrants
+/// (weak→low … strong→high) instead of one global effort for every rung.
+///
+/// Precedence: an explicit user pin (`config.reasoning_effort`) always wins and
+/// behaves exactly as [`request_reasoning_effort`]. Otherwise, when tier-effort
+/// is enabled and routing is on: a per-task `judge_effort` (from the routing
+/// judge, when `[routing].judge_effort` is on) overrides the static map, so two
+/// turns on the same rung can run at different depths; failing that, the rung's
+/// effort ([`RoutingConfig::effort_for_tier`] → [`ModelTier::default_effort`]).
+/// With tier-effort off, or routing disabled, we fall back to the global path so
+/// behavior is unchanged. The capability gate runs against the LIVE routed
+/// `model` (not `config.model`), so a non-reasoning rung correctly drops the
+/// field even when the parent supports effort.
+fn request_reasoning_effort_for_tier(
+    config: &AppConfig,
+    provider_name: &str,
+    model: &str,
+    tier: ModelTier,
+    judge_effort: Option<squeezy_core::ReasoningEffort>,
+) -> Option<squeezy_core::ReasoningEffort> {
+    let routing = &config.routing;
+    let effort = match config.reasoning_effort {
+        // User pin: hard override, every rung.
+        Some(pinned) => pinned,
+        // No pin, but tier-effort disabled or routing off: preserve the global
+        // (None → provider default) behavior.
+        None if !routing.tier_effort || !routing.enabled => return None,
+        // No pin: the judge's per-task effort wins when present (a task-specific
+        // signal — e.g. Opus@xhigh for a tricky bug vs Opus@medium for a routine
+        // edit). Otherwise a per-tier override; otherwise cheaper rungs get their
+        // shallower default while the Strong (parent) rung keeps the provider
+        // default — so enabling tier-effort never silently deepens (and raises
+        // the cost of) un-rerouted turns. Opt into a deeper flagship via
+        // `effort_strong` or judge-effort.
+        None => match judge_effort.or_else(|| routing.effort_for_tier(tier)) {
+            Some(over) => over,
+            None if tier == ModelTier::Strong => return None,
+            None => tier.default_effort(),
+        },
+    };
+    capabilities_for(provider_name, model)
+        .filter(|capabilities| capabilities.reasoning_effort)
+        .map(|_| effort)
+}
+
 /// Effective reasoning effort for a spawned subagent of `kind`.
 ///
 /// Catalog roles override the parent's inherited global effort with their
@@ -6396,7 +6444,13 @@ impl TurnRuntime {
     /// it into `ConversationState` for resume, spawns telemetry, and emits the
     /// `TurnRouted` event. The caller updates `current_model` / `current_tier` /
     /// `on_cheap_turn` / re-arms the detector locally before calling this.
-    async fn emit_escalation(&self, from_model: String, to_model: String, reason_token: &str) {
+    async fn emit_escalation(
+        &self,
+        from_model: String,
+        to_model: String,
+        to_tier: ModelTier,
+        reason_token: &str,
+    ) {
         let sticky_remaining = {
             let mut state = self.routing_state.lock().expect("routing state lock");
             state
@@ -6410,6 +6464,16 @@ impl TurnRuntime {
             .set_routing_sticky_remaining_turns(sticky_remaining);
         self.telemetry
             .spawn(TelemetryEvent::routing_escalated(reason_token));
+        // An escalated rung uses its own tier-default effort: the judge's
+        // per-task estimate was for the cheaper rung that just proved
+        // insufficient, so it no longer applies.
+        let effort = request_reasoning_effort_for_tier(
+            &self.config,
+            self.provider.name(),
+            &to_model,
+            to_tier,
+            None,
+        );
         let _ = self
             .tx
             .send(AgentEvent::TurnRouted {
@@ -6417,6 +6481,7 @@ impl TurnRuntime {
                 from: from_model,
                 to: to_model,
                 reason: format!("escalated_{reason_token}"),
+                effort,
             })
             .await;
     }
@@ -7259,6 +7324,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        store: self.store.clone(),
                         hooks: self.hooks.clone(),
                     },
                     &mut broker,
@@ -7433,6 +7499,13 @@ impl TurnRuntime {
         let decision = classify_result.decision;
         let judge_cost = classify_result.judge_cost;
         let judge_model = classify_result.judge_model;
+        // The judge's per-task effort (when `[routing].judge_effort` is on)
+        // overrides the static tier→effort map — but only while the turn is on
+        // the rung the judge actually assigned. Once an escalation (or a
+        // context bump) moves to a different rung, the judge's estimate no
+        // longer applies and the rung's own default effort takes over.
+        let judge_assigned_tier = decision.tier();
+        let judge_effort = classify_result.judge_effort;
         // Fold the judge call's spend into the broker so its tokens
         // count against `max_session_cost_usd_micros` and surface in
         // the turn's provider cost — that's the bill the provider
@@ -7543,6 +7616,7 @@ impl TurnRuntime {
                         from: parent_model_str.clone(),
                         to: parent_model_str.clone(),
                         reason: "reroute_skipped_context".to_string(),
+                        effort: None,
                     })
                     .await;
                 on_cheap_turn = false;
@@ -7562,6 +7636,17 @@ impl TurnRuntime {
             if let Some(reason_label) = decision.reason_label() {
                 self.telemetry
                     .spawn(TelemetryEvent::routing_routed(&reason_label));
+                let effort = request_reasoning_effort_for_tier(
+                    &self.config,
+                    self.provider.name(),
+                    &current_model,
+                    current_tier,
+                    if current_tier == judge_assigned_tier {
+                        judge_effort
+                    } else {
+                        None
+                    },
+                );
                 let _ = self
                     .tx
                     .send(AgentEvent::TurnRouted {
@@ -7569,6 +7654,7 @@ impl TurnRuntime {
                         from: parent_model_str.clone(),
                         to: current_model.to_string(),
                         reason: reason_label,
+                        effort,
                     })
                     .await;
             }
@@ -7864,8 +7950,13 @@ impl TurnRuntime {
                     broker.metrics.tool_errors,
                     broker.metrics.budget_denials,
                 );
-                self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
-                    .await;
+                self.emit_escalation(
+                    from_model,
+                    to_model.to_string(),
+                    current_tier,
+                    reason.as_str(),
+                )
+                .await;
             }
             // Tell the model which rung it is on — and, after an escalation, tell
             // the strong model not to trust the weaker model's earlier work
@@ -7888,7 +7979,17 @@ impl TurnRuntime {
                 frequency_penalty: self.config.frequency_penalty,
                 presence_penalty: self.config.presence_penalty,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
-                reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
+                reasoning_effort: request_reasoning_effort_for_tier(
+                    &self.config,
+                    self.provider.name(),
+                    &current_model,
+                    current_tier,
+                    if current_tier == judge_assigned_tier {
+                        judge_effort
+                    } else {
+                        None
+                    },
+                ),
                 previous_response_id: previous_response_id.clone(),
                 cache_key: None,
                 cache: self.session_prompt_cache_key().into(),
@@ -8152,8 +8253,13 @@ impl TurnRuntime {
                                 broker.metrics.tool_errors,
                                 broker.metrics.budget_denials,
                             );
-                            self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
-                                .await;
+                            self.emit_escalation(
+                                from_model,
+                                to_model.to_string(),
+                                current_tier,
+                                reason.as_str(),
+                            )
+                            .await;
                         }
                     }
                     LlmEvent::Refusal { content } => {
@@ -8426,8 +8532,13 @@ impl TurnRuntime {
                     current_tier = ModelTier::Strong;
                     on_cheap_turn = false;
                     broker.metrics.escalated_to_parent = true;
-                    self.emit_escalation(from_model, parent_model_str.clone(), reason.as_str())
-                        .await;
+                    self.emit_escalation(
+                        from_model,
+                        parent_model_str.clone(),
+                        ModelTier::Strong,
+                        reason.as_str(),
+                    )
+                    .await;
                     continue;
                 }
                 // Terminal stream error after retries are exhausted (most
@@ -9121,6 +9232,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        store: self.store.clone(),
                         hooks: self.hooks.clone(),
                     },
                     &mut broker,
@@ -9218,8 +9330,13 @@ impl TurnRuntime {
                         broker.metrics.tool_errors,
                         broker.metrics.budget_denials,
                     );
-                    self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
-                        .await;
+                    self.emit_escalation(
+                        from_model,
+                        to_model.to_string(),
+                        current_tier,
+                        reason.as_str(),
+                    )
+                    .await;
                 }
             }
 
@@ -10153,7 +10270,34 @@ impl SubagentKind {
             Self::Skill => None,
         }
     }
+
+    /// Whether this is a general-purpose worker that should be able to EDIT and
+    /// RUN (write/shell), not just read. `Delegate` is the broad worker the main
+    /// model spawns to do scoped work end-to-end, so it gets the parent's full
+    /// toolset (minus subagent-spawn/control tools) and runs in the parent's
+    /// session mode rather than the read-only + forced-Plan sandbox. The
+    /// role-scoped kinds (Explorer/Planner/Reviewer) and DocHelp stay read-only
+    /// — a reviewer or planner shouldn't be mutating the tree.
+    fn is_write_capable(self) -> bool {
+        matches!(self, Self::Delegate)
+    }
 }
+
+/// Subagent-spawning and interactive control tools a write-capable subagent
+/// must NOT receive: handing it `delegate`/`explore`/… would let subagents
+/// recursively spawn subagents, and the interactive control tools have no
+/// meaning inside a scoped subagent. Everything else the parent advertises
+/// (read, search, edit, shell, network, compiler) is fair game.
+const SUBAGENT_EXCLUDED_TOOL_NAMES: &[&str] = &[
+    DELEGATE_TOOL_NAME,
+    EXPLORE_TOOL_NAME,
+    DELEGATE_PLAN_TOOL_NAME,
+    DELEGATE_REVIEW_TOOL_NAME,
+    DELEGATE_CHAIN_TOOL_NAME,
+    REQUEST_USER_INPUT_TOOL_NAME,
+    TASK_STATE_TOOL_NAME,
+    LOAD_TOOL_SCHEMA_TOOL_NAME,
+];
 
 /// Re-applies any pins added concurrently while the turn was running.
 ///
@@ -10215,6 +10359,12 @@ struct ToolExecutionContext<'a> {
     conversation_state: Option<Arc<Mutex<ConversationState>>>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     subagents: SubagentRegistry,
+    /// Cross-session receipt store, shared with the parent `Agent`. Lets a
+    /// subagent seed its dedup index from receipts the parent already
+    /// committed (see `SeenToolOutputs::seeded_read_only`). `None` on paths
+    /// without a persistent store (in-memory tests, the doc-help and
+    /// local-tool one-shot turns).
+    store: Option<Arc<SqueezyStore>>,
     all_tool_specs: &'a [AdvertisedTool],
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
@@ -10266,6 +10416,7 @@ impl<'a> ToolExecutionContext<'a> {
             conversation_state: self.conversation_state.clone(),
             task_state: self.task_state.clone(),
             subagents: self.subagents.clone(),
+            store: self.store.clone(),
             all_tool_specs: self.all_tool_specs,
             loaded_tool_schemas: self.loaded_tool_schemas.clone(),
             exploration_state: self.exploration_state.clone(),
@@ -11232,7 +11383,12 @@ async fn run_subagent(
     activity_id: Option<SubagentId>,
 ) -> SubagentExecution {
     let mut config = parent.config.clone();
-    config.session_mode = SessionMode::Plan;
+    // Read-only kinds run in the Plan sandbox (edits blocked). Write-capable
+    // workers inherit the parent's session mode so they can actually edit/run;
+    // their tool calls still go through the parent's permission policy.
+    if !kind.is_write_capable() {
+        config.session_mode = SessionMode::Plan;
+    }
     config.store_responses = false;
     // Plan/Delegate/Review subagents do real agent work and should be sized
     // like the main agent. Inherit the parent's cap; only fall back to
@@ -11274,7 +11430,7 @@ async fn run_subagent(
             status: ToolStatus::Error,
             summary: String::new(),
             status_label: "failed",
-            error: Some("no read-only tools are available to the subagent".to_string()),
+            error: Some("no tools are available to the subagent".to_string()),
             metrics: TurnMetrics::default(),
             supporting_receipts: Vec::new(),
             model,
@@ -11333,9 +11489,20 @@ async fn run_subagent(
                 let _ = parent_tx.try_send(event);
                 continue;
             }
-            // Other interesting events surface to the parent transcript only as
-            // completed tool results (below), so a watching user sees the
-            // subagent's tool churn without its raw intermediate events.
+            // Permission prompts MUST reach the user: a write-capable subagent's
+            // edit/shell tool call asks for approval by sending this event with a
+            // `decision_tx` oneshot inside it, then awaits the reply. Forward it
+            // to the real UI channel (await, don't drop) so the prompt renders
+            // and the decision routes straight back to the waiting subagent. Read
+            // -only subagents never reach an approval, so this is inert for them.
+            if matches!(event, AgentEvent::ApprovalRequested { .. }) {
+                let _ = parent_tx.send(event).await;
+                continue;
+            }
+            // Other interesting events surface to the parent transcript
+            // as a compact SubagentActivity line so a watching user can
+            // see the subagent's tool churn without seeing its raw
+            // events.
             let Some(id) = activity_id else {
                 continue;
             };
@@ -11356,9 +11523,9 @@ async fn run_subagent(
     let local_jobs = JobRegistry::new();
     let local_task_state = Arc::new(Mutex::new(None));
     let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
-    let local_mode = Arc::new(AtomicU8::new(SessionMode::Plan.to_u8()));
+    let local_mode = Arc::new(AtomicU8::new(config.session_mode.to_u8()));
     let local_exploration = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
-    let mut seen_outputs = SeenToolOutputs::default();
+    let mut seen_outputs = SeenToolOutputs::seeded_read_only(parent.store.clone());
 
     let mut execution = run_subagent_loop(
         parent,
@@ -11986,6 +12153,7 @@ async fn run_subagent_rounds(
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
                         subagents: parent.subagents.clone(),
+                        store: parent.store.clone(),
                         hooks: parent.hooks.clone(),
                     },
                     broker,
@@ -12013,6 +12181,12 @@ async fn run_subagent_rounds(
                 ));
             }
         }
+        // Index this round's outputs so a later round collapses a repeat
+        // read/grep into a receipt stub instead of re-billing the bytes,
+        // and so dedup also fires against the parent receipts preloaded at
+        // construction. Read-only seed (`seeded_read_only`), so this only
+        // updates the in-memory index — it never writes to the store.
+        seen_outputs.remember_results(&results);
         conversation.extend(
             tool_calls
                 .iter()
@@ -12858,6 +13032,19 @@ fn subagent_allowed_tools(
     all_tool_specs: &[AdvertisedTool],
     kind: SubagentKind,
 ) -> Vec<AdvertisedTool> {
+    // Write-capable workers get the parent's FULL toolset (read/search/edit/
+    // shell/network/…) minus the subagent-spawn + interactive control tools, so
+    // they can actually do the work end-to-end. Their tool calls still flow
+    // through the same permission/approval path as the main loop (approvals are
+    // forwarded out of the subagent), and writes still require the parent's
+    // permission policy to allow them.
+    if kind.is_write_capable() {
+        return all_tool_specs
+            .iter()
+            .filter(|tool| !SUBAGENT_EXCLUDED_TOOL_NAMES.contains(&tool.spec.name.as_str()))
+            .cloned()
+            .collect();
+    }
     let names: BTreeSet<&str> = match kind {
         SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
@@ -16750,6 +16937,14 @@ pub(crate) fn permission_rule_for_persistence(
         if squeezy_core::target_is_effectively_wildcard(&rule.target) {
             return None;
         }
+        // `shell:*` is the catch-all the shell analyzer assigns to dynamic,
+        // unparseable, or unknown-env commands precisely so each one re-prompts.
+        // Persisting it as an Allow rule would silently auto-approve every future
+        // dynamic command, defeating that guard — refuse it like any other
+        // blanket target. (Deny rules may keep it: a broad deny fails closed.)
+        if rule.target == "shell:*" {
+            return None;
+        }
     }
     Some(rule)
 }
@@ -16861,7 +17056,8 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Delegate open-ended research to an isolated subagent. \
+            description: "Delegate open-ended work — research AND scoped implementation — to an isolated subagent. \
+                          The subagent can read, edit, and run with the same permissions you have (edits/shell still prompt for approval where your policy requires it); it reports back a structured summary. \
                           Reserve it for genuinely multi-pass, context-isolating, or cross-cutting work — \
                           a task spanning several rounds of discovery, or one whose intermediate reading would bloat your context, or one that fans out across unrelated areas. \
                           NOT for greetings, casual replies, or simple questions the parent can answer directly. \
@@ -16875,7 +17071,7 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required, non-empty: a concrete research instruction for the subagent."
+                        "description": "Required, non-empty: a concrete instruction for the subagent (research or a scoped change)."
                     },
                     "scope": {
                         "type": ["string", "null"],
@@ -18635,12 +18831,15 @@ pub enum AgentEvent {
     /// used; `to` is the model the next round will dispatch on; `reason`
     /// is a short stable token (`heuristic_slam_dunk_<rule>`,
     /// `llm_judge`, `user_explicit`, `escalated_<signal>`) so TUI and
-    /// eval consumers can match on it without parsing prose.
+    /// eval consumers can match on it without parsing prose. `effort` is the
+    /// reasoning effort the `to` rung will run at (tier-effort), or `None` when
+    /// the rung uses the provider default — surfaced as a live indicator.
     TurnRouted {
         turn_id: TurnId,
         from: String,
         to: String,
         reason: String,
+        effort: Option<squeezy_core::ReasoningEffort>,
     },
 }
 
