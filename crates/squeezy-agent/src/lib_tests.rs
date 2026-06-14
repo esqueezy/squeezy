@@ -5486,6 +5486,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
             None,
         ))),
         subagents: SubagentRegistry::default(),
+        store: None,
         hooks: None,
     };
 
@@ -5561,6 +5562,42 @@ fn persistence_guard_refuses_allow_with_star_target() {
         .is_none(),
         "Allow rules with a catch-all target must not be persisted",
     );
+}
+
+#[test]
+fn persistence_guard_refuses_allow_on_shell_catch_all_target() {
+    // `shell:*` is the fallback the analyzer assigns to dynamic / unparseable /
+    // unknown-env commands so each one re-prompts. Persisting it as Allow would
+    // auto-approve every future dynamic command — it must be refused.
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "shell:*".to_string(),
+        risk: PermissionRisk::High,
+        summary: "CUSTOM_VAR=1 cargo build".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+    assert!(
+        permission_rule_for_persistence(
+            &request,
+            PermissionRuleSource::Project,
+            PermissionAction::Allow
+        )
+        .is_none(),
+        "Allow rules with the shell catch-all target must not be persisted",
+    );
+
+    // A broad Deny is still allowed: it fails closed (blocks future dynamic
+    // commands rather than waving them through).
+    let deny = permission_rule_for_persistence(
+        &request,
+        PermissionRuleSource::Project,
+        PermissionAction::Deny,
+    );
+    assert!(deny.is_some(), "broad shell Deny rules may persist");
+    assert_eq!(deny.expect("deny rule").action, PermissionAction::Deny);
 }
 
 #[tokio::test]
@@ -7104,14 +7141,13 @@ fn explore_subagent_cannot_call_write_file() {
 
 #[test]
 fn typed_subagents_filter_to_read_search_capability() {
-    // The capability filter is the load-bearing safety guarantee. Iterate
-    // every non-DocHelp role kind and assert that no tool of a capability
-    // outside `{Read, Search}` survives the filter. Captures explorer,
-    // planner, and reviewer — extending to any future typed subagent kind
-    // requires updating this matrix.
+    // The capability filter is the load-bearing safety guarantee for the
+    // ROLE-SCOPED read-only kinds: a reviewer/planner/explorer must never reach
+    // a tool outside `{Read, Search}`. The general-purpose Delegate worker is
+    // intentionally write-capable (it does scoped work end-to-end) and is
+    // covered by `delegate_subagent_is_write_capable_minus_spawn_tools`.
     let parent_tools = parent_tools_with_mutators();
     for kind in [
-        SubagentKind::Delegate,
         SubagentKind::Explore,
         SubagentKind::Plan,
         SubagentKind::Review,
@@ -12709,5 +12745,68 @@ fn local_tool_completion_message_omits_shell_hint_on_success() {
     assert!(
         !message.contains("set SQUEEZY_SHELL to change"),
         "success path must not surface the shell hint: {message}",
+    );
+}
+
+// -- Write-capable general-purpose subagents --------------------------------
+
+#[test]
+fn delegate_subagent_is_write_capable_minus_spawn_tools() {
+    // The general-purpose Delegate worker gets the parent's full toolset
+    // (read/search/edit/shell) so it can do work end-to-end, minus the
+    // subagent-spawn + interactive control tools (no recursive subagents).
+    let tools = [
+        ("read_file", PermissionCapability::Read),
+        ("grep", PermissionCapability::Search),
+        ("write_file", PermissionCapability::Edit),
+        ("shell", PermissionCapability::Shell),
+        ("delegate", PermissionCapability::Read),
+        ("explore", PermissionCapability::Read),
+        ("delegate_chain", PermissionCapability::Read),
+        ("request_user_input", PermissionCapability::Read),
+        ("update_task_state", PermissionCapability::Read),
+    ]
+    .map(|(name, cap)| test_advertised_tool(name, cap));
+
+    let allowed = super::subagent_allowed_tools(&tools, super::SubagentKind::Delegate);
+    let names: Vec<&str> = allowed.iter().map(|t| t.spec.name.as_str()).collect();
+    assert!(
+        names.contains(&"write_file") && names.contains(&"shell"),
+        "delegate must be able to edit/run: {names:?}"
+    );
+    assert!(
+        names.contains(&"read_file") && names.contains(&"grep"),
+        "delegate keeps read/search: {names:?}"
+    );
+    for spawn in [
+        "delegate",
+        "explore",
+        "delegate_chain",
+        "request_user_input",
+        "update_task_state",
+    ] {
+        assert!(
+            !names.contains(&spawn),
+            "delegate must NOT recursively spawn or carry control tool {spawn}: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn read_only_subagent_kinds_still_exclude_write_tools() {
+    let tools = [
+        ("read_file", PermissionCapability::Read),
+        ("grep", PermissionCapability::Search),
+        ("write_file", PermissionCapability::Edit),
+        ("shell", PermissionCapability::Shell),
+    ]
+    .map(|(name, cap)| test_advertised_tool(name, cap));
+
+    // Explore is role-scoped read-only: write/shell never reach it.
+    let allowed = super::subagent_allowed_tools(&tools, super::SubagentKind::Explore);
+    let names: Vec<&str> = allowed.iter().map(|t| t.spec.name.as_str()).collect();
+    assert!(
+        !names.contains(&"write_file") && !names.contains(&"shell"),
+        "explore must stay read-only: {names:?}"
     );
 }
