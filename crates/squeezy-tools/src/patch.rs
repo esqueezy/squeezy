@@ -524,18 +524,7 @@ impl ToolRegistry {
             .clamp(1, MAX_GRAPH_MAX_RESULTS);
         let candidate_paths = normalized_path_set(args.candidate_paths.as_deref().unwrap_or(&[]));
         let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
-        let mut graph = match self.graph.lock() {
-            Ok(graph) => graph,
-            Err(_) => {
-                return make_result(
-                    call,
-                    ToolStatus::Error,
-                    json!({"error": "semantic graph lock poisoned"}),
-                    ToolCostHint::default(),
-                    None,
-                );
-            }
-        };
+        let mut graph = self.graph.lock().unwrap_or_else(|err| err.into_inner());
         let Some(manager) = graph.as_mut() else {
             let locality = patch_locality_json(&candidate_paths, &BTreeSet::new());
             let plan_id = patch_plan_id(&call.arguments, &candidate_paths);
