@@ -1520,13 +1520,13 @@ pub(crate) fn resolve_definition_candidates(
     path: Option<&str>,
     language: Option<&str>,
 ) -> Vec<GraphSymbol> {
-    if let Some(symbol_id) = symbol_id {
-        return graph
-            .symbols
-            .get(&SymbolId::new(symbol_id))
-            .cloned()
-            .into_iter()
-            .collect();
+    // A supplied symbol_id is authoritative *only while it's live*: a stale id
+    // (graph re-indexed since it was minted) must fall through to the
+    // query/kind/path search rather than dead-ending on an empty result.
+    if let Some(symbol_id) = symbol_id
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return vec![symbol.clone()];
     }
     let Some(query) = query else {
         return Vec::new();
@@ -2539,8 +2539,11 @@ fn resolve_single_symbol(
     graph: &squeezy_graph::SemanticGraph,
     args: &FlowArgs,
 ) -> Option<GraphSymbol> {
-    if let Some(symbol_id) = args.symbol_id.as_deref() {
-        return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
+    // A live symbol_id wins; a stale one falls through to the query search.
+    if let Some(symbol_id) = args.symbol_id.as_deref()
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return Some(symbol.clone());
     }
     let query = args.query.as_deref()?;
     graph_symbol_search(
@@ -2560,8 +2563,11 @@ fn resolve_flow_target(
     graph: &squeezy_graph::SemanticGraph,
     args: &FlowArgs,
 ) -> Option<GraphSymbol> {
-    if let Some(symbol_id) = args.target_symbol_id.as_deref() {
-        return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
+    // A live target symbol_id wins; a stale one falls through to the query.
+    if let Some(symbol_id) = args.target_symbol_id.as_deref()
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return Some(symbol.clone());
     }
     let query = args.target_query.as_deref()?;
     graph_symbol_search(graph, Some(query), None, None, None, None, None)
@@ -2629,8 +2635,11 @@ fn resolve_hierarchy_root(
     graph: &squeezy_graph::SemanticGraph,
     args: &HierarchyArgs,
 ) -> Option<GraphSymbol> {
-    if let Some(symbol_id) = args.symbol_id.as_deref() {
-        return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
+    // A live symbol_id wins; a stale one falls through to the query search.
+    if let Some(symbol_id) = args.symbol_id.as_deref()
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return Some(symbol.clone());
     }
     let query = args.query.as_deref()?;
     graph_symbol_search(
@@ -2726,10 +2735,14 @@ fn read_slice_target(
     if let Some(symbol_id) = args.symbol_id.as_deref() {
         let graph =
             graph.ok_or_else(|| "read_slice symbol_id requires an available graph".to_string())?;
-        let symbol = graph
-            .symbols
-            .get(&SymbolId::new(symbol_id))
-            .ok_or_else(|| format!("symbol_id not found: {symbol_id}"))?;
+        let symbol = graph.symbols.get(&SymbolId::new(symbol_id)).ok_or_else(|| {
+            // A stale id (graph re-indexed since it was minted) is recoverable:
+            // tell the caller to re-resolve by name rather than reporting an
+            // opaque "not found".
+            format!(
+                "symbol_id stale; re-resolve via definition_search (stale id: {symbol_id})"
+            )
+        })?;
         let span = match args.span_kind.unwrap_or_default() {
             // Read only the declaration header when the extractor pinned a real
             // signature span; fall back to the full node for bodyless symbols
@@ -3697,9 +3710,13 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let subtypes = args.subtypes.unwrap_or(false);
 
-        // Resolve the root symbol via id or text query.
-        let root = if let Some(id) = args.symbol_id.as_deref() {
-            graph.symbols.get(&SymbolId::new(id)).cloned()
+        // Resolve the root symbol via id or text query. A live symbol_id wins;
+        // a stale one (graph re-indexed) transparently falls through to the
+        // query so the caller isn't dead-ended on an empty result.
+        let root = if let Some(id) = args.symbol_id.as_deref()
+            && let Some(sym) = graph.symbols.get(&SymbolId::new(id))
+        {
+            Some(sym.clone())
         } else if let Some(q) = args.query.as_deref() {
             graph_symbol_search(graph, Some(q), None, None, None, None, None)
                 .into_iter()
@@ -3714,7 +3731,7 @@ impl ToolRegistry {
             payload.insert("packets".to_string(), json!([]));
             return make_result(
                 call,
-                ToolStatus::Success,
+                ToolStatus::Stale,
                 Value::Object(payload),
                 ToolCostHint::default(),
                 None,
