@@ -232,6 +232,54 @@ fn rule_preview_warns_when_target_is_wildcard() {
 }
 
 #[test]
+fn project_allow_not_persistable_for_shell_catch_all_target() {
+    // `shell:*` is the catch-all for dynamic/unknown-env commands; the backend
+    // refuses to persist it as Allow, so the TUI must not advertise it as
+    // savable. A concrete prefix like `cargo:*` still persists.
+    let mut shell_req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "eval $X",
+        &[("command", "eval $X")],
+    );
+    shell_req
+        .permission
+        .suggested_rules
+        .push(PermissionRule::new(
+            "shell",
+            "shell:*",
+            PermissionMode::Allow,
+            PermissionRuleSource::Session,
+            None,
+        ));
+    assert!(
+        !project_allow_is_persistable(&shell_req.permission),
+        "shell:* catch-all must not be marked persistable",
+    );
+
+    let mut cargo_req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test")],
+    );
+    cargo_req
+        .permission
+        .suggested_rules
+        .push(PermissionRule::new(
+            "shell",
+            "cargo:*",
+            PermissionMode::Allow,
+            PermissionRuleSource::Session,
+            None,
+        ));
+    assert!(
+        project_allow_is_persistable(&cargo_req.permission),
+        "concrete cargo:* prefix must remain persistable",
+    );
+}
+
+#[test]
 fn rule_preview_keeps_durable_caption_for_persistable_request() {
     let req = request_with(
         "shell",

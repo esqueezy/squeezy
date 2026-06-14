@@ -2669,6 +2669,18 @@ async fn handle_input_event(
             if let Some((token, rgb)) = app.theme_editor_preview_pending.take() {
                 theme_editor_preview(agent, token, rgb);
             }
+            // A click on a post-plan choice row arms its activation (mode switch /
+            // turn start); drain it here, where the `agent` is in scope, by
+            // replaying the choice's Enter verb so a mouse activation runs the same
+            // handler as the keyboard path.
+            if std::mem::take(&mut app.plan_choice_click_activate) {
+                handle_plan_choice_key(
+                    app,
+                    agent,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                )
+                .await;
+            }
             if consumed {
                 app.needs_redraw = true;
             } else {
@@ -2971,6 +2983,54 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((
             interaction::TargetKey::Chrome(interaction::ChromeKey::PasteTransformItem(_)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // The inline decision modals (tool approval, plan-mode question, MCP
+    // elicitation, post-plan choice) follow the same inline rule as the paste
+    // questions above: a left click on an option row drives its verb, while a
+    // click that misses the rows falls through to normal transcript handling.
+    // Approval clicks only HIGHLIGHT (never approve) — see `ApprovalSelect`.
+    // Hit-tested in ABSOLUTE screen coordinates against the per-option targets
+    // the render path registered this frame.
+    if app.pending_approval.is_some()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ApprovalOption(_)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+    if app.pending_request_user_input.is_some()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::RequestUserInputOption(_)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+    if app.pending_mcp_elicitation.is_some()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::McpElicitationOption(_)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+    if app.pending_plan_choice.is_some()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::PlanChoiceOption(_)),
             action,
         )) = app.click_target_at(mouse.column, mouse.row)
     {
@@ -19071,6 +19131,38 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             }
             resolve_paste_transform(app);
         }
+        // Inline decision modals (tool approval / plan-mode question / MCP
+        // elicitation / post-plan choice). Each routes through the same logic the
+        // keyboard verb drives, so mouse/keyboard parity holds by construction.
+        interaction::Action::ApprovalSelect(index) => {
+            // Highlight only — approving stays an explicit Enter/key press so a
+            // stray click can never approve a consequential command.
+            app.approval_selection_index = index;
+            app.needs_redraw = true;
+        }
+        interaction::Action::RequestUserInputActivate(index) => {
+            if let Some(pending) = app.pending_request_user_input.as_mut() {
+                pending.selection_index = index;
+            }
+            crate::input::handle_request_user_input_key(
+                app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
+        }
+        interaction::Action::McpElicitationActivate(index) => {
+            app.mcp_elicitation_selection_index = index;
+            handle_mcp_elicitation_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        interaction::Action::PlanChoiceActivate(index) => {
+            // Activation switches mode / starts a turn, which needs the agent —
+            // not in scope on the click path. Arm it; the event loop drains it
+            // where the agent is available (mirrors the command-palette / theme-
+            // editor click path), so mouse and keyboard run the same handler.
+            if let Some(pending) = app.pending_plan_choice.as_mut() {
+                pending.selection_index = index;
+            }
+            app.plan_choice_click_activate = true;
+        }
         // Clipboard-history picker (§12.6.1). Each routes through the same handler
         // the keyboard verb drives, so mouse/keyboard parity holds by
         // construction. Select resolves the row by its stable id; re-copy/delete
@@ -25961,7 +26053,7 @@ fn choice_label_prefix(index: usize) -> String {
 fn format_request_user_input_menu_lines(
     request: &RequestUserInputRequest,
     selected: usize,
-    input: &str,
+    answer: &str,
     answer_cursor: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![{
@@ -26063,7 +26155,7 @@ fn format_request_user_input_menu_lines(
             Span::styled(marker, marker_style),
             Span::styled("Answer › ", label_style),
         ];
-        if input.is_empty() {
+        if answer.is_empty() {
             spans.push(Span::styled(
                 "(type your answer · Enter sends when selected)",
                 Style::default().fg(crate::render::theme::quiet()),
@@ -26073,12 +26165,12 @@ fn format_request_user_input_menu_lines(
             // edit position. Split the raw answer at the byte cursor and
             // compact each half independently so the block lands exactly
             // where the user is typing, even mid-text.
-            let mut cursor = answer_cursor.min(input.len());
-            while cursor > 0 && !input.is_char_boundary(cursor) {
+            let mut cursor = answer_cursor.min(answer.len());
+            while cursor > 0 && !answer.is_char_boundary(cursor) {
                 cursor -= 1;
             }
-            let head = compact_text(&input[..cursor], 200);
-            let tail = compact_text(&input[cursor..], 200);
+            let head = compact_text(&answer[..cursor], 200);
+            let tail = compact_text(&answer[cursor..], 200);
             spans.push(Span::styled(head, entry_style));
             spans.push(Span::styled("▌", cursor_style));
             spans.push(Span::styled(tail, entry_style));
@@ -26212,14 +26304,20 @@ fn approval_block_full(
 /// options or their key hints — when space is tight. This makes it
 /// structurally impossible for the options to be clipped behind the status
 /// line on a short terminal.
-fn approval_block_capped(
+/// Render the approval block to fit `max_height` visible rows at `width`, AND
+/// return the half-open range of line indices that hold the decision options so
+/// the mouse path can register a click target per option row. The hard-ceiling
+/// truncate can, in a pathologically short area, drop trailing option rows, so
+/// the caller clamps the range to the lines actually returned.
+fn approval_block_capped_indexed(
     request: &ToolApprovalRequest,
     selected: usize,
     max_height: u16,
     width: u16,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, std::ops::Range<usize>) {
     let parts = approval::render_preview_parts(request);
     let mut options = approval_option_lines(request, selected);
+    let option_count = options.len();
     let mut footer = approval_footer_block(width as usize);
     // Keep the footer rows single-line like the options: the separator is built
     // to exactly `width`, but the hint can be long, and an unbudgeted wrap would
@@ -26247,9 +26345,10 @@ fn approval_block_capped(
         out.push(parts.header);
         out.extend(body);
         out.push(Line::raw(""));
+        let option_start = out.len();
         out.extend(options);
         out.extend(footer);
-        return out;
+        return (out, option_start..option_start + option_count);
     }
 
     // Tight layout: compact each option onto a single row so a wrapped label
@@ -26331,6 +26430,7 @@ fn approval_block_capped(
     if keep_blank {
         out.push(Line::raw(""));
     }
+    let option_start = out.len();
     out.extend(options);
     if keep_footer {
         out.extend(footer);
@@ -26339,7 +26439,7 @@ fn approval_block_capped(
     // all fit, keep the leading rows rather than letting ratatui clip an
     // unaccounted bottom row. Esc still denies, so no decision is lost.
     out.truncate(max);
-    out
+    (out, option_start..option_start + option_count)
 }
 
 /// Resolved heights for the main (inline) view's vertical layout. The
@@ -34302,6 +34402,45 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
     }
 }
 
+/// Register a left-click target for each decision-option row of an inline modal.
+/// `option_rows` is the half-open range of indices into `lines` that hold the
+/// option rows; each maps to its on-screen `Rect` (wrap-aware via
+/// [`visual_line_count`]). Rows pushed below `area` by a short terminal are
+/// skipped, so a click never resolves to an off-screen option.
+fn register_modal_option_targets(
+    app: &TuiApp,
+    area: Rect,
+    lines: &[Line<'static>],
+    option_rows: std::ops::Range<usize>,
+    mut target: impl FnMut(usize) -> (interaction::TargetKey, interaction::Action),
+) {
+    let width = area.width;
+    let area_bottom = area.y.saturating_add(area.height);
+    for (option_index, line_index) in option_rows.enumerate() {
+        if line_index >= lines.len() {
+            break;
+        }
+        let row_y = area
+            .y
+            .saturating_add(visual_line_count(&lines[..line_index], width));
+        if row_y >= area_bottom {
+            break;
+        }
+        let height = visual_line_count(&lines[line_index..=line_index], width).max(1);
+        let (key, action) = target(option_index);
+        app.register_click(
+            Rect {
+                x: area.x,
+                y: row_y,
+                width,
+                height: height.min(area_bottom.saturating_sub(row_y)),
+            },
+            key,
+            action,
+        );
+    }
+}
+
 fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if let Some(preview) = app.paste_preview.as_ref() {
         render_paste_preview_inline(frame, area, app, preview);
@@ -34313,16 +34452,79 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
     // Approvals render through the height-capped builder so the decision
     // options always fit the chunk the layout reserved for them; the other
-    // pending prompts keep their existing (uncapped) rendering.
+    // pending prompts keep their existing (uncapped) rendering. Each modal also
+    // registers a per-option click target so the mouse can drive it.
     let lines = if let Some(pending) = app.pending_approval.as_ref() {
-        approval_block_capped(
+        let (lines, option_rows) = approval_block_capped_indexed(
             &pending.request,
             app.approval_selection_index,
             area.height,
             area.width,
-        )
+        );
+        register_modal_option_targets(app, area, &lines, option_rows, |index| {
+            (
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ApprovalOption(index)),
+                interaction::Action::ApprovalSelect(index),
+            )
+        });
+        lines
     } else {
-        approval_lines(app)
+        let lines = approval_lines(app);
+        if let Some(pending) = app.pending_request_user_input.as_ref() {
+            // The title (line 0) and question (line 1) precede the choice rows;
+            // the free-form answer box (when present) follows them and is driven
+            // by typing, not a click-select, so only the choices are click targets.
+            let start = 2usize;
+            register_modal_option_targets(
+                app,
+                area,
+                &lines,
+                start..start + pending.request.choices.len(),
+                |index| {
+                    (
+                        interaction::TargetKey::Chrome(
+                            interaction::ChromeKey::RequestUserInputOption(index),
+                        ),
+                        interaction::Action::RequestUserInputActivate(index),
+                    )
+                },
+            );
+        } else if app.pending_mcp_elicitation.is_some() {
+            // The accept/decline options are the trailing rows of the block.
+            let count = mcp_elicitation_options().len();
+            register_modal_option_targets(
+                app,
+                area,
+                &lines,
+                lines.len().saturating_sub(count)..lines.len(),
+                |index| {
+                    (
+                        interaction::TargetKey::Chrome(
+                            interaction::ChromeKey::McpElicitationOption(index),
+                        ),
+                        interaction::Action::McpElicitationActivate(index),
+                    )
+                },
+            );
+        } else if app.pending_plan_choice.is_some() {
+            // The plan choices are the trailing rows of the block.
+            let count = PLAN_CHOICES.len();
+            register_modal_option_targets(
+                app,
+                area,
+                &lines,
+                lines.len().saturating_sub(count)..lines.len(),
+                |index| {
+                    (
+                        interaction::TargetKey::Chrome(interaction::ChromeKey::PlanChoiceOption(
+                            index,
+                        )),
+                        interaction::Action::PlanChoiceActivate(index),
+                    )
+                },
+            );
+        }
+        lines
     };
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(crate::render::theme::quiet()))
@@ -47774,6 +47976,12 @@ pub(crate) struct TuiApp {
     /// `Some` for at most one loop turn. The keyboard path previews inline (it
     /// already carries the agent), so this only ever serves the mouse twin.
     pub(crate) theme_editor_preview_pending: Option<(&'static str, squeezy_core::TuiRgb)>,
+    /// Armed by a left click on a post-plan choice row: activation switches mode
+    /// / starts a turn, which needs the agent, so the click path can't run it
+    /// directly. The event loop drains this the same iteration (where the agent is
+    /// in scope) by replaying the choice's Enter verb. `true` for at most one loop
+    /// turn; the keyboard path activates inline so this only serves the mouse twin.
+    pub(crate) plan_choice_click_activate: bool,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -48639,6 +48847,7 @@ impl TuiApp {
             command_palette: None,
             command_palette_pending: None,
             theme_editor_preview_pending: None,
+            plan_choice_click_activate: false,
             editor_handoff: None,
             pending_editor_handoff: None,
             editor_handoff_temp_nonce: 0,

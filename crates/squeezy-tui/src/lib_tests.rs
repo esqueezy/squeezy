@@ -10661,12 +10661,15 @@ fn approval_keybind_hint_lives_in_block_not_status() {
         decision_tx,
     });
 
-    let block = lines_to_plain_text(&approval_block_capped(
-        &app.pending_approval.as_ref().unwrap().request,
-        0,
-        100,
-        100,
-    ));
+    let block = lines_to_plain_text(
+        &approval_block_capped_indexed(
+            &app.pending_approval.as_ref().unwrap().request,
+            0,
+            100,
+            100,
+        )
+        .0,
+    );
     // The decision keys live inline as per-option tags; the folded footer row
     // carries the navigation hint.
     assert!(block.contains("[y]"), "{block}");
@@ -10699,7 +10702,7 @@ fn approval_block_capped_always_keeps_options() {
     for width in [80u16, 50, 30, 24] {
         let full_rows = visual_line_count(&approval_block_full(&req, 0, width), width);
         for max in 4u16..=full_rows + 2 {
-            let lines = approval_block_capped(&req, 0, max, width);
+            let lines = approval_block_capped_indexed(&req, 0, max, width).0;
             let rows = visual_line_count(&lines, width);
             assert!(rows <= max, "width={width} max={max} produced {rows} rows");
             let text = lines_to_plain_text(&lines);
@@ -10713,7 +10716,7 @@ fn approval_block_capped_always_keeps_options() {
     }
 
     // With room, the full untruncated labels and the folded footer are present.
-    let roomy = lines_to_plain_text(&approval_block_capped(&req, 0, 100, 80));
+    let roomy = lines_to_plain_text(&approval_block_capped_indexed(&req, 0, 100, 80).0);
     assert!(
         roomy.contains("Always approve this command in this repo"),
         "{roomy}"
@@ -10721,6 +10724,95 @@ fn approval_block_capped_always_keeps_options() {
     assert!(roomy.contains("Enter confirm"), "{roomy}");
     // The separator rule fences the options off from the folded hint row.
     assert!(roomy.contains('─'), "{roomy}");
+}
+
+#[test]
+fn approval_block_capped_indexed_range_locates_option_rows() {
+    // The mouse path registers a click target per option row using the line-index
+    // range this returns; if the range drifts off the options, clicks land on the
+    // wrong decision. Pin it: roomy → the located rows are exactly the option
+    // rows; tight → the range never points past the produced lines.
+    let req = sample_approval_request();
+    let plain = |line: &Line| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
+
+    let (lines, options) = approval_block_capped_indexed(&req, 0, 100, 100);
+    let expected = approval_option_lines(&req, 0);
+    assert_eq!(
+        options.len(),
+        expected.len(),
+        "located {} rows for {} options",
+        options.len(),
+        expected.len()
+    );
+    let got: Vec<String> = options.clone().map(|i| plain(&lines[i])).collect();
+    let want: Vec<String> = expected.iter().map(&plain).collect();
+    assert_eq!(got, want, "located rows must be the option rows verbatim");
+
+    for max in 4u16..=14 {
+        let (lines, options) = approval_block_capped_indexed(&req, 0, max, 60);
+        assert!(
+            options.end <= lines.len(),
+            "max={max}: range {options:?} exceeds {} produced lines",
+            lines.len()
+        );
+    }
+}
+
+#[test]
+fn approval_click_highlights_but_never_approves() {
+    let mut app = test_app(SessionMode::Build);
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+
+    // A click on a decision row only moves the highlight — it must NOT resolve the
+    // approval, so a stray click can never approve a consequential command.
+    dispatch_click_action(&mut app, interaction::Action::ApprovalSelect(2));
+    assert_eq!(app.approval_selection_index, 2);
+    assert!(
+        app.pending_approval.is_some(),
+        "an approval click must not resolve the prompt; Enter/key still confirms",
+    );
+}
+
+#[tokio::test]
+async fn request_user_input_click_activates_the_choice() {
+    let mut app = test_app(SessionMode::Build);
+    let request = RequestUserInputRequest {
+        question: "which?".to_string(),
+        choices: vec![
+            RequestUserInputChoice {
+                label: "First".to_string(),
+                value: "first".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "Second".to_string(),
+                value: "second".to_string(),
+            },
+        ],
+        allow_freeform: false,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    // A click on a choice both selects and answers in one go (mouse twin of Enter).
+    dispatch_click_action(&mut app, interaction::Action::RequestUserInputActivate(1));
+    assert!(
+        app.pending_request_user_input.is_none(),
+        "a choice click answers and closes the modal",
+    );
+    assert!(
+        response_rx.await.is_ok(),
+        "a response must be delivered to the agent",
+    );
 }
 
 #[test]

@@ -454,7 +454,14 @@ pub(crate) fn project_allow_is_persistable(permission: &PermissionRequest) -> bo
         .first()
         .map(|rule| rule.target.as_str())
         .unwrap_or(permission.target.as_str());
-    !squeezy_core::target_is_effectively_wildcard(rule_target)
+    if squeezy_core::target_is_effectively_wildcard(rule_target) {
+        return false;
+    }
+    // `shell:*` is the catch-all the shell analyzer assigns to dynamic or
+    // unknown-env commands so each one re-prompts; persisting it as Allow would
+    // auto-approve every future dynamic command. The backend refuses it, so the
+    // TUI must too. (Deny may still persist — a blanket deny fails closed.)
+    rule_target != "shell:*"
 }
 
 fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {

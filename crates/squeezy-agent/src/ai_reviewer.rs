@@ -92,6 +92,7 @@ pub(crate) struct AiReviewerTranscriptSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewerAuditVerdict {
     Allow,
+    AllowDowngraded,
     Deny,
     NoDecision,
     CircuitTripped,
@@ -101,6 +102,7 @@ impl ReviewerAuditVerdict {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Allow => "allow",
+            Self::AllowDowngraded => "allow-downgraded",
             Self::Deny => "deny",
             Self::NoDecision => "no-decision",
             Self::CircuitTripped => "circuit-tripped",
@@ -364,7 +366,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
                     state.record_audit(
                         input.turn_id,
                         input.request,
-                        ReviewerAuditVerdict::NoDecision,
+                        ReviewerAuditVerdict::AllowDowngraded,
                         &reason,
                     );
                 }
