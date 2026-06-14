@@ -160,14 +160,12 @@ fn fuzzy_query_filters_and_orders_by_score() {
     }
     let visible = palette.visible();
     assert!(!visible.is_empty(), "‘timeline’ should match something");
-    // Every surviving entry is a genuine fuzzy match of the query.
+    // Every surviving entry is a genuine fuzzy match of the query against the same
+    // haystack the production filter scores (label + description + binding + the
+    // hidden search_extra tokens).
     for entry in &visible {
         assert!(
-            crate::fuzzy::score(
-                &format!("{} {} {}", entry.label, entry.description, entry.binding),
-                "timeline"
-            )
-            .is_some(),
+            crate::fuzzy::score(&entry.haystack(), "timeline").is_some(),
             "{:?} should fuzzy-match the query",
             entry.label
         );

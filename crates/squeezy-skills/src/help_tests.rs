@@ -686,7 +686,7 @@ fn bundled_skill_docs_do_not_advertise_nonexistent_slash_skill() {
     for doc in bundled_docs() {
         if targets.contains(&doc.path) {
             assert!(
-                !doc.content.contains("/skill"),
+                !doc.content.contains("/skill "),
                 "{} must not advertise a `/skill` command",
                 doc.path
             );

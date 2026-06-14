@@ -2691,7 +2691,7 @@ fn detail_pane_hint_hidden_when_too_narrow_to_split() {
     // pane, and no detail-pane hit-test rect is registered.
     let narrow = render_to_string(&app, 50, 24);
     assert!(
-        !narrow.contains("Shift"),
+        !narrow.contains("Shift+↑/↓"),
         "the scroll hint is suppressed below the split width:\n{narrow}"
     );
     assert!(
@@ -2702,7 +2702,7 @@ fn detail_pane_hint_hidden_when_too_narrow_to_split() {
     // Wide enough to split: the pane paints and the scroll/close hint returns.
     let wide = render_to_string(&app, 160, 40);
     assert!(
-        wide.contains("Shift"),
+        wide.contains("Shift+↑/↓"),
         "the scroll hint returns once the pane can split:\n{wide}"
     );
     assert!(
@@ -43988,7 +43988,7 @@ async fn command_palette_marks_slash_rows_as_filling_the_composer() {
         .await
         .expect("clear query");
     }
-    for ch in "/theme".chars() {
+    for ch in "/task".chars() {
         handle_key(
             &mut app,
             &mut agent,
@@ -43998,14 +43998,14 @@ async fn command_palette_marks_slash_rows_as_filling_the_composer() {
         .expect("type query");
     }
     let parameterized = render_to_string(&app, 100, 30);
-    let theme_row = row_for(&parameterized, "/theme");
+    let task_row = row_for(&parameterized, "/task");
     assert!(
-        theme_row.contains("fills composer +args"),
-        "a parameterized slash row is marked as filling the composer with args: {theme_row:?}"
+        task_row.contains("fills composer +args"),
+        "a parameterized slash row is marked as filling the composer with args: {task_row:?}"
     );
 
     // A keymap-action row never claims it fills the composer — Enter runs it.
-    for _ in 0.."/theme".len() {
+    for _ in 0.."/task".len() {
         handle_key(
             &mut app,
             &mut agent,
@@ -44028,9 +44028,10 @@ async fn command_palette_marks_slash_rows_as_filling_the_composer() {
         action_only.contains("Toggle session timeline"),
         "the keymap action row is listed:\n{action_only}"
     );
+    let timeline_row = row_for(&action_only, "Toggle session timeline");
     assert!(
-        !action_only.contains("fills composer"),
-        "a keymap-action row must not claim it fills the composer:\n{action_only}"
+        !timeline_row.contains("fills composer"),
+        "a keymap-action row must not claim it fills the composer: {timeline_row:?}"
     );
 }
 

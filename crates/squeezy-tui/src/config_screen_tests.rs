@@ -91,6 +91,7 @@ fn discard_all_skips_tier_files_changed_externally() {
 
     // Simulate this session having written the file, then an external
     // editor changing it afterwards.
+    state.push_undo_snapshot(user.clone(), Some(b"baseline = true\n".to_vec()));
     std::fs::write(&user, b"session = true\n").expect("session write");
     state.note_session_write(&user);
     std::fs::write(&user, b"edited-by-an-outside-process = true\n").expect("external edit");
@@ -134,6 +135,7 @@ fn discard_all_restores_files_unchanged_since_session_write() {
     ];
 
     // This session wrote the file and nothing external touched it after.
+    state.push_undo_snapshot(user.clone(), Some(b"baseline = true\n".to_vec()));
     std::fs::write(&user, b"session = true\n").expect("session write");
     state.note_session_write(&user);
 

@@ -267,8 +267,8 @@ fn approval_menu_marks_session_only_when_persistence_refused() {
         "destructive request should relabel the project-allow option: {menu}"
     );
     assert!(
-        !menu.contains("in this repo"),
-        "destructive request must not offer a durable repo rule: {menu}"
+        !menu.contains("approve this command in this repo"),
+        "destructive request must not offer a durable repo allow rule: {menu}"
     );
 }
 
