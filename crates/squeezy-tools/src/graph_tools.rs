@@ -1677,12 +1677,30 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
 /// knows how to do unprompted; the reason code is the load-bearing signal.
 fn graph_zero_hit_fallback(
     graph: &squeezy_graph::SemanticGraph,
+    symbol_id: Option<&str>,
     path: Option<&str>,
     _query: Option<&str>,
     packet_count: usize,
 ) -> Value {
     if packet_count > 0 {
         return Value::Null;
+    }
+    // A supplied-but-absent symbol_id is the most actionable zero-hit cause:
+    // the id was minted against an earlier graph and is now stale. Surface that
+    // distinctly so the caller re-resolves by name rather than rewording the
+    // query (the misdirection the path/query reasons would otherwise give).
+    if let Some(id) = symbol_id
+        && graph.symbols.get(&SymbolId::new(id)).is_none()
+    {
+        let mut obj = serde_json::Map::new();
+        obj.insert("status".to_string(), json!("no_graph_evidence"));
+        obj.insert("reason".to_string(), json!("symbol_id_stale"));
+        obj.insert(
+            "hint".to_string(),
+            json!("re-resolve the symbol by name via definition_search; the supplied symbol_id is stale"),
+        );
+        obj.insert("symbol_id".to_string(), json!(id));
+        return Value::Object(obj);
     }
     // Normalize backslashes once so all branches see forward-slash paths.
     // This mirrors path_matches_filter's normalization and ensures the file
@@ -3287,6 +3305,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(
                 graph,
+                None,
                 args.path.as_deref(),
                 args.query.as_deref(),
                 packet_count,
@@ -3352,6 +3371,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(
                 graph,
+                args.symbol_id.as_deref(),
                 args.path.as_deref(),
                 args.query.as_deref(),
                 packet_count,
@@ -3424,6 +3444,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(
                 graph,
+                args.symbol_id.as_deref(),
                 args.path.as_deref(),
                 query_text.as_deref(),
                 packet_count,
@@ -3641,7 +3662,7 @@ impl ToolRegistry {
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            graph_zero_hit_fallback(graph, path_filter, Some(&args.query), packet_count),
+            graph_zero_hit_fallback(graph, None, path_filter, Some(&args.query), packet_count),
         );
         payload.insert("truncated".to_string(), json!(truncated));
         make_result(
