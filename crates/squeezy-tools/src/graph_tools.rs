@@ -2540,6 +2540,10 @@ fn hierarchy_result(
     refresh: &squeezy_graph::RefreshReport,
     graph: &squeezy_graph::SemanticGraph,
     nodes: Vec<HierarchyNode>,
+    // Pre-cap count of roots. When `nodes` was already capped (e.g. via
+    // `hierarchy_capped`) this is the real total so truncation is still
+    // detectable; otherwise it equals `nodes.len()`.
+    total_roots: usize,
     max_depth: usize,
     max_results: Option<usize>,
     root: Option<GraphSymbol>,
@@ -2554,7 +2558,7 @@ fn hierarchy_result(
         .iter()
         .map(|node| hierarchy_node_count(node))
         .sum::<usize>();
-    let truncated = nodes.len() > max_results || serialized_nodes > max_results;
+    let truncated = total_roots > max_results || serialized_nodes > max_results;
     let hierarchy = selected
         .iter()
         .map(|node| hierarchy_node_json(graph, node))
@@ -3220,8 +3224,11 @@ impl ToolRegistry {
         let graph = manager.graph();
         let max_depth = args.max_depth.unwrap_or(2).clamp(1, MAX_GRAPH_MAX_DEPTH);
         let max_files = args.max_files.unwrap_or(50).clamp(1, 200);
-        let nodes = graph.hierarchy(None, max_depth);
-        let selected = nodes.iter().take(max_files).collect::<Vec<_>>();
+        // Cap the roots before expansion instead of building the entire forest
+        // and discarding all but `max_files`; `total_roots` is the pre-cap count
+        // used for the truncation signal.
+        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_files);
+        let selected = nodes.iter().collect::<Vec<_>>();
         // Count total serialized nodes (roots + recursively-emitted children),
         // not just the number of roots, so a single wide root that exceeds
         // `max_files` in the serialized output is reported as truncated.
@@ -3229,7 +3236,7 @@ impl ToolRegistry {
             .iter()
             .map(|node| hierarchy_node_count(node))
             .sum::<usize>();
-        let truncated = nodes.len() > max_files || serialized_nodes > max_files;
+        let truncated = total_roots > max_files || serialized_nodes > max_files;
         let hierarchy = selected
             .iter()
             .map(|node| hierarchy_node_json(graph, node))
@@ -3756,24 +3763,30 @@ impl ToolRegistry {
                 return unresolved_hierarchy_result(call, manager, refresh, &args);
             };
             let nodes = graph.hierarchy(Some(&root.id), max_depth);
+            let total_roots = nodes.len();
             return hierarchy_result(
                 call,
                 manager,
                 refresh,
                 graph,
                 nodes,
+                total_roots,
                 max_depth,
                 args.max_results,
                 Some(root),
             );
         }
-        let nodes = graph.hierarchy(None, max_depth);
+        // Rootless map: cap the forest roots before expansion instead of
+        // building the whole forest and discarding all but `max_results`.
+        let max_results = graph_limit(args.max_results);
+        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_results);
         hierarchy_result(
             call,
             manager,
             refresh,
             graph,
             nodes,
+            total_roots,
             max_depth,
             args.max_results,
             None,
