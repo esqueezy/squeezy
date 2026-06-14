@@ -389,7 +389,7 @@ pub(crate) fn read_tool_output_spec() -> ToolSpec {
 pub(crate) fn repo_map_spec() -> ToolSpec {
     ToolSpec {
         name: "repo_map".to_string(),
-        description: "Return a compact semantic architecture map from the local graph: hierarchy, language counts, coverage, unsupported files, and next graph actions.".to_string(),
+        description: "Return a compact semantic architecture map from the local graph: hierarchy, language counts, and unsupported files.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({

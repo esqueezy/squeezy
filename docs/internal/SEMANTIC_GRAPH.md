@@ -281,7 +281,7 @@ The in-memory graph supports:
 
 The agent-facing graph tool surface is:
 
-- `repo_map` for compact architecture maps, language counts, coverage, and
+- `repo_map` for compact architecture maps, language counts, and
   unsupported-file samples
 - `decl_search` and `definition_search` for declaration lookup and
   disambiguation
