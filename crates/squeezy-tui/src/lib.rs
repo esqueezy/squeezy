@@ -55,11 +55,12 @@ use squeezy_core::{
     detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
-use squeezy_skills::{HelpStatus, PromptTemplateCatalog, SqueezyHelp};
+use squeezy_skills::{HelpAnswerSource, HelpStatus, PromptTemplateCatalog, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::{
-    ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, PreparedFeedback,
-    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, StartupRoute, TelemetryClient,
+    ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, HelpAnswerSourceKind,
+    HelpRatingKind, PreparedFeedback, SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface,
+    StartupRoute, TelemetryClient,
 };
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
@@ -113,6 +114,7 @@ mod focus_resize;
 mod fuzzy;
 mod gesture_settings;
 mod glyph_mode;
+mod help_links;
 mod history;
 mod hover_intent;
 mod hover_preview;
@@ -8931,6 +8933,26 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         && let Some(slot) = ch.to_digit(10)
         && (1..=9).contains(&slot)
         && handle_session_quick_switch(app, agent, slot as usize).await
+    {
+        return Ok(false);
+    }
+
+    // Help-answer rating chords (§help-rating): Ctrl+G = 👍, Ctrl+B = 👎 on the
+    // most recent LOCAL `/help` answer. Probed BEFORE the keymap/legacy
+    // dispatch, but ONLY consumed when the last assistant message was a help
+    // answer (`rate_help_answer` returns false otherwise). So Ctrl+B keeps its
+    // emacs cursor-left meaning in the composer, and Ctrl+G is otherwise a
+    // harmless no-op. Each rating fires one anonymous `help_answer_rated` event
+    // and clears the slot so the same answer is never double-counted.
+    if key.modifiers == KeyModifiers::CONTROL
+        && key.code == KeyCode::Char('g')
+        && rate_help_answer(app, agent, HelpRatingKind::Up)
+    {
+        return Ok(false);
+    }
+    if key.modifiers == KeyModifiers::CONTROL
+        && key.code == KeyCode::Char('b')
+        && rate_help_answer(app, agent, HelpRatingKind::Down)
     {
         return Ok(false);
     }
@@ -18862,6 +18884,45 @@ fn begin_queue_edit(app: &mut TuiApp, id: u64) -> bool {
     true
 }
 
+/// Route a clicked hyperlink whose target uses the internal `squeezy:cmd:` scheme
+/// (ITEM 3 — actionable help answers): prefill the composer with the referenced
+/// slash command so the user can review and press Enter. Returns `true` when the
+/// URI was one of ours and was handled, `false` when it is a foreign scheme the
+/// caller should keep routing as a normal URL/file link.
+///
+/// This deliberately *only prefills* — it never auto-executes the command — so a
+/// stray click on a help link can never run a destructive verb on its own. It
+/// refuses to clobber an in-progress draft (a `/`-prefixed composer is treated as
+/// a fresh command line and is safe to replace; any other non-empty draft is
+/// protected, mirroring `begin_queue_edit`'s data-loss guard).
+///
+/// Not yet reached from a live affordance: the TUI has no in-app hyperlink-click
+/// handler today (OSC 8 links are activated by the terminal, which cannot service
+/// the internal `squeezy:cmd:` scheme). The remaining wiring — registering a
+/// frame-local `interaction` hit target over each detected command span during the
+/// transcript/help render and routing its click here — is described in the
+/// crate's `help_links` notes. Exercised by the unit tests meanwhile.
+#[allow(dead_code)]
+fn handle_command_hyperlink(app: &mut TuiApp, uri: &str) -> bool {
+    let Some(action) = help_links::parse_command_uri(uri) else {
+        return false;
+    };
+    // Protect a real in-progress draft. A composer that is empty, or that already
+    // holds only a slash-command line the user is mid-typing, is safe to overwrite
+    // with the chosen command.
+    let draft_is_protected = !app.input.is_empty() && !app.input.starts_with('/');
+    if draft_is_protected {
+        app.status = "clear the composer before opening a command link".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    app.input = action.command;
+    app.input_cursor = app.input.len();
+    app.status = "command ready in composer — press Enter to run".to_string();
+    app.needs_redraw = true;
+    true
+}
+
 /// Save the composer draft back onto the queued item being edited (§11G.8).
 /// Resolves `editing_queue_id` to its live slot and replaces the text *by id*
 /// (so a drain/reorder since editing began can't misdirect the save), then
@@ -22422,11 +22483,77 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
         && answer.status == HelpStatus::Answered
     {
         app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
-        app.status = format!("help: {}", answer.topic);
+        // Track the rateable answer (anonymous topic id + source only) so the
+        // thumbs-up / thumbs-down chords can fire `help_answer_rated` telemetry.
+        app.last_help_answer = Some((answer.topic.clone(), answer.source));
+        app.status = format!("help: {} · Ctrl+G 👍 / Ctrl+B 👎", answer.topic);
         return;
     }
     // Topic not covered locally — fall back to a model turn (network).
+    // A model-backed answer is not tracked for rating here: the rating chords
+    // only cover the deterministic local-help surface this function rendered.
     start_user_turn(app, agent, prompt);
+}
+
+/// Map the skills crate's help-answer source onto the telemetry-local enum so
+/// the telemetry crate stays independent of `squeezy-skills`.
+fn help_source_kind(source: HelpAnswerSource) -> HelpAnswerSourceKind {
+    match source {
+        HelpAnswerSource::LocalCurated => HelpAnswerSourceKind::LocalCurated,
+        HelpAnswerSource::DocHelpModel => HelpAnswerSourceKind::DocHelpModel,
+        // A web-fallback answer is still a model-generated doc-help answer for
+        // rating telemetry; the rating UI tracks only curated answers today, so
+        // this arm is currently unreached but keeps the match exhaustive.
+        HelpAnswerSource::DocHelpWeb => HelpAnswerSourceKind::DocHelpModel,
+    }
+}
+
+/// Outcome of attempting to rate the last help answer. Pure data so the rating
+/// decision is unit-testable without standing up a `TuiApp` or an `Agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HelpRatingOutcome {
+    pub(crate) topic: String,
+    pub(crate) source: HelpAnswerSourceKind,
+    pub(crate) rating: HelpRatingKind,
+    pub(crate) confirmation: String,
+}
+
+/// Decide whether the `last_help_answer` slot can be rated, and if so consume it
+/// (so the same answer is not double-counted) and return the anonymous telemetry
+/// dimensions plus a confirmation line. Returns `None` — a no-op — when the last
+/// assistant message was NOT a help answer, so the rating chords fall through to
+/// their normal key meaning in every other context.
+pub(crate) fn rate_last_help_answer(
+    last_help_answer: &mut Option<(String, HelpAnswerSource)>,
+    rating: HelpRatingKind,
+) -> Option<HelpRatingOutcome> {
+    let (topic, source) = last_help_answer.take()?;
+    let confirmation = match rating {
+        HelpRatingKind::Up => format!("Thanks — marked the `{topic}` help answer helpful."),
+        HelpRatingKind::Down => format!(
+            "Thanks — marked the `{topic}` help answer not helpful. Maintainers will see the anonymous signal."
+        ),
+    };
+    Some(HelpRatingOutcome {
+        topic,
+        source: help_source_kind(source),
+        rating,
+        confirmation,
+    })
+}
+
+/// Rate the most recent local `/help` answer (thumbs up/down), emit anonymous
+/// `help_answer_rated` telemetry, and show a brief confirmation. Returns `true`
+/// when a rateable help answer was present (the chord is consumed); `false` when
+/// there is nothing to rate so the caller lets the key keep its normal meaning.
+fn rate_help_answer(app: &mut TuiApp, agent: &Agent, rating: HelpRatingKind) -> bool {
+    let Some(outcome) = rate_last_help_answer(&mut app.last_help_answer, rating) else {
+        return false;
+    };
+    agent.record_help_answer_rated_telemetry(&outcome.topic, outcome.source, outcome.rating);
+    app.status = outcome.confirmation;
+    app.needs_redraw = true;
+    true
 }
 
 async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
@@ -47190,6 +47317,14 @@ pub(crate) struct TuiApp {
     pub(crate) last_turn_had_edits: bool,
     pub(crate) mcp_elicitation_selection_index: usize,
     pub(crate) pending_feedback: Option<PreparedFeedback>,
+    /// The most recent locally-answered `/help` topic, as `(topic id, source)`.
+    /// Set whenever a curated/local help answer is rendered into the transcript;
+    /// drives the thumbs-up / thumbs-down rating chords (Ctrl+G / Ctrl+B). It is
+    /// `None` until the first help answer and is left intact afterwards so the
+    /// last answer stays rateable while the user reads it. Cleared once rated so
+    /// the same answer is not double-counted. Holds only the anonymous topic id
+    /// + source — never the answer body.
+    pub(crate) last_help_answer: Option<(String, HelpAnswerSource)>,
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
     /// Resolved clipboard provider chain for semantic copy/export
@@ -48540,6 +48675,7 @@ impl TuiApp {
             last_turn_had_edits: false,
             mcp_elicitation_selection_index: 0,
             pending_feedback: None,
+            last_help_answer: None,
             pending_report: None,
             clipboard,
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),

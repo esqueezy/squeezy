@@ -1366,6 +1366,20 @@ pub(crate) fn find_inline_slash_dispatch_command(input: &str) -> Option<SlashCom
     None
 }
 
+/// Look up a registered slash command by its exact name token (e.g. `/theme`).
+///
+/// Returns the [`SlashCommand`] only when `token` matches a registry entry
+/// *exactly* — `/theme` matches, `/themeXYZ`, `/the`, and `theme` (no leading
+/// slash) do not. This is the single source of truth for "is this run of text a
+/// real slash command", shared by the actionable-help linkifier
+/// (`crate::help_links`) so it never has to re-encode the command set.
+pub(crate) fn lookup_slash_command(token: &str) -> Option<SlashCommand> {
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .find(|command| command.name == token)
+}
+
 pub(crate) fn slash_command_ranges(input: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut cursor = 0;
