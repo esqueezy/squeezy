@@ -2714,6 +2714,17 @@ fn unresolved_hierarchy_result(
     payload.insert("symbol_id".to_string(), json!(args.symbol_id));
     payload.insert("query".to_string(), json!(args.query));
     payload.insert("packets".to_string(), json!(packets));
+    // Mirror the flow path's dead-end: point the caller at definition_search to
+    // resolve a unique symbol before re-asking, instead of leaving them with an
+    // unactionable empty result.
+    payload.insert(
+        "next_action".to_string(),
+        json!({
+            "tool": "definition_search",
+            "arguments": {"query": query},
+            "reason": "resolve a unique symbol with definition_search"
+        }),
+    );
     make_result(
         call,
         ToolStatus::Stale,
@@ -3768,9 +3779,36 @@ impl ToolRegistry {
         };
 
         let Some(root_sym) = root else {
+            // Dead-end: surface candidate packets and a re-resolve next_action so
+            // the caller can pick a unique symbol, mirroring the flow/hierarchy
+            // unresolved paths instead of returning a bare error.
+            let query = args.query.as_deref().unwrap_or("");
+            let candidate_packets = if query.is_empty() {
+                Vec::new()
+            } else {
+                graph_symbol_search(graph, Some(query), None, None, None, None, None)
+                    .into_iter()
+                    .take(DEFAULT_GRAPH_MAX_RESULTS)
+                    .map(|symbol| {
+                        let rank_label = symbol_rank_label(&symbol, query);
+                        symbol_packet(graph, &symbol, "inheritance_hierarchy", Some(rank_label))
+                    })
+                    .collect::<Vec<_>>()
+            };
             let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
             payload.insert("error".to_string(), json!("symbol not found"));
-            payload.insert("packets".to_string(), json!([]));
+            payload.insert("resolved".to_string(), json!(false));
+            payload.insert("symbol_id".to_string(), json!(args.symbol_id));
+            payload.insert("query".to_string(), json!(args.query));
+            payload.insert("packets".to_string(), json!(candidate_packets));
+            payload.insert(
+                "next_action".to_string(),
+                json!({
+                    "tool": "definition_search",
+                    "arguments": {"query": query},
+                    "reason": "resolve a unique symbol with definition_search"
+                }),
+            );
             return make_result(
                 call,
                 ToolStatus::Stale,
