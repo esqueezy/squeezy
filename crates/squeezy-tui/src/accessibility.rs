@@ -731,6 +731,14 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // row) before the global keymap sees them, reaching the same
         // `resolve_paste_transform` handler a row click drives.
         A::PasteTransformSelect(_) => KeyboardPath::Always("paste question ↑↓/Enter"),
+        // Inline decision modals. Each modal's own key handler owns ↑/↓ (move the
+        // selection) and Enter / its per-option key before the global keymap sees
+        // them, so the click affordance and the keyboard reach the same handler.
+        // Approval clicks only highlight, so its keyboard twin is the ↑/↓ move.
+        A::ApprovalSelect(_) => KeyboardPath::Always("approval ↑/↓"),
+        A::RequestUserInputActivate(_) => KeyboardPath::Always("plan-mode question ↑↓/Enter"),
+        A::McpElicitationActivate(_) => KeyboardPath::Always("mcp request ↑↓/Enter"),
+        A::PlanChoiceActivate(_) => KeyboardPath::Always("plan choice ↑↓/Enter"),
         // Clipboard-history picker (§12.6.1) — the picker's own key handler owns
         // Up/Down (select), Enter (re-copy), `d` (delete), and `c` (clear) before
         // the global keymap sees them, so every mouse affordance routes to the

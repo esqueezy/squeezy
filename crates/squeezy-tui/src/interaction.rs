@@ -330,6 +330,22 @@ pub(crate) enum ChromeKey {
     /// on it restores the saved checkpoint onto the running session — the mouse
     /// twin of the overlay's `r` verb.
     CheckpointRestore,
+    /// A decision-option row in the tool-approval modal, keyed by its 0-based
+    /// index in the option list. A click only *highlights* that option (sets the
+    /// selection) — approving stays an explicit Enter/key press so a stray click
+    /// can never approve a consequential command.
+    ApprovalOption(usize),
+    /// A choice row in the plan-mode question modal, keyed by its 0-based index in
+    /// the question's choice list. A click selects + answers with that choice (the
+    /// mouse twin of moving to it and pressing Enter).
+    RequestUserInputOption(usize),
+    /// An option row in the MCP elicitation modal, keyed by its 0-based index in
+    /// the accept/decline list. A click selects + activates that option.
+    McpElicitationOption(usize),
+    /// A choice row in the post-plan choice modal, keyed by its 0-based index in
+    /// [`crate::PLAN_CHOICES`]. A click selects + activates that choice (the mouse
+    /// twin of its `[e]`/`[c]`/`[r]`/`[d]` key).
+    PlanChoiceOption(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -700,6 +716,22 @@ pub(crate) enum Action {
     /// the same `restore_session_checkpoint` handler so keyboard/mouse parity holds
     /// by construction. A click on the overlay's `[restore]` affordance reaches it.
     CheckpointRestore,
+    /// Highlight the given tool-approval option (by 0-based index). A click only
+    /// moves the selection — approving stays an explicit Enter/key press so a
+    /// stray click can never approve a consequential command.
+    ApprovalSelect(usize),
+    /// Select + answer with the given plan-mode question choice (by 0-based index).
+    /// Mouse twin of moving to it and pressing Enter; a click both selects and
+    /// answers in one go.
+    RequestUserInputActivate(usize),
+    /// Select + activate the given MCP elicitation option (by 0-based index: 0=accept,
+    /// 1=decline). Mouse twin of moving to it and pressing Enter.
+    McpElicitationActivate(usize),
+    /// Select + activate the given post-plan choice (by 0-based index into
+    /// [`crate::PLAN_CHOICES`]). Activation needs the agent, so the click arms it and
+    /// the event loop drains it where the agent is in scope — the mouse twin of the
+    /// choice's key.
+    PlanChoiceActivate(usize),
 }
 
 impl Action {
@@ -793,6 +825,10 @@ impl Action {
         Action::CycleDockPanel,
         Action::ToggleZenMode,
         Action::CheckpointRestore,
+        Action::ApprovalSelect(0),
+        Action::RequestUserInputActivate(0),
+        Action::McpElicitationActivate(0),
+        Action::PlanChoiceActivate(0),
     ];
 }
 

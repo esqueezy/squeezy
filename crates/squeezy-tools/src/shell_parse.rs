@@ -373,10 +373,7 @@ pub(crate) fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
         ShellPermissionAnalysis {
             capability: PermissionCapability::Compiler,
             risk: PermissionRisk::Medium,
-            rule_target: format!(
-                "{}:*",
-                shell_command_prefix(segments.first().unwrap_or(&normalized))
-            ),
+            rule_target: format!("{first}:*"),
             network: false,
             destructive: false,
             parser_backed,
@@ -393,10 +390,7 @@ pub(crate) fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             } else {
                 PermissionRisk::High
             },
-            rule_target: format!(
-                "{}:*",
-                shell_command_prefix(segments.first().unwrap_or(&normalized))
-            ),
+            rule_target: format!("{first}:*"),
             network: false,
             destructive: false,
             parser_backed,

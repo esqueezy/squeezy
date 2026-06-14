@@ -261,6 +261,28 @@ fn record_audit_captures_reason_and_caps_at_ring_size() {
     );
 }
 
+#[test]
+fn withheld_allow_records_allow_downgraded() {
+    // When the reviewer says Allow but auto-approval is withheld, telemetry
+    // emits `ai_reviewer_allow_downgrade`; the audit ring must agree by
+    // recording `AllowDowngraded` (not `NoDecision`) so the two never diverge.
+    assert_eq!(
+        ReviewerAuditVerdict::AllowDowngraded.as_str(),
+        "allow-downgraded"
+    );
+
+    let mut state = AiReviewerState::default();
+    state.record_audit(
+        TurnId::new(1),
+        &sample_request("write_file", "path:/etc/hosts"),
+        ReviewerAuditVerdict::AllowDowngraded,
+        "ai reviewer allow withheld for out-of-workspace edit request",
+    );
+    let entries = state.recent_decisions();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].verdict, ReviewerAuditVerdict::AllowDowngraded);
+}
+
 /// The reviewer schema (M13) must mirror exactly what
 /// `parse_reviewer_response` deserializes into `ReviewerDecision`: the
 /// `action` enum carries the three canonical `PermissionMode` strings and

@@ -11712,6 +11712,19 @@ fn plan_mode_shell_read_only_classifier_blocks_repo_mutators() {
 }
 
 #[test]
+fn compiler_and_git_rule_targets_reuse_command_prefix() {
+    // Compiler and git branches derive their rule_target from the leading
+    // segment's command prefix, the same value every other branch uses.
+    let compiler = analyze_shell_command("cargo test --workspace");
+    assert_eq!(compiler.capability, PermissionCapability::Compiler);
+    assert_eq!(compiler.rule_target, "cargo test:*");
+
+    let git = analyze_shell_command("git status --short");
+    assert_eq!(git.capability, PermissionCapability::Git);
+    assert_eq!(git.rule_target, "git status:*");
+}
+
+#[test]
 fn destructive_git_detection_requires_token_boundaries() {
     // `git push --force-with-lease` is destructive.
     let force_lease = analyze_shell_command("git push --force-with-lease");
