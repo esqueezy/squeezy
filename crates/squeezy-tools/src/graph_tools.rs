@@ -3746,6 +3746,7 @@ impl ToolRegistry {
             Value::Object(payload),
             ToolCostHint {
                 matches_returned: symbols.len() as u64,
+                truncated,
                 confidence_distribution,
                 ..ToolCostHint::default()
             },
