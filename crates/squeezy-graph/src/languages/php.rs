@@ -307,6 +307,42 @@ impl SemanticGraph {
         };
         psr4.is_consistent(dotted, &file.relative_path)
     }
+
+    /// Resolve a PHP type-bearing call — `new ClassName(...)` object creation —
+    /// to its declaring class/interface/trait/enum symbol, accepting candidates
+    /// that are merely PSR-4-consistent (autoloadable) with the call site in
+    /// addition to same-namespace / explicitly-`use`d types.
+    ///
+    /// The call resolver dispatches here for PHP callers on a
+    /// [`ParsedCallKind::Direct`] call whose `target_text` names a type the
+    /// generic single-name resolver did not already bind. Declines (returns
+    /// `None`) for non-PHP callers, calls with an instance/scope receiver
+    /// (`$x->m()`, `Foo::bar()` — those are method calls, not constructions),
+    /// empty names, and whenever the relaxed candidate set is not exactly one
+    /// symbol so the caller can fall back to a `CandidateSet` edge.
+    pub(crate) fn php_type_candidate_for_reference(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if !self.caller_is_php(caller_id) {
+            return None;
+        }
+        if call.kind != ParsedCallKind::Direct || call.receiver.is_some() {
+            return None;
+        }
+        let name = call.target_text.trim();
+        if name.is_empty() {
+            return None;
+        }
+        match self
+            .php_type_candidates_for_name_in_file(&call.file_id, name)
+            .as_slice()
+        {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// PSR-4 autoload table: dotted namespace prefix (`Vendor.Pkg`) → source root
@@ -343,10 +379,6 @@ impl Psr4Map {
         self.entries.push((prefix, root));
         self.entries
             .sort_by(|left, right| right.0.len().cmp(&left.0.len()).then(left.0.cmp(&right.0)));
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// True when the class whose dotted fully-qualified name is `dotted_identity`
