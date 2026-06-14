@@ -623,6 +623,7 @@ pub(crate) fn symbol_context_spec() -> ToolSpec {
             "additionalProperties": false,
             "properties": {
                 "query": {"type": "string", "description": "Text to match against indexed symbol signatures."},
+                "symbol_id": {"type": "string", "description": "Exact graph symbol id from a prior packet to anchor context directly instead of re-resolving by name."},
                 "path": {"type": "string", "description": "Optional workspace-relative file path filter."},
                 "diff_only": {"type": "boolean", "description": "When true, return only symbols touched by the current Git diff."},
                 "max_references": {"type": "integer", "minimum": 1, "maximum": 50},
