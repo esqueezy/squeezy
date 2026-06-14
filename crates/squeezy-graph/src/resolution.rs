@@ -202,10 +202,10 @@ impl SemanticGraph {
                     Some((GenericInheritanceKind::Base, name.to_string()))
                 } else if let Some(name) = attribute.strip_prefix("iface:") {
                     Some((GenericInheritanceKind::Iface, name.to_string()))
-                } else if let Some(name) = attribute.strip_prefix("mixin:") {
-                    Some((GenericInheritanceKind::Mixin, name.to_string()))
                 } else {
-                    None
+                    attribute
+                        .strip_prefix("mixin:")
+                        .map(|name| (GenericInheritanceKind::Mixin, name.to_string()))
                 }
             })
             .collect()
