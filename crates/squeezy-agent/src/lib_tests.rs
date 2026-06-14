@@ -5482,6 +5482,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
             None,
         ))),
         subagents: SubagentRegistry::default(),
+        store: None,
         hooks: None,
     };
 
@@ -5557,6 +5558,42 @@ fn persistence_guard_refuses_allow_with_star_target() {
         .is_none(),
         "Allow rules with a catch-all target must not be persisted",
     );
+}
+
+#[test]
+fn persistence_guard_refuses_allow_on_shell_catch_all_target() {
+    // `shell:*` is the fallback the analyzer assigns to dynamic / unparseable /
+    // unknown-env commands so each one re-prompts. Persisting it as Allow would
+    // auto-approve every future dynamic command — it must be refused.
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "shell:*".to_string(),
+        risk: PermissionRisk::High,
+        summary: "CUSTOM_VAR=1 cargo build".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+    assert!(
+        permission_rule_for_persistence(
+            &request,
+            PermissionRuleSource::Project,
+            PermissionAction::Allow
+        )
+        .is_none(),
+        "Allow rules with the shell catch-all target must not be persisted",
+    );
+
+    // A broad Deny is still allowed: it fails closed (blocks future dynamic
+    // commands rather than waving them through).
+    let deny = permission_rule_for_persistence(
+        &request,
+        PermissionRuleSource::Project,
+        PermissionAction::Deny,
+    );
+    assert!(deny.is_some(), "broad shell Deny rules may persist");
+    assert_eq!(deny.expect("deny rule").action, PermissionAction::Deny);
 }
 
 #[tokio::test]
