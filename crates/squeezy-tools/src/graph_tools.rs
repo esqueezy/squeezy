@@ -3031,18 +3031,10 @@ impl ToolRegistry {
         } else {
             self.wait_for_graph_ready(graph_ready_wait())
         };
-        let mut graph = match self.graph.lock() {
-            Ok(graph) => graph,
-            Err(_) => {
-                return make_result(
-                    call,
-                    ToolStatus::Error,
-                    json!({"error": "semantic graph lock poisoned"}),
-                    ToolCostHint::default(),
-                    None,
-                );
-            }
-        };
+        // A poisoned mutex used to brick every graph tool. Recover the guard
+        // instead so a panic in one handler doesn't permanently disable the
+        // rest of the semantic toolset.
+        let mut graph = self.graph.lock().unwrap_or_else(|e| e.into_inner());
         let Some(manager) = graph.as_mut() else {
             // Bug #1: a path-only `read_slice` (no `symbol_id`) reads bytes
             // straight off disk and never touches the graph. Don't strand it on
@@ -4264,9 +4256,13 @@ impl ToolRegistry {
                 let total_changed_ranges = changed_ranges.len();
                 for range in changed_ranges.into_iter().take(max_ranges) {
                     let bytes = text.as_bytes();
-                    let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+                    let capped_end =
+                        range.end.min(range.start.saturating_add(MAX_READ_LIMIT)).min(bytes.len());
+                    // Clamp the start too: a malformed range whose start lands
+                    // past `capped_end` would otherwise panic the slice.
                     let content =
-                        String::from_utf8_lossy(&bytes[range.start..capped_end]).to_string();
+                        String::from_utf8_lossy(&bytes[range.start.min(capped_end)..capped_end])
+                            .to_string();
                     let range_truncated = capped_end < range.end;
                     truncated |= range_truncated;
                     let range_cost = ToolCostHint {
@@ -4514,9 +4510,15 @@ impl ToolRegistry {
         {
             let start = offset.saturating_add(range.start);
             let end_bytes = offset.saturating_add(range.end);
-            let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
-            let content =
-                String::from_utf8_lossy(&current.as_bytes()[range.start..capped_end]).to_string();
+            let capped_end = range
+                .end
+                .min(range.start.saturating_add(MAX_READ_LIMIT))
+                .min(current.len());
+            // Clamp the start too so a malformed range can't panic the slice.
+            let content = String::from_utf8_lossy(
+                &current.as_bytes()[range.start.min(capped_end)..capped_end],
+            )
+            .to_string();
             let range_truncated = capped_end < range.end;
             let start_line = line_number_for_byte(&current, range.start)
                 .saturating_add(line_offset_before_window);
@@ -4601,10 +4603,8 @@ impl ToolRegistry {
         max_references: usize,
     ) -> Value {
         let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
-        let mut graph = match self.graph.lock() {
-            Ok(graph) => graph,
-            Err(_) => return json!({"available": false, "error": "semantic graph lock poisoned"}),
-        };
+        // Recover a poisoned guard instead of permanently failing impact lookups.
+        let mut graph = self.graph.lock().unwrap_or_else(|e| e.into_inner());
         let Some(manager) = graph.as_mut() else {
             return if !graph_ready {
                 json!({
