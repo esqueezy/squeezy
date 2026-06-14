@@ -1167,6 +1167,18 @@ impl SemanticGraph {
             .collect()
     }
 
+    /// Borrow the `SymbolId`s indexed under `name` without allocating. Returns
+    /// an empty slice when no symbol carries that name. Read-only callers that
+    /// only iterate the ids (and look each up via [`Self::symbols`]) should
+    /// prefer this over [`Self::symbols_by_name_or_scan`], which clones the
+    /// whole vector on every call.
+    pub fn symbols_by_name(&self, name: &str) -> &[SymbolId] {
+        self.symbols_by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Return all inheritance-style ancestors of `start` (i.e. symbols
     /// reachable via `UsesTrait`, `Extends`, and `Implements` edges in PHP
     /// method-resolution order) as a breadth-first list, excluding `start`

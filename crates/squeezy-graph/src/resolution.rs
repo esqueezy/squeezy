@@ -267,8 +267,8 @@ impl SemanticGraph {
                 .owner_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let candidates = graph.symbols_by_name_or_scan(last_path_segment_str(&reference.text));
-            let (to, confidence) = match candidates.as_slice() {
+            let candidates = graph.symbols_by_name(last_path_segment_str(&reference.text));
+            let (to, confidence) = match candidates {
                 [only] => (Some(only.clone()), Confidence::Heuristic),
                 _ => return None,
             };
@@ -307,14 +307,15 @@ impl SemanticGraph {
     ) -> (Option<SymbolId>, Confidence, &'static str, Vec<SymbolId>) {
         if call.kind == ParsedCallKind::Macro {
             let candidates = self
-                .symbols_by_name_or_scan(&call.name)
-                .into_iter()
+                .symbols_by_name(&call.name)
+                .iter()
                 .filter(|id| {
                     self.symbols
                         .get(id)
                         .map(|symbol| symbol.kind == SymbolKind::Macro)
                         .unwrap_or(false)
                 })
+                .cloned()
                 .collect::<Vec<_>>();
             return match candidates.as_slice() {
                 [only] => (
@@ -449,8 +450,8 @@ impl SemanticGraph {
         }
 
         let candidates = self
-            .symbols_by_name_or_scan(&call.name)
-            .into_iter()
+            .symbols_by_name(&call.name)
+            .iter()
             .filter(|id| {
                 self.symbols
                     .get(id)
@@ -465,6 +466,7 @@ impl SemanticGraph {
                     })
                     .unwrap_or(false)
             })
+            .cloned()
             .collect::<Vec<_>>();
 
         if let Some(id) = self.qualified_direct_call(&candidates, caller_id, call) {
