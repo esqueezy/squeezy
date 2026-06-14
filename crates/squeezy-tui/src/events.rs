@@ -700,7 +700,13 @@ pub(crate) fn apply_mcp_status_update(app: &mut TuiApp, snapshot: McpStatusSnaps
         .as_ref()
         .is_some_and(|prior| !prior.per_server.is_empty());
     let now_has_servers = !snapshot.per_server.is_empty();
-    app.mcp_status = Some(snapshot);
+    app.mcp_status = Some(snapshot.clone());
+    // Mirror the live snapshot into an open /mcp config page so a
+    // background discovery / restart result lands on the row as soon as
+    // the event arrives, not only on the next animation-tick refresh.
+    if let Some(state) = app.config_screen.as_mut() {
+        state.mcp_status = snapshot;
+    }
     app.status = format!("mcp {summary}");
     let changed = prior_summary.as_deref() != Some(&summary);
     if changed && (now_has_servers || prior_had_servers) {
