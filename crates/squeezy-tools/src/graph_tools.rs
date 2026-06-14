@@ -33,6 +33,10 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub(crate) struct SymbolContextArgs {
     pub(crate) query: String,
+    /// Optional symbol id minted by a sibling tool (definition_search, flow,
+    /// etc.). When live, it resolves the target directly; a stale id falls
+    /// through to the `query` search.
+    symbol_id: Option<String>,
     path: Option<String>,
     diff_only: Option<bool>,
     mode: Option<DiffMode>,
@@ -3613,18 +3617,28 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
+        // A live symbol_id from a sibling tool resolves the target directly;
+        // a stale id (graph re-indexed since it was minted) falls through to
+        // the name query so the call still lands on the right symbol.
+        let resolved_by_id = args
+            .symbol_id
+            .as_deref()
+            .and_then(|id| graph.symbols.get(&SymbolId::new(id)).cloned());
         // Count candidates BEFORE `take(max_results)` so the response can
         // report `truncated` honestly: emitting `truncated:false` while
         // dropping matches misleads the model into thinking it saw everything.
-        let candidates = graph_symbol_search(
-            graph,
-            Some(&args.query),
-            None,
-            path_filter,
-            None,
-            None,
-            None,
-        )
+        let candidates = match resolved_by_id {
+            Some(symbol) => vec![symbol],
+            None => graph_symbol_search(
+                graph,
+                Some(&args.query),
+                None,
+                path_filter,
+                None,
+                None,
+                None,
+            ),
+        }
         .into_iter()
         .filter(|symbol| {
             !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
@@ -3653,6 +3667,7 @@ impl ToolRegistry {
             ToolCostHint::confidence_distribution_from(symbols.iter().map(|s| s.confidence));
         let mut payload = graph_payload("symbol_context", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
+        payload.insert("symbol_id".to_string(), json!(args.symbol_id));
         payload.insert(
             "mode".to_string(),
             json!(diff_mode_str(args.mode.unwrap_or_default())),
@@ -3662,7 +3677,13 @@ impl ToolRegistry {
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            graph_zero_hit_fallback(graph, None, path_filter, Some(&args.query), packet_count),
+            graph_zero_hit_fallback(
+                graph,
+                args.symbol_id.as_deref(),
+                path_filter,
+                Some(&args.query),
+                packet_count,
+            ),
         );
         payload.insert("truncated".to_string(), json!(truncated));
         make_result(
