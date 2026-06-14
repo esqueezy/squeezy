@@ -50,6 +50,59 @@ impl SemanticGraph {
         self.python_method_on_class(&class.id, &call.name)
     }
 
+    /// ORM manager dispatch (Django / SQLAlchemy-style): resolve a call whose
+    /// receiver is a model class's manager attribute back to a method on that
+    /// model class. For `User.objects.filter(...)` tree-sitter records the call
+    /// as `name=filter`, `receiver="User.objects"`; we strip the allow-listed
+    /// manager segment (`objects` / `query`), resolve the leading `User` to a
+    /// model class in scope, and look the method up on that class (or its
+    /// bases). Precision is kept high by the manager allow-list and by reusing
+    /// the scope-aware class resolver — we never bind to an arbitrary same-named
+    /// method, and decline outright when the receiver is not a recognised
+    /// `<Class>.<manager>` chain or the head does not resolve to a class.
+    pub(crate) fn python_manager_dispatch_call(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if !self.caller_is_python(caller_id) {
+            return None;
+        }
+        let receiver = call.receiver.as_deref()?;
+        // Split the receiver into `<head>.<manager>` and require the trailing
+        // segment to be an allow-listed manager attribute. A bare `objects`
+        // with no class head (`objects.filter()`) is too ambiguous to bind.
+        let (head, manager) = receiver.rsplit_once('.')?;
+        if !is_python_manager_attribute(manager) {
+            return None;
+        }
+        let head = head.trim();
+        if head.is_empty() {
+            return None;
+        }
+        let class_name = last_path_segment(head);
+        let caller = self.symbols.get(caller_id)?;
+
+        // Resolve `<head>` to a model class. `self`/`cls` managers point at the
+        // enclosing class; an imported/aliased name resolves through the same
+        // scope-aware path the rest of the Python resolver uses; otherwise fall
+        // back to a same-file (or unambiguous workspace) class declaration.
+        let class_id = if matches!(head, "self" | "cls") {
+            self.python_class_for_caller(caller_id)?
+        } else if let Some(class) =
+            self.python_class_for_alias(caller, &class_name, Some(call.span.start_byte))
+        {
+            class.id
+        } else {
+            single_symbol(
+                self.python_class_candidates_for_name_in_file(&caller.file_id, &class_name)
+                    .into_iter(),
+            )?
+        };
+
+        self.python_method_on_class_or_bases(&class_id, &call.name)
+    }
+
     pub(crate) fn python_module_qualified_call(
         &self,
         candidates: &[SymbolId],
@@ -365,6 +418,16 @@ impl SemanticGraph {
             .map(|method_id| method_id == symbol.id)
             .unwrap_or(false)
     }
+}
+
+/// Allow-listed ORM "manager" attributes that stand in front of a model class
+/// in a query expression (`Model.objects.filter(...)`,
+/// `Model.query.get(...)`). Kept deliberately small so the manager-dispatch
+/// heuristic only fires on the well-known Django (`objects`) and
+/// Flask-SQLAlchemy (`query`) idioms and never on an arbitrary attribute
+/// access that happens to be followed by a method call.
+pub(crate) fn is_python_manager_attribute(attribute: &str) -> bool {
+    matches!(attribute.trim(), "objects" | "query")
 }
 
 pub(crate) fn python_path_segments(path: &str) -> Vec<String> {
