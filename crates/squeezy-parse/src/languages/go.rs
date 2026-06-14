@@ -780,6 +780,7 @@ pub(crate) fn go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
 ///   * `var x T` / `var x *T` (explicit type)
 ///   * `x := T{...}` / `x := &T{...}` (composite-literal construction)
 ///   * `x := T(v)` (type conversion to a named type)
+///
 /// `<Type>` is always the leaf type name (pointer `*` and `pkg.` qualifiers
 /// stripped) so the resolver can match it against same-package type symbols.
 /// We deliberately do not descend into nested `func_literal` bodies so their
