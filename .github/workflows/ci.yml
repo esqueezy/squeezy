@@ -455,13 +455,14 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Free disk space (linux)
+      - name: Free disk space and build on /mnt (linux)
         if: matrix.platform == 'linux'
         run: |
           # cargo-llvm-cov instruments the whole workspace and writes a profraw
-          # per test process, which overruns the stock ubuntu runner's ~14 GB
-          # root volume. Drop preinstalled toolchains this job never uses so the
-          # coverage build has headroom.
+          # per test process — far more than the runner's ~14 GB root volume
+          # holds. The runner ships a separate ~65 GB ephemeral disk at /mnt;
+          # build there, and drop preinstalled toolchains this job never uses so
+          # the root volume keeps headroom for /tmp.
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -469,7 +470,10 @@ jobs:
             /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost
           sudo docker image prune --all --force || true
-          df -h /
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+          df -h / /mnt
 
       - name: Ensure coverage component
         run: rustup component add llvm-tools-preview
