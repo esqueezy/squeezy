@@ -673,6 +673,17 @@ impl SemanticGraph {
         self.calls.retain(|call| &call.file_id != file_id);
         self.references
             .retain(|reference| &reference.file_id != file_id);
+        // `body_hits` and `body_hit_text_lower` are parallel vectors addressed
+        // by the same index from `body_hit_trigram_index`. Drop the lowercase
+        // shadow in lockstep so the index does not point past the truncated
+        // `body_hits` (a later rebuild repopulates both, but read paths between
+        // here and that rebuild must still see aligned vectors). The lengths
+        // can legitimately differ before the first `rebuild_indexes`, so guard
+        // on equal length and otherwise leave the shadow for the rebuild.
+        if self.body_hit_text_lower.len() == self.body_hits.len() {
+            let mut keep = self.body_hits.iter().map(|hit| &hit.file_id != file_id);
+            self.body_hit_text_lower.retain(|_| keep.next().unwrap_or(true));
+        }
         self.body_hits.retain(|hit| &hit.file_id != file_id);
         self.java_project_facts
             .retain(|fact| &fact.source_file != file_id);
@@ -3135,14 +3146,29 @@ impl GraphManager {
             // on a previous run) the row would otherwise leak.
             graph_batch.remove_resolver_entry(file_id);
         }
+        // Track whether a supported->Unsupported flip purged derived data via
+        // `remove_file_data`. When that is the only change in a refresh (no
+        // reparsed files, no metadata change, no removals) the index rebuild
+        // below would otherwise be skipped, leaving `edges_by_from`/
+        // `symbols_by_name`/etc. pointing at the just-purged symbols.
+        let mut unsupported_purged = false;
         for record in unsupported_changed_records {
             // A file that flipped from a supported language to unsupported
             // still has its old symbols/edges/calls/references/packages/facts
             // in the graph. Purge all derived data for the file before
             // recording the unsupported placeholder, otherwise the stale rows
             // remain queryable and poison every downstream tool.
+            let was_supported = self
+                .graph
+                .files
+                .get(&record.id)
+                .map(|old| old.language != LanguageKind::Unsupported)
+                .unwrap_or(false);
             self.graph.remove_file_data(&record.id);
             self.graph.files.insert(record.id.clone(), record.clone());
+            if was_supported {
+                unsupported_purged = true;
+            }
         }
 
         let mut parsed_files = Vec::new();
@@ -3172,7 +3198,7 @@ impl GraphManager {
                 }
             }
             self.graph.replace_files(parsed_files);
-        } else if metadata_refresh_needed || !removed_files.is_empty() {
+        } else if metadata_refresh_needed || !removed_files.is_empty() || unsupported_purged {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
             self.graph.rebuild_kotlin_project_facts();
