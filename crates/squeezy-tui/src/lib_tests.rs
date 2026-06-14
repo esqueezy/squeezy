@@ -51469,3 +51469,90 @@ fn turn_primary_model_picks_the_dominant_main_bucket() {
         "a turn with no per-model cost names no model",
     );
 }
+
+#[test]
+fn rate_last_help_answer_is_noop_when_no_help_answer_tracked() {
+    // No help answer recorded → the rating chord must be a no-op so it can fall
+    // through to its normal key meaning (e.g. Ctrl+B emacs cursor-left).
+    let mut slot: Option<(String, HelpAnswerSource)> = None;
+    assert!(rate_last_help_answer(&mut slot, HelpRatingKind::Up).is_none());
+    assert!(rate_last_help_answer(&mut slot, HelpRatingKind::Down).is_none());
+    assert!(slot.is_none());
+}
+
+#[test]
+fn rate_last_help_answer_reports_anonymous_dimensions_and_consumes_slot() {
+    let mut slot = Some(("providers".to_string(), HelpAnswerSource::LocalCurated));
+
+    let outcome = rate_last_help_answer(&mut slot, HelpRatingKind::Down)
+        .expect("a tracked help answer is rateable");
+    assert_eq!(outcome.topic, "providers");
+    assert_eq!(outcome.source, HelpAnswerSourceKind::LocalCurated);
+    assert_eq!(outcome.rating, HelpRatingKind::Down);
+    assert!(outcome.confirmation.contains("providers"));
+    // The slot is consumed so the same answer cannot be double-rated.
+    assert!(slot.is_none());
+    assert!(rate_last_help_answer(&mut slot, HelpRatingKind::Up).is_none());
+}
+
+#[test]
+fn rate_last_help_answer_maps_doc_help_model_source() {
+    let mut slot = Some(("tui".to_string(), HelpAnswerSource::DocHelpModel));
+    let outcome =
+        rate_last_help_answer(&mut slot, HelpRatingKind::Up).expect("rateable answer present");
+    assert_eq!(outcome.source, HelpAnswerSourceKind::DocHelpModel);
+    assert_eq!(outcome.rating, HelpRatingKind::Up);
+}
+
+// ---------------------------------------------------------------------------
+// Actionable help answers (ITEM 3): squeezy:cmd: hyperlink → composer prefill
+// ---------------------------------------------------------------------------
+
+#[test]
+fn command_hyperlink_prefills_the_composer_without_executing() {
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.input.is_empty());
+
+    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/theme");
+    assert!(handled, "an internal command URI is handled in-app");
+    // Prefilled, NOT executed: the command sits in the composer with the cursor
+    // at the end, awaiting an explicit Enter.
+    assert_eq!(app.input, "/theme");
+    assert_eq!(app.input_cursor, "/theme".len());
+}
+
+#[test]
+fn command_hyperlink_ignores_foreign_schemes() {
+    let mut app = test_app(SessionMode::Build);
+    let handled = handle_command_hyperlink(&mut app, "https://example.com/theme");
+    assert!(
+        !handled,
+        "a web URL is not ours; the caller keeps routing it as a normal link"
+    );
+    assert!(app.input.is_empty(), "the composer is untouched");
+}
+
+#[test]
+fn command_hyperlink_protects_an_in_progress_draft() {
+    let mut app = test_app(SessionMode::Build);
+    app.input = "an important half-typed prompt".to_string();
+    app.input_cursor = app.input.len();
+
+    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/theme");
+    assert!(handled, "the URI is recognised (and consumed)");
+    // The non-command draft is preserved; nothing was overwritten.
+    assert_eq!(app.input, "an important half-typed prompt");
+}
+
+#[test]
+fn command_hyperlink_replaces_a_slash_command_draft() {
+    let mut app = test_app(SessionMode::Build);
+    // A composer that already holds a slash-command line is a fresh command line
+    // the user is mid-choosing; swapping in the clicked command is safe.
+    app.input = "/he".to_string();
+    app.input_cursor = app.input.len();
+
+    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/help");
+    assert!(handled);
+    assert_eq!(app.input, "/help");
+}
