@@ -36268,6 +36268,65 @@ fn main_render_cached_matches_uncached_byte_for_byte() {
 }
 
 #[test]
+fn main_surface_search_row_kinds_align_and_classify() {
+    // Regression for the row-kinds drift on the MAIN surface: the search row-kind
+    // map must come from the SAME pipeline that paints the main rows, so it is
+    // length-locked to them AND faithfully classifies tool-result / reasoning
+    // rows (rather than tripping the all-`Normal` fallback that silently no-ops
+    // the Ctrl+O / Ctrl+R toggles). `main_render_app_rich` carries both a
+    // reasoning entry and a tool-result run.
+    let _theme = lock_main_render_theme();
+    let app = main_render_app_rich();
+    let rows = main_surface_rows(&app);
+    let kinds = search_row_kinds(&app, selection::SelectionSurface::Main, rows.len());
+    assert_eq!(
+        kinds.len(),
+        rows.len(),
+        "main-surface row kinds are length-locked to the painted rows"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| *k == crate::search::RowKind::ToolOutput),
+        "tool-result rows classify as ToolOutput, not all-Normal"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| *k == crate::search::RowKind::Reasoning),
+        "reasoning rows classify as Reasoning, not all-Normal"
+    );
+}
+
+#[test]
+fn main_surface_search_row_kinds_align_with_startup_card() {
+    // The startup card prepends head chrome to the painted main rows; the kinds
+    // map must still align with — and classify within — those rows. Drive the
+    // card-on path explicitly via the text-area cache (the source
+    // `main_surface_render_params` reads), then assert alignment + classification
+    // hold exactly as without the card.
+    let _theme = lock_main_render_theme();
+    let app = main_render_app_rich();
+    // Paint the main surface so `main_text_area_cache` records the real wrap
+    // width, soft-wrap mode, and startup-card flag the kinds path reads. Height
+    // >= 16 enables the startup card.
+    let _ = render_transcript_to_buffer(&app, 80, 40);
+    let rows = main_surface_rows(&app);
+    let kinds = search_row_kinds(&app, selection::SelectionSurface::Main, rows.len());
+    assert_eq!(kinds.len(), rows.len());
+    assert!(
+        kinds
+            .iter()
+            .any(|k| *k == crate::search::RowKind::ToolOutput)
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| *k == crate::search::RowKind::Reasoning)
+    );
+}
+
+#[test]
 fn transcript_entry_offsets_does_not_clone_cached_rows() {
     // Regression for deep-review #39: the offsets-only callers (card hit-testing,
     // annotation/rename-label placement, hover affordances, the minimap rail)

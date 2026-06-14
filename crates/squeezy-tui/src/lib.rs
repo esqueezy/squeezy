@@ -4400,17 +4400,22 @@ fn main_scrollbar_from_bottom_from_mouse(app: &TuiApp, column: u16, row: u16) ->
 /// The painted wrapped rows of the MAIN transcript surface this frame — the
 /// exact `Vec<Line>` `render_transcript` drew, so a `selection::Pos` row indexes
 /// them faithfully. Rebuilt from the cached width + startup-card flag.
-fn main_surface_rows(app: &TuiApp) -> Vec<Line<'static>> {
-    let cache = app.main_text_area_cache.get();
-    // Rebuild the SAME row list the frame painted: wrapped to the text column when
-    // soft-wrap was on, unwrapped (one row per logical line) when off (§11G.4).
-    // Threading the cached `soft_wrap` keeps selection/copy row indices aligned
-    // with the painted rows in both modes.
-    let (build_width, include_card) = match cache {
+/// The `(build_width, include_startup_card)` the main surface's painted rows were
+/// built with this frame: wrapped to the text column when soft-wrap was on,
+/// unwrapped (one row per logical line) when off (§11G.4). Threading the cached
+/// `soft_wrap` keeps selection/copy/search row indices aligned with the painted
+/// rows in both modes. Shared by `main_surface_rows` and the search row-kind path
+/// so the rows and their kinds are always derived from the SAME inputs.
+fn main_surface_render_params(app: &TuiApp) -> (Option<u16>, bool) {
+    match app.main_text_area_cache.get() {
         Some(c) if c.soft_wrap => (Some(c.text_area.width.max(1)), c.include_startup_card),
         Some(c) => (None, c.include_startup_card),
         None => (Some(main_text_width(app).max(1)), false),
-    };
+    }
+}
+
+fn main_surface_rows(app: &TuiApp) -> Vec<Line<'static>> {
+    let (build_width, include_card) = main_surface_render_params(app);
     transcript_lines_for_render(app, build_width, include_card)
 }
 
@@ -34162,57 +34167,57 @@ fn rows_with_search_highlight(
 
 /// Build a `Vec<search::RowKind>` parallel to the painted rows of `surface`, so
 /// the search find pass can honour the include-tool-output / include-reasoning
-/// toggles. Classification reuses the shared row model
-/// ([`transcript_surface::build_transcript_rows`]) which carries each row's
-/// owning entry kind; rows the model classifies as a tool result map to
-/// [`search::RowKind::ToolOutput`] and reasoning rows to
-/// [`search::RowKind::Reasoning`], everything else (and chrome) to `Normal`.
+/// toggles. Rows owned by a tool-result entry map to [`search::RowKind::ToolOutput`]
+/// and reasoning rows to [`search::RowKind::Reasoning`]; everything else (and
+/// chrome) is `Normal`.
 ///
-/// The shared row model only faithfully mirrors the OVERLAY surface today (see
-/// `transcript_surface`'s module doc); for the main surface its row count can
-/// diverge from the painted rows, so a length mismatch falls back to an
-/// all-`Normal` slice (every row searched). That is the correct default: when
-/// both toggles are on — the common case — classification is irrelevant anyway,
-/// and an over-broad search is the safe failure mode.
+/// Each surface derives its kinds from the SAME pipeline that paints its rows:
+///
+/// - The MAIN surface reads the row-kind tags the main render produces alongside
+///   its wrapped rows ([`transcript_row_kinds`]), built at the same
+///   `(build_width, include_startup_card)` `main_surface_rows` paints with — so
+///   the startup card, settle-fold heights, and the main semantic filter are all
+///   reflected and the kinds are length-locked to the painted rows by
+///   construction.
+/// - The OVERLAY surface reads the attributed overlay row model
+///   ([`transcript_surface::build_transcript_rows_filtered`]), which already
+///   mirrors the painted overlay rows.
+///
+/// A length mismatch still falls back to an all-`Normal` slice (every row
+/// searched) as a defensive degrade, but the main pipeline keeps the lengths
+/// equal in every state, so the fallback no longer silently fires in the common
+/// startup-card / settle-fold / semantic-filter states.
 fn search_row_kinds(
     app: &TuiApp,
     surface: selection::SelectionSurface,
     painted_len: usize,
 ) -> Vec<search::RowKind> {
-    // Wrap at the width the surface is actually painted at: the overlay text
-    // split for the overlay surface (deep-review #16), the main cache width for
-    // the main surface.
-    let width = match surface {
-        selection::SelectionSurface::Overlay => overlay_text_width(app),
-        selection::SelectionSurface::Main => app
-            .main_text_area_cache
-            .get()
-            .map(|c| c.text_area.width)
-            .unwrap_or_else(|| main_text_width(app))
-            .max(1),
+    let kinds = match surface {
+        selection::SelectionSurface::Main => {
+            let (build_width, include_card) = main_surface_render_params(app);
+            transcript_row_kinds(app, build_width, include_card)
+        }
+        selection::SelectionSurface::Overlay => {
+            // Wrap at the overlay text split the overlay paints at (deep-review #16).
+            let width = overlay_text_width(app);
+            let detail = transcript_surface::DetailPolicy::from(overlay_detail(app));
+            let filter = overlay_filter(app);
+            let model =
+                transcript_surface::build_transcript_rows_filtered(app, width, detail, filter);
+            model
+                .iter()
+                .map(|row| match row.entry_kind {
+                    Some(transcript_surface::RowKind::ToolResult) => search::RowKind::ToolOutput,
+                    Some(transcript_surface::RowKind::Reasoning) => search::RowKind::Reasoning,
+                    _ => search::RowKind::Normal,
+                })
+                .collect()
+        }
     };
-    let (detail, filter) = match surface {
-        selection::SelectionSurface::Overlay => (
-            transcript_surface::DetailPolicy::from(overlay_detail(app)),
-            overlay_filter(app),
-        ),
-        selection::SelectionSurface::Main => (
-            transcript_surface::DetailPolicy::Collapsed,
-            OverlayFilter::All,
-        ),
-    };
-    let model = transcript_surface::build_transcript_rows_filtered(app, width, detail, filter);
-    if model.len() != painted_len {
+    if kinds.len() != painted_len {
         return vec![search::RowKind::Normal; painted_len];
     }
-    model
-        .iter()
-        .map(|row| match row.entry_kind {
-            Some(transcript_surface::RowKind::ToolResult) => search::RowKind::ToolOutput,
-            Some(transcript_surface::RowKind::Reasoning) => search::RowKind::Reasoning,
-            _ => search::RowKind::Normal,
-        })
-        .collect()
+    kinds
 }
 
 /// Re-run the search find pass against the live painted rows of `state.surface`
@@ -37517,6 +37522,20 @@ fn transcript_entry_offsets(
     cached_main_rows(app, width, include_startup_card).1.clone()
 }
 
+/// Per-row [`search::RowKind`] tags for the cached main render, in lock-step with
+/// the wrapped rows `transcript_lines_for_render` returns for the same
+/// `(width, include_startup_card)`. The incremental-search find pass reads this so
+/// its tool-output / reasoning toggles classify the EXACT rows that were painted
+/// on the main surface, length-locked by construction. Clones only the cheap
+/// `Vec<RowKind>` out of the shared `Arc`, leaving the rows behind it.
+fn transcript_row_kinds(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> Vec<search::RowKind> {
+    cached_main_rows(app, width, include_startup_card).2.clone()
+}
+
 /// Shared cache front door returning the `Arc<(rows, offsets)>` without cloning
 /// either inner `Vec`. The rows-consuming and offsets-only accessors clone only
 /// the part they actually need out of the returned `Arc`.
@@ -37657,7 +37676,7 @@ fn transcript_lines_and_entry_offsets_uncached(
     app: &TuiApp,
     width: Option<u16>,
     include_startup_card: bool,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<search::RowKind>) {
     let mut lines = Vec::new();
     // Logical-line index at which each entry's block starts. Filled lazily —
     // `entry_line_starts[i]` is set to `lines.len()` the first time entry `i`
@@ -37850,6 +37869,12 @@ fn transcript_lines_and_entry_offsets_uncached(
             turn_divider_width,
         );
     }
+    // Logical-line index one past the last entry-owned line: everything pushed
+    // from here on (the closing turn divider, pending reasoning, the streaming
+    // assistant tail) is chrome owned by no transcript entry, so it classifies as
+    // `RowKind::Normal` for search. Captured before those pushes so the row-kind
+    // map does not over-claim the tail as the last entry's kind.
+    let entry_region_end = lines.len();
     maybe_push_overlay_turn_divider(
         &mut lines,
         turn_divider,
@@ -37900,6 +37925,13 @@ fn transcript_lines_and_entry_offsets_uncached(
         let w = usize::from(width.max(1));
         let mut rows: Vec<Line<'static>> = Vec::with_capacity(lines.len());
         let mut entry_offsets: Vec<usize> = vec![0; entry_line_starts.len()];
+        // Search classification parallel to `rows` (deep-search row-kinds): every
+        // entry's wrapped rows carry that entry's kind, while head chrome and the
+        // streaming tail are `Normal`. Length-locked to `rows` by construction so
+        // the Ctrl+O / Ctrl+R toggles exclude tool-output / reasoning rows against
+        // the SAME rows that are painted, instead of an independently-rebuilt model
+        // whose length could diverge.
+        let mut row_kinds: Vec<search::RowKind> = Vec::with_capacity(lines.len());
         let palette_generation = render::palette::palette_generation();
         let n = lines.len();
         let mut cursor = 0usize;
@@ -37916,6 +37948,7 @@ fn transcript_lines_and_entry_offsets_uncached(
             if seg_lo > cursor {
                 for line in &lines[cursor..seg_lo] {
                     wrap_transcript_overlay_line(line, w, &mut rows);
+                    row_kinds.resize(rows.len(), search::RowKind::Normal);
                 }
                 cursor = seg_lo;
             }
@@ -37945,15 +37978,41 @@ fn transcript_lines_and_entry_offsets_uncached(
                 },
             );
             rows.extend(wrapped.iter().cloned());
+            // Tag this entry's wrapped rows with its kind. The last entry's
+            // segment additionally absorbs the closing turn divider and the
+            // streaming tail (they have no entry id and fall past
+            // `entry_region_end`); those are chrome and must stay `Normal`, so
+            // split the tag at the entry-owned/tail row boundary. For every other
+            // entry the whole block is entry-owned (no extra work).
+            let kind = main_search_row_kind(&entry.kind);
+            if seg_hi > entry_region_end {
+                // Count the wrapped rows produced by just the entry-owned logical
+                // lines (the chrome/tail suffix wraps separately into `Normal`).
+                // Per-line wrapping is additive, so the prefix's row count is the
+                // sum of each owned line's wrapped rows.
+                let owned_hi = entry_region_end.max(cursor).min(seg_hi);
+                let mut scratch: Vec<Line<'static>> = Vec::new();
+                for line in &lines[cursor..owned_hi] {
+                    wrap_transcript_overlay_line(line, w, &mut scratch);
+                }
+                let owned_rows = scratch.len().min(wrapped.len());
+                row_kinds.resize(row_kinds.len() + owned_rows, kind);
+                row_kinds.resize(rows.len(), search::RowKind::Normal);
+            } else {
+                row_kinds.resize(rows.len(), kind);
+            }
+            debug_assert_eq!(row_kinds.len(), rows.len());
             cursor = seg_hi;
         }
         // Trailing tail (pending reasoning + assistant stream) after the last
-        // entry's segment. No stable entry id → wrap directly.
+        // entry's segment. No stable entry id → wrap directly, classified Normal.
         if cursor < n {
             for line in &lines[cursor..n] {
                 wrap_transcript_overlay_line(line, w, &mut rows);
+                row_kinds.resize(rows.len(), search::RowKind::Normal);
             }
         }
+        debug_assert_eq!(row_kinds.len(), rows.len());
         // An entry whose logical start fell past the line list (e.g. a fully
         // suppressed trailing run) anchors at the end of the wrapped rows,
         // matching the prior `row_starts.get(logical).unwrap_or(rows.len())`.
@@ -37962,10 +38021,62 @@ fn transcript_lines_and_entry_offsets_uncached(
                 entry_offsets[index] = rows.len();
             }
         }
-        (rows, entry_offsets)
+        (rows, entry_offsets, row_kinds)
     } else {
-        (lines, entry_line_starts)
+        // Unwrapped (logical-line) path: per-logical-line classification. Lines
+        // owned by an entry carry its kind; head chrome and the tail are `Normal`.
+        let line_kinds =
+            main_logical_line_kinds(entries, &entry_line_starts, entry_region_end, &lines);
+        (lines, entry_line_starts, line_kinds)
     }
+}
+
+/// Map a transcript entry's kind to the coarse [`search::RowKind`] the find pass
+/// keys its include/exclude toggles on. Routed through the overlay row model's
+/// [`transcript_surface::RowKind`] (and its exhaustive `From` drift guard) so the
+/// main and overlay surfaces classify identically: a tool-result entry's rows are
+/// tool output, a reasoning entry's rows are reasoning, everything else is normal.
+fn main_search_row_kind(kind: &TranscriptEntryKind) -> search::RowKind {
+    match transcript_surface::RowKind::from(kind) {
+        transcript_surface::RowKind::ToolResult => search::RowKind::ToolOutput,
+        transcript_surface::RowKind::Reasoning => search::RowKind::Reasoning,
+        _ => search::RowKind::Normal,
+    }
+}
+
+/// Per-logical-line search classification for the unwrapped (`width == None`)
+/// render: `kinds[i]` matches `lines[i]`. A logical line owned by entry `e`
+/// (in the half-open range `[entry_line_starts[e], next_start)` and before
+/// `entry_region_end`) carries that entry's kind; head chrome and the streaming
+/// tail are `Normal`. The wrapped path tags at the visual-row granularity in the
+/// wrap loop; this is the logical-line analogue for off-frame copy/export, which
+/// is the only consumer of the unwrapped path.
+fn main_logical_line_kinds(
+    entries: &[TranscriptEntry],
+    entry_line_starts: &[usize],
+    entry_region_end: usize,
+    lines: &[Line<'static>],
+) -> Vec<search::RowKind> {
+    let n = lines.len();
+    let mut kinds = vec![search::RowKind::Normal; n];
+    for (index, &start) in entry_line_starts.iter().enumerate() {
+        let lo = start.min(n);
+        let hi = entry_line_starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(n)
+            .min(entry_region_end)
+            .min(n)
+            .max(lo);
+        if lo >= hi {
+            continue;
+        }
+        let kind = main_search_row_kind(&entries[index].kind);
+        for slot in &mut kinds[lo..hi] {
+            *slot = kind;
+        }
+    }
+    kinds
 }
 
 /// Content fingerprint of one entry's wrapped-segment logical lines: every
