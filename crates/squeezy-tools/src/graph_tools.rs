@@ -1140,31 +1140,49 @@ pub(crate) fn graph_symbol_search(
     // whose names happen to share characters (e.g. `PQueue.add`
     // colliding with `QueueAddOptions`).
     let dotted_hits = query.and_then(|q| resolve_dotted_query(graph, q));
-    let candidates = if let Some(matches) = dotted_hits {
-        matches
+    let candidates: Option<Vec<GraphSymbol>> = if let Some(matches) = dotted_hits {
+        Some(matches)
     } else if let Some(query) = query {
-        graph
-            .signature_search(&SignatureQuery {
-                text: query.to_string(),
-                kind: single_symbol_kind(kind_filter),
-                visibility: visibility.map(str::to_string),
-                attribute: attribute.map(str::to_string),
-            })
-            .into_iter()
-            .chain(graph.find_symbol_by_name(query))
-            .collect::<Vec<_>>()
+        Some(
+            graph
+                .signature_search(&SignatureQuery {
+                    text: query.to_string(),
+                    kind: single_symbol_kind(kind_filter),
+                    visibility: visibility.map(str::to_string),
+                    attribute: attribute.map(str::to_string),
+                })
+                .into_iter()
+                .chain(graph.find_symbol_by_name(query))
+                .collect::<Vec<_>>(),
+        )
     } else {
-        graph.symbols.values().cloned().collect::<Vec<_>>()
+        // No query: rather than cloning the entire symbol table and then
+        // dropping most of it, filter over borrowed values and clone only the
+        // survivors.
+        None
     };
-    let mut symbols = candidates
-        .into_iter()
-        .filter(|symbol| seen.insert(symbol.id.clone()))
-        .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
-        .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
-        .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
-        .filter(|symbol| symbol_matches_path_filter(symbol, path))
-        .filter(|symbol| language_matches(graph, symbol, language))
-        .collect::<Vec<_>>();
+    let mut symbols = match candidates {
+        Some(candidates) => candidates
+            .into_iter()
+            .filter(|symbol| seen.insert(symbol.id.clone()))
+            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+            .filter(|symbol| symbol_matches_path_filter(symbol, path))
+            .filter(|symbol| language_matches(graph, symbol, language))
+            .collect::<Vec<_>>(),
+        None => graph
+            .symbols
+            .values()
+            .filter(|symbol| seen.insert(symbol.id.clone()))
+            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+            .filter(|symbol| symbol_matches_path_filter(symbol, path))
+            .filter(|symbol| language_matches(graph, symbol, language))
+            .cloned()
+            .collect::<Vec<_>>(),
+    };
 
     // Fuzzy widening: when the trigram-anchored candidate pool is empty
     // but a query was provided, run a fuzzy subsequence scan over a
@@ -1380,6 +1398,19 @@ pub(crate) fn graph_transitive_subtype_closure(
     let mut seen_ids: HashSet<SymbolId> = HashSet::new();
     let mut results: Vec<GraphSymbol> = Vec::new();
 
+    // Hoist a single borrowed snapshot scoped by the constant walk filters
+    // (`path`/`language`/`visibility`) once, instead of re-scanning and cloning
+    // the whole symbol table inside `graph_symbol_search` for every BFS node.
+    // Only the per-node attribute filter varies, so it's applied below over
+    // references and survivors are cloned.
+    let scope: Vec<&GraphSymbol> = graph
+        .symbols
+        .values()
+        .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+        .filter(|symbol| symbol_matches_path_filter(symbol, path))
+        .filter(|symbol| language_matches(graph, symbol, language))
+        .collect();
+
     while let Some(name) = queue.pop_front() {
         let attribute = format!("base:{name}|mixin:{name}|iface:{name}");
         // Expand KIND-AGNOSTICALLY. The hierarchy must be walked through every
@@ -1388,16 +1419,12 @@ pub(crate) fn graph_transitive_subtype_closure(
         // ones) is never enqueued and its whole subtree is silently dropped
         // (`class C implements J` would be missed for a `kind=class base:I`
         // query). The requested `kind` is applied to *emitted* results below,
-        // not to the walk. `path`/`language`/`visibility` still scope the walk.
-        let matches = graph_symbol_search(
-            graph,
-            None,
-            None,
-            path,
-            language,
-            visibility,
-            Some(&attribute),
-        );
+        // not to the walk. `path`/`language`/`visibility` already scoped the
+        // hoisted snapshot above.
+        let matches = scope
+            .iter()
+            .copied()
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, Some(&attribute)));
         for symbol in matches {
             let newly_seen = seen_ids.insert(symbol.id.clone());
             // Enqueue every newly-seen *name* so its subtypes are discovered too
@@ -1432,7 +1459,8 @@ pub(crate) fn graph_transitive_subtype_closure(
                 // truncated so callers can surface it distinctly.
                 return (results, true);
             }
-            results.push(symbol);
+            // Only survivors are cloned out of the borrowed snapshot.
+            results.push(symbol.clone());
         }
     }
 
