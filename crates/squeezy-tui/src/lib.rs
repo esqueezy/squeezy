@@ -17843,6 +17843,10 @@ fn lane_fold_anchor_id(app: &TuiApp) -> Option<u64> {
 /// every frame.
 pub(crate) fn refresh_lane_fold(app: &mut TuiApp) {
     let entries = active_transcript_entries(app);
+    // `manual_option_zip` misfires here: the `position` lookup reads the
+    // `and_then`-bound `id`, so the two options are not independent and
+    // `Option::zip` cannot express the dependency.
+    #[allow(clippy::manual_option_zip)]
     let (entry_id, lanes) = match lane_fold_anchor_id(app).and_then(|id| {
         entries
             .iter()
