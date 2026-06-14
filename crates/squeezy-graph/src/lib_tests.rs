@@ -8469,6 +8469,106 @@ internal class TraceJsonReader : JsonReader
 }
 
 #[test]
+fn graph_lowers_python_inheritance_attributes_to_edges() {
+    // Before the generic lowering pass, only C#/PHP materialized inheritance
+    // edges; Python recorded inheritance solely as `base:` attributes, so
+    // inheritance_ancestors / Extends edges were empty for it.
+    let mut parser = LanguageParser::new().unwrap();
+    let record = python_record(
+        "app/models.py",
+        "class Base:\n    pass\n\nclass Derived(Base):\n    pass\n",
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let base = graph
+        .find_symbol_by_name("Base")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Base class symbol");
+    let derived = graph
+        .find_symbol_by_name("Derived")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Derived class symbol");
+
+    assert!(
+        graph
+            .inheritance_ancestors(&derived.id)
+            .iter()
+            .any(|symbol| symbol.id == base.id),
+        "Derived should report Base as an ancestor via generic inheritance lowering"
+    );
+    assert!(
+        graph.edges().iter().any(|edge| edge.kind == EdgeKind::Extends
+            && edge.from == derived.id
+            && edge.to.as_ref() == Some(&base.id)),
+        "expected an Extends edge Derived -> Base"
+    );
+}
+
+#[test]
+fn graph_materializes_rust_trait_impl_edges() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record(
+        "src/lib.rs",
+        r#"
+pub trait Greet {
+    fn hello(&self);
+}
+
+pub struct Person;
+
+impl Greet for Person {
+    fn hello(&self) {}
+}
+
+impl Person {
+    fn new() -> Self {
+        Person
+    }
+}
+"#,
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let person = graph
+        .find_symbol_by_name("Person")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Struct)
+        .expect("Person struct symbol");
+    let greet = graph
+        .find_symbol_by_name("Greet")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Trait)
+        .expect("Greet trait symbol");
+
+    // The type -> trait Implements edge is what drives the ancestor walk.
+    assert!(
+        graph
+            .inheritance_ancestors(&person.id)
+            .iter()
+            .any(|symbol| symbol.id == greet.id),
+        "Person should report Greet as an ancestor via the materialized Implements edge"
+    );
+    assert!(
+        graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::TraitImpl && edge.to.as_ref() == Some(&greet.id)),
+        "expected a TraitImpl edge targeting Greet"
+    );
+    assert!(
+        graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::InherentImpl),
+        "expected an InherentImpl edge for `impl Person`"
+    );
+}
+
+#[test]
 fn graph_records_js_ts_class_heritage_as_base_and_iface_attributes() {
     // The JS/TS extractor records inheritance as queryable `base:`/`iface:`
     // attributes (not only type-reference edges), and the graph build carries
