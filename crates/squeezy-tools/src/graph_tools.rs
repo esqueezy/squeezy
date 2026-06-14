@@ -1361,7 +1361,7 @@ pub(crate) fn graph_transitive_subtype_closure(
     visibility: Option<&str>,
     seed_names: &[String],
     cap: usize,
-) -> Vec<GraphSymbol> {
+) -> (Vec<GraphSymbol>, bool) {
     let kind_filter = kind.and_then(parse_symbol_kind_filter);
     let query = query.map(str::trim).filter(|value| !value.is_empty());
 
@@ -1424,13 +1424,15 @@ pub(crate) fn graph_transitive_subtype_closure(
                 }
             }
             if results.len() >= cap {
-                return results;
+                // Closure hit the cap: signal that the subtype tree was
+                // truncated so callers can surface it distinctly.
+                return (results, true);
             }
             results.push(symbol);
         }
     }
 
-    results
+    (results, false)
 }
 
 /// Resolve a dotted-or-double-coloned query like `PQueue.add` or
@@ -3217,7 +3219,7 @@ impl ToolRegistry {
                 .filter(|attr| attribute_has_inheritance_prefix(attr))
                 .map(seed_type_names)
         });
-        let symbols = match transitive_seed {
+        let (symbols, closure_capped) = match transitive_seed {
             Some(Some(seed_names)) if !seed_names.is_empty() => graph_transitive_subtype_closure(
                 graph,
                 args.query.as_deref(),
@@ -3228,17 +3230,25 @@ impl ToolRegistry {
                 &seed_names,
                 TRANSITIVE_CLOSURE_CAP,
             ),
-            _ => graph_symbol_search(
-                graph,
-                args.query.as_deref(),
-                args.kind.as_deref(),
-                args.path.as_deref(),
-                args.language.as_deref(),
-                args.visibility.as_deref(),
-                args.attribute.as_deref(),
+            _ => (
+                graph_symbol_search(
+                    graph,
+                    args.query.as_deref(),
+                    args.kind.as_deref(),
+                    args.path.as_deref(),
+                    args.language.as_deref(),
+                    args.visibility.as_deref(),
+                    args.attribute.as_deref(),
+                ),
+                false,
             ),
         };
-        let truncated = symbols.len().saturating_sub(offset) > max_results;
+        // The closure cap is a distinct truncation source from the result-window
+        // cap: fold it into `truncated` so the page is flagged, and also surface
+        // it as a separate `closure_capped` signal so a caller can tell the
+        // subtype *tree* itself was clipped (and may re-scope the walk).
+        let truncated =
+            closure_capped || symbols.len().saturating_sub(offset) > max_results;
         let selected = symbols
             .iter()
             .skip(offset)
@@ -3278,6 +3288,7 @@ impl ToolRegistry {
         );
         payload.insert("counts_by_kind".to_string(), decl_counts_by_kind(&symbols));
         payload.insert("truncated".to_string(), json!(truncated));
+        payload.insert("closure_capped".to_string(), json!(closure_capped));
         make_result(
             call,
             ToolStatus::Success,
